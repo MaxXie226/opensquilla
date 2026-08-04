@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPORT_MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -244,6 +245,120 @@ class CostTests(unittest.TestCase):
         self.assertEqual(priced["mode"], "ignored")
         self.assertIsNone(priced["usd"])
 
+    def test_actual_cost_evidence_and_zero_placeholder_fallbacks(self) -> None:
+        token_usage = {
+            "model": "vendor/model",
+            "input_tokens": 1000,
+            "output_tokens": 100,
+            "cached_tokens": 400,
+        }
+        cases = [
+            (
+                "placeholder zero with tokens",
+                {**token_usage, "billed_cost": 0.0, "cost_source": "unavailable"},
+                "estimated_cache_aware",
+                0.0024,
+            ),
+            (
+                "provider billed zero",
+                {**token_usage, "billed_cost": 0.0, "cost_source": "provider_billed"},
+                "actual",
+                0.0,
+            ),
+            (
+                "nested provider billed zero",
+                {
+                    **token_usage,
+                    "billed_cost": 0.0,
+                    "cost_source": "unavailable",
+                    "provider_usage": {
+                        "cost_source": "provider_billed",
+                        "provider_reported_cost": 0.0,
+                    },
+                },
+                "actual",
+                0.0,
+            ),
+            (
+                "legacy positive",
+                {"model": "vendor/model", "billed_cost": 0.125},
+                "actual",
+                0.125,
+            ),
+            (
+                "nested positive wins over outer zero",
+                {
+                    "model": "vendor/model",
+                    "billed_cost": 0.0,
+                    "provider_usage": {"provider_reported_cost": 0.375},
+                },
+                "actual",
+                0.375,
+            ),
+            (
+                "BYOK zero",
+                {
+                    **token_usage,
+                    "billed_cost": 0.0,
+                    "cost_source": "openrouter_usage",
+                    "provider_usage": {"is_byok": True, "provider_reported_cost": 0.0},
+                },
+                "estimated_cache_aware",
+                0.0024,
+            ),
+            (
+                "no money or tokens",
+                {"model": "vendor/model", "billed_cost": 0.0, "cost_source": "unknown"},
+                "ignored",
+                None,
+            ),
+            (
+                "OpenSquilla estimate is not actual",
+                {
+                    **token_usage,
+                    "billed_cost": 0.5,
+                    "cost_source": "opensquilla_model_registry",
+                },
+                "estimated_cache_aware",
+                0.0024,
+            ),
+            (
+                "confirmed billing receipt",
+                {
+                    "model": "vendor/model",
+                    "billed_cost": 0.0,
+                    "cost_source": "unknown",
+                    "billing_receipt": {
+                        "status": "confirmed",
+                        "usd_equivalent_nanos": 250_000_000,
+                    },
+                },
+                "actual",
+                0.25,
+            ),
+            (
+                "pending billing receipt is not actual",
+                {
+                    **token_usage,
+                    "billed_cost": 0.5,
+                    "billing_receipt": {
+                        "status": "pending",
+                        "usd_equivalent_nanos": None,
+                    },
+                },
+                "estimated_cache_aware",
+                0.0024,
+            ),
+        ]
+        for name, unit, expected_mode, expected_usd in cases:
+            with self.subTest(name=name):
+                priced = report.price_unit(unit, self.prices)
+                self.assertEqual(priced["mode"], expected_mode)
+                if expected_usd is None:
+                    self.assertIsNone(priced["usd"])
+                else:
+                    self.assertAlmostEqual(priced["usd"], expected_usd)
+
     def test_selected_scope_does_not_use_whole_generation_retry_spend(self) -> None:
         row = {
             "cost_accounting": {
@@ -323,7 +438,7 @@ class PairingTests(unittest.TestCase):
     @staticmethod
     def arm(arm_id: str, offset: float) -> dict:
         return {
-            "spec": {"arm_id": arm_id},
+            "spec": {"arm_id": arm_id, "analyzer_mode": "frozen_replay"},
             "rows": [
                 {
                     "task_id": f"task-{index}",
@@ -390,6 +505,217 @@ class PairingTests(unittest.TestCase):
         self.assertEqual(comparison["request_context_match_count"], 8)
         self.assertEqual(comparison["task_profile_match_count"], 8)
 
+    def test_pairing_rejects_mixed_analyzer_modes(self) -> None:
+        control = self.arm("E0", 0)
+        variant = self.arm("E1", 1)
+        variant["spec"]["analyzer_mode"] = "live"
+        with self.assertRaisesRegex(report.ReportError, "identical non-empty analyzer_mode"):
+            report.paired(control, variant)
+
+
+class ScheduleAndSeedTests(unittest.TestCase):
+    @staticmethod
+    def plan() -> dict:
+        candidate_ids = [f"P0.5-36-E1-R{replicate}" for replicate in (1, 2, 3)]
+        anchors = {
+            "common-E0-source": "common-E0-source",
+            "common-E0-R1": "common-E0-R1",
+            candidate_ids[0]: "common-E0-R1",
+            "common-E0-R2": "common-E0-R2",
+            candidate_ids[1]: "common-E0-R2",
+            "common-E0-R3": "common-E0-R3",
+            candidate_ids[2]: "common-E0-R3",
+        }
+        order = list(anchors)
+        return {
+            "run_id": "fixture",
+            "execution": {
+                "schedule": {
+                    "mode": "anchored_serial",
+                    "strict_task_interleaving": False,
+                    "arm_order": order,
+                    "anchor_by_arm_id": anchors,
+                }
+            },
+            "comparison_controls": {
+                "source_arm_id": "common-E0-source",
+                "live_control_arm_id": "common-E0-source",
+                "default_control_arm_id": "common-E0-R1",
+                "replay_control_arm_ids": [
+                    "common-E0-R1",
+                    "common-E0-R2",
+                    "common-E0-R3",
+                ],
+                "require_same_analyzer_mode": True,
+                "arm_control_overrides": dict(
+                    zip(
+                        candidate_ids,
+                        ("common-E0-R1", "common-E0-R2", "common-E0-R3"),
+                        strict=True,
+                    )
+                ),
+            },
+            "common_e0": [
+                {
+                    "arm_id": "common-E0-source",
+                    "variant": "E0-live",
+                    "replicate": 1,
+                    "analyzer_mode": "live",
+                    "override": {},
+                },
+                *[
+                    {
+                        "arm_id": f"common-E0-R{replicate}",
+                        "variant": "E0-replay",
+                        "replicate": replicate,
+                        "analyzer_mode": "frozen_replay",
+                        "override": {},
+                    }
+                    for replicate in (1, 2, 3)
+                ],
+            ],
+            "experiments": [
+                {
+                    "id": "P0.5-36",
+                    "directory_name": "P0-5-36",
+                    "title": "Candidate order",
+                    "variants": [
+                        {
+                            "id": "E1",
+                            "replicates": 3,
+                            "override": {"ensemble": {"shuffle_candidates": True}},
+                            "replicate_overrides": [
+                                {"ensemble": {"candidate_order_seed": seed}}
+                                for seed in (0, 1, 4)
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def test_dynamic_controls_and_replicate_seeds_expand_exactly(self) -> None:
+        specs = report.expand_arms(self.plan())
+        variants = [spec for spec in specs if spec.experiment_id == "P0.5-36"]
+        self.assertEqual(
+            [spec.control_arm_id for spec in variants],
+            ["common-E0-R1", "common-E0-R2", "common-E0-R3"],
+        )
+        self.assertEqual(
+            [spec.override["ensemble"]["candidate_order_seed"] for spec in variants],
+            [0, 1, 4],
+        )
+        self.assertTrue(all(spec.override["ensemble"]["shuffle_candidates"] for spec in variants))
+
+    def test_schedule_binds_sha_ordinals_anchors_and_non_interleaving(self) -> None:
+        plan = self.plan()
+        specs = report.expand_arms(plan)
+        schedule = plan["execution"]["schedule"]
+        status = {
+            "schedule_sha256": report.canonical_sha256(schedule),
+            "schedule_mode": "anchored_serial",
+            "strict_task_interleaving": False,
+            "arms": {
+                arm_id: {
+                    "schedule_ordinal": ordinal,
+                    "anchor_arm_id": schedule["anchor_by_arm_id"][arm_id],
+                }
+                for ordinal, arm_id in enumerate(schedule["arm_order"], start=1)
+            },
+        }
+        evidence = report.validate_schedule_evidence(plan, status, specs)
+        self.assertTrue(evidence["valid"], evidence["reasons"])
+        self.assertFalse(evidence["strict_task_interleaving"])
+        self.assertEqual(evidence["design_label"], "anchored_serial_not_task_interleaved")
+        status["arms"]["P0.5-36-E1-R2"]["schedule_ordinal"] = 99
+        evidence = report.validate_schedule_evidence(plan, status, specs)
+        self.assertFalse(evidence["valid"])
+        self.assertIn(
+            "status schedule ordinal differs: P0.5-36-E1-R2",
+            evidence["reasons"],
+        )
+
+    def test_seed_gate_only_applies_after_candidate_aggregation_starts(self) -> None:
+        spec = next(
+            spec
+            for spec in report.expand_arms(self.plan())
+            if spec.arm_id == "P0.5-36-E1-R1"
+        )
+        evidence = report.p0_5_36_seed_evidence(
+            spec,
+            {
+                "valid": [
+                    {
+                        "applicable": True,
+                        "configured_candidate_order_seed": 0,
+                        "candidate_order_seed": 0,
+                    }
+                ],
+                "pre-aggregation": [
+                    {
+                        "applicable": False,
+                        "configured_candidate_order_seed": 0,
+                        "candidate_order_seed": None,
+                    }
+                ],
+                "mismatch": [
+                    {
+                        "applicable": True,
+                        "configured_candidate_order_seed": 0,
+                        "candidate_order_seed": 1,
+                    }
+                ],
+            },
+            expected_task_ids=["valid", "pre-aggregation", "mismatch"],
+        )
+        assert evidence is not None
+        self.assertEqual(evidence["valid_task_ids"], ["valid"])
+        self.assertEqual(evidence["not_applicable_task_ids"], ["pre-aggregation"])
+        self.assertEqual(evidence["invalid_task_ids"], ["mismatch"])
+        self.assertEqual(evidence["per_task"]["pre-aggregation"]["state"], "not_applicable")
+        self.assertTrue(evidence["comparison_slice_available"])
+
+    def test_seed_gate_all_pre_aggregation_has_no_comparison_slice(self) -> None:
+        spec = next(
+            spec
+            for spec in report.expand_arms(self.plan())
+            if spec.arm_id == "P0.5-36-E1-R1"
+        )
+        evidence = report.p0_5_36_seed_evidence(
+            spec,
+            {
+                "pre-aggregation": [
+                    {
+                        "applicable": False,
+                        "configured_candidate_order_seed": 0,
+                        "candidate_order_seed": None,
+                    }
+                ]
+            },
+            expected_task_ids=["pre-aggregation"],
+        )
+        assert evidence is not None
+        self.assertEqual(evidence["not_applicable_task_ids"], ["pre-aggregation"])
+        self.assertFalse(evidence["comparison_slice_available"])
+
+    def test_p0_20_e3_is_not_c3_promotion_evidence_without_interleaving(self) -> None:
+        evidence = report.p0_20_e3_promotion_evidence(
+            {
+                "strict_task_interleaving": False,
+                "arm_timing": {
+                    "common-E0-R1": {"schedule_ordinal": 6},
+                    "P0-20-E3": {
+                        "schedule_ordinal": 13,
+                        "anchor_arm_id": "common-E0-R1",
+                    },
+                },
+            }
+        )
+        self.assertEqual(evidence["status"], "mini_diagnostic_only")
+        self.assertFalse(evidence["eligible_as_c3_promotion_evidence"])
+        self.assertTrue(evidence["scheduled_after_r1_anchor"])
+        self.assertEqual(evidence["schedule_ordinal_gap"], 7)
+
 
 class ReceiptTests(unittest.TestCase):
     def test_wire_receipt_hash_allows_derived_path_annotation(self) -> None:
@@ -409,7 +735,36 @@ class ReceiptTests(unittest.TestCase):
         receipt["receipt_sha256"] = report.canonical_sha256(receipt)
         plan = {
             "run_id": "fixture",
-            "common_e0": [],
+            "comparison_controls": {
+                "source_arm_id": "common-E0-source",
+                "default_control_arm_id": "common-E0-R1",
+                "replay_control_arm_ids": [
+                    "common-E0-R1",
+                    "common-E0-R2",
+                    "common-E0-R3",
+                ],
+                "require_same_analyzer_mode": True,
+                "arm_control_overrides": {},
+            },
+            "common_e0": [
+                {
+                    "arm_id": "common-E0-source",
+                    "variant": "E0-live",
+                    "replicate": 1,
+                    "analyzer_mode": "live",
+                    "override": {},
+                },
+                *[
+                    {
+                        "arm_id": f"common-E0-R{replicate}",
+                        "variant": "E0-replay",
+                        "replicate": replicate,
+                        "analyzer_mode": "frozen_replay",
+                        "override": {},
+                    }
+                    for replicate in (1, 2, 3)
+                ],
+            ],
             "experiments": [],
             "no_op_experiments": [{"id": "P0.5-07", "title": "Analyzer temperature"}],
         }
@@ -597,22 +952,63 @@ class EndToEndTests(unittest.TestCase):
                 "report_root": str(self.report_root),
             },
             "benchmark": {"task_count": 10, "task_ids": self.task_ids, "groups": ["G1"]},
-            "execution": {"task_concurrency": 6},
+            "execution": {
+                "task_concurrency": 6,
+                "schedule": {
+                    "mode": "anchored_serial",
+                    "strict_task_interleaving": False,
+                    "arm_order": [
+                        "common-E0-source",
+                        "common-E0-R1",
+                        "P0-12-E1",
+                        "common-E0-R2",
+                        "common-E0-R3",
+                    ],
+                    "anchor_by_arm_id": {
+                        "common-E0-source": "common-E0-source",
+                        "common-E0-R1": "common-E0-R1",
+                        "P0-12-E1": "common-E0-R1",
+                        "common-E0-R2": "common-E0-R2",
+                        "common-E0-R3": "common-E0-R3",
+                    },
+                },
+            },
+            "comparison_controls": {
+                "source_arm_id": "common-E0-source",
+                "live_control_arm_id": "common-E0-source",
+                "default_control_arm_id": "common-E0-R1",
+                "replay_control_arm_ids": [
+                    "common-E0-R1",
+                    "common-E0-R2",
+                    "common-E0-R3",
+                ],
+                "require_same_analyzer_mode": True,
+                "arm_control_overrides": {"P0-12-E1": "common-E0-R1"},
+            },
             "common_e0": [
                 {
-                    "arm_id": "common-E0-R1",
-                    "variant": "E0",
+                    "arm_id": "common-E0-source",
+                    "variant": "E0-live",
                     "replicate": 1,
                     "analyzer_mode": "live",
                     "override": {},
-                }
+                },
+                *[
+                    {
+                        "arm_id": f"common-E0-R{replicate}",
+                        "variant": "E0-replay",
+                        "replicate": replicate,
+                        "analyzer_mode": "frozen_replay",
+                        "override": {},
+                    }
+                    for replicate in (1, 2, 3)
+                ],
             ],
             "experiments": [
                 {
                     "id": "P0-12",
                     "directory_name": "P0-12",
                     "title": "Synthetic variable",
-                    "control_arm_id": "common-E0-R1",
                     "variants": [{"id": "E1", "override": {"x": 1}}],
                 }
             ],
@@ -627,10 +1023,18 @@ class EndToEndTests(unittest.TestCase):
         self.plan_path = self.run_root / "campaign-plan.json"
         write_json(self.plan_path, self.plan)
         self.arm_dirs = {
+            "common-E0-source": self.report_root
+            / "common"
+            / "common-E0-source-synthetic",
             "common-E0-R1": self.report_root / "common" / "common-E0-R1-synthetic",
+            "common-E0-R2": self.report_root / "common" / "common-E0-R2-synthetic",
+            "common-E0-R3": self.report_root / "common" / "common-E0-R3-synthetic",
             "P0-12-E1": self.report_root / "P0-12" / "P0-12-E1-synthetic",
         }
+        self._formal_arm(self.arm_dirs["common-E0-source"], 50.0, "common-E0-source")
         self._formal_arm(self.arm_dirs["common-E0-R1"], 50.0, "common-E0-R1")
+        self._formal_arm(self.arm_dirs["common-E0-R2"], 50.5, "common-E0-R2")
+        self._formal_arm(self.arm_dirs["common-E0-R3"], 49.5, "common-E0-R3")
         self._formal_arm(self.arm_dirs["P0-12-E1"], 51.0, "P0-12-E1")
         artifact = {"schema": "test-artifact", "task_count": 10}
         artifact["artifact_sha256"] = report.canonical_sha256(artifact)
@@ -660,17 +1064,41 @@ class EndToEndTests(unittest.TestCase):
         offline_receipt["receipt_sha256"] = report.canonical_sha256(offline_receipt)
         offline_receipt_path = self.run_root / "offline-P0-12-E1.json"
         write_json(offline_receipt_path, offline_receipt)
+        replay_overlay_sha = "d" * 64
+        replay_receipt = {
+            "schema": "opensquilla.draco.offline-effect-receipt/v1",
+            "kind": "offline-main-runner-behavior-effect",
+            "arm_ids": ["common-E0-R1", "common-E0-R2", "common-E0-R3"],
+            "experiment_ids": ["common-E0"],
+            "campaign_plan_sha256": report.canonical_sha256(self.plan),
+            "source_artifact_sha256": artifact["artifact_sha256"],
+            "overlay_sha256": replay_overlay_sha,
+            "decision": "run",
+            "comparison_by_proposer_cap_explicitness": {},
+        }
+        replay_receipt["receipt_sha256"] = report.canonical_sha256(replay_receipt)
+        replay_receipt_path = self.run_root / "offline-common-E0-replays.json"
+        write_json(replay_receipt_path, replay_receipt)
         derived = {
             "schema": report.DERIVED_SCHEMA,
             "campaign_plan_sha256": report.canonical_sha256(self.plan),
-            "source_arm_id": "common-E0-R1",
-            "source_output_dir": str(self.arm_dirs["common-E0-R1"]),
+            "source_arm_id": "common-E0-source",
+            "source_output_dir": str(self.arm_dirs["common-E0-source"]),
             "frozen_analyzer_artifact": {
                 "path": str(artifact_path),
                 "file_sha256": report.file_sha256(artifact_path),
                 "artifact_sha256": artifact["artifact_sha256"],
             },
             "offline_effect": {
+                **{
+                    f"common-E0-R{replicate}": {
+                        "decision": "run",
+                        "overlay_sha256": replay_overlay_sha,
+                        "receipt_path": str(replay_receipt_path),
+                        "receipt_sha256": replay_receipt["receipt_sha256"],
+                    }
+                    for replicate in (1, 2, 3)
+                },
                 "P0-12-E1": {
                     "decision": "run",
                     "overlay_sha256": overlay_sha,
@@ -679,6 +1107,10 @@ class EndToEndTests(unittest.TestCase):
                 }
             },
             "offline_unique_overlays": {
+                replay_overlay_sha: {
+                    **replay_receipt,
+                    "path": str(replay_receipt_path),
+                },
                 overlay_sha: {
                     **offline_receipt,
                     "path": str(offline_receipt_path),
@@ -699,6 +1131,11 @@ class EndToEndTests(unittest.TestCase):
             "schema": report.STATUS_SCHEMA,
             "run_id": "synthetic",
             "campaign_plan_sha256": report.canonical_sha256(self.plan),
+            "schedule_sha256": report.canonical_sha256(
+                self.plan["execution"]["schedule"]
+            ),
+            "schedule_mode": "anchored_serial",
+            "strict_task_interleaving": False,
             "phase": "succeeded",
             "derived_plan": {
                 "path": str(self.derived_path),
@@ -709,6 +1146,35 @@ class EndToEndTests(unittest.TestCase):
                     "state": "succeeded",
                     "output_dir": str(path),
                     "completion_evidence": arm_evidence[arm_id],
+                    "schedule_ordinal": self.plan["execution"]["schedule"][
+                        "arm_order"
+                    ].index(arm_id)
+                    + 1,
+                    "anchor_arm_id": self.plan["execution"]["schedule"][
+                        "anchor_by_arm_id"
+                    ][arm_id],
+                    "started_at": (
+                        "2026-08-05T00:00:00+00:00"
+                        if arm_id == "common-E0-source"
+                        else "2026-08-05T00:10:00+00:00"
+                        if arm_id == "common-E0-R1"
+                        else "2026-08-05T00:20:00+00:00"
+                        if arm_id == "P0-12-E1"
+                        else "2026-08-05T00:30:00+00:00"
+                        if arm_id == "common-E0-R2"
+                        else "2026-08-05T00:40:00+00:00"
+                    ),
+                    "completed_at": (
+                        "2026-08-05T00:09:00+00:00"
+                        if arm_id == "common-E0-source"
+                        else "2026-08-05T00:19:00+00:00"
+                        if arm_id == "common-E0-R1"
+                        else "2026-08-05T00:29:00+00:00"
+                        if arm_id == "P0-12-E1"
+                        else "2026-08-05T00:39:00+00:00"
+                        if arm_id == "common-E0-R2"
+                        else "2026-08-05T00:49:00+00:00"
+                    ),
                 }
                 for arm_id, path in self.arm_dirs.items()
             },
@@ -992,6 +1458,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Judge$", markdown)
         self.assertIn("没有独立 SafetyGate", markdown)
         self.assertIn("失败/被替换 retry", markdown)
+        self.assertIn("anchored-serial", markdown)
+        self.assertIn("不是逐题 AB/BA", markdown)
+        self.assertTrue(result["schedule_evidence"]["valid"])
+        self.assertFalse(result["schedule_evidence"]["strict_task_interleaving"])
+        self.assertEqual(result["replay_control_drift"]["comparison_count"], 2)
+        self.assertEqual(result["unique_arm_costs"]["unique_formal_arm_count"], 5)
         root_json = json.loads((output / "EXPERIMENT_RESULTS.json").read_text())
         self.assertTrue(report.validate_embedded_hash(root_json, "report_sha256"))
         group_json = json.loads((output / "P0-12" / "EXPERIMENT_RESULTS.json").read_text())
@@ -1025,7 +1497,43 @@ class EndToEndTests(unittest.TestCase):
             reasons,
         )
         self.assertEqual(result["experiments"]["P0-12"]["comparisons"], [])
-        self.assertEqual(result["unique_arm_costs"]["unique_formal_arm_count"], 1)
+        self.assertEqual(result["unique_arm_costs"]["unique_formal_arm_count"], 4)
+
+    def test_invalid_active_comparison_evidence_is_partial_and_strict_exit_two(self) -> None:
+        output = self.root / "invalid-comparison-output"
+        args = argparse.Namespace(
+            plan=self.plan_path,
+            status=self.status_path,
+            derived_plan=self.derived_path,
+            price_registry=self.snapshot / report.PRICE_REGISTRY_RELATIVE,
+            output_root=output,
+            allow_nonterminal=False,
+            strict=True,
+        )
+        original = report.build_experiment_inventory
+
+        def invalidate_comparison(*call_args, **call_kwargs):
+            experiments = original(*call_args, **call_kwargs)
+            experiments["P0-12"]["comparison_evidence_valid"] = False
+            experiments["P0-12"]["comparison_invalid_reasons"] = [
+                "no candidate-order comparison slice is available"
+            ]
+            return experiments
+
+        with mock.patch.object(
+            report,
+            "build_experiment_inventory",
+            side_effect=invalidate_comparison,
+        ):
+            result, exit_code = report.generate(args)
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["completion"]["status"], "partial_or_failed")
+        self.assertFalse(result["completion"]["comparison_evidence_valid"])
+        self.assertEqual(
+            result["completion"]["comparison_evidence_invalid_experiment_ids"],
+            ["P0-12"],
+        )
 
     def test_unfrozen_79_model_price_registry_is_rejected(self) -> None:
         original_path = self.snapshot / report.PRICE_REGISTRY_RELATIVE

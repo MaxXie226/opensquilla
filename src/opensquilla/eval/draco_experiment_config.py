@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 FORMAL_DRACO_OPENROUTER_PROVIDER = "openrouter"
 FORMAL_DRACO_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -277,6 +277,18 @@ class DracoEnsembleConfig(_StrictConfig):
     proposer_visible_answer_reserve_tokens: int = Field(default=4_096, ge=1)
     wait_for_all_proposers: bool
     quorum_grace_seconds: float = Field(ge=0.0)
+    candidate_order_seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=(1 << 64) - 1,
+    )
+
+    @field_validator("candidate_order_seed", mode="before")
+    @classmethod
+    def _reject_boolean_candidate_order_seed(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("candidate_order_seed must be an unsigned 64-bit integer")
+        return value
 
     @model_validator(mode="after")
     def _validate_wait_policy(self) -> DracoEnsembleConfig:

@@ -8,18 +8,20 @@ replaced and `validate-only` succeeds against the clean isolated snapshot.
 ## What is already implemented
 
 - Exact remaining matrix from `Agentic-Routing-Step2-Tuning-Plan.md`:
-  31 live experiment groups, 65 candidate live campaigns before offline
+  31 live experiment groups, 66 candidate live campaigns before offline
   wire-effect deletion, plus the P0.5-07 no-op receipt.
 - Explicit exclusions: completed P0-01, P0-02, P0.5-31 and stopped P0-15.
-- `common-E0-R1` uses live Analyzer; its ten task profiles are frozen once.
+- `common-E0-source` uses live Analyzer; its ten task profiles are frozen once.
   The source manifest/audit/non-BYOK proof self-hashes, manifest artifact
   size/raw-SHA bindings, result-row evidence hashes, and trace/result bindings
   are verified before replay. A profile is accepted only from a schema-valid
   `llm_provider` Analyzer trace whose final physical attempt has known usage.
   Normalization warnings are retained verbatim.
-  `common-E0-R2/R3` and every non-Analyzer candidate replay exactly that bundle
-  with zero Analyzer requests.
-- P0-03, P0.5-05 and P0.5-06 remain live Analyzer-variable experiments.
+  `common-E0-R1/R2/R3` and every non-Analyzer candidate replay exactly that
+  bundle with zero Analyzer requests. All replay candidates are paired only
+  with the nearest replay control, so Analyzer cost and latency cannot leak
+  into their comparison. P0-03, P0.5-05 and P0.5-06 remain live
+  Analyzer-variable experiments and pair only with `common-E0-source`.
 - P0.5-06 derives `T` from the **final successful physical Analyzer attempt**
   for each new E0 task (never retry-aggregated usage), with
   Hyndman-Fan linear type-7 p99, then freezes `floor(0.8*T)` and
@@ -29,8 +31,8 @@ replaced and `validate-only` succeeds against the clean isolated snapshot.
   records config/compat/payload source hashes. It is deleted only when both
   wire temperatures are truly omitted.
 - After E0, the production main runner is invoked with `--dry-run` and the
-  frozen replay bundle once per unique non-Analyzer overlay (55 unique
-  overlays across 60 arms). The baseline dry replay must reproduce E0's
+  frozen replay bundle once per unique non-Analyzer overlay (57 unique
+  overlays across 61 arms). The baseline dry replay must reproduce E0's
   ordered selected P/A, recovery roster, quorum, shuffle behavior, prompt
   contract, and request-visible member configuration on all ten tasks.
 - Every non-Analyzer candidate receives an offline-effect receipt. Any arm
@@ -41,15 +43,34 @@ replaced and `validate-only` succeeds against the clean isolated snapshot.
   `temperature_parameter_sent` and `wire_temperature` using the production
   official-host compatibility helper. Reports can therefore analyze only
   requests on which temperature is real.
-- P0.5-36 treats `effective_shuffle_candidates` as an actual execution
-  behavior change even when P/A identities are unchanged.
+- P0.5-36 freezes three distinct uint64 candidate-order seeds (`0`, `1`, `4`)
+  through generic per-replicate deep-merged overrides. Both configured and
+  effective seed, plus `effective_shuffle_candidates`, enter the behavior
+  projection, so an offline receipt proves the exact shuffle rather than only
+  the boolean switch.
 - P0.5-10/38/39 retain an additional production
   `_proposer_chat_config`/`_aggregator_chat_config` budget gate. Both possible
   proposer-cap explicitness modes are projected; request-budget rebinding is
   source-proven disabled for this DRACO builder. If that proof drifts, the arm
   runs conservatively rather than being deleted.
-- Arms run serially; the launcher receives task concurrency `6`; each arm keeps
-  its own account window, preflight, settlement, finalizer, and formal report.
+- Arms run in one hash-frozen anchored-serial schedule: live source, the four
+  live Analyzer candidates, then replay anchors R1/R2/R3 followed by their
+  explicitly bound tranches. P0.5-11 and P0.5-36 R1/R2/R3 bind to the matching
+  replay anchor. Within the R1 tranche, P0-20-E3 is the first candidate after
+  `common-E0-R1`, immediately followed by P0-20-E2, to reduce the source plan's
+  C3 time-separation bias. P0-20-E3 remains a mini diagnostic and must not be
+  used as C3 promotion evidence. The controller validates the exact 66-arm order, nearest
+  anchor and Analyzer mode and records the schedule SHA, ordinal and anchor in
+  status. As each anchor is encountered, the controller authenticates its formal
+  output once for the current process. Before opening any non-anchor paid arm,
+  it requires both that current-run authentication and `succeeded` status;
+  otherwise the dependent arm becomes `blocked_prerequisite` without a launch.
+  `strict_task_interleaving=false` is intentional: arms are serial,
+  while the launcher runs up to six tasks concurrently within an arm. Thus the
+  design removes Analyzer-mode bias; adjacency to an anchor only reduces time
+  drift and cannot substitute for strict task-by-task E0/candidate interleaving.
+- Each arm keeps its own account window, preflight, settlement, finalizer, and
+  formal report.
 - A controller lock prevents duplicate controllers. `status.json`, the frozen
   Analyzer artifact, receipts, and `derived-plan.json` are written atomically
   with semantic and raw hashes.
@@ -69,6 +90,10 @@ replaced and `validate-only` succeeds against the clean isolated snapshot.
   launcher, controller, reporter, main runner, resume runner, snapshot commit,
   and tree are all frozen. They are rechecked immediately before every paid arm
   so a long campaign cannot silently consume a changed shared reference.
+- The G1-C contract freezes both layers: the packaged
+  `step2-ranking-config-v4`/full-79 source and its assignment-OFF formal v3
+  compatibility projection with its own canonical SHA. The controller binds
+  both identities, so this is not reuse of the stale B2/full-80 contract.
 - After all arms reach terminal states, the controller publishes an immutable,
   self-hashed `terminal-status-input.json` and invokes the separately frozen
   reporter in strict mode. Reporter output hashes are recorded in a terminal

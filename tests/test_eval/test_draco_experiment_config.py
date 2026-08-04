@@ -102,6 +102,7 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.ensemble.all_failed_policy == "fallback_single"
     assert config.ensemble.candidate_max_chars == 24_000
     assert config.ensemble.shuffle_candidates is False
+    assert config.ensemble.candidate_order_seed is None
     assert config.ensemble.record_candidates is True
     assert config.ensemble.proposer_tools is False
     assert config.ensemble.aggregator_tools is True
@@ -136,6 +137,29 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.judge.repeats == 3
     assert config.judge.concurrency == 6
     assert config.judge.max_attempts == 3
+
+
+@pytest.mark.parametrize("seed", [0, (1 << 64) - 1])
+def test_draco_ensemble_accepts_uint64_candidate_order_seed(seed: int) -> None:
+    config = load_draco_experiment_config(
+        DEFAULT_CONFIG,
+        inline_overlay_json=json.dumps(
+            {"ensemble": {"candidate_order_seed": seed}}
+        ),
+    ).config
+
+    assert config.ensemble.candidate_order_seed == seed
+
+
+@pytest.mark.parametrize("seed", [True, -1, 1 << 64])
+def test_draco_ensemble_rejects_invalid_candidate_order_seed(seed: object) -> None:
+    with pytest.raises(ValidationError, match="candidate_order_seed"):
+        load_draco_experiment_config(
+            DEFAULT_CONFIG,
+            inline_overlay_json=json.dumps(
+                {"ensemble": {"candidate_order_seed": seed}}
+            ),
+        )
 
 
 def test_draco_ensemble_rejects_invalid_aggregator_output_budget() -> None:

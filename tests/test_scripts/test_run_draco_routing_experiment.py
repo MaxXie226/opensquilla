@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import random
 import sys
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
@@ -4950,6 +4951,12 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
         thinking_assignment_enabled=thinking_assignment_enabled,
     )
     experiment_payload = experiment.model_dump(mode="json")
+    experiment_payload["ensemble"].update(
+        {
+            "shuffle_candidates": True,
+            "candidate_order_seed": 0,
+        }
+    )
     experiment_payload["g1_routing"].update(
         {
             "source_registry_snapshot_version": current_registry["snapshot_version"],
@@ -5068,6 +5075,10 @@ async def test_g1_provider_native_recovery_runs_task_analysis_once(
     assert plan["effective_proposer_backup_count"] == 2
     assert plan["effective_min_successful_proposers"] == 2
     assert build.provider.min_successful_proposers == 2
+    assert build.provider.shuffle_candidates is True
+    assert build.provider.candidate_order_seed == 0
+    assert plan["configured_candidate_order_seed"] == 0
+    assert plan["effective_candidate_order_seed"] == 0
 
     setup = module.consume_provider_setup(build.provider)
     assert setup["usage"] == build.setup_usage
@@ -11678,6 +11689,14 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
         resume_runner,
         thinking_assignment_enabled=True,
     )
+    experiment_payload = experiment.model_dump(mode="json")
+    experiment_payload["ensemble"].update(
+        {
+            "shuffle_candidates": True,
+            "candidate_order_seed": 0,
+        }
+    )
+    experiment = type(experiment).model_validate(experiment_payload)
     config = GatewayConfig(
         llm={
             "provider": "openrouter",
@@ -11803,6 +11822,10 @@ async def test_resume_frozen_g1_provider_build_does_not_repeat_analyzer_or_cost(
     assert resumed.setup_usage == []
     assert resume_runner.consume_provider_setup(resumed.provider)["usage"] == []
     assert resumed.provider._draco_g1_initial_selection_plan == initial_plan
+    assert resumed.provider.shuffle_candidates is True
+    assert resumed.provider.candidate_order_seed == 0
+    assert resumed.provider.selection_plan["configured_candidate_order_seed"] == 0
+    assert resumed.provider.selection_plan["effective_candidate_order_seed"] == 0
     assert resumed.routing_trace["task_analyzer_reuse"]["physical_request_count"] == 0
     assert resumed.routing_trace["task_analyzer_reuse"]["historical_physical_request_count"] == 1
 
@@ -13818,7 +13841,7 @@ def test_agent_ensemble_root_summary_uses_terminal_call(module) -> None:
         "selected_A": "openrouter:agg",
     }
     recorder = module.BenchmarkTurnCallRecorder()
-    for call in (
+    calls = (
         _terminal_policy_call(
             index=1,
             plan=plan,
@@ -13833,7 +13856,16 @@ def test_agent_ensemble_root_summary_uses_terminal_call(module) -> None:
             fallback=False,
             output="final answer",
         ),
-    ):
+    )
+    for call, seed in zip(calls, (11, 22), strict=True):
+        call.update(
+            {
+                "shuffle_candidates": True,
+                "configured_candidate_order_seed": None,
+                "candidate_order_seed": seed,
+                "candidate_order_seed_source": "system_random",
+            }
+        )
         recorder.write(
             "llm_response",
             {
@@ -13849,6 +13881,10 @@ def test_agent_ensemble_root_summary_uses_terminal_call(module) -> None:
     assert trace["final_request_role"] == "aggregator"
     assert trace["successful_proposers"] == 4
     assert trace["total_candidates"] == 4
+    assert trace["shuffle_candidates"] is True
+    assert trace["configured_candidate_order_seed"] is None
+    assert trace["candidate_order_seed"] == 22
+    assert trace["candidate_order_seed_source"] == "system_random"
     assert trace["terminal_call_index"] == 2
     assert trace["any_intermediate_fallback"] is True
     assert trace["intermediate_fallback_call_indexes"] == [1]
@@ -14237,6 +14273,8 @@ async def test_g1_dry_build_applies_experiment_quorum_wait_policy(
     payload = experiment.model_dump(mode="json")
     payload["ensemble"]["wait_for_all_proposers"] = wait_for_all_proposers
     payload["ensemble"]["quorum_grace_seconds"] = quorum_grace_seconds
+    payload["ensemble"]["shuffle_candidates"] = True
+    payload["ensemble"]["candidate_order_seed"] = 0
     experiment = type(experiment).model_validate(payload)
     config = GatewayConfig(
         llm={
@@ -14269,7 +14307,55 @@ async def test_g1_dry_build_applies_experiment_quorum_wait_policy(
     assert result.provider.quorum_grace_seconds == pytest.approx(quorum_grace_seconds)
     assert plan["quorum_grace_seconds"] == pytest.approx(quorum_grace_seconds)
     assert plan["wait_for_all_proposers"] is wait_for_all_proposers
+    assert plan["effective_shuffle_candidates"] is True
+    assert plan["configured_candidate_order_seed"] == 0
+    assert plan["effective_candidate_order_seed"] == 0
     assert result.provider.selection_plan == plan
+
+    events = [
+        event
+        async for event in result.provider.chat(
+            [module.Message(role="user", content="dry candidate order prompt")]
+        )
+    ]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    trace = done.ensemble_trace
+    assert trace is not None
+    assert trace["selection_plan"] == plan
+    assert trace["shuffle_candidates"] is True
+    assert trace["configured_candidate_order_seed"] == 0
+    assert trace["candidate_order_seed"] == 0
+    assert trace["candidate_order_seed_source"] == "configured"
+    expected_order = list(range(len(result.provider.proposer_models)))
+    random.Random(0).shuffle(expected_order)
+    assert trace["candidate_display_order"] == expected_order
+
+    system_random_provider = module.DryEnsembleProvider(
+        group="G1",
+        profile="router_dynamic",
+        proposer_models=["p1", "p2", "p3"],
+    )
+    system_random_provider.selection_plan = {
+        "effective_shuffle_candidates": True,
+    }
+    system_random_events = [
+        event
+        async for event in system_random_provider.chat(
+            [module.Message(role="user", content="dry random order prompt")]
+        )
+    ]
+    system_random_done = next(
+        event for event in system_random_events if isinstance(event, DoneEvent)
+    )
+    system_random_trace = system_random_done.ensemble_trace
+    assert system_random_trace is not None
+    assert system_random_trace["configured_candidate_order_seed"] is None
+    assert system_random_trace["candidate_order_seed_source"] == "system_random"
+    system_random_seed = system_random_trace["candidate_order_seed"]
+    assert type(system_random_seed) is int
+    expected_random_order = [0, 1, 2]
+    random.Random(system_random_seed).shuffle(expected_random_order)
+    assert system_random_trace["candidate_display_order"] == expected_random_order
 
 
 def test_g1_dry_cli_main_exits_zero_with_frozen_registry_contract(

@@ -75,6 +75,7 @@ from .types import (
 )
 
 TRACE_CONTENT_MAX_CHARS = 8_000
+_UINT64_MAX = (1 << 64) - 1
 _ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS = 15.0
 _ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS = 5.0
 # The aggregator leg is retried in-place on transient upstream errors: the
@@ -3371,6 +3372,7 @@ class EnsembleProvider:
         aggregator_serving_chain_timeout_seconds: float = 120.0,
         candidate_max_chars: int = 24_000,
         shuffle_candidates: bool = True,
+        candidate_order_seed: int | None = None,
         record_candidates: bool = False,
         proposer_tools: bool = False,
         aggregator_tools: bool = True,
@@ -3415,6 +3417,18 @@ class EnsembleProvider:
             raise ValueError("aggregator_serving_chain_timeout_seconds must be positive")
         self.candidate_max_chars = int(candidate_max_chars or 0)
         self.shuffle_candidates = bool(shuffle_candidates)
+        if (
+            isinstance(candidate_order_seed, bool)
+            or (
+                candidate_order_seed is not None
+                and (
+                    not isinstance(candidate_order_seed, int)
+                    or not 0 <= candidate_order_seed <= _UINT64_MAX
+                )
+            )
+        ):
+            raise ValueError("candidate_order_seed must be an unsigned 64-bit integer")
+        self.candidate_order_seed = candidate_order_seed
         self.record_candidates = bool(record_candidates)
         self.proposer_tools = bool(proposer_tools)
         self.aggregator_tools = bool(aggregator_tools)
@@ -6469,9 +6483,13 @@ class EnsembleProvider:
                 ] = True
 
         proposer_rows = _candidate_usage_rows(candidates, profile=self.profile_name)
-        candidate_order_seed = (
-            random.SystemRandom().getrandbits(64) if self.shuffle_candidates else None
-        )
+        candidate_order_seed = None
+        if self.shuffle_candidates:
+            candidate_order_seed = (
+                self.candidate_order_seed
+                if self.candidate_order_seed is not None
+                else random.SystemRandom().getrandbits(64)
+            )
         aggregator_chain_timeout_seconds = (
             self._aggregator_only_timeout_seconds(config)
             if self.aggregator_recovery_mode == "serving"
@@ -10627,6 +10645,8 @@ class EnsembleProvider:
             seed = (
                 candidate_order_seed
                 if candidate_order_seed is not None
+                else self.candidate_order_seed
+                if self.candidate_order_seed is not None
                 else random.SystemRandom().getrandbits(64)
             )
             random.Random(seed).shuffle(ordered)
@@ -10776,6 +10796,14 @@ class EnsembleProvider:
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason,
             "shuffle_candidates": self.shuffle_candidates,
+            "configured_candidate_order_seed": self.candidate_order_seed,
+            "candidate_order_seed_source": (
+                "disabled"
+                if not self.shuffle_candidates
+                else "configured"
+                if self.candidate_order_seed is not None
+                else "system_random"
+            ),
             "record_candidates": self.record_candidates,
             "proposer_tools": self.proposer_tools,
             "aggregator_tools": self.aggregator_tools,
@@ -17281,6 +17309,11 @@ def build_ensemble_provider_from_config(
     configured_shuffle_candidates = bool(
         getattr(ensemble_cfg, "shuffle_candidates", _LEGACY_ENSEMBLE_SHUFFLE_CANDIDATES)
     )
+    configured_candidate_order_seed = getattr(
+        ensemble_cfg,
+        "candidate_order_seed",
+        None,
+    )
     shuffle_candidates = configured_shuffle_candidates
     if is_static_b5 and configured_shuffle_candidates == _LEGACY_ENSEMBLE_SHUFFLE_CANDIDATES:
         shuffle_candidates = _STATIC_B5_DEFAULT_SHUFFLE_CANDIDATES
@@ -17300,6 +17333,11 @@ def build_ensemble_provider_from_config(
     )
     selection_plan["configured_shuffle_candidates"] = configured_shuffle_candidates
     selection_plan["effective_shuffle_candidates"] = shuffle_candidates
+    if configured_candidate_order_seed is not None:
+        selection_plan["configured_candidate_order_seed"] = configured_candidate_order_seed
+        selection_plan["effective_candidate_order_seed"] = (
+            configured_candidate_order_seed if shuffle_candidates else None
+        )
     selection_plan["quorum_grace_seconds"] = quorum_grace_seconds
     selection_plan["selection_mode"] = selection_mode
     selection_plan["profile"] = profile_name
@@ -17488,6 +17526,7 @@ def build_ensemble_provider_from_config(
         ),
         candidate_max_chars=int(getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0),
         shuffle_candidates=shuffle_candidates,
+        candidate_order_seed=configured_candidate_order_seed,
         record_candidates=bool(getattr(ensemble_cfg, "record_candidates", False)),
         proposer_tools=bool(getattr(ensemble_cfg, "proposer_tools", False)),
         aggregator_tools=bool(getattr(ensemble_cfg, "aggregator_tools", True)),

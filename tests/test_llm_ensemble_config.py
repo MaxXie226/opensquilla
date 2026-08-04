@@ -47,6 +47,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert ensemble.aggregator_timeout_seconds == 3600.0
     assert ensemble.aggregator_serving_chain_timeout_seconds == 120.0
     assert ensemble.shuffle_candidates is True
+    assert ensemble.candidate_order_seed is None
     assert ensemble.record_candidates is False
 
     enabled_cfg = cfg.model_copy(deep=True)
@@ -75,7 +76,21 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.aggregator_serving_chain_timeout_seconds == 120.0
     assert provider.shuffle_candidates is False
+    assert provider.candidate_order_seed is None
     assert provider.quorum_grace_seconds == 10.0
+
+
+@pytest.mark.parametrize("seed", [0, (1 << 64) - 1])
+def test_llm_ensemble_accepts_uint64_candidate_order_seed(seed: int) -> None:
+    cfg = GatewayConfig(llm_ensemble={"candidate_order_seed": seed})
+
+    assert cfg.llm_ensemble.candidate_order_seed == seed
+
+
+@pytest.mark.parametrize("seed", [True, -1, 1 << 64])
+def test_llm_ensemble_rejects_invalid_candidate_order_seed(seed: object) -> None:
+    with pytest.raises(ValueError, match="candidate_order_seed"):
+        GatewayConfig(llm_ensemble={"candidate_order_seed": seed})
 
 
 def test_router_dynamic_legacy_backup_count_must_match_ranking_config() -> None:

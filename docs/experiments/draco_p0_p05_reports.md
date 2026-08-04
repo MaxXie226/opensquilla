@@ -36,6 +36,9 @@ For a nonterminal diagnostic snapshot, explicitly add `--allow-nonterminal`.
 It is always labelled nonterminal and never presented as a complete result.
 `--strict` returns exit code 2 if the generated report is partial/failed; the
 reports are still written so terminal failures retain evidence.
+Top-level completion additionally requires `comparison_evidence_valid=true`
+for every active experiment in `plan.experiments`; a missing or invalid active
+comparison can therefore never produce a strict-success report.
 
 ## Outputs
 
@@ -59,6 +62,28 @@ It also includes separate selected-generation/Judge cost evidence, separate
 execution/policy/audit/account status, task-level quality deltas, routing
 changes, retry/fallback/degraded counters and evidence paths.
 
+## Comparison controls and schedule
+
+Controls are resolved from the frozen top-level `comparison_controls`
+contract, never from a reporter hard-code. The live Analyzer source is
+`common-E0-source`; `common-E0-R1/R2/R3` are separate frozen-replay controls.
+Live Analyzer candidates compare only with the live source, all other
+candidates compare with their declared replay control, and the reporter
+rejects every pairing whose `analyzer_mode` differs.
+
+The controller runs `execution.schedule.mode=anchored_serial` with
+`strict_task_interleaving=false`. The reporter authenticates the schedule SHA
+recorded by terminal status and every arm's 1-based `schedule_ordinal` and
+`anchor_arm_id`. It reports replay-E0 drift and candidate start lag from its
+anchor. This is intentionally described as whole-arm serial anchoring, not as
+per-task AB/BA interleaving; provider/time drift can remain in paired deltas.
+
+The source plan requires per-task E0/candidate interleaving before the
+cost-reduction-chain C3 arm may advance. Consequently `P0-20-E3` is always
+published as `mini_diagnostic_only` and is not C3 promotion evidence in this
+campaign. It is scheduled after the R1 anchor in the nearby serial tranche to
+reduce drift, but that proximity is not task interleaving.
+
 ## Pairing and uncertainty
 
 - Pair exclusively by exact `task_id`; missing tasks are disclosed and never
@@ -69,6 +94,19 @@ changes, retry/fallback/degraded counters and evidence paths.
   common-E0-R1/R2/R3 respectively. The repeat summary first averages the three
   deltas within each task and then bootstraps the ten task-level means. It does
   not pretend the 30 correlated observations are 30 independent tasks.
+- P0.5-11 does not configure or send a model sampling seed on the current
+  production path. Its repeats are stochastic diagnostics and are explicitly
+  not exact replays.
+- P0.5-36 freezes candidate-order seeds `0`, `1`, and `4`. For each trace call,
+  configured and effective seeds must match only when candidate shuffling
+  produced a non-empty display order and an Aggregator physical request
+  actually started. A pre-aggregation failure (for example, no proposer
+  quorum) is `not_applicable`, not an execution failure. Applicable mismatches
+  invalidate comparison evidence; valid task slices remain reportable with
+  the limitation disclosed. One or more pre-aggregation `not_applicable` tasks
+  do not invalidate an otherwise non-empty valid slice, but an arm with no
+  valid aggregation slice makes the active experiment comparison evidence
+  invalid and the top-level report partial/failed.
 
 ## Cost semantics
 
@@ -80,7 +118,16 @@ into the comparison.
 
 For every selected physical usage unit:
 
-1. Use provider actual/billed/reported USD when available.
+1. Use provider actual/billed/reported USD only when backed by a confirmed
+   billing receipt, an explicit `provider_billed`/`openrouter_usage` source, or
+   a legacy positive amount. Prefer nested `provider_reported_cost` so an outer
+   placeholder zero cannot hide a positive provider amount; a nested explicit
+   provider source also overrides an outer missing-source marker. Legacy
+   positive amounts are accepted only with an empty/`none`/`unavailable`
+   source. `opensquilla_*`, `mixed`, and other non-actual sources always use
+   the estimate path even when their compatibility `billed_cost` is positive.
+   A zero paired with `none`/`unavailable`/`unknown` is missing cost evidence,
+   not actual `$0`.
 2. Otherwise require a frozen-registry price plus token usage and calculate:
 
    ```text
@@ -126,6 +173,8 @@ For each succeeded live arm the generator verifies:
 - manifest status/result/task/execution contract;
 - source-manifest task concurrency exactly 6;
 - manifest/audit/proof hash bindings.
+- the frozen anchored-serial schedule, status schedule SHA, 1-based ordinal,
+  anchor binding, and same-Analyzer-mode comparison contract.
 
 Audit or policy warnings remain warnings and do not erase an execution-success
 answer. Artifact corruption, missing tasks, wrong concurrency or a missing
@@ -140,7 +189,8 @@ contains only ten diagnostic tasks, and cannot automatically promote a winner.
 
 ## Tests
 
-The end-to-end test constructs two complete ten-row G1 arm roots, a
+The end-to-end test constructs five complete ten-row G1 arm roots (one live
+source, three replay controls and one candidate), a
 hash-frozen controller fixture using the current `runner_identities` mapping,
 a frozen 79-model price registry, campaign plan/terminal-status/derived
 artifacts, self-hashed result rows, manifests/audit/proof files and account
@@ -159,4 +209,8 @@ PYTHONPYCACHEPREFIX=/private/tmp/p0-p05-report-generator-pycache \
 The focused tests prove actual-cost precedence, cache-aware estimation,
 missing-cache-rate disclosure, no-money/no-token ignore behavior, exclusion of
 whole-generation retry spend, exact task pairing, deterministic 20k bootstrap,
-W/T/L and R1-R3 task-level aggregation.
+W/T/L and R1-R3 task-level aggregation. They also cover dynamic controls,
+same-mode pairing, schedule/status tampering, replicate seed expansion, and
+the P0.5-36 aggregation-applicability seed gate. They also prove that a valid
+slice may coexist with pre-aggregation `not_applicable` tasks, while an empty
+slice or any other invalid active comparison forces strict exit code 2.

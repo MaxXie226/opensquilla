@@ -312,6 +312,16 @@ def code_json(value: Any) -> str:
     return "`" + json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "`"
 
 
+def deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = copy.deepcopy(dict(base))
+    for key, value in overlay.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def validate_embedded_hash(
     document: Mapping[str, Any],
     field: str,
@@ -364,6 +374,23 @@ def atomic_write_json(path: Path, value: Any) -> None:
 
 def expand_arms(plan: Mapping[str, Any]) -> list[ArmSpec]:
     run_id = str(plan.get("run_id") or "")
+    comparison_controls = plan.get("comparison_controls")
+    if not isinstance(comparison_controls, Mapping):
+        raise ReportError("comparison_controls contract is missing")
+    source_control = str(comparison_controls.get("source_arm_id") or "")
+    default_control = str(comparison_controls.get("default_control_arm_id") or "")
+    replay_controls = comparison_controls.get("replay_control_arm_ids")
+    control_overrides = comparison_controls.get("arm_control_overrides")
+    if (
+        not source_control
+        or not default_control
+        or not isinstance(replay_controls, list)
+        or len(replay_controls) != 3
+        or len({str(value) for value in replay_controls}) != 3
+        or not isinstance(control_overrides, Mapping)
+        or comparison_controls.get("require_same_analyzer_mode") is not True
+    ):
+        raise ReportError("comparison_controls contract is malformed")
     result: list[ArmSpec] = []
     for row in plan.get("common_e0") or []:
         arm_id = str(row["arm_id"])
@@ -389,17 +416,20 @@ def expand_arms(plan: Mapping[str, Any]) -> list[ArmSpec]:
         directory_name = str(experiment.get("directory_name") or experiment_id.replace(".", "-"))
         for variant in experiment.get("variants") or []:
             replicates = int(variant.get("replicates", 1))
+            replicate_overrides = variant.get("replicate_overrides")
+            if replicate_overrides is not None and (
+                not isinstance(replicate_overrides, list)
+                or len(replicate_overrides) != replicates
+                or any(not isinstance(value, Mapping) for value in replicate_overrides)
+            ):
+                raise ReportError(f"{experiment_id} replicate_overrides/replicates differ")
             for replicate in range(1, replicates + 1):
                 suffix = f"-R{replicate}" if replicates > 1 else ""
                 arm_id = f"{experiment_id}-{variant['id']}{suffix}"
-                control_ids = experiment.get("control_arm_ids")
-                if isinstance(control_ids, list) and replicates > 1:
-                    if len(control_ids) != replicates:
-                        raise ReportError(f"{experiment_id} control_arm_ids/replicates differ")
-                    default_control = control_ids[replicate - 1]
-                else:
-                    default_control = experiment.get("control_arm_id", "common-E0-R1")
-                control = variant.get("control_arm_id") or default_control
+                control = str(control_overrides.get(arm_id) or default_control)
+                override = copy.deepcopy(dict(variant.get("override") or {}))
+                if isinstance(replicate_overrides, list):
+                    override = deep_merge(override, replicate_overrides[replicate - 1])
                 result.append(
                     ArmSpec(
                         arm_id=arm_id,
@@ -409,8 +439,8 @@ def expand_arms(plan: Mapping[str, Any]) -> list[ArmSpec]:
                         variant=str(variant["id"]),
                         replicate=replicate,
                         analyzer_mode=str(variant.get("analyzer_mode", "frozen_replay")),
-                        control_arm_id=str(control) if control is not None else None,
-                        override=dict(variant.get("override") or {}),
+                        control_arm_id=control,
+                        override=override,
                         dynamic=(
                             dict(variant["dynamic"])
                             if isinstance(variant.get("dynamic"), Mapping)
@@ -423,7 +453,228 @@ def expand_arms(plan: Mapping[str, Any]) -> list[ArmSpec]:
     ids = [arm.arm_id for arm in result]
     if len(ids) != len(set(ids)):
         raise ReportError("expanded arm ids are not unique")
+    specs_by_id = {arm.arm_id: arm for arm in result}
+    candidate_ids = {
+        arm.arm_id for arm in result if arm.experiment_id != "common-E0"
+    }
+    if set(str(key) for key in control_overrides) != candidate_ids:
+        raise ReportError("comparison_controls.arm_control_overrides must cover every candidate")
+    if source_control not in specs_by_id or specs_by_id[source_control].analyzer_mode != "live":
+        raise ReportError("comparison source control must be one live Analyzer common E0")
+    replay_ids = [str(value) for value in replay_controls]
+    if default_control not in replay_ids:
+        raise ReportError("default comparison control must be a replay control")
+    if any(
+        control_id not in specs_by_id
+        or specs_by_id[control_id].experiment_id != "common-E0"
+        or specs_by_id[control_id].analyzer_mode != "frozen_replay"
+        for control_id in replay_ids
+    ):
+        raise ReportError("replay comparison controls must be frozen-replay common E0 arms")
+    for arm in result:
+        if arm.experiment_id == "common-E0":
+            continue
+        control = specs_by_id.get(str(arm.control_arm_id or ""))
+        if control is None or control.experiment_id != "common-E0":
+            raise ReportError(f"{arm.arm_id} comparison control is unavailable")
+        if control.analyzer_mode != arm.analyzer_mode:
+            raise ReportError(
+                f"{arm.arm_id} comparison control analyzer_mode differs: "
+                f"{control.analyzer_mode} != {arm.analyzer_mode}"
+            )
     return result
+
+
+def comparison_control_contract(
+    plan: Mapping[str, Any], specs: Sequence[ArmSpec]
+) -> dict[str, Any]:
+    raw = plan.get("comparison_controls")
+    if not isinstance(raw, Mapping):
+        raise ReportError("comparison_controls contract is missing")
+    by_id = {spec.arm_id: spec for spec in specs}
+    source = str(raw.get("source_arm_id") or "")
+    default = str(raw.get("default_control_arm_id") or "")
+    replay = [str(value) for value in raw.get("replay_control_arm_ids") or []]
+    overrides = {
+        str(key): str(value)
+        for key, value in (raw.get("arm_control_overrides") or {}).items()
+    }
+    if source not in by_id or default not in by_id or len(replay) != 3:
+        raise ReportError("comparison control ids are malformed")
+    return {
+        "source_arm_id": source,
+        "default_control_arm_id": default,
+        "replay_control_arm_ids": replay,
+        "require_same_analyzer_mode": raw.get("require_same_analyzer_mode") is True,
+        "arm_control_overrides": overrides,
+    }
+
+
+def parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def validate_schedule_evidence(
+    plan: Mapping[str, Any],
+    status: Mapping[str, Any],
+    specs: Sequence[ArmSpec],
+) -> dict[str, Any]:
+    """Authenticate the relaxed anchored-serial order without calling it AB/BA."""
+
+    execution = plan.get("execution") if isinstance(plan.get("execution"), Mapping) else {}
+    schedule = execution.get("schedule") if isinstance(execution.get("schedule"), Mapping) else {}
+    order = [str(value) for value in schedule.get("arm_order") or []]
+    anchors = (
+        {str(key): str(value) for key, value in schedule.get("anchor_by_arm_id", {}).items()}
+        if isinstance(schedule.get("anchor_by_arm_id"), Mapping)
+        else {}
+    )
+    expected_ids = [spec.arm_id for spec in specs]
+    expected_set = set(expected_ids)
+    expected_sha = canonical_sha256(schedule) if schedule else ""
+    reasons: list[str] = []
+    if schedule.get("mode") != "anchored_serial":
+        reasons.append("execution schedule mode is not anchored_serial")
+    if schedule.get("strict_task_interleaving") is not False:
+        reasons.append("execution schedule must explicitly disclose non-strict task interleaving")
+    if len(order) != len(expected_ids) or len(order) != len(set(order)) or set(order) != expected_set:
+        reasons.append("execution schedule arm_order is not an exact arm permutation")
+    if set(anchors) != expected_set or any(anchor not in expected_set for anchor in anchors.values()):
+        reasons.append("execution schedule anchor coverage differs from arm inventory")
+    if str(status.get("schedule_sha256") or "").removeprefix("sha256:") != expected_sha:
+        reasons.append("status schedule SHA differs from the frozen plan")
+    state_map = status.get("arms") if isinstance(status.get("arms"), Mapping) else {}
+    # The controller freezes and persists 1-based ordinals so operator-facing
+    # status agrees with the rendered schedule table.
+    ordinals = {arm_id: index for index, arm_id in enumerate(order, start=1)}
+    if status.get("schedule_mode") != schedule.get("mode"):
+        reasons.append("status schedule mode differs from the frozen plan")
+    if status.get("strict_task_interleaving") is not schedule.get(
+        "strict_task_interleaving"
+    ):
+        reasons.append("status task-interleaving disclosure differs from the frozen plan")
+    if set(state_map) != expected_set:
+        reasons.append("status schedule arm inventory differs from the frozen plan")
+    rows: dict[str, dict[str, Any]] = {}
+    for arm_id in expected_ids:
+        state = state_map.get(arm_id) if isinstance(state_map.get(arm_id), Mapping) else {}
+        expected_ordinal = ordinals.get(arm_id)
+        expected_anchor = anchors.get(arm_id)
+        if state.get("schedule_ordinal") != expected_ordinal:
+            reasons.append(f"status schedule ordinal differs: {arm_id}")
+        if str(state.get("anchor_arm_id") or "") != str(expected_anchor or ""):
+            reasons.append(f"status schedule anchor differs: {arm_id}")
+        anchor_state = (
+            state_map.get(expected_anchor)
+            if expected_anchor and isinstance(state_map.get(expected_anchor), Mapping)
+            else {}
+        )
+        started = parse_iso(state.get("started_at"))
+        anchor_completed = parse_iso(anchor_state.get("completed_at"))
+        lag_seconds = (
+            (started - anchor_completed).total_seconds()
+            if (
+                expected_anchor != arm_id
+                and started is not None
+                and anchor_completed is not None
+            )
+            else None
+        )
+        if (
+            expected_ordinal is not None
+            and expected_anchor in ordinals
+            and ordinals[expected_anchor] > expected_ordinal
+        ):
+            reasons.append(f"schedule anchor follows candidate: {arm_id}")
+        rows[arm_id] = {
+            "schedule_ordinal": expected_ordinal,
+            "anchor_arm_id": expected_anchor,
+            "started_at": state.get("started_at"),
+            "completed_at": state.get("completed_at"),
+            "anchor_completed_at": anchor_state.get("completed_at"),
+            "anchor_lag_seconds": lag_seconds,
+        }
+    controls = comparison_control_contract(plan, specs)
+    for spec in specs:
+        expected_anchor = anchors.get(spec.arm_id)
+        expected_control = (
+            spec.arm_id if spec.experiment_id == "common-E0" else spec.control_arm_id
+        )
+        if expected_anchor != expected_control:
+            reasons.append(f"schedule anchor/comparison control differs: {spec.arm_id}")
+    return {
+        "valid": not reasons,
+        "mode": schedule.get("mode"),
+        "strict_task_interleaving": False,
+        "task_interleaving_contract_satisfied": False,
+        "design_label": "anchored_serial_not_task_interleaved",
+        "schedule_sha256": expected_sha or None,
+        "status_schedule_sha256": status.get("schedule_sha256"),
+        "source_arm_id": controls["source_arm_id"],
+        "default_control_arm_id": controls["default_control_arm_id"],
+        "replay_control_arm_ids": controls["replay_control_arm_ids"],
+        "arm_timing": rows,
+        "reasons": reasons,
+        "limitation": (
+            "E0 controls and candidates use separate serial account windows and are not "
+            "interleaved AB/BA within each task; paired deltas may retain temporal drift."
+        ),
+    }
+
+
+def p0_20_e3_promotion_evidence(
+    schedule_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Disclose why this mini arm cannot satisfy the source C3 promotion gate."""
+
+    timings = (
+        schedule_evidence.get("arm_timing")
+        if isinstance(schedule_evidence.get("arm_timing"), Mapping)
+        else {}
+    )
+    arm = timings.get("P0-20-E3") if isinstance(timings.get("P0-20-E3"), Mapping) else {}
+    anchor = (
+        timings.get("common-E0-R1")
+        if isinstance(timings.get("common-E0-R1"), Mapping)
+        else {}
+    )
+    ordinal = integer(arm.get("schedule_ordinal"))
+    anchor_ordinal = integer(anchor.get("schedule_ordinal"))
+    return {
+        "arm_id": "P0-20-E3",
+        "status": "mini_diagnostic_only",
+        "eligible_as_c3_promotion_evidence": False,
+        "required_strict_task_interleaving": True,
+        "observed_strict_task_interleaving": (
+            schedule_evidence.get("strict_task_interleaving") is True
+        ),
+        "anchor_arm_id": arm.get("anchor_arm_id"),
+        "scheduled_after_r1_anchor": bool(
+            arm.get("anchor_arm_id") == "common-E0-R1"
+            and ordinal > 0
+            and anchor_ordinal > 0
+            and ordinal > anchor_ordinal
+        ),
+        "schedule_ordinal": ordinal or None,
+        "anchor_schedule_ordinal": anchor_ordinal or None,
+        "schedule_ordinal_gap": (
+            ordinal - anchor_ordinal if ordinal > anchor_ordinal > 0 else None
+        ),
+        "limitation": (
+            "P0-20-E3 is placed after the R1 anchor in the nearby anchored-serial "
+            "tranche to reduce temporal drift, but whole-arm serial execution is not "
+            "per-task E0/candidate interleaving and cannot satisfy the source C3 "
+            "promotion gate."
+        ),
+    }
 
 
 Price = tuple[float, float, float | None, float | None]
@@ -589,14 +840,45 @@ def usage_tokens(unit: Mapping[str, Any]) -> tuple[int, int, int, int]:
 
 def unit_actual_usd(unit: Mapping[str, Any]) -> float | None:
     provider = unit.get("provider_usage") if isinstance(unit.get("provider_usage"), Mapping) else {}
+    receipt = unit.get("billing_receipt")
+    if receipt is None:
+        receipt = provider.get("billing_receipt")
+    receipt_present = receipt is not None
+    receipt_usd: float | None = None
+    if (
+        isinstance(receipt, Mapping)
+        and str(receipt.get("status") or "").strip().casefold() == "confirmed"
+    ):
+        nanos = receipt.get("usd_equivalent_nanos")
+        if isinstance(nanos, int) and not isinstance(nanos, bool) and nanos >= 0:
+            receipt_usd = nanos / 1_000_000_000
+    if receipt_present and receipt_usd is None:
+        return None
+    reported = number(provider.get("provider_reported_cost"))
     billed = number(unit.get("billed_cost"))
-    if billed is None:
-        billed = number(provider.get("provider_reported_cost"))
+    outer_source = str(unit.get("cost_source") or "").strip().casefold()
+    provider_source = str(provider.get("cost_source") or "").strip().casefold()
+    actual_sources = {"provider_billed", "openrouter_usage"}
+    legacy_sources = {"", "none", "unavailable"}
+    actual = receipt_usd
+    source_is_actual = outer_source in actual_sources or (
+        outer_source in legacy_sources and provider_source in actual_sources
+    )
+    source_allows_legacy = (
+        outer_source in legacy_sources and provider_source in legacy_sources
+    )
+    if actual is None and source_is_actual:
+        actual = reported if reported is not None else billed
+    if actual is None and source_allows_legacy:
+        actual = next(
+            (value for value in (reported, billed) if value is not None and value > 0),
+            None,
+        )
     # OpenRouter's zero-dollar BYOK receipt is not the underlying provider
     # spend.  It is therefore estimated from tokens instead of called actual.
-    if provider.get("is_byok") is True and billed == 0:
+    if provider.get("is_byok") is True and actual == 0:
         return None
-    return billed if billed is not None and billed >= 0 else None
+    return actual if actual is not None and actual >= 0 else None
 
 
 def price_unit(unit: Mapping[str, Any], prices: Mapping[str, Price]) -> dict[str, Any]:
@@ -1201,8 +1483,73 @@ def read_compact_rows(
     return rows, reasons
 
 
-def read_trace_evidence(path: Path) -> tuple[dict[str, str], list[str]]:
-    """Stream trace JSONL and retain only task/result-evidence bindings.
+def aggregator_request_started(call: Mapping[str, Any]) -> bool:
+    recovery = (
+        call.get("aggregator_recovery")
+        if isinstance(call.get("aggregator_recovery"), Mapping)
+        else {}
+    )
+    return any(
+        isinstance(attempt, Mapping)
+        and (
+            attempt.get("request_started") is True
+            or integer(attempt.get("physical_request_count")) > 0
+        )
+        for attempt in recovery.get("attempts") or []
+    )
+
+
+def trace_candidate_order_calls(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    ensemble = row.get("ensemble_trace") if isinstance(row.get("ensemble_trace"), Mapping) else {}
+    raw_calls = ensemble.get("calls")
+    calls = (
+        [call for call in raw_calls if isinstance(call, Mapping)]
+        if isinstance(raw_calls, list)
+        else [ensemble]
+        if ensemble
+        else []
+    )
+    result: list[dict[str, Any]] = []
+    for index, call in enumerate(calls, start=1):
+        display_order = call.get("candidate_display_order")
+        request_started = aggregator_request_started(call)
+        applicable = bool(
+            call.get("shuffle_candidates") is True
+            and isinstance(display_order, list)
+            and display_order
+            and request_started
+        )
+        result.append(
+            {
+                "call_index": integer(call.get("agent_call_index")) or index,
+                "shuffle_candidates": call.get("shuffle_candidates"),
+                "configured_candidate_order_seed": call.get(
+                    "configured_candidate_order_seed"
+                ),
+                "candidate_order_seed": call.get("candidate_order_seed"),
+                "candidate_display_order_present": bool(
+                    isinstance(display_order, list) and display_order
+                ),
+                "aggregator_request_started": request_started,
+                "applicable": applicable,
+                "not_applicable_reason": (
+                    None
+                    if applicable
+                    else "shuffle_disabled"
+                    if call.get("shuffle_candidates") is not True
+                    else "candidate_display_order_absent"
+                    if not isinstance(display_order, list) or not display_order
+                    else "aggregator_request_not_started"
+                ),
+            }
+        )
+    return result
+
+
+def read_trace_evidence(
+    path: Path,
+) -> tuple[dict[str, str], dict[str, list[dict[str, Any]]], list[str]]:
+    """Stream trace JSONL and retain task bindings plus shuffle seed evidence.
 
     Trace files are large, and U+2028/U+2029 are valid characters inside JSON
     strings rather than JSONL record separators.  Iterating the text handle is
@@ -1212,6 +1559,7 @@ def read_trace_evidence(path: Path) -> tuple[dict[str, str], list[str]]:
 
     regular_file(path)
     bindings: dict[str, str] = {}
+    candidate_order_calls: dict[str, list[dict[str, Any]]] = {}
     reasons: list[str] = []
     row_count = 0
     with path.open("r", encoding="utf-8") as handle:
@@ -1236,9 +1584,106 @@ def read_trace_evidence(path: Path) -> tuple[dict[str, str], list[str]]:
                 reasons.append(f"duplicate trace task id {task_id}")
                 continue
             bindings[task_id] = evidence_sha
+            candidate_order_calls[task_id] = trace_candidate_order_calls(row)
     if row_count != 10:
         reasons.append(f"trace row count is {row_count}, expected 10")
-    return bindings, reasons
+    return bindings, candidate_order_calls, reasons
+
+
+def p0_5_36_seed_evidence(
+    spec: ArmSpec,
+    calls_by_task: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    expected_task_ids: Sequence[str],
+) -> dict[str, Any] | None:
+    if spec.experiment_id != "P0.5-36":
+        return None
+    ensemble = spec.override.get("ensemble") if isinstance(spec.override.get("ensemble"), Mapping) else {}
+    configured = ensemble.get("candidate_order_seed")
+    configuration_valid = (
+        isinstance(configured, int)
+        and not isinstance(configured, bool)
+        and configured in {0, 1, 4}
+        and ensemble.get("shuffle_candidates") is True
+    )
+    valid_tasks: list[str] = []
+    invalid_tasks: list[str] = []
+    not_applicable_tasks: list[str] = []
+    applicable_call_count = 0
+    invalid_call_count = 0
+    per_task: dict[str, Any] = {}
+    for task_id in expected_task_ids:
+        calls = [call for call in calls_by_task.get(task_id, ()) if isinstance(call, Mapping)]
+        applicable = [call for call in calls if call.get("applicable") is True]
+        mismatches = [
+            call
+            for call in applicable
+            if (
+                not configuration_valid
+                or call.get("configured_candidate_order_seed") != configured
+                or call.get("candidate_order_seed") != configured
+            )
+        ]
+        applicable_call_count += len(applicable)
+        invalid_call_count += len(mismatches)
+        if not applicable:
+            not_applicable_tasks.append(task_id)
+            state = "not_applicable"
+        elif mismatches:
+            invalid_tasks.append(task_id)
+            state = "invalid"
+        else:
+            valid_tasks.append(task_id)
+            state = "valid"
+        per_task[task_id] = {
+            "state": state,
+            "applicable_call_count": len(applicable),
+            "invalid_call_count": len(mismatches),
+            "observed_configured_seeds": sorted(
+                {
+                    call.get("configured_candidate_order_seed")
+                    for call in applicable
+                    if isinstance(call.get("configured_candidate_order_seed"), int)
+                    and not isinstance(call.get("configured_candidate_order_seed"), bool)
+                }
+            ),
+            "observed_effective_seeds": sorted(
+                {
+                    call.get("candidate_order_seed")
+                    for call in applicable
+                    if isinstance(call.get("candidate_order_seed"), int)
+                    and not isinstance(call.get("candidate_order_seed"), bool)
+                }
+            ),
+            "not_applicable_call_count": len(calls) - len(applicable),
+        }
+    return {
+        "configured_seed": configured,
+        "effective_seed_expected": configured if configuration_valid else None,
+        "configuration_valid": configuration_valid,
+        "expected_seed_set": [0, 1, 4],
+        "valid_task_ids": valid_tasks,
+        "invalid_task_ids": invalid_tasks,
+        "not_applicable_task_ids": not_applicable_tasks,
+        "valid_task_count": len(valid_tasks),
+        "invalid_task_count": len(invalid_tasks),
+        "not_applicable_task_count": len(not_applicable_tasks),
+        "applicable_call_count": applicable_call_count,
+        "invalid_call_count": invalid_call_count,
+        "comparison_slice_available": configuration_valid and bool(valid_tasks),
+        "comparison_evidence_complete": bool(
+            configuration_valid
+            and len(valid_tasks) == len(expected_task_ids)
+            and not invalid_tasks
+            and not not_applicable_tasks
+        ),
+        "per_task": per_task,
+        "policy": (
+            "Only calls that actually shuffled a non-empty candidate display order and "
+            "started an Aggregator request require the configured seed. Calls that never "
+            "entered candidate aggregation are disclosed as not_applicable, not execution failures."
+        ),
+    }
 
 
 def status_dimension(values: Sequence[Any], *, warning_status: str = "warning") -> str:
@@ -1592,6 +2037,7 @@ def load_formal_arm(
         "proof": {},
         "statuses": {"execution": "unknown", "policy": "unknown", "audit": "unknown"},
         "account": {},
+        "candidate_order_seed_evidence": None,
     }
     if declared_state == "no_op_deleted" and not initial_reasons:
         result["no_op_receipt"] = state.get("offline_effect_receipt")
@@ -1636,9 +2082,11 @@ def load_formal_arm(
         rows, row_reasons = [], [str(exc)]
     reasons.extend(row_reasons)
     try:
-        trace_bindings, trace_reasons = read_trace_evidence(root / "trace.jsonl")
+        trace_bindings, trace_candidate_calls, trace_reasons = read_trace_evidence(
+            root / "trace.jsonl"
+        )
     except ReportError as exc:
-        trace_bindings, trace_reasons = {}, [str(exc)]
+        trace_bindings, trace_candidate_calls, trace_reasons = {}, {}, [str(exc)]
     reasons.extend(trace_reasons)
     task_ids = [str(row.get("task_id") or "") for row in rows]
     expected_task_ids = [str(value) for value in plan.get("benchmark", {}).get("task_ids") or []]
@@ -1673,6 +2121,11 @@ def load_formal_arm(
     }
     if trace_bindings != result_bindings:
         reasons.append("trace/result evidence bindings differ")
+    seed_evidence = p0_5_36_seed_evidence(
+        spec,
+        trace_candidate_calls,
+        expected_task_ids=expected_task_ids,
+    )
     if manifest.get("schema") != "opensquilla.draco.campaign-final-manifest/v1":
         reasons.append("manifest schema differs")
     if manifest.get("status") != "complete":
@@ -1753,6 +2206,7 @@ def load_formal_arm(
                 "audit": audit_status,
             },
             "account": account_evidence(manifest, proof),
+            "candidate_order_seed_evidence": seed_evidence,
         }
     )
     return result
@@ -1777,6 +2231,13 @@ def paired(
     scope: str = "all_tasks",
     allowed_task_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    control_mode = str(control.get("spec", {}).get("analyzer_mode") or "")
+    variant_mode = str(variant.get("spec", {}).get("analyzer_mode") or "")
+    if not control_mode or control_mode != variant_mode:
+        raise ReportError(
+            "paired comparison requires identical non-empty analyzer_mode: "
+            f"{control_mode!r} != {variant_mode!r}"
+        )
     control_rows = {row["task_id"]: row for row in control.get("rows") or []}
     variant_rows = {row["task_id"]: row for row in variant.get("rows") or []}
     common_ids = sorted(set(control_rows) & set(variant_rows))
@@ -1787,7 +2248,7 @@ def paired(
         left, right = control_rows[task_id], variant_rows[task_id]
         if allowed_task_ids is not None and task_id not in allowed_task_ids:
             continue
-        if scope == "ap_non_overlap" and (left.get("ap_overlap") or right.get("ap_overlap")):
+        if "ap_non_overlap" in scope and (left.get("ap_overlap") or right.get("ap_overlap")):
             continue
         before, after = number(left.get("quality")), number(right.get("quality"))
         if before is None or after is None:
@@ -1810,6 +2271,8 @@ def paired(
         "control_arm_id": control.get("spec", {}).get("arm_id"),
         "variant_arm_id": variant.get("spec", {}).get("arm_id"),
         "scope": scope,
+        "analyzer_mode": control_mode,
+        "same_analyzer_mode": True,
         "pair_count": len(deltas),
         "complete_task_id_pairing": len(deltas) == 10,
         "missing_from_control": sorted(set(variant_rows) - set(control_rows)),
@@ -1880,6 +2343,39 @@ def repeated_pairing(comparisons: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         "ties": sum(abs(delta) <= 1e-12 for delta in deltas),
         "losses": sum(delta < -1e-12 for delta in deltas),
         "per_task_mean_delta": averaged,
+    }
+
+
+def replay_control_drift(
+    plan: Mapping[str, Any],
+    specs: Sequence[ArmSpec],
+    arms: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    controls = comparison_control_contract(plan, specs)
+    replay_ids = list(controls["replay_control_arm_ids"])
+    comparisons: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for left_id, right_id in zip(replay_ids, replay_ids[1:], strict=False):
+        left, right = arms.get(left_id), arms.get(right_id)
+        if (
+            not isinstance(left, Mapping)
+            or not isinstance(right, Mapping)
+            or left.get("formal_evidence_valid") is not True
+            or right.get("formal_evidence_valid") is not True
+        ):
+            missing.append(f"{right_id}-{left_id}")
+            continue
+        comparisons.append(paired(left, right, scope="replay_control_temporal_drift"))
+    return {
+        "source_arm_id": controls["source_arm_id"],
+        "replay_control_arm_ids": replay_ids,
+        "comparison_count": len(comparisons),
+        "comparisons": comparisons,
+        "missing_comparisons": missing,
+        "note": (
+            "Replay-control deltas diagnose provider/time drift under the same frozen Analyzer "
+            "mode. They do not convert the anchored-serial schedule into strict per-task AB/BA."
+        ),
     }
 
 
@@ -2324,6 +2820,9 @@ def load_derived_evidence(
     if noop is not None and not receipt_hash_valid(noop):
         result["reasons"].append("P0.5-07 receipt hash differs")
     specs = expand_arms(plan)
+    controls = comparison_control_contract(plan, specs)
+    if derived.get("source_arm_id") != controls["source_arm_id"]:
+        result["reasons"].append("derived Analyzer source differs from comparison_controls")
     offline_effect, offline_reasons, temperature_scope = load_offline_effect_receipts(
         derived,
         specs=specs,
@@ -2619,6 +3118,8 @@ def build_experiment_inventory(
     derived: Mapping[str, Any],
     legacy: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, dict[str, Any]]:
+    control_contract = comparison_control_contract(plan, expand_arms(plan))
+    default_control_id = str(control_contract["default_control_arm_id"])
     result: dict[str, dict[str, Any]] = {}
     for experiment in plan.get("experiments") or []:
         experiment_id = str(experiment["id"])
@@ -2641,6 +3142,46 @@ def build_experiment_inventory(
         controls = [arms[arm_id] for arm_id in control_ids if arm_id in arms]
         comparisons: list[dict[str, Any]] = []
         scoped_comparisons: list[dict[str, Any]] = []
+        comparison_invalid_reasons: list[str] = []
+        shuffle_seed_protocol: dict[str, Any] | None = None
+        if experiment_id == "P0.5-36":
+            configured_by_arm = {
+                str(arm.get("spec", {}).get("arm_id") or ""): (
+                    (arm.get("spec", {}).get("override") or {}).get("ensemble", {}).get(
+                        "candidate_order_seed"
+                    )
+                    if isinstance(
+                        (arm.get("spec", {}).get("override") or {}).get("ensemble"),
+                        Mapping,
+                    )
+                    else None
+                )
+                for arm in variant_arms
+            }
+            configured_values = list(configured_by_arm.values())
+            configuration_valid = bool(
+                len(configured_values) == 3
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in configured_values
+                )
+                and sorted(configured_values) == [0, 1, 4]
+            )
+            shuffle_seed_protocol = {
+                "expected_seeds": [0, 1, 4],
+                "configured_seed_by_arm": configured_by_arm,
+                "configuration_valid": configuration_valid,
+                "trace_evidence_by_arm": {
+                    str(arm.get("spec", {}).get("arm_id") or ""): arm.get(
+                        "candidate_order_seed_evidence"
+                    )
+                    for arm in variant_arms
+                },
+            }
+            if not configuration_valid:
+                comparison_invalid_reasons.append(
+                    "P0.5-36 replicate candidate_order_seed configuration is not exactly 0/1/4"
+                )
         for variant in variant_arms:
             control_id = variant.get("spec", {}).get("control_arm_id")
             control = arms.get(str(control_id)) if control_id else None
@@ -2653,9 +3194,45 @@ def build_experiment_inventory(
                 and control.get("rows")
                 and variant.get("rows")
             ):
-                comparisons.append(paired(control, variant))
                 if experiment_id == "P0.5-36":
-                    scoped_comparisons.append(paired(control, variant, scope="ap_non_overlap"))
+                    seed_evidence = variant.get("candidate_order_seed_evidence")
+                    if isinstance(seed_evidence, Mapping) and integer(
+                        seed_evidence.get("invalid_task_count")
+                    ):
+                        comparison_invalid_reasons.append(
+                            "P0.5-36 configured/effective candidate-order seed mismatch: "
+                            f"{variant.get('spec', {}).get('arm_id')}"
+                        )
+                    if (
+                        not isinstance(shuffle_seed_protocol, Mapping)
+                        or shuffle_seed_protocol.get("configuration_valid") is not True
+                        or not isinstance(seed_evidence, Mapping)
+                        or seed_evidence.get("comparison_slice_available") is not True
+                    ):
+                        comparison_invalid_reasons.append(
+                            f"P0.5-36 candidate-order seed evidence unavailable: "
+                            f"{variant.get('spec', {}).get('arm_id')}"
+                        )
+                        continue
+                    allowed = set(seed_evidence.get("valid_task_ids") or [])
+                    comparisons.append(
+                        paired(
+                            control,
+                            variant,
+                            scope="candidate_order_seed_verified",
+                            allowed_task_ids=allowed,
+                        )
+                    )
+                    scoped_comparisons.append(
+                        paired(
+                            control,
+                            variant,
+                            scope="candidate_order_seed_verified_ap_non_overlap",
+                            allowed_task_ids=allowed,
+                        )
+                    )
+                else:
+                    comparisons.append(paired(control, variant))
         temperature_subanalysis: dict[str, Any] | None = None
         if experiment_id == "P0.5-11":
             temperature_scope = derived.get("p0_5_11_scope")
@@ -2711,6 +3288,17 @@ def build_experiment_inventory(
                         "model-level request/usage/cost is reported only for temperature_parameter_sent=true; "
                         "task score cannot be causally assigned to one model"
                     ),
+                    "sampling_seed_protocol": {
+                        "supported": False,
+                        "configured": False,
+                        "wire_sent": False,
+                        "exact_replay_possible": False,
+                        "note": (
+                            "The current production experiment schema/provider path does not "
+                            "support or send a frozen model-sampling seed. The three temperature "
+                            "replicates are stochastic diagnostics and cannot be replayed bit-for-bit."
+                        ),
+                    },
                 }
         if experiment_id in {"P0.5-10", "P0.5-38", "P0.5-39"}:
             for variant in variant_arms:
@@ -2824,6 +3412,9 @@ def build_experiment_inventory(
             "scoped_comparisons": scoped_comparisons,
             "scoped_repeated_pairing": scoped_repeat_summary,
             "temperature_subanalysis": temperature_subanalysis,
+            "shuffle_seed_protocol": shuffle_seed_protocol,
+            "comparison_evidence_valid": not comparison_invalid_reasons,
+            "comparison_invalid_reasons": sorted(set(comparison_invalid_reasons)),
             "analyzer_effect": analyzer_effect,
         }
     noop_status = derived.get("p0_5_07") if isinstance(derived.get("p0_5_07"), Mapping) else None
@@ -2861,7 +3452,7 @@ def build_experiment_inventory(
                 and receipt_binding_ok
                 else "incomplete_no_op_evidence"
             ),
-            "controls": [arms["common-E0-R1"]] if "common-E0-R1" in arms else [],
+            "controls": [arms[default_control_id]] if default_control_id in arms else [],
             "variants": [],
             "comparisons": [],
             "repeated_pairing": None,
@@ -3009,6 +3600,8 @@ def build_group_markdown(
         [
             f"- 变量：{title}；组状态：`{experiment.get('state')}`；controller=`{status.get('phase')}`。",
             "- 所有质量比较只按 `task_id` 配对；缺题不会伪装成完整均值。",
+            "- 候选只与 `analyzer_mode` 完全相同的冻结 comparison control 比较；live source 不与 frozen-replay candidate 混配。",
+            "- 执行为 anchored-serial、每臂独立串行账户窗口，不是逐题 AB/BA 交错；时间/provider 漂移仍可能混入 ΔQ。",
             f"- 固定 seed `{BOOTSTRAP_SEED}`，每个 paired bootstrap 使用 `{BOOTSTRAP_SAMPLES}` 次重采样。",
             "- execution、policy、audit 三条状态彼此独立；BYOK/费用缺口不自动改判已有答案执行失败。",
             "- DRACO mini 没有独立 SafetyGate；10 题是调参诊断，不自动推广 winner。",
@@ -3026,6 +3619,40 @@ def build_group_markdown(
         lines.append(
             f"| {display_arm(arm)} | {role} | `{spec.get('analyzer_mode')}` | {code_json(configuration)} | "
             f"{arm_artifact_label(arm)} | `{arm.get('output_dir')}` |"
+        )
+    if experiment_id == "P0-20":
+        c3 = next(
+            (
+                arm.get("c3_promotion_evidence")
+                for arm in variants
+                if arm.get("spec", {}).get("arm_id") == "P0-20-E3"
+            ),
+            {},
+        )
+        lines.extend(
+            [
+                "",
+                "### C3 晋级证据边界",
+                "",
+                "- `P0-20-E3` 仅为 `mini_diagnostic_only`，不得作为降本链 C3 晋级证据。源计划要求 E0/候选逐题交错，而本 campaign 明确 `strict_task_interleaving=false`。",
+                f"- 它位于 R1 anchor 后的近邻 anchored-serial tranche（ordinal gap={c3.get('schedule_ordinal_gap', 'unknown')}）以减小时漂，但整臂串行不等同 task interleaving。",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "### Anchored-serial 调度",
+            "",
+            "| Arm | Ordinal | Anchor/control | Start | Anchor complete | Lag s |",
+            "|---|---:|---|---|---|---:|",
+        ]
+    )
+    for arm in display_arms:
+        timing = arm.get("schedule") if isinstance(arm.get("schedule"), Mapping) else {}
+        lines.append(
+            f"| {display_arm(arm)} | {integer(timing.get('schedule_ordinal'))} | "
+            f"`{timing.get('anchor_arm_id') or 'missing'}` | `{timing.get('started_at') or 'not-started'}` | "
+            f"`{timing.get('anchor_completed_at') or 'not-complete'}` | {fmt(timing.get('anchor_lag_seconds'), 1)} |"
         )
     if experiment.get("analysis_scope"):
         lines.extend(
@@ -3114,6 +3741,7 @@ def build_group_markdown(
             )
     temperature = experiment.get("temperature_subanalysis")
     if isinstance(temperature, Mapping):
+        seed_protocol = temperature.get("sampling_seed_protocol") or {}
         lines.extend(
             [
                 "",
@@ -3121,6 +3749,7 @@ def build_group_markdown(
                 "",
                 f"- receipt SHA list={code_json(temperature.get('receipt_sha256s') or [])}；scope verifiable=`{temperature.get('scope_verifiable')}`；records={integer(temperature.get('receipt_record_count'))}，unresolved={integer(temperature.get('unresolved_receipt_record_count'))}。",
                 "- 只有 offline receipt 明确 `temperature_parameter_sent=true` 且给出 `wire_temperature` 的模型进入正式子分析。模型级 usage/cost 可统计，但 task score 无法拆分归因到单个模型，因此不伪造模型级质量分。",
+                f"- Sampling seed：supported=`{seed_protocol.get('supported')}`、wire sent=`{seed_protocol.get('wire_sent')}`、exact replay=`{seed_protocol.get('exact_replay_possible')}`。当前协议不支持/不发送模型 sampling seed，三次重复不能精确重放。",
                 "",
                 "| Arm | Model | Wire scope | Wire temperatures | Requests | Input | Output | Cache read/write | Cost$ | Actual/estimated/ignored |",
                 "|---|---|---|---|---:|---:|---:|---:|---:|---|",
@@ -3142,6 +3771,32 @@ def build_group_markdown(
         if model_rows == 0:
             lines.append(
                 "| — | — | `scope_unverifiable_or_no_sent_model` | — | 0 | 0 | 0 | 0/0 | — | — |"
+            )
+    shuffle_seed = experiment.get("shuffle_seed_protocol")
+    if isinstance(shuffle_seed, Mapping):
+        lines.extend(
+            [
+                "",
+                "### Candidate-order seed 证据",
+                "",
+                f"- 冻结 replicate seed 必须恰为 `0/1/4`；configuration valid=`{shuffle_seed.get('configuration_valid')}`。只有 trace 中 `shuffle_candidates=true`、存在 candidate display order 且 Aggregator 物理请求已启动的调用才适用 seed gate。未进入候选聚合的调用记为 `not_applicable`，不改判 execution。",
+                "",
+                "| Arm | Config seed | Valid tasks | Invalid tasks | Not applicable | Applicable calls | Invalid calls |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for arm_id, evidence in (shuffle_seed.get("trace_evidence_by_arm") or {}).items():
+            evidence = evidence if isinstance(evidence, Mapping) else {}
+            lines.append(
+                f"| {arm_id} | {evidence.get('configured_seed', 'missing')} | "
+                f"{integer(evidence.get('valid_task_count'))} | {integer(evidence.get('invalid_task_count'))} | "
+                f"{integer(evidence.get('not_applicable_task_count'))} | {integer(evidence.get('applicable_call_count'))} | "
+                f"{integer(evidence.get('invalid_call_count'))} |"
+            )
+        if experiment.get("comparison_evidence_valid") is not True:
+            lines.append(
+                "\n- Candidate-order 比较证据无效/不完整："
+                + code_json(experiment.get("comparison_invalid_reasons") or [])
             )
     lines.extend(["", "## 总表", "", METRIC_HEADER])
     for arm in display_arms:
@@ -3326,6 +3981,10 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
     arms = report["arms"]
     completion = report["completion"]
     costs = report["unique_arm_costs"]
+    schedule = report.get("schedule_evidence") or {}
+    drift = report.get("replay_control_drift") or {}
+    controls = report.get("comparison_controls") or {}
+    c3 = (report.get("promotion") or {}).get("P0-20-E3") or {}
     lines = [
         "# P0 / P0.5 DRACO Mini 综合实验结果",
         "",
@@ -3334,14 +3993,63 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
         f"- Campaign：`{report['run_id']}`；controller phase=`{report['controller_phase']}`；报告状态=`{completion['status']}`。",
         f"- 冻结提交/tree：`{report['freeze'].get('snapshot_commit')}` / `{report['freeze'].get('snapshot_tree')}`；DRACO mini 10 题，task concurrency=`{report['execution'].get('task_concurrency')}`。",
         f"- 计划候选 live arms={completion['planned_arm_count']}；formal succeeded={completion['formal_succeeded_arm_count']}；wire no-op={completion['wire_no_op_arm_count']}；failed/blocked={completion['failed_or_blocked_arm_count']}。",
+        f"- Active experiment comparison evidence=`{completion['comparison_evidence_valid']}`；invalid={code_json(completion['comparison_evidence_invalid_experiment_ids'])}。",
         "- 31 个新 live experiment groups、P0.5-07 formal no-op，以及 P0-01/P0-02/P0.5-31/P0-15 既有证据均单独索引；任何缺失/失败均保持显式，不伪装完整。",
         "- 本任务集没有独立 SafetyGate。所有结果只是固定 10 题 mini 调参诊断，不能自动推广 winner 或直接改写默认配置。",
+        f"- 调度=`{schedule.get('design_label')}`、schedule evidence=`{schedule.get('valid')}`、strict task interleaving=`False`。这是三 replay E0 锚定的整臂串行近似，不是逐题 AB/BA。",
+        f"- `P0-20-E3`=`{c3.get('status') or 'mini_diagnostic_only'}`，不得作为降本链 C3 晋级证据。它位于 R1 anchor 后的近邻串行 tranche（ordinal gap={c3.get('schedule_ordinal_gap', 'unknown')}）以减小时漂，但不满足源计划要求的逐题 E0/候选交错。",
+        "- source control 使用 live Analyzer；三个 replay controls 与所有 frozen candidates 使用同一 frozen-replay Analyzer mode，跨 mode 不生成 paired 比较。",
+        "",
+        "## 调度、E0 漂移与时间局限",
+        "",
+        f"- Schedule SHA=`{schedule.get('schedule_sha256')}`；status SHA=`{schedule.get('status_schedule_sha256')}`；source=`{controls.get('source_arm_id')}`；replay controls={code_json(controls.get('replay_control_arm_ids') or [])}。",
+        "- 每个正式臂保留独立的 10 行 finalizer 和串行账户窗口；因此只能做 anchored-serial 时间控制。候选与 anchor 的 lag 如实列出，ΔQ 仍可能包含 provider/time drift。",
+        f"- Schedule validation reasons={code_json(schedule.get('reasons') or [])}。",
+        "",
+        "### Frozen-replay E0 漂移",
+        "",
+        "| Later - earlier | Pairs | Mean ΔQ | 95% CI | W/T/L |",
+        "|---|---:|---:|---|---|",
+    ]
+    for comparison in drift.get("comparisons") or []:
+        low, high = comparison.get("bootstrap_ci95") or [None, None]
+        lines.append(
+            f"| {comparison.get('variant_arm_id')} - {comparison.get('control_arm_id')} | "
+            f"{integer(comparison.get('pair_count'))} | {fmt(comparison.get('mean_delta_quality'), 4)} | "
+            f"[{fmt(low, 4)}, {fmt(high, 4)}] | {integer(comparison.get('wins'))}/"
+            f"{integer(comparison.get('ties'))}/{integer(comparison.get('losses'))} |"
+        )
+    if not drift.get("comparisons"):
+        lines.append("| — | 0 | — | — | — |")
+    lines.extend(
+        [
+            "",
+            "### 每臂 anchor lag",
+            "",
+            "| Ordinal | Arm | Anchor/control | Start | Anchor complete | Lag s |",
+            "|---:|---|---|---|---|---:|",
+        ]
+    )
+    timing_rows = schedule.get("arm_timing") if isinstance(schedule.get("arm_timing"), Mapping) else {}
+    for arm_id, timing in sorted(
+        timing_rows.items(),
+        key=lambda item: integer(item[1].get("schedule_ordinal")) if isinstance(item[1], Mapping) else 0,
+    ):
+        timing = timing if isinstance(timing, Mapping) else {}
+        lines.append(
+            f"| {integer(timing.get('schedule_ordinal'))} | {arm_id} | `{timing.get('anchor_arm_id') or 'missing'}` | "
+            f"`{timing.get('started_at') or 'not-started'}` | `{timing.get('anchor_completed_at') or 'not-complete'}` | "
+            f"{fmt(timing.get('anchor_lag_seconds'), 1)} |"
+        )
+    lines.extend(
+        [
         "",
         "## 全组完成矩阵",
         "",
         "| Group | Variable | State | Variant arms | Arm states | Complete pairings | Mean ΔQ list | Report |",
         "|---|---|---|---:|---|---:|---|---|",
-    ]
+        ]
+    )
     for experiment_id in sorted(
         experiments, key=lambda item: (item.replace("P0.5", "P0.50"), item)
     ):
@@ -3370,9 +4078,11 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
             f"| Campaign account actual | {fmt(costs.get('account_delta_usd'), 6)} | `{costs.get('account_windows_complete')}` | — | — | includes Judge; never add to theoretical totals |",
             f"| Campaign BYOK delta | {fmt(costs.get('byok_delta_usd'), 6)} | — | — | — | policy/audit evidence, not execution status |",
             "",
+            "source 与三个 replay control 均只按唯一 arm 各计一次；它们虽被多个实验组引用，绝不按引用次数重复累计。",
+            "",
             "## 重复实验配对",
             "",
-            "P0.5-11 和 P0.5-36 的 E1-R1/R2/R3 分别配对 common-E0-R1/R2/R3；另以每题三次 ΔQ 的均值形成 10 个独立 task-level delta，再做固定 seed、20,000 次 paired bootstrap。没有把 30 个相关观测伪装成 30 个独立题目。",
+            f"P0.5-11 和 P0.5-36 的三次 E1 分别配对动态冻结的 replay controls {code_json(controls.get('replay_control_arm_ids') or [])}；比较前强制 analyzer_mode 相同。另以每题三次 ΔQ 的均值形成最多 10 个独立 task-level delta，再做固定 seed、20,000 次 paired bootstrap，没有把 30 个相关观测伪装成 30 个独立题目。P0.5-11 当前不支持/不发送 model sampling seed，不能精确重放；P0.5-36 仅纳入 trace candidate-order seed 与配置 0/1/4 一致且实际进入 aggregation 的 task slice。",
             "",
             "| Group | Replicates | Tasks | Mean ΔQ | 95% CI | W/T/L |",
             "|---|---:|---:|---:|---|---|",
@@ -3559,6 +4269,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         ):
             raise ReportError("terminal status input freeze contract differs")
     specs = expand_arms(plan)
+    schedule_evidence = validate_schedule_evidence(plan, status, specs)
     canonical_derived_path = run_root / "derived-plan.json"
     if (
         args.derived_plan is not None
@@ -3596,8 +4307,26 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             derived,
             verifier,
         )
+        arms[spec.arm_id]["schedule"] = copy.deepcopy(
+            schedule_evidence.get("arm_timing", {}).get(spec.arm_id, {})
+        )
+    c3_evidence = p0_20_e3_promotion_evidence(schedule_evidence)
+    if "P0-20-E3" in arms:
+        arms["P0-20-E3"]["c3_promotion_evidence"] = c3_evidence
     legacy = validate_legacy_evidence(plan)
     experiments = build_experiment_inventory(plan, status, arms, derived, legacy)
+    active_experiment_ids = [
+        str(experiment.get("id") or "")
+        for experiment in plan.get("experiments") or []
+        if isinstance(experiment, Mapping)
+    ]
+    comparison_evidence_invalid_experiment_ids = sorted(
+        experiment_id
+        for experiment_id in active_experiment_ids
+        if not experiment_id
+        or experiments.get(experiment_id, {}).get("comparison_evidence_valid") is not True
+    )
+    comparison_evidence_valid = not comparison_evidence_invalid_experiment_ids
     arm_states = [str(arm.get("state") or "unknown") for arm in arms.values()]
     terminal_arms = all(state in TERMINAL_ARM_STATES for state in arm_states)
     succeeded = [arm for arm in arms.values() if arm.get("state") == "succeeded"]
@@ -3620,6 +4349,8 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         and declared_noop_valid
         and legacy_valid
         and derived.get("valid") is True
+        and schedule_evidence.get("valid") is True
+        and comparison_evidence_valid
         else "partial_or_failed"
         if phase in TERMINAL_PHASES
         else "nonterminal_snapshot"
@@ -3633,6 +4364,11 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "no_op_evidence_valid": no_op_valid and declared_noop_valid,
         "legacy_evidence_valid": legacy_valid,
         "derived_evidence_valid": derived.get("valid") is True,
+        "schedule_evidence_valid": schedule_evidence.get("valid") is True,
+        "comparison_evidence_valid": comparison_evidence_valid,
+        "comparison_evidence_invalid_experiment_ids": (
+            comparison_evidence_invalid_experiment_ids
+        ),
         "planned_arm_count": len(arms),
         "formal_succeeded_arm_count": len(succeeded),
         "wire_no_op_arm_count": len(no_op_arms),
@@ -3659,6 +4395,9 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "terminal_status_input_sha256": status.get("terminal_status_input_sha256"),
         "freeze": dict(plan.get("freeze") or {}),
         "execution": dict(plan.get("execution") or {}),
+        "comparison_controls": comparison_control_contract(plan, specs),
+        "schedule_evidence": schedule_evidence,
+        "replay_control_drift": replay_control_drift(plan, specs, arms),
         "benchmark": dict(plan.get("benchmark") or {}),
         "paths": {
             "campaign_plan": str(args.plan),
@@ -3684,6 +4423,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "promotion": {
             "mini_is_diagnostic_only": True,
             "automatic_winner_promotion": False,
+            "P0-20-E3": c3_evidence,
         },
         "completion": completion,
         "derived": derived,

@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shlex
 import statistics
 import subprocess
@@ -1341,6 +1342,24 @@ class DryEnsembleProvider:
                     ],
                 }
             candidates.append(candidate)
+        shuffle_candidates = (
+            self.selection_plan.get("effective_shuffle_candidates") is True
+        )
+        configured_candidate_order_seed = self.selection_plan.get(
+            "configured_candidate_order_seed"
+        )
+        candidate_order_seed = None
+        candidate_display_order: list[int] = []
+        if shuffle_candidates:
+            candidate_order_seed = (
+                configured_candidate_order_seed
+                if configured_candidate_order_seed is not None
+                else random.SystemRandom().getrandbits(64)
+            )
+            candidate_display_order = [
+                int(candidate["index"]) for candidate in candidates
+            ]
+            random.Random(candidate_order_seed).shuffle(candidate_display_order)
         text = f"[dry:{self.group}:{self.profile}] fused answer for {prompt[:120]}"
         proposer_usage = []
         for candidate in candidates:
@@ -1444,7 +1463,17 @@ class DryEnsembleProvider:
                 "total_candidates": len(candidates),
                 "fallback_used": False,
                 "candidates": candidates,
-                "shuffle_candidates": False,
+                "shuffle_candidates": shuffle_candidates,
+                "configured_candidate_order_seed": configured_candidate_order_seed,
+                "candidate_order_seed": candidate_order_seed,
+                "candidate_order_seed_source": (
+                    "disabled"
+                    if not shuffle_candidates
+                    else "configured"
+                    if configured_candidate_order_seed is not None
+                    else "system_random"
+                ),
+                "candidate_display_order": candidate_display_order,
                 "proposer_tools": getattr(self, "proposer_tools", False),
                 "aggregator_tools": getattr(self, "aggregator_tools", True),
                 "aggregator_recovery": {
@@ -2941,6 +2970,7 @@ def align_b2_provider_to_g12(
     provider.aggregator_timeout_seconds = experiment.timeouts.aggregator_seconds
     provider.candidate_max_chars = ensemble.candidate_max_chars
     provider.shuffle_candidates = ensemble.shuffle_candidates
+    provider.candidate_order_seed = ensemble.candidate_order_seed
     provider.record_candidates = ensemble.record_candidates
     provider.proposer_tools = ensemble.proposer_tools
     provider.aggregator_tools = ensemble.aggregator_tools
@@ -3023,6 +3053,13 @@ def align_b2_provider_to_g12(
         "require_highest_thinking": experiment.generation.require_highest_thinking,
         "member_generation": member_generation,
     }
+    if ensemble.candidate_order_seed is not None:
+        provider.selection_plan["configured_candidate_order_seed"] = (
+            ensemble.candidate_order_seed
+        )
+        provider.selection_plan["effective_candidate_order_seed"] = (
+            ensemble.candidate_order_seed if provider.shuffle_candidates else None
+        )
     return provider
 
 
@@ -4114,6 +4151,19 @@ async def build_experiment_provider(
                     },
                 }
             )
+            if b2_experiment.ensemble.candidate_order_seed is not None:
+                dry_routing_trace["selection_plan"].update(
+                    {
+                        "configured_candidate_order_seed": (
+                            b2_experiment.ensemble.candidate_order_seed
+                        ),
+                        "effective_candidate_order_seed": (
+                            b2_experiment.ensemble.candidate_order_seed
+                            if b2_experiment.ensemble.shuffle_candidates
+                            else None
+                        ),
+                    }
+                )
             dry_provider.selection_plan = dict(dry_routing_trace["selection_plan"])
         elif g1_routing is not None:
             from opensquilla.provider.ranking_router import (
@@ -4137,6 +4187,9 @@ async def build_experiment_provider(
             dry_ensemble.selection_mode = "router_dynamic"
             dry_ensemble.ranking_user_profile_generation_enabled = False
             dry_ensemble.ranking_user_profile_enabled = False
+            if g1_ensemble is not None:
+                dry_ensemble.shuffle_candidates = g1_ensemble.shuffle_candidates
+                dry_ensemble.candidate_order_seed = g1_ensemble.candidate_order_seed
             apply_aggregator_recovery_policy(dry_ensemble, recovery_policy)
             apply_aggregator_recovery_policy(dry_ensemble, proposer_policy)
             dry_ensemble.min_successful_proposers = (
@@ -4405,8 +4458,20 @@ async def build_experiment_provider(
     ensemble_cfg.record_candidates = (
         b2_experiment.ensemble.record_candidates if b2_experiment is not None else True
     )
+    experiment_ensemble = (
+        b2_experiment.ensemble
+        if b2_experiment is not None
+        else g1_ensemble
+    )
     ensemble_cfg.shuffle_candidates = (
-        b2_experiment.ensemble.shuffle_candidates if b2_experiment is not None else False
+        experiment_ensemble.shuffle_candidates
+        if experiment_ensemble is not None
+        else False
+    )
+    ensemble_cfg.candidate_order_seed = (
+        experiment_ensemble.candidate_order_seed
+        if experiment_ensemble is not None
+        else None
     )
     if ensemble_proposer_timeout is not None:
         ensemble_cfg.proposer_timeout_seconds = float(ensemble_proposer_timeout)
@@ -5886,6 +5951,13 @@ def aggregate_agent_ensemble_trace(records: list[dict[str, Any]]) -> dict[str, A
     ):
         if key in first_trace:
             payload[key] = first_trace[key]
+    for key in (
+        "configured_candidate_order_seed",
+        "candidate_order_seed",
+        "candidate_order_seed_source",
+    ):
+        if key in terminal_trace:
+            payload[key] = terminal_trace[key]
     for key in (
         "successful_proposers",
         "total_candidates",

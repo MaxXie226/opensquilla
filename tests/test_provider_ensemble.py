@@ -2973,8 +2973,10 @@ async def test_ensemble_aggregator_only_clears_tool_choice_when_tools_disabled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("configured_seed", [None, 0], ids=["system-random", "configured-zero"])
 async def test_shuffled_candidate_order_is_replayable_from_trace_seed(
     monkeypatch: pytest.MonkeyPatch,
+    configured_seed: int | None,
 ) -> None:
     registry = _FakeRegistry(
         {
@@ -2992,6 +2994,7 @@ async def test_shuffled_candidate_order_is_replayable_from_trace_seed(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=True,
+        candidate_order_seed=configured_seed,
     )
 
     events = await _collect(provider)
@@ -2999,6 +3002,12 @@ async def test_shuffled_candidate_order_is_replayable_from_trace_seed(
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
     seed = done.ensemble_trace["candidate_order_seed"]
+    assert done.ensemble_trace["configured_candidate_order_seed"] == configured_seed
+    assert done.ensemble_trace["candidate_order_seed_source"] == (
+        "configured" if configured_seed is not None else "system_random"
+    )
+    if configured_seed is not None:
+        assert seed == configured_seed
     expected_order = [0, 1, 2]
     random.Random(seed).shuffle(expected_order)
     assert done.ensemble_trace["candidate_display_order"] == expected_order
@@ -3010,6 +3019,17 @@ async def test_shuffled_candidate_order_is_replayable_from_trace_seed(
         key=lambda index: candidate_prompt.index(f"draft-p{index + 1}"),
     )
     assert prompt_order == expected_order
+
+
+@pytest.mark.parametrize("seed", [True, -1, 1 << 64])
+def test_ensemble_rejects_invalid_candidate_order_seed(seed: object) -> None:
+    with pytest.raises(ValueError, match="candidate_order_seed"):
+        EnsembleProvider(
+            profile_name="invalid-order-seed",
+            proposers=[_member("p1")],
+            aggregator=_member("agg"),
+            candidate_order_seed=seed,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.asyncio

@@ -521,7 +521,21 @@ class LlmEnsembleConfig(BaseSettings):
     aggregator_max_tokens_cap: int = Field(default=65_536, ge=2)
     aggregator_visible_answer_reserve_tokens: int = Field(default=8_192, ge=1)
     shuffle_candidates: bool = True
+    # Optional deterministic seed for candidate presentation order. ``None``
+    # preserves the historical per-call SystemRandom behavior.
+    candidate_order_seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=(1 << 64) - 1,
+    )
     record_candidates: bool = False
+
+    @field_validator("candidate_order_seed", mode="before")
+    @classmethod
+    def _reject_boolean_candidate_order_seed(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("candidate_order_seed must be an unsigned 64-bit integer")
+        return value
 
     @model_validator(mode="after")
     def _validate_model_options(self) -> LlmEnsembleConfig:

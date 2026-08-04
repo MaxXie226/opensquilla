@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 CONTROLLER_PATH = (
@@ -54,15 +55,205 @@ def sealed_result(task_id: str) -> dict[str, object]:
 
 
 class ControllerTests(unittest.TestCase):
-    def test_matrix_remains_65_arms_and_31_groups(self) -> None:
+    def test_matrix_freezes_66_arms_controls_modes_and_schedule(self) -> None:
         plan = controller.load_json(PLAN_TEMPLATE)
         arms = controller.validate_plan(plan, allow_placeholders=True)
-        self.assertEqual(len(arms), 65)
+        self.assertEqual(len(arms), 66)
         self.assertEqual(
             len({arm.experiment_id for arm in arms if arm.experiment_id != "common-E0"}),
             31,
         )
-        self.assertEqual(sum(arm.analyzer_mode == "frozen_replay" for arm in arms), 60)
+        self.assertEqual(sum(arm.analyzer_mode == "frozen_replay" for arm in arms), 61)
+        self.assertEqual(sum(arm.analyzer_mode == "live" for arm in arms), 5)
+        self.assertEqual(
+            [arm.arm_id for arm in arms],
+            plan["execution"]["schedule"]["arm_order"],
+        )
+        r1_index = plan["execution"]["schedule"]["arm_order"].index("common-E0-R1")
+        self.assertEqual(
+            plan["execution"]["schedule"]["arm_order"][r1_index : r1_index + 3],
+            ["common-E0-R1", "P0-20-E3", "P0-20-E2"],
+        )
+        by_id = {arm.arm_id: arm for arm in arms}
+        for arm in arms:
+            if arm.experiment_id == "common-E0":
+                continue
+            control = by_id[arm.control_arm_id]
+            self.assertEqual(arm.analyzer_mode, control.analyzer_mode)
+
+    def test_plan_rejects_schedule_control_or_mode_drift(self) -> None:
+        template = controller.load_json(PLAN_TEMPLATE)
+        mutations = []
+        wrong_order = copy.deepcopy(template)
+        wrong_order["execution"]["schedule"]["arm_order"][6:8] = reversed(
+            wrong_order["execution"]["schedule"]["arm_order"][6:8]
+        )
+        mutations.append(wrong_order)
+        wrong_anchor = copy.deepcopy(template)
+        wrong_anchor["execution"]["schedule"]["anchor_by_arm_id"]["P0-12-E1"] = "common-E0-R2"
+        mutations.append(wrong_anchor)
+        wrong_control = copy.deepcopy(template)
+        wrong_control["comparison_controls"]["arm_control_overrides"]["P0-12-E1"] = "common-E0-R2"
+        mutations.append(wrong_control)
+        strict_interleaving = copy.deepcopy(template)
+        strict_interleaving["execution"]["schedule"]["strict_task_interleaving"] = True
+        mutations.append(strict_interleaving)
+        wrong_mode = copy.deepcopy(template)
+        wrong_mode["common_e0"][1]["analyzer_mode"] = "live"
+        mutations.append(wrong_mode)
+        for plan in mutations:
+            with self.subTest(plan=plan):
+                with self.assertRaises(controller.ControllerError):
+                    controller.validate_plan(plan, allow_placeholders=True)
+
+    def test_anchor_gate_blocks_source_and_replay_tranches_after_anchor_failure(self) -> None:
+        plan = controller.load_json(PLAN_TEMPLATE)
+        arms = controller.validate_plan(plan, allow_placeholders=True)
+        by_id = {arm.arm_id: arm for arm in arms}
+        status = controller.initialize_status(
+            plan,
+            arms,
+            plan_sha256="plan",
+            snapshot_identity={"commit": "commit", "tree": "tree"},
+        )
+        cases = (
+            ("P0-03-E1", "common-E0-source"),
+            ("P0-20-E3", "common-E0-R1"),
+        )
+        for arm_id, anchor_id in cases:
+            status["arms"][anchor_id]["state"] = "failed"
+            with self.subTest(arm_id=arm_id):
+                allowed, failure = controller.schedule_anchor_launch_gate(
+                    plan,
+                    by_id[arm_id],
+                    status=status,
+                    authenticated_anchor_ids=set(),
+                )
+                self.assertFalse(allowed)
+                self.assertEqual(failure["reason"], "anchor_not_succeeded")
+                self.assertEqual(failure["anchor_arm_id"], anchor_id)
+                self.assertEqual(failure["anchor_state"], "failed")
+
+    def test_anchor_gate_allows_restart_anchor_authenticated_earlier_in_schedule(self) -> None:
+        plan = controller.load_json(PLAN_TEMPLATE)
+        arms = controller.validate_plan(plan, allow_placeholders=True)
+        by_id = {arm.arm_id: arm for arm in arms}
+        status = controller.initialize_status(
+            plan,
+            arms,
+            plan_sha256="plan",
+            snapshot_identity={"commit": "commit", "tree": "tree"},
+        )
+        status["arms"]["common-E0-R1"]["state"] = "succeeded"
+        allowed, evidence = controller.schedule_anchor_launch_gate(
+            plan,
+            by_id["P0-20-E3"],
+            status=status,
+            authenticated_anchor_ids={"common-E0-R1"},
+        )
+        self.assertTrue(allowed)
+        self.assertTrue(evidence["anchor_authenticated"])
+
+    def test_anchor_gate_rejects_forged_succeeded_status_without_artifacts(self) -> None:
+        plan = controller.load_json(PLAN_TEMPLATE)
+        arms = controller.validate_plan(plan, allow_placeholders=True)
+        by_id = {arm.arm_id: arm for arm in arms}
+        status = controller.initialize_status(
+            plan,
+            arms,
+            plan_sha256="plan",
+            snapshot_identity={"commit": "commit", "tree": "tree"},
+        )
+        status["arms"]["common-E0-source"]["state"] = "succeeded"
+        allowed, failure = controller.schedule_anchor_launch_gate(
+            plan,
+            by_id["P0-03-E1"],
+            status=status,
+            authenticated_anchor_ids=set(),
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(failure["reason"], "anchor_not_succeeded")
+        self.assertEqual(failure["anchor_state"], "succeeded")
+        self.assertFalse(failure["anchor_authenticated"])
+
+    def test_replicate_overrides_deep_merge_and_seed_contract(self) -> None:
+        plan = controller.load_json(PLAN_TEMPLATE)
+        arms = controller.validate_plan(plan, allow_placeholders=True)
+        by_id = {arm.arm_id: arm for arm in arms}
+        for replicate, seed in enumerate((0, 1, 4), start=1):
+            override = by_id[f"P0.5-36-E1-R{replicate}"].override
+            self.assertIs(override["ensemble"]["shuffle_candidates"], True)
+            self.assertEqual(override["ensemble"]["candidate_order_seed"], seed)
+
+        merge_plan = copy.deepcopy(plan)
+        temperature_variant = next(
+            experiment for experiment in merge_plan["experiments"] if experiment["id"] == "P0.5-11"
+        )["variants"][0]
+        temperature_variant["replicate_overrides"] = [
+            {"generation": {"max_tokens": value}} for value in (1, 2, 3)
+        ]
+        merged = {
+            arm.arm_id: arm
+            for arm in controller.expand_arms(merge_plan)
+            if arm.experiment_id == "P0.5-11"
+        }
+        for replicate in range(1, 4):
+            generation = merged[f"P0.5-11-E1-R{replicate}"].override["generation"]
+            self.assertEqual(generation["temperature"], 0.2)
+            self.assertEqual(generation["max_tokens"], replicate)
+
+    def test_replicate_overrides_and_shuffle_seeds_fail_closed(self) -> None:
+        template = controller.load_json(PLAN_TEMPLATE)
+        shuffle_variant = next(
+            experiment for experiment in template["experiments"] if experiment["id"] == "P0.5-36"
+        )["variants"][0]
+        invalid: list[dict[str, object]] = []
+        for value in (True, -1, 1 << 64):
+            plan = copy.deepcopy(template)
+            variant = next(
+                experiment for experiment in plan["experiments"] if experiment["id"] == "P0.5-36"
+            )["variants"][0]
+            variant["replicate_overrides"][0]["ensemble"]["candidate_order_seed"] = value
+            invalid.append(plan)
+        duplicate = copy.deepcopy(template)
+        variant = next(
+            experiment for experiment in duplicate["experiments"] if experiment["id"] == "P0.5-36"
+        )["variants"][0]
+        variant["replicate_overrides"][0]["ensemble"]["candidate_order_seed"] = 1
+        invalid.append(duplicate)
+        shuffle_off = copy.deepcopy(template)
+        variant = next(
+            experiment for experiment in shuffle_off["experiments"] if experiment["id"] == "P0.5-36"
+        )["variants"][0]
+        variant["override"]["ensemble"]["shuffle_candidates"] = False
+        invalid.append(shuffle_off)
+        for plan in invalid:
+            with self.subTest(plan=plan):
+                with self.assertRaises(controller.ControllerError):
+                    controller.validate_plan(plan, allow_placeholders=True)
+
+        for malformed in (
+            shuffle_variant["replicate_overrides"][:2],
+            [*shuffle_variant["replicate_overrides"], {}],
+            "not-a-list",
+            [shuffle_variant["replicate_overrides"][0], 1, {}],
+        ):
+            plan = copy.deepcopy(template)
+            variant = next(
+                experiment for experiment in plan["experiments"] if experiment["id"] == "P0.5-36"
+            )["variants"][0]
+            variant["replicate_overrides"] = copy.deepcopy(malformed)
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(controller.ControllerError):
+                    controller.expand_arms(plan)
+        single = copy.deepcopy(template)
+        variant = next(
+            experiment for experiment in single["experiments"] if experiment["id"] == "P0.5-36"
+        )["variants"][0]
+        variant["replicates"] = 1
+        variant["replicate_overrides"] = [variant["replicate_overrides"][0]]
+        with self.assertRaises(controller.ControllerError):
+            controller.expand_arms(single)
 
     def test_plan_rejects_judge_or_generation_budget_drift(self) -> None:
         template = controller.load_json(PLAN_TEMPLATE)
@@ -185,7 +376,7 @@ class ControllerTests(unittest.TestCase):
             manifest["manifest_sha256"] = "sha256:" + controller.canonical_sha256(manifest)
             write_json(root / "manifest.json", manifest)
             source_arm = controller.Arm(
-                arm_id="common-E0-R1",
+                arm_id="common-E0-source",
                 experiment_id="common-E0",
                 directory_name="common",
                 variant="E0",
@@ -243,6 +434,104 @@ class ControllerTests(unittest.TestCase):
             baseline, {"a": {"selected_P": ["q"], "selected_A": "a"}}
         )
         self.assertEqual(changed["changed_task_count"], 1)
+
+    def test_candidate_order_seed_is_request_visible_behavior(self) -> None:
+        baseline = controller._candidate_order_seed_projection(
+            SimpleNamespace(candidate_order_seed=0, shuffle_candidates=True),
+            {
+                "configured_candidate_order_seed": 0,
+                "effective_candidate_order_seed": 0,
+            },
+            task_id="task",
+        )
+        candidate = controller._candidate_order_seed_projection(
+            SimpleNamespace(candidate_order_seed=1, shuffle_candidates=True),
+            {
+                "configured_candidate_order_seed": 1,
+                "effective_candidate_order_seed": 1,
+            },
+            task_id="task",
+        )
+        comparison = controller.compare_behavior_projections(
+            {"task": baseline},
+            {"task": candidate},
+        )
+        self.assertEqual(comparison["changed_task_count"], 1)
+        with self.assertRaises(controller.ControllerError):
+            controller._candidate_order_seed_projection(
+                SimpleNamespace(candidate_order_seed=4, shuffle_candidates=True),
+                {
+                    "configured_candidate_order_seed": 4,
+                    "effective_candidate_order_seed": 0,
+                },
+                task_id="task",
+            )
+
+    def test_candidate_order_seed_execution_evidence_gate(self) -> None:
+        expected = {
+            "required": True,
+            "configured_candidate_order_seed": 0,
+            "effective_candidate_order_seed": 0,
+        }
+        aggregate_call = {
+            "final_request_role": "aggregator",
+            "total_candidates": 3,
+            "selected_candidate_count": 3,
+            "shuffle_candidates": True,
+            "configured_candidate_order_seed": 0,
+            "candidate_order_seed": 0,
+            "candidate_order_seed_source": "configured",
+            "candidate_display_order": [0, 2, 1],
+            "selection_plan": {
+                "configured_candidate_order_seed": 0,
+                "effective_candidate_order_seed": 0,
+            },
+            "candidates": [
+                {"index": index, "selected_for_aggregation": True}
+                for index in range(3)
+            ],
+        }
+        rows = [
+            {
+                "task_id": "task",
+                "ensemble_trace": {"mode": "agent_loop", "calls": [aggregate_call]},
+            }
+        ]
+        matched = controller.candidate_order_seed_execution_evidence(
+            rows,
+            expected=expected,
+        )
+        self.assertTrue(matched["pass"])
+        self.assertEqual(matched["status"], "matched")
+        self.assertEqual(matched["aggregation_call_count"], 1)
+
+        wrong_seed = copy.deepcopy(rows)
+        wrong_seed[0]["ensemble_trace"]["calls"][0]["candidate_order_seed"] = 1
+        mismatched = controller.candidate_order_seed_execution_evidence(
+            wrong_seed,
+            expected=expected,
+        )
+        self.assertFalse(mismatched["pass"])
+        self.assertIn(
+            "candidate_order_seed",
+            mismatched["failures"][0]["fields"],
+        )
+
+        pre_aggregation = copy.deepcopy(rows)
+        pre_aggregation[0]["ensemble_trace"]["calls"] = [
+            {
+                "final_request_role": "fallback_single",
+                "total_candidates": 3,
+                "fallback_used": True,
+            }
+        ]
+        not_applicable = controller.candidate_order_seed_execution_evidence(
+            pre_aggregation,
+            expected=expected,
+        )
+        self.assertTrue(not_applicable["pass"])
+        self.assertEqual(not_applicable["status"], "not_applicable")
+        self.assertEqual(not_applicable["aggregation_call_count"], 0)
 
     def test_selection_projection_rejects_duplicate_or_mismatched_proposers(self) -> None:
         base = {
@@ -303,7 +592,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(
             controller.offline_effect_decision(
                 comparisons={"actual": same},
-                arm_ids=["common-E0-R2"],
+                arm_ids=["common-E0-R1"],
                 budget_gated=False,
                 production_budget_projection_complete=True,
                 projection_uncertain=False,
@@ -311,7 +600,7 @@ class ControllerTests(unittest.TestCase):
             "run_required_replicate",
         )
 
-    def test_plan_freezes_55_unique_replay_overlays_and_registry_identities(self) -> None:
+    def test_plan_freezes_57_unique_replay_overlays_and_registry_identities(self) -> None:
         plan = controller.load_json(PLAN_TEMPLATE)
         arms = controller.validate_plan(plan, allow_placeholders=True)
         replay_overlays = {
@@ -319,10 +608,38 @@ class ControllerTests(unittest.TestCase):
             for arm in arms
             if arm.analyzer_mode == "frozen_replay"
         }
-        self.assertEqual(len(replay_overlays), 55)
+        self.assertEqual(len(replay_overlays), 57)
+        self.assertEqual(controller.EXPECTED_OFFLINE_UNIQUE_REPLAY_OVERLAYS, 57)
+        controller.validate_offline_unique_replay_overlay_count(
+            {str(index): {} for index in range(57)}
+        )
+        with self.assertRaises(controller.ControllerError):
+            controller.validate_offline_unique_replay_overlay_count(
+                {str(index): {} for index in range(56)}
+            )
         registry = plan["freeze"]["model_registry"]
         self.assertEqual(registry["full_model_count"], 79)
         self.assertEqual(registry["formal_model_count"], 79)
+
+    def test_status_freezes_schedule_hash_ordinals_and_anchors(self) -> None:
+        plan = controller.load_json(PLAN_TEMPLATE)
+        arms = controller.validate_plan(plan, allow_placeholders=True)
+        status = controller.initialize_status(
+            plan,
+            arms,
+            plan_sha256=controller.canonical_sha256(plan),
+            snapshot_identity={"commit": "c", "tree": "t"},
+        )
+        schedule = plan["execution"]["schedule"]
+        self.assertEqual(status["schedule_sha256"], controller.canonical_sha256(schedule))
+        self.assertIs(status["strict_task_interleaving"], False)
+        for ordinal, arm in enumerate(arms, start=1):
+            state = status["arms"][arm.arm_id]
+            self.assertEqual(state["schedule_ordinal"], ordinal)
+            self.assertEqual(
+                state["anchor_arm_id"],
+                schedule["anchor_by_arm_id"][arm.arm_id],
+            )
 
     def test_main_dry_replay_blanks_network_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

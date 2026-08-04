@@ -31,6 +31,7 @@ import inspect
 import json
 import math
 import os
+import random
 import re
 import stat
 import subprocess
@@ -57,6 +58,7 @@ AGGREGATOR_PROMPT_VERSIONS = frozenset(
     }
 )
 EXPECTED_TASK_COUNT = 10
+EXPECTED_OFFLINE_UNIQUE_REPLAY_OVERLAYS = 57
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLACEHOLDER_PREFIX = "TODO_"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -64,6 +66,7 @@ PHYSICAL_ATTEMPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 PRODUCTION_BUDGET_GATE_EXPERIMENTS = frozenset({"P0.5-10", "P0.5-38", "P0.5-39"})
 REQUIRED_REPLICATE_ARMS = frozenset(
     {
+        "common-E0-R1",
         "common-E0-R2",
         "common-E0-R3",
         "P0.5-11-E1-R1",
@@ -74,6 +77,108 @@ REQUIRED_REPLICATE_ARMS = frozenset(
         "P0.5-36-E1-R3",
     }
 )
+ANALYZER_SOURCE_ARM_ID = "common-E0-source"
+REPLAY_CONTROL_ARM_IDS = (
+    "common-E0-R1",
+    "common-E0-R2",
+    "common-E0-R3",
+)
+LIVE_ANALYZER_CANDIDATE_ARM_IDS = (
+    "P0-03-E1",
+    "P0.5-05-E1",
+    "P0.5-06-E1",
+    "P0.5-06-E2",
+)
+REPLAY_TRANCHES = {
+    "common-E0-R1": (
+        "P0-20-E3",
+        "P0-20-E2",
+        "P0.5-11-E1-R1",
+        "P0.5-36-E1-R1",
+        "P0-12-E1",
+        "P0-12-E2",
+        "P0-12-E3",
+        "P0-22-E1",
+        "P0-22-E2",
+        "P0-23-E1",
+        "P0-23-E2",
+        "P0-32-E1",
+        "P0-32-E2",
+        "P0-35-E1",
+        "P0-35-E2",
+        "P0.5-10-E1",
+        "P0.5-10-E2",
+        "P0.5-13-E1",
+        "P0.5-13-E2",
+        "P0.5-28-E1",
+    ),
+    "common-E0-R2": (
+        "P0.5-11-E1-R2",
+        "P0.5-36-E1-R2",
+        "P0.5-14-E1",
+        "P0.5-14-E2",
+        "P0.5-16-E1",
+        "P0.5-16-E2",
+        "P0.5-17-E1",
+        "P0.5-17-E2",
+        "P0.5-18-E1",
+        "P0.5-18-E2",
+        "P0.5-19-E1",
+        "P0.5-19-E2",
+        "P0.5-21-E1",
+        "P0.5-21-E2",
+        "P0.5-24-E1",
+        "P0.5-24-E2",
+        "P0.5-25-E1",
+        "P0.5-25-E2",
+    ),
+    "common-E0-R3": (
+        "P0.5-11-E1-R3",
+        "P0.5-36-E1-R3",
+        "P0.5-26-E1",
+        "P0.5-26-E2",
+        "P0.5-27-E1",
+        "P0.5-27-E2",
+        "P0.5-29-E1",
+        "P0.5-29-E2",
+        "P0.5-30-E1",
+        "P0.5-30-E2",
+        "P0.5-33-E1",
+        "P0.5-33-E2",
+        "P0.5-34-E1",
+        "P0.5-34-E2",
+        "P0.5-37-E1",
+        "P0.5-37-E2",
+        "P0.5-38-E1",
+        "P0.5-38-E2",
+        "P0.5-39-E1",
+        "P0.5-39-E2",
+    ),
+}
+EXPECTED_SCHEDULE_ARM_ORDER = (
+    ANALYZER_SOURCE_ARM_ID,
+    *LIVE_ANALYZER_CANDIDATE_ARM_IDS,
+    *(
+        arm_id
+        for anchor_id in REPLAY_CONTROL_ARM_IDS
+        for arm_id in (anchor_id, *REPLAY_TRANCHES[anchor_id])
+    ),
+)
+EXPECTED_SCHEDULE_ANCHORS = {
+    ANALYZER_SOURCE_ARM_ID: ANALYZER_SOURCE_ARM_ID,
+    **{arm_id: ANALYZER_SOURCE_ARM_ID for arm_id in LIVE_ANALYZER_CANDIDATE_ARM_IDS},
+    **{
+        arm_id: anchor_id
+        for anchor_id in REPLAY_CONTROL_ARM_IDS
+        for arm_id in (anchor_id, *REPLAY_TRANCHES[anchor_id])
+    },
+}
+EXPECTED_ARM_CONTROL_OVERRIDES = {
+    arm_id: anchor_id
+    for arm_id, anchor_id in EXPECTED_SCHEDULE_ANCHORS.items()
+    if arm_id not in {ANALYZER_SOURCE_ARM_ID, *REPLAY_CONTROL_ARM_IDS}
+}
+UINT64_MAX = (1 << 64) - 1
 RUN_DECISIONS = frozenset(
     {
         "run",
@@ -256,6 +361,16 @@ class Arm:
 
 def expand_arms(plan: Mapping[str, Any]) -> list[Arm]:
     run_id = str(plan["run_id"])
+    controls = plan.get("comparison_controls")
+    if isinstance(controls, Mapping):
+        default_control_arm_id = str(controls.get("default_control_arm_id") or "common-E0-R1")
+        raw_control_overrides = controls.get("arm_control_overrides")
+        control_overrides = (
+            dict(raw_control_overrides) if isinstance(raw_control_overrides, Mapping) else {}
+        )
+    else:
+        default_control_arm_id = "common-E0-R1"
+        control_overrides = {}
     arms: list[Arm] = []
     for row in plan["common_e0"]:
         arm_id = str(row["arm_id"])
@@ -279,6 +394,25 @@ def expand_arms(plan: Mapping[str, Any]) -> list[Arm]:
         directory_name = str(experiment["directory_name"])
         for variant in experiment.get("variants", []):
             repetitions = int(variant.get("replicates", 1))
+            base_override = variant.get("override") or {}
+            if not isinstance(base_override, Mapping):
+                raise ControllerError(f"{experiment_id} variant override must be an object")
+            replicate_overrides = variant.get("replicate_overrides")
+            if replicate_overrides is not None:
+                if repetitions < 2:
+                    raise ControllerError(
+                        f"{experiment_id} replicate_overrides requires replicates >= 2"
+                    )
+                if not isinstance(replicate_overrides, list):
+                    raise ControllerError(f"{experiment_id} replicate_overrides must be a list")
+                if len(replicate_overrides) != repetitions:
+                    raise ControllerError(
+                        f"{experiment_id} replicate_overrides must match repetitions"
+                    )
+                if any(not isinstance(item, Mapping) for item in replicate_overrides):
+                    raise ControllerError(
+                        f"{experiment_id} replicate_overrides entries must be objects"
+                    )
             for replicate in range(1, repetitions + 1):
                 suffix = f"-R{replicate}" if repetitions > 1 else ""
                 arm_id = f"{experiment_id}-{variant['id']}{suffix}"
@@ -290,8 +424,17 @@ def expand_arms(plan: Mapping[str, Any]) -> list[Arm]:
                         )
                     default_control = control_ids[replicate - 1]
                 else:
-                    default_control = experiment.get("control_arm_id", "common-E0-R1")
-                control = variant.get("control_arm_id") or default_control
+                    default_control = experiment.get("control_arm_id", default_control_arm_id)
+                control = control_overrides.get(
+                    arm_id,
+                    variant.get("control_arm_id") or default_control,
+                )
+                arm_override = copy.deepcopy(dict(base_override))
+                if replicate_overrides is not None:
+                    arm_override = deep_merge(
+                        arm_override,
+                        replicate_overrides[replicate - 1],
+                    )
                 arms.append(
                     Arm(
                         arm_id=arm_id,
@@ -300,7 +443,7 @@ def expand_arms(plan: Mapping[str, Any]) -> list[Arm]:
                         variant=str(variant["id"]),
                         replicate=replicate,
                         analyzer_mode=str(variant.get("analyzer_mode", "frozen_replay")),
-                        override=copy.deepcopy(variant.get("override") or {}),
+                        override=arm_override,
                         dynamic=copy.deepcopy(variant.get("dynamic")),
                         wire_gate=(
                             str(variant["wire_gate"])
@@ -312,6 +455,39 @@ def expand_arms(plan: Mapping[str, Any]) -> list[Arm]:
                     )
                 )
     return arms
+
+
+def scheduled_arms(plan: Mapping[str, Any], arms: Sequence[Arm]) -> list[Arm]:
+    execution = plan.get("execution")
+    schedule = execution.get("schedule") if isinstance(execution, Mapping) else None
+    if not isinstance(schedule, Mapping):
+        raise ControllerError("execution.schedule is missing")
+    if schedule.get("mode") != "anchored_serial":
+        raise ControllerError("execution schedule mode must be anchored_serial")
+    if schedule.get("strict_task_interleaving") is not False:
+        raise ControllerError("execution schedule must freeze strict_task_interleaving=false")
+    arm_order = schedule.get("arm_order")
+    if not isinstance(arm_order, list) or any(not isinstance(item, str) for item in arm_order):
+        raise ControllerError("execution schedule arm_order must be a string list")
+    if tuple(arm_order) != EXPECTED_SCHEDULE_ARM_ORDER:
+        raise ControllerError("execution schedule arm_order differs from the frozen matrix")
+    anchors = schedule.get("anchor_by_arm_id")
+    if not isinstance(anchors, Mapping) or dict(anchors) != EXPECTED_SCHEDULE_ANCHORS:
+        raise ControllerError("execution schedule anchor mapping differs from the frozen matrix")
+    by_id = {arm.arm_id: arm for arm in arms}
+    if len(by_id) != len(arms) or set(by_id) != set(arm_order):
+        raise ControllerError("execution schedule does not cover the exact expanded arm set")
+    ordered = [by_id[arm_id] for arm_id in arm_order]
+    current_anchor: str | None = None
+    for arm in ordered:
+        if arm.arm_id in {ANALYZER_SOURCE_ARM_ID, *REPLAY_CONTROL_ARM_IDS}:
+            current_anchor = arm.arm_id
+        if current_anchor is None or anchors.get(arm.arm_id) != current_anchor:
+            raise ControllerError(f"{arm.arm_id} is not bound to its nearest schedule anchor")
+        anchor = by_id[current_anchor]
+        if arm.analyzer_mode != anchor.analyzer_mode:
+            raise ControllerError(f"{arm.arm_id} Analyzer mode differs from schedule anchor")
+    return ordered
 
 
 def all_strings(value: Any) -> Iterable[str]:
@@ -482,13 +658,65 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
     arm_ids = [arm.arm_id for arm in arms]
     if len(arm_ids) != len(set(arm_ids)):
         raise ControllerError("expanded arm ids are not unique")
-    if len(plan.get("common_e0", [])) != 3:
-        raise ControllerError("plan must contain exactly three common E0 repetitions")
-    if len(arms) != 65:
-        raise ControllerError(f"expected 65 candidate live arms before gates, got {len(arms)}")
+    common_rows = plan.get("common_e0", [])
+    if not isinstance(common_rows, list) or [row.get("arm_id") for row in common_rows] != [
+        ANALYZER_SOURCE_ARM_ID,
+        *REPLAY_CONTROL_ARM_IDS,
+    ]:
+        raise ControllerError("plan must contain the live source then three replay controls")
+    if len(arms) != 66:
+        raise ControllerError(f"expected 66 candidate live arms before gates, got {len(arms)}")
     experiment_ids = {arm.experiment_id for arm in arms if arm.experiment_id != "common-E0"}
     if len(experiment_ids) != 31:
         raise ControllerError(f"expected 31 live experiment groups, got {len(experiment_ids)}")
+    by_id = {arm.arm_id: arm for arm in arms}
+    source_arm = by_id.get(ANALYZER_SOURCE_ARM_ID)
+    if (
+        source_arm is None
+        or source_arm.analyzer_mode != "live"
+        or source_arm.override
+        or source_arm.control_arm_id is not None
+    ):
+        raise ControllerError("common-E0-source must be the unmodified live Analyzer source")
+    for control_arm_id in REPLAY_CONTROL_ARM_IDS:
+        control_arm = by_id.get(control_arm_id)
+        if (
+            control_arm is None
+            or control_arm.analyzer_mode != "frozen_replay"
+            or control_arm.override
+            or control_arm.control_arm_id is not None
+        ):
+            raise ControllerError(f"{control_arm_id} must be an unmodified replay control")
+    controls = plan.get("comparison_controls")
+    if not isinstance(controls, Mapping):
+        raise ControllerError("comparison_controls is missing")
+    if (
+        controls.get("source_arm_id") != ANALYZER_SOURCE_ARM_ID
+        or controls.get("live_control_arm_id") != ANALYZER_SOURCE_ARM_ID
+        or controls.get("default_control_arm_id") != REPLAY_CONTROL_ARM_IDS[0]
+        or controls.get("replay_control_arm_ids") != list(REPLAY_CONTROL_ARM_IDS)
+        or controls.get("require_same_analyzer_mode") is not True
+    ):
+        raise ControllerError("comparison control identities or mode contract differs")
+    raw_control_overrides = controls.get("arm_control_overrides")
+    if (
+        not isinstance(raw_control_overrides, Mapping)
+        or dict(raw_control_overrides) != EXPECTED_ARM_CONTROL_OVERRIDES
+    ):
+        raise ControllerError("comparison arm-control mapping differs from the frozen matrix")
+    for arm_id, expected_control_id in EXPECTED_ARM_CONTROL_OVERRIDES.items():
+        arm = by_id[arm_id]
+        control = by_id[expected_control_id]
+        if arm.control_arm_id != expected_control_id:
+            raise ControllerError(f"{arm_id} is not paired with its frozen control")
+        if arm.analyzer_mode != control.analyzer_mode:
+            raise ControllerError(f"{arm_id} Analyzer mode differs from its paired control")
+    if set(LIVE_ANALYZER_CANDIDATE_ARM_IDS) != {
+        arm.arm_id
+        for arm in arms
+        if arm.experiment_id != "common-E0" and arm.analyzer_mode == "live"
+    }:
+        raise ControllerError("live Analyzer candidate set differs from the frozen matrix")
     noop_rows = plan.get("no_op_experiments", [])
     if not isinstance(noop_rows, list):
         raise ControllerError("no_op_experiments must be a list")
@@ -504,6 +732,7 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
         temperature_noop.get("provider_kind") != "openrouter"
         or temperature_noop.get("model") != "anthropic/claude-opus-4.8"
         or temperature_noop.get("requested_values") != [0.0, 0.2]
+        or temperature_noop.get("control_arm_id") != ANALYZER_SOURCE_ARM_ID
     ):
         raise ControllerError("P0.5-07 official-host wire gate contract differs")
     gated = {arm.experiment_id for arm in arms if arm.wire_gate}
@@ -522,6 +751,18 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
         REQUIRED_REPLICATE_ARMS
     ):
         raise ControllerError("offline required-replicate arm set differs")
+    shuffle_arms = [by_id[f"P0.5-36-E1-R{replicate}"] for replicate in range(1, 4)]
+    shuffle_seeds: list[int] = []
+    for arm in shuffle_arms:
+        ensemble = arm.override.get("ensemble")
+        if not isinstance(ensemble, Mapping) or ensemble.get("shuffle_candidates") is not True:
+            raise ControllerError(f"{arm.arm_id} must enable candidate shuffle")
+        seed = ensemble.get("candidate_order_seed")
+        if type(seed) is not int or not 0 <= seed <= UINT64_MAX:
+            raise ControllerError(f"{arm.arm_id} candidate_order_seed must be uint64")
+        shuffle_seeds.append(seed)
+    if shuffle_seeds != [0, 1, 4] or len(set(shuffle_seeds)) != len(shuffle_seeds):
+        raise ControllerError("P0.5-36 replicate seeds must be the unique frozen values 0/1/4")
     for arm in arms:
         if not SAFE_COMPONENT_RE.fullmatch(arm.arm_id):
             raise ControllerError(f"unsafe arm id: {arm.arm_id}")
@@ -539,7 +780,7 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
             raise ControllerError(
                 "unresolved plan placeholders prevent live execution: " + ", ".join(placeholders)
             )
-    return arms
+    return scheduled_arms(plan, arms)
 
 
 def output_dir(plan: Mapping[str, Any], arm: Arm) -> Path:
@@ -830,6 +1071,138 @@ def verify_arm_publication_identity(
     }
 
 
+def candidate_order_seed_execution_evidence(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    expected: Any,
+) -> dict[str, Any]:
+    """Validate P0.5-36 seed evidence only for calls that reached aggregation."""
+
+    if not isinstance(expected, Mapping) or expected.get("required") is not True:
+        return {"required": False, "pass": True, "status": "not_required"}
+    expected_configured = expected.get("configured_candidate_order_seed")
+    expected_effective = expected.get("effective_candidate_order_seed")
+    failures: list[dict[str, Any]] = []
+    aggregation_call_count = 0
+    not_applicable_call_count = 0
+    for row in rows:
+        task_id = str(row.get("task_id") or "")
+        root_trace = row.get("ensemble_trace")
+        if not isinstance(root_trace, Mapping):
+            continue
+        raw_calls = root_trace.get("calls")
+        calls = (
+            [call for call in raw_calls if isinstance(call, Mapping)]
+            if isinstance(raw_calls, list)
+            else [root_trace]
+        )
+        for call_index, call in enumerate(calls, start=1):
+            aggregator_recovery = call.get("aggregator_recovery")
+            aggregator_attempts = (
+                aggregator_recovery.get("attempts")
+                if isinstance(aggregator_recovery, Mapping)
+                else None
+            )
+            aggregator_request_started = bool(
+                isinstance(aggregator_attempts, list)
+                and any(
+                    isinstance(attempt, Mapping)
+                    and attempt.get("request_started") is True
+                    for attempt in aggregator_attempts
+                )
+            )
+            entered_aggregation = (
+                call.get("execution_mode") != "aggregator_only"
+                and type(call.get("total_candidates")) is int
+                and call["total_candidates"] > 0
+                and (
+                    call.get("final_request_role") == "aggregator"
+                    or aggregator_request_started
+                    or bool(call.get("candidate_display_order"))
+                )
+            )
+            if not entered_aggregation:
+                not_applicable_call_count += 1
+                continue
+            aggregation_call_count += 1
+            plan = call.get("selection_plan")
+            candidates = call.get("candidates")
+            selected_indexes = (
+                [
+                    candidate.get("index")
+                    for candidate in candidates
+                    if isinstance(candidate, Mapping)
+                    and candidate.get("selected_for_aggregation") is True
+                ]
+                if isinstance(candidates, list)
+                else []
+            )
+            expected_display_order = list(selected_indexes)
+            if all(type(index) is int for index in expected_display_order):
+                random.Random(expected_effective).shuffle(expected_display_order)
+            display_order = call.get("candidate_display_order")
+            call_failures: list[str] = []
+            if call.get("shuffle_candidates") is not True:
+                call_failures.append("shuffle_candidates")
+            if (
+                type(call.get("configured_candidate_order_seed")) is not int
+                or call.get("configured_candidate_order_seed") != expected_configured
+            ):
+                call_failures.append("configured_candidate_order_seed")
+            if (
+                type(call.get("candidate_order_seed")) is not int
+                or call.get("candidate_order_seed") != expected_effective
+            ):
+                call_failures.append("candidate_order_seed")
+            if call.get("candidate_order_seed_source") != "configured":
+                call_failures.append("candidate_order_seed_source")
+            if (
+                not isinstance(plan, Mapping)
+                or type(plan.get("configured_candidate_order_seed")) is not int
+                or plan.get("configured_candidate_order_seed") != expected_configured
+                or type(plan.get("effective_candidate_order_seed")) is not int
+                or plan.get("effective_candidate_order_seed") != expected_effective
+            ):
+                call_failures.append("selection_plan_seed")
+            if (
+                type(call.get("selected_candidate_count")) is not int
+                or call.get("selected_candidate_count") != len(selected_indexes)
+                or not selected_indexes
+                or len(set(selected_indexes)) != len(selected_indexes)
+            ):
+                call_failures.append("selected_candidates")
+            if (
+                not isinstance(display_order, list)
+                or any(type(index) is not int for index in display_order)
+                or display_order != expected_display_order
+            ):
+                call_failures.append("candidate_display_order")
+            if call_failures:
+                failures.append(
+                    {
+                        "task_id": task_id,
+                        "call_index": call_index,
+                        "fields": call_failures,
+                    }
+                )
+    return {
+        "required": True,
+        "pass": not failures,
+        "status": (
+            "mismatched"
+            if failures
+            else "matched"
+            if aggregation_call_count
+            else "not_applicable"
+        ),
+        "configured_candidate_order_seed": expected_configured,
+        "effective_candidate_order_seed": expected_effective,
+        "aggregation_call_count": aggregation_call_count,
+        "not_applicable_call_count": not_applicable_call_count,
+        "failures": failures,
+    }
+
+
 def inspect_complete_arm(
     directory: Path,
     *,
@@ -848,6 +1221,11 @@ def inspect_complete_arm(
         return False, {"reason": "output_absent"}
     if directory.is_symlink() or not directory.is_dir():
         return False, {"reason": "unsafe_output_directory"}
+    seed_evidence: dict[str, Any] = {
+        "required": False,
+        "pass": True,
+        "status": "not_required",
+    }
     try:
         manifest, audit, proof, _ = authenticate_published_arm_artifacts(directory)
         if expected_identity is None:
@@ -891,6 +1269,10 @@ def inspect_complete_arm(
                         f"trace line {line_number} lacks a result evidence binding"
                     )
                 trace_rows.append(trace_row)
+        seed_evidence = candidate_order_seed_execution_evidence(
+            rows,
+            expected=expected_identity.get("candidate_order_seed_evidence"),
+        )
     except (ControllerError, OSError) as exc:
         return False, {"reason": "artifact_validation_failed", "detail": str(exc)}
     actual_task_ids = {str(row.get("task_id") or "") for row in rows}
@@ -926,6 +1308,7 @@ def inspect_complete_arm(
         "task_concurrency": scheduling_ok,
         "audit_execution_pass": audit.get("execution_pass") is True,
         "proof_execution_pass": proof.get("execution_pass") is True,
+        "candidate_order_seed_evidence": seed_evidence["pass"] is True,
     }
     evidence = {
         "reason": "complete" if all(checks.values()) else "completion_contract_failed",
@@ -941,6 +1324,7 @@ def inspect_complete_arm(
         "manifest_audit_pass": manifest.get("audit_pass"),
         "artifact_sha256": {key: file_sha256(path) for key, path in required.items()},
         "arm_identity": arm_identity,
+        "candidate_order_seed_evidence": seed_evidence,
     }
     # Audit/policy findings are retained, but do not erase a complete answer or
     # cause a costly duplicate rerun.  That separation is intentional.
@@ -1964,6 +2348,25 @@ def _model_capabilities_projection(value: Any) -> dict[str, Any]:
     }
 
 
+def _candidate_order_seed_projection(
+    ensemble: Any,
+    selection: Mapping[str, Any],
+    *,
+    task_id: str,
+) -> dict[str, int | None]:
+    configured = ensemble.candidate_order_seed
+    effective = configured if ensemble.shuffle_candidates else None
+    if (
+        selection.get("configured_candidate_order_seed") != configured
+        or selection.get("effective_candidate_order_seed") != effective
+    ):
+        raise ControllerError(f"task {task_id} candidate order seed differs from production config")
+    return {
+        "configured_candidate_order_seed": configured,
+        "effective_candidate_order_seed": effective,
+    }
+
+
 def _aggregator_budget_projection(
     *,
     helpers: Mapping[str, Any],
@@ -2178,6 +2581,11 @@ def request_visible_selection_projection(
             raise ControllerError(
                 f"task {task_id} declared member generation differs from production policy"
             )
+        seed_projection = _candidate_order_seed_projection(
+            config.ensemble,
+            selection,
+            task_id=task_id,
+        )
         projected[task_id] = {
             "N_min": n_min,
             "N_max": n_max,
@@ -2204,6 +2612,7 @@ def request_visible_selection_projection(
             "quorum_grace_seconds": selection.get("quorum_grace_seconds"),
             # This is the actual execution behavior changed by P0.5-36.
             "effective_shuffle_candidates": selection.get("effective_shuffle_candidates"),
+            **seed_projection,
             "effective_proposer_timeout_seconds": selection.get(
                 "effective_proposer_timeout_seconds"
             ),
@@ -2296,14 +2705,21 @@ def initialize_status(
     plan_sha256: str,
     snapshot_identity: Mapping[str, str],
 ) -> dict[str, Any]:
+    schedule = plan["execution"]["schedule"]
+    schedule_sha256 = canonical_sha256(schedule)
+    anchor_by_arm_id = schedule["anchor_by_arm_id"]
     return {
         "schema": STATUS_SCHEMA,
         "run_id": plan["run_id"],
         "campaign_plan_sha256": plan_sha256,
         "snapshot_commit": snapshot_identity["commit"],
         "snapshot_tree": snapshot_identity["tree"],
+        "schedule_sha256": schedule_sha256,
+        "schedule_mode": schedule["mode"],
+        "strict_task_interleaving": schedule["strict_task_interleaving"],
         "phase": "prepared",
         "active_arm": None,
+        "active_schedule_ordinal": None,
         "started_at": None,
         "completed_at": None,
         "updated_at": utc_now(),
@@ -2315,11 +2731,13 @@ def initialize_status(
                 "replicate": arm.replicate,
                 "analyzer_mode": arm.analyzer_mode,
                 "control_arm_id": arm.control_arm_id,
+                "schedule_ordinal": ordinal,
+                "anchor_arm_id": anchor_by_arm_id[arm.arm_id],
                 "state": "pending",
                 "attempts": [],
                 "output_dir": str(output_dir(plan, arm)),
             }
-            for arm in arms
+            for ordinal, arm in enumerate(arms, start=1)
         },
         "no_op_experiments": {
             str(row["id"]): {"state": "pending", "receipt": None}
@@ -2564,6 +2982,15 @@ def arm_completion_identity(
         "generation_max_attempts": int(plan["execution"]["generation_max_attempts"]),
         "override_sha256": canonical_sha256(override),
         "effective_config_sha256": canonical_sha256(config.model_dump(mode="json")),
+        "candidate_order_seed_evidence": {
+            "required": arm.experiment_id == "P0.5-36",
+            "configured_candidate_order_seed": config.ensemble.candidate_order_seed,
+            "effective_candidate_order_seed": (
+                config.ensemble.candidate_order_seed
+                if config.ensemble.shuffle_candidates
+                else None
+            ),
+        },
     }
 
 
@@ -2623,6 +3050,20 @@ def load_or_initialize_status(
             raise ControllerError("status is bound to a different campaign plan")
         if status_payload.get("snapshot_commit") != snapshot_identity["commit"]:
             raise ControllerError("status is bound to a different snapshot commit")
+        schedule = plan["execution"]["schedule"]
+        if status_payload.get("schedule_sha256") != canonical_sha256(schedule):
+            raise ControllerError("status is bound to a different execution schedule")
+        status_arms = status_payload.get("arms")
+        if not isinstance(status_arms, Mapping):
+            raise ControllerError("status arm inventory is malformed")
+        for ordinal, arm in enumerate(arms, start=1):
+            state = status_arms.get(arm.arm_id)
+            if (
+                not isinstance(state, Mapping)
+                or state.get("schedule_ordinal") != ordinal
+                or state.get("anchor_arm_id") != schedule["anchor_by_arm_id"][arm.arm_id]
+            ):
+                raise ControllerError(f"status schedule binding differs for {arm.arm_id}")
         return status_payload
     payload = initialize_status(
         plan,
@@ -2637,6 +3078,54 @@ def load_or_initialize_status(
 def update_status(path: Path, payload: dict[str, Any]) -> None:
     payload["updated_at"] = utc_now()
     atomic_write_json(path, payload)
+
+
+def schedule_anchor_launch_gate(
+    plan: Mapping[str, Any],
+    arm: Arm,
+    *,
+    status: Mapping[str, Any],
+    authenticated_anchor_ids: set[str],
+) -> tuple[bool, dict[str, Any]]:
+    """Fail closed unless this run already authenticated the frozen anchor."""
+
+    anchor_id = str(
+        plan["execution"]["schedule"]["anchor_by_arm_id"][arm.arm_id]
+    )
+    if anchor_id == arm.arm_id:
+        return True, {}
+    status_arms = status.get("arms")
+    anchor_state = (
+        status_arms.get(anchor_id)
+        if isinstance(status_arms, Mapping)
+        and isinstance(status_arms.get(anchor_id), Mapping)
+        else {}
+    )
+    recorded_state = str(anchor_state.get("state") or "unknown")
+    failure = {
+        "reason": "anchor_not_succeeded",
+        "anchor_arm_id": anchor_id,
+        "anchor_state": recorded_state,
+        "anchor_authenticated": False,
+    }
+    if recorded_state != "succeeded" or anchor_id not in authenticated_anchor_ids:
+        return False, failure
+    return True, {
+        "anchor_arm_id": anchor_id,
+        "anchor_state": recorded_state,
+        "anchor_authenticated": True,
+    }
+
+
+def validate_offline_unique_replay_overlay_count(
+    unique_overlays: Mapping[str, Any],
+) -> None:
+    if len(unique_overlays) != EXPECTED_OFFLINE_UNIQUE_REPLAY_OVERLAYS:
+        raise ControllerError(
+            "offline unique replay overlay count differs from the frozen matrix: "
+            f"expected {EXPECTED_OFFLINE_UNIQUE_REPLAY_OVERLAYS}, "
+            f"got {len(unique_overlays)}"
+        )
 
 
 def prepare_derived(
@@ -2743,6 +3232,7 @@ def prepare_derived(
             {"overlay": candidate_override, "arm_ids": []},
         )
         unique["arm_ids"].append(arm.arm_id)
+    validate_offline_unique_replay_overlay_count(unique_overlays)
 
     offline_by_arm: dict[str, Any] = {}
     unique_receipts: dict[str, Any] = {}
@@ -2972,7 +3462,7 @@ def load_derived(
     if (
         derived.get("snapshot_commit") != plan["freeze"]["snapshot_commit"]
         or derived.get("snapshot_tree") != plan["freeze"]["snapshot_tree"]
-        or derived.get("source_arm_id") != "common-E0-R1"
+        or derived.get("source_arm_id") != ANALYZER_SOURCE_ARM_ID
     ):
         raise ControllerError("derived plan source/snapshot identity differs")
     if artifact.get("task_ids") != sorted(plan["benchmark"]["task_ids"]):
@@ -2983,7 +3473,7 @@ def load_derived(
     source_dir = Path(str(derived.get("source_output_dir") or ""))
     if source_dir.resolve() != Path(str(source.get("output_dir") or "")).resolve():
         raise ControllerError("derived/source Analyzer output directory differs")
-    source_arm = next(arm for arm in expand_arms(plan) if arm.arm_id == "common-E0-R1")
+    source_arm = next(arm for arm in expand_arms(plan) if arm.arm_id == ANALYZER_SOURCE_ARM_ID)
     snapshot = Path(str(plan["paths"]["snapshot"])).resolve()
     source_identity = arm_completion_identity(
         plan,
@@ -3297,7 +3787,7 @@ def run_campaign(plan_path: Path) -> int:
         update_status(status_file, status)
 
         expected_task_ids = set(plan["benchmark"]["task_ids"])
-        source_arm = next(arm for arm in arms if arm.arm_id == "common-E0-R1")
+        source_arm = next(arm for arm in arms if arm.arm_id == ANALYZER_SOURCE_ARM_ID)
         derived: dict[str, Any] | None = None
         artifact: dict[str, Any] | None = None
         derived_path = run_root / "derived-plan.json"
@@ -3307,6 +3797,8 @@ def run_campaign(plan_path: Path) -> int:
             update_status(status_file, status)
 
         any_failure = False
+        authenticated_anchor_ids: set[str] = set()
+        anchor_by_arm_id = plan["execution"]["schedule"]["anchor_by_arm_id"]
         for arm in arms:
             arm_state = status["arms"][arm.arm_id]
             directory = output_dir(plan, arm)
@@ -3336,6 +3828,8 @@ def run_campaign(plan_path: Path) -> int:
                 expected_identity=expected_identity,
             )
             if complete:
+                if anchor_by_arm_id[arm.arm_id] == arm.arm_id:
+                    authenticated_anchor_ids.add(arm.arm_id)
                 arm_state.update(
                     {
                         "state": "succeeded",
@@ -3450,6 +3944,24 @@ def run_campaign(plan_path: Path) -> int:
                 update_status(status_file, status)
                 continue
 
+            anchor_ready, anchor_failure = schedule_anchor_launch_gate(
+                plan,
+                arm,
+                status=status,
+                authenticated_anchor_ids=authenticated_anchor_ids,
+            )
+            if not anchor_ready:
+                arm_state.update(
+                    {
+                        "state": "blocked_prerequisite",
+                        "completed_at": utc_now(),
+                        "failure": anchor_failure,
+                    }
+                )
+                any_failure = True
+                update_status(status_file, status)
+                continue
+
             # The snapshot is immutable, but the benchmark/reference config
             # lives outside it. Re-freeze immediately before the launcher can
             # open a paid account window.
@@ -3459,10 +3971,14 @@ def run_campaign(plan_path: Path) -> int:
                 expected_snapshot_identity=snapshot_identity,
             )
             status["active_arm"] = arm.arm_id
+            status["active_schedule_ordinal"] = arm_state["schedule_ordinal"]
             arm_state["state"] = "running"
             arm_state["started_at"] = utc_now()
             attempt = {
                 "started_at": arm_state["started_at"],
+                "schedule_sha256": status["schedule_sha256"],
+                "schedule_ordinal": arm_state["schedule_ordinal"],
+                "anchor_arm_id": arm_state["anchor_arm_id"],
                 "override_sha256": canonical_sha256(override),
                 "output_dir": str(directory),
             }
@@ -3490,6 +4006,7 @@ def run_campaign(plan_path: Path) -> int:
             if launch_error is not None:
                 attempt["launcher_error"] = launch_error
             status["active_arm"] = None
+            status["active_schedule_ordinal"] = None
             complete, evidence = inspect_complete_arm(
                 directory,
                 expected_task_ids=expected_task_ids,
@@ -3500,6 +4017,8 @@ def run_campaign(plan_path: Path) -> int:
             arm_state["completed_at"] = utc_now()
             if complete:
                 arm_state["state"] = "succeeded"
+                if anchor_by_arm_id[arm.arm_id] == arm.arm_id:
+                    authenticated_anchor_ids.add(arm.arm_id)
             else:
                 arm_state["state"] = "failed"
                 arm_state["failure"] = {
@@ -3541,6 +4060,7 @@ def run_campaign(plan_path: Path) -> int:
         status["phase"] = campaign_terminal_phase(status)
         status["completed_at"] = utc_now()
         status["active_arm"] = None
+        status["active_schedule_ordinal"] = None
         update_status(status_file, status)
         terminal_status = publish_terminal_status_input(plan, status)
         status["terminal_status_input"] = terminal_status
