@@ -23,8 +23,31 @@ describe('useSandboxSetupRecovery', () => {
 
     await Promise.resolve()
     expect(rpc.call).not.toHaveBeenCalled()
+    expect(recovery.resolved.value).toBe(false)
     await recovery.refresh()
     expect(rpc.call).toHaveBeenCalledOnce()
+    expect(recovery.resolved.value).toBe(true)
+    scope.stop()
+  })
+
+  it('resolves the initial check even when an old Gateway has no setup RPC', async () => {
+    const rpc = { call: vi.fn().mockRejectedValue(new Error('Method not found')) }
+    const connectionState = ref('connected')
+    const scope = effectScope()
+    const recovery = scope.run(() => useSandboxSetupRecovery({
+      rpc,
+      connectionState,
+      runMode: ref('safe'),
+      autoRefresh: false,
+    }))!
+
+    expect(recovery.resolved.value).toBe(false)
+    await recovery.refresh()
+    expect(recovery.resolved.value).toBe(true)
+
+    connectionState.value = 'disconnected'
+    await nextTick()
+    expect(recovery.resolved.value).toBe(false)
     scope.stop()
   })
 

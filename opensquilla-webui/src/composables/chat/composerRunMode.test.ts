@@ -30,6 +30,10 @@ describe('effectiveComposerRunMode', () => {
     expect(effectiveComposerRunMode('safe', null, null)).toBe('safe')
   })
 
+  it('shows Full Access until the initial setup check resolves', () => {
+    expect(effectiveComposerRunMode('safe', null, null, false)).toBe('full')
+  })
+
   it('preserves an active task lock even if setup status changes', () => {
     expect(effectiveComposerRunMode(
       'full',

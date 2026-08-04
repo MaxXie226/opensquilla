@@ -967,6 +967,7 @@ const runMode = computed<SandboxRunMode>(() => effectiveComposerRunMode(
   globalRunMode.value,
   sandboxSetupStatus.value,
   activeRunModeLock.value,
+  sandboxSetupRecovery.resolved.value,
 ))
 const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
   const status = sandboxSetupStatus.value

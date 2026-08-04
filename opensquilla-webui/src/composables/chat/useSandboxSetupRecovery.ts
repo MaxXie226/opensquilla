@@ -27,6 +27,7 @@ export interface UseSandboxSetupRecoveryOptions {
 
 export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions) {
   const status = ref<SandboxSetupStatusPayload | null>(null)
+  const resolved = ref(false)
   const loading = ref(false)
   const ensuring = ref(false)
   const dismissed = ref(false)
@@ -111,7 +112,10 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
       error.value = cause instanceof Error ? cause.message : String(cause)
       schedulePoll()
     } finally {
-      if (generation === requestGeneration) loading.value = false
+      if (generation === requestGeneration) {
+        resolved.value = true
+        loading.value = false
+      }
     }
   }
 
@@ -146,6 +150,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
       }
       else {
         status.value = null
+        resolved.value = false
         lastState = ''
         lastUnavailableFingerprint = ''
         loading.value = false
@@ -169,6 +174,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
 
   return {
     status,
+    resolved,
     loading,
     ensuring,
     dismissed,
