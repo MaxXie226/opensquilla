@@ -894,9 +894,9 @@
       "singleDependency": "Choose the model used for every request.",
       "singleProviderLabel": "Current model provider",
       "singleModelLabel": "Fixed and fallback model",
-      "singleModelDesc": "Used for every request in Fixed model mode, and as the fallback when routing or collaboration cannot complete.",
+      "singleModelDesc": "Used for every request in Fixed model mode, and as the fallback if routing or ensemble execution cannot complete.",
       "singleModelPlaceholder": "Enter a model ID",
-      "singleDesc": "Use one predictable model without automatic routing or multi-model collaboration.",
+      "singleDesc": "Use one predictable model without automatic routing or model ensemble.",
       "crossProviderNotice": "Cross-provider routing is active. Review each tier before saving.",
       "cards": {
         "router": {
@@ -905,9 +905,9 @@
           "desc": "Each request goes to a fitting model, so simple tasks stay cheap."
         },
         "ensemble": {
-          "title": "Multi-model collaboration",
+          "title": "Model ensemble",
           "badge": "Capability-first",
-          "desc": "Several models tackle complex tasks together. Uses more tokens."
+          "desc": "Candidate models answer in parallel, then one aggregator model produces the final reply. Uses more tokens."
         },
         "single": {
           "title": "Fixed model",

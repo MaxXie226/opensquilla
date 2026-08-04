@@ -893,9 +893,9 @@
           "desc": "Jede Anfrage geht an ein passendes Modell — einfache Aufgaben bleiben günstig."
         },
         "ensemble": {
-          "title": "Zusammenarbeit mehrerer Modelle",
+          "title": "Modell-Ensemble",
           "badge": "Leistung im Fokus",
-          "desc": "Mehrere Modelle bearbeiten komplexe Aufgaben gemeinsam. Verbraucht mehr Tokens."
+          "desc": "Mehrere Kandidatenmodelle antworten parallel; ein Aggregator erstellt daraus die endgültige Antwort. Verbraucht mehr Tokens."
         },
         "single": {
           "title": "Festes Modell",
@@ -912,9 +912,9 @@
       "singleDependency": "Wählen Sie das Modell aus, das für jede Anfrage verwendet wird.",
       "singleProviderLabel": "Aktueller Modellanbieter",
       "singleModelLabel": "Festes und Fallback-Modell",
-      "singleModelDesc": "Wird im Modus „Festes Modell“ für jede Anfrage verwendet und dient als Fallback, wenn Routing oder Zusammenarbeit nicht abgeschlossen werden können.",
+      "singleModelDesc": "Wird im Modus „Festes Modell“ für jede Anfrage verwendet und dient als Fallback, wenn Routing oder das Modell-Ensemble nicht abgeschlossen werden kann.",
       "singleModelPlaceholder": "Modell-ID eingeben",
-      "singleDesc": "Nutze ein vorhersehbares Modell ohne automatisches Routing oder Zusammenarbeit mehrerer Modelle.",
+      "singleDesc": "Nutze ein vorhersehbares Modell ohne automatisches Routing oder Modell-Ensemble.",
       "openrouterFixedTitle": "Feste {provider}-Ensemble-Konfiguration",
       "openrouterFixedDesc": "Wenn der Modelldienst {provider} nutzt, verwendet Ensemble-Routing vier Vorschlagsmodelle und einen Aggregator.",
       "openrouterFixedProposer": "Vorschlagsmodell",

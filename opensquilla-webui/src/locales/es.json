@@ -893,9 +893,9 @@
           "desc": "Cada solicitud va a un modelo adecuado; las tareas simples salen baratas."
         },
         "ensemble": {
-          "title": "Colaboración entre varios modelos",
+          "title": "Ensamble de modelos",
           "badge": "Prioriza capacidad",
-          "desc": "Varios modelos colaboran en tareas complejas. Usa más tokens."
+          "desc": "Varios modelos candidatos responden en paralelo y un modelo agregador produce la respuesta final. Usa más tokens."
         },
         "single": {
           "title": "Modelo fijo",
@@ -912,9 +912,9 @@
       "singleDependency": "Elige el modelo que se usará para cada solicitud.",
       "singleProviderLabel": "Proveedor de modelos actual",
       "singleModelLabel": "Modelo fijo y de respaldo",
-      "singleModelDesc": "Se usa para cada solicitud en el modo de modelo fijo y como respaldo cuando el enrutamiento o la colaboración no pueden completarse.",
+      "singleModelDesc": "Se usa para cada solicitud en el modo Modelo fijo y como respaldo cuando no se puede completar el enrutamiento o el ensamble de modelos.",
       "singleModelPlaceholder": "Introduce un ID de modelo",
-      "singleDesc": "Usa un modelo predecible sin enrutamiento automático ni colaboración entre varios modelos.",
+      "singleDesc": "Usa un modelo predecible sin enrutamiento automático ni ensamble de modelos.",
       "openrouterFixedTitle": "Conjunto fijo de {provider}",
       "openrouterFixedDesc": "Cuando el servicio de modelos usa {provider}, el enrutamiento agregado usa cuatro modelos proponentes y un agregador.",
       "openrouterFixedProposer": "Modelo proponente",

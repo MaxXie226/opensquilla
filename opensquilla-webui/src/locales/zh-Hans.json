@@ -893,9 +893,9 @@
           "desc": "每个请求交给合适的模型，简单任务不浪费。"
         },
         "ensemble": {
-          "title": "多模型协作",
+          "title": "多模型融合",
           "badge": "能力优先",
-          "desc": "多模型协作攻克复杂任务。"
+          "desc": "多个候选模型并行作答，再由一个融合模型汇总为最终回复；会消耗更多 Token。"
         },
         "single": {
           "title": "固定模型",
@@ -912,9 +912,9 @@
       "singleDependency": "选择每个请求都使用的模型。",
       "singleProviderLabel": "当前模型服务商",
       "singleModelLabel": "固定与回退模型",
-      "singleModelDesc": "固定模型模式下用于每个请求；智能路由或多模型协作无法完成时也会回退到它。",
+      "singleModelDesc": "固定模型模式下用于每个请求；智能路由或多模型融合无法完成时也会回退到它。",
       "singleModelPlaceholder": "输入模型 ID",
-      "singleDesc": "始终使用一个可预期的模型，不进行自动路由或多模型协作。",
+      "singleDesc": "始终使用一个可预期的模型，不进行自动路由或多模型融合。",
       "openrouterFixedTitle": "{provider} 固定融合",
       "openrouterFixedDesc": "当模型服务使用 {provider} 时，模型融合路由固定使用四个候选生成模型和一个融合模型。",
       "openrouterFixedProposer": "候选生成模型",

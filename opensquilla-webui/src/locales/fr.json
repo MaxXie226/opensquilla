@@ -893,9 +893,9 @@
           "desc": "Chaque requête va au modèle adapté ; les tâches simples restent économes."
         },
         "ensemble": {
-          "title": "Collaboration multimodèle",
+          "title": "Ensemble de modèles",
           "badge": "Capacités prioritaires",
-          "desc": "Plusieurs modèles collaborent sur les tâches complexes. Consomme plus de tokens."
+          "desc": "Plusieurs modèles candidats répondent en parallèle, puis un modèle agrégateur produit la réponse finale. Consomme plus de tokens."
         },
         "single": {
           "title": "Modèle fixe",
@@ -912,9 +912,9 @@
       "singleDependency": "Choisissez le modèle utilisé pour chaque requête.",
       "singleProviderLabel": "Fournisseur de modèles actuel",
       "singleModelLabel": "Modèle fixe et de repli",
-      "singleModelDesc": "Utilisé pour chaque requête en mode Modèle fixe, et comme solution de repli lorsque le routage ou la collaboration ne peuvent pas aboutir.",
+      "singleModelDesc": "Utilisé pour chaque requête en mode Modèle fixe, et comme solution de repli si le routage ou l’ensemble ne peut pas aboutir.",
       "singleModelPlaceholder": "Saisir un identifiant de modèle",
-      "singleDesc": "Utilisez un modèle prévisible sans routage automatique ni collaboration multimodèle.",
+      "singleDesc": "Utilisez un modèle prévisible, sans routage automatique ni ensemble de modèles.",
       "openrouterFixedTitle": "Ensemble {provider} fixe",
       "openrouterFixedDesc": "Quand le service de modèles utilise {provider}, le routage agrégé utilise quatre modèles proposants et un agrégateur.",
       "openrouterFixedProposer": "Modèle proposant",
