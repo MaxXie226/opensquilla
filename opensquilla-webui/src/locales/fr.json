@@ -462,8 +462,8 @@
         "default": "Mode par défaut", "safe": "Sûr", "full": "Accès complet", "resetWarning": "Réafficher l’avertissement au démarrage"
       },
       "setup": {
-        "title": "Configurer le mode sûr", "description": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer la protection des fichiers et du réseau.",
-        "continue": "Continuer", "configuring": "Configuration…", "requestingApproval": "Confirmez l’invite Windows pour continuer.", "configuringProtection": "OpenSquilla termine la configuration du mode sûr. Gardez l’application ouverte.", "takingLonger": "La première configuration peut prendre quelques minutes. La vérification se lancera automatiquement.", "cancelled": "Configuration annulée. L’accès complet reste inchangé ; vous pouvez réessayer.",
+        "title": "Configurer le mode sûr", "description": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer la protection des fichiers et du réseau.", "descriptionWithDuration": "OpenSquilla a besoin d’une autorisation administrateur pour créer un compte isolé et configurer les protections. La première configuration prend généralement environ 20 à 30 secondes. Gardez OpenSquilla ouvert.",
+        "continue": "Continuer", "configuring": "Configuration…", "requestingApproval": "Confirmez l’invite Windows pour continuer.", "configuringProtection": "OpenSquilla termine la configuration du mode sûr. Gardez l’application ouverte.", "takingLonger": "La première configuration peut prendre quelques minutes. La vérification se lancera automatiquement.", "elapsed": "{seconds} s écoulées", "cancelled": "Configuration annulée. L’accès complet reste inchangé ; vous pouvez réessayer.",
         "failed": "Le mode sûr n’a pas pu être configuré. L’accès complet reste inchangé.", "verificationFailed": "La configuration est terminée, mais la vérification de sécurité a échoué. L’accès complet reste inchangé."
       },
       "files": {

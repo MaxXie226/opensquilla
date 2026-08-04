@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { effectiveComposerRunMode } from './composerRunMode'
+import {
+  completeComposerSafeSetup,
+  composerRunModeSelectionAction,
+  effectiveComposerRunMode,
+} from './composerRunMode'
 
 describe('effectiveComposerRunMode', () => {
   it.each(['not_setup', 'setting_up', 'failed', 'unavailable'] as const)(
@@ -32,5 +36,25 @@ describe('effectiveComposerRunMode', () => {
       { state: 'not_setup', platform: 'win32', message: '', requiresAdmin: true },
       'safe',
     )).toBe('safe')
+  })
+
+  it('routes a repairable Safe selection into setup instead of persistence', () => {
+    const status = { state: 'not_setup', platform: 'win32', message: '', requiresAdmin: true } as const
+
+    expect(composerRunModeSelectionAction('safe', status, true)).toBe('setup')
+    expect(composerRunModeSelectionAction('safe', status, false)).toBe('ignore')
+    expect(composerRunModeSelectionAction('full', status, true)).toBe('persist')
+    expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, false)).toBe('persist')
+  })
+
+  it('persists Safe only after setup succeeds', async () => {
+    const persist = vi.fn().mockResolvedValue(undefined)
+
+    await expect(completeComposerSafeSetup(async () => false, persist)).resolves.toBe(false)
+    expect(persist).not.toHaveBeenCalled()
+
+    await expect(completeComposerSafeSetup(async () => true, persist)).resolves.toBe(true)
+    expect(persist).toHaveBeenCalledOnce()
+    expect(persist).toHaveBeenCalledWith('safe')
   })
 })

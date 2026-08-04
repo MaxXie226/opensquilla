@@ -462,8 +462,8 @@
         "default": "既定モード", "safe": "Safe", "full": "完全アクセス", "resetWarning": "起動時の警告を再表示"
       },
       "setup": {
-        "title": "Safe モードを設定", "description": "OpenSquilla は、分離アカウントとファイル・ネットワーク保護を設定するために、一度だけ管理者の承認を必要とします。",
-        "continue": "続ける", "configuring": "設定中…", "requestingApproval": "続行するには、Windows の確認画面で承認してください。", "configuringProtection": "OpenSquilla が Safe モードの設定を完了しています。アプリは開いたままにしてください。", "takingLonger": "初回設定には数分かかる場合があります。確認は自動的に実行されます。", "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
+        "title": "Safe モードを設定", "description": "OpenSquilla は、分離アカウントとファイル・ネットワーク保護を設定するために、一度だけ管理者の承認を必要とします。", "descriptionWithDuration": "OpenSquilla は、分離アカウントと安全保護を設定するために、一度だけ管理者の承認を必要とします。初回設定には通常約 20～30 秒かかります。設定中は OpenSquilla を開いたままにしてください。",
+        "continue": "続ける", "configuring": "設定中…", "requestingApproval": "続行するには、Windows の確認画面で承認してください。", "configuringProtection": "OpenSquilla が Safe モードの設定を完了しています。アプリは開いたままにしてください。", "takingLonger": "初回設定には数分かかる場合があります。確認は自動的に実行されます。", "elapsed": "経過 {seconds} 秒", "cancelled": "設定をキャンセルしました。完全アクセスは変更されていません。いつでも再試行できます。",
         "failed": "Safe モードを設定できませんでした。完全アクセスは変更されていません。", "verificationFailed": "設定は完了しましたが、安全性の確認に失敗しました。完全アクセスは変更されていません。"
       },
       "files": {

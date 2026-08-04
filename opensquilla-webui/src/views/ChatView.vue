@@ -491,6 +491,7 @@
       :input-disabled="Boolean(dockedPlanQuestionnaire)"
       :run-mode="runMode"
       :allowed-run-modes="composerAllowedRunModes"
+      :safe-setup-available="composerSafeSetupAvailable"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :model-routing-mode="modelRoutingMode"
@@ -531,6 +532,13 @@
       @stop="onComposerStop"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
+    />
+    <SandboxSetupDialog
+      :open="composerSandboxSetupOpen"
+      :pending="sandboxSetupRecovery.ensuring.value"
+      :outcome="sandboxSetupRecovery.outcome.value"
+      @cancel="cancelComposerSandboxSetup"
+      @confirm="void confirmComposerSandboxSetup()"
     />
     <ProjectWorkspacePickerDialog
       v-if="rpc.canChooseProject"
@@ -615,6 +623,7 @@ import PlanCard from '@/components/chat/PlanCard.vue'
 import PlanRunRibbon from '@/components/chat/PlanRunRibbon.vue'
 import RouterFxStrip from '@/components/chat/RouterFxStrip.vue'
 import SharePreviewModal from '@/components/chat/SharePreviewModal.vue'
+import SandboxSetupDialog from '@/components/sandbox/SandboxSetupDialog.vue'
 import ToolResultModal from '@/components/chat/ToolResultModal.vue'
 import Icon from '@/components/Icon.vue'
 import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
@@ -645,7 +654,11 @@ import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
-import { effectiveComposerRunMode } from '@/composables/chat/composerRunMode'
+import {
+  completeComposerSafeSetup,
+  composerRunModeSelectionAction,
+  effectiveComposerRunMode,
+} from '@/composables/chat/composerRunMode'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
@@ -965,6 +978,8 @@ const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
   }
   return allowedRunModes.value
 })
+const composerSafeSetupAvailable = computed(() => sandboxSetupRecovery.canSetup.value)
+const composerSandboxSetupOpen = ref(false)
 
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
@@ -2699,15 +2714,52 @@ function readAuthToken(): string {
   }
 }
 
-async function setComposerRunMode(mode: SandboxRunMode) {
+function reportRunModePersistenceError(cause: unknown): void {
+  const detail = cause instanceof Error ? cause.message : String(cause)
+  console.warn('Failed to persist sandbox run mode:', detail)
+  pushToast(detail, { tone: 'danger' })
+}
+
+async function persistComposerRunMode(mode: SandboxRunMode): Promise<void> {
+  await setGlobalRunMode(mode)
+  void sandboxSetupRecovery.refresh()
+}
+
+async function setComposerRunMode(mode: SandboxRunMode): Promise<void> {
   if (runModeLocked.value) return
+  const action = composerRunModeSelectionAction(
+    mode,
+    sandboxSetupStatus.value,
+    composerSafeSetupAvailable.value,
+  )
+  if (action === 'ignore') return
+  if (action === 'setup') {
+    sandboxSetupRecovery.outcome.value = 'idle'
+    composerSandboxSetupOpen.value = true
+    return
+  }
   try {
-    await setGlobalRunMode(mode)
-    void sandboxSetupRecovery.refresh()
+    await persistComposerRunMode(mode)
   } catch (cause) {
-    const detail = cause instanceof Error ? cause.message : String(cause)
-    console.warn('Failed to persist sandbox run mode:', detail)
-    pushToast(detail, { tone: 'danger' })
+    reportRunModePersistenceError(cause)
+  }
+}
+
+function cancelComposerSandboxSetup(): void {
+  if (sandboxSetupRecovery.ensuring.value) return
+  composerSandboxSetupOpen.value = false
+}
+
+async function confirmComposerSandboxSetup(): Promise<void> {
+  if (sandboxSetupRecovery.ensuring.value) return
+  try {
+    const ready = await completeComposerSafeSetup(
+      () => sandboxSetupRecovery.ensureSetup(),
+      persistComposerRunMode,
+    )
+    if (ready) composerSandboxSetupOpen.value = false
+  } catch (cause) {
+    reportRunModePersistenceError(cause)
   }
 }
 

@@ -194,6 +194,7 @@
                 v-if="runModeOpen"
                 :run-mode="runMode"
                 :allowed-run-modes="allowedRunModes"
+                :safe-setup-available="safeSetupAvailable"
                 @close="runModeOpen = false"
                 @set-run-mode="emit('setRunMode', $event)"
               />
@@ -337,6 +338,7 @@ const props = withDefaults(defineProps<{
   inputDisabled?: boolean
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
+  safeSetupAvailable?: boolean
   runModeLocked: boolean
   runModeLockMessage: string
   modelRoutingMode: ModelRoutingMode
@@ -362,6 +364,7 @@ const props = withDefaults(defineProps<{
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
   inputDisabled: false,
+  safeSetupAvailable: false,
 })
 
 const emit = defineEmits<{

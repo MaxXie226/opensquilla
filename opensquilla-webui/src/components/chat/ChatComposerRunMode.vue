@@ -49,6 +49,7 @@ const { t } = useI18n()
 const props = defineProps<{
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
+  safeSetupAvailable?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -77,6 +78,7 @@ const allowedRunModes = computed(() => {
 })
 
 function isDisabled(mode: SandboxRunMode): boolean {
+  if (mode === 'safe' && props.safeSetupAvailable) return false
   return !allowedRunModes.value.includes(mode)
 }
 
