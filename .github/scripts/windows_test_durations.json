@@ -994,6 +994,7 @@
     "tests/test_skills/test_skill_disable_toggle.py": 0.031,
     "tests/test_skills/test_skill_exec_non_blocking.py": 3.06,
     "tests/test_skills/test_skill_exec_python_resolution.py": 0.222,
+    "tests/test_skills/test_skill_exec_subprocess_encoding.py": 0.01,
     "tests/test_skills/test_sop_compiler.py": 0.581,
     "tests/test_skills/test_swebench_skill.py": 1.845,
     "tests/test_skills/test_weather_skill_entrypoint.py": 0.01,

@@ -678,6 +678,7 @@
       "tests/test_skills/test_nano_banana_openrouter_image.py",
       "tests/test_skills/test_retrieval_fingerprint.py",
       "tests/test_skills/test_skill_exec_python_resolution.py",
+      "tests/test_skills/test_skill_exec_subprocess_encoding.py",
       "tests/test_skills/test_sop_compiler.py",
       "tests/test_skills_hot_reload.py",
       "tests/test_skills_memory_contract.py",
