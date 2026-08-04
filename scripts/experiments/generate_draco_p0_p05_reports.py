@@ -1,0 +1,3767 @@
+#!/usr/bin/env python3
+# ruff: noqa: E501
+"""Generate terminal P0/P0.5 DRACO-mini reports without making model calls.
+
+The campaign arm finalizer remains authoritative for sealed results.  This
+program validates those formal artifacts, compacts their per-task evidence,
+and writes one Markdown report per tuning experiment plus a comprehensive
+Markdown/JSON report at the campaign report root.
+
+Cost policy is deliberately narrower than account spend: selected-generation
+cost uses the final selected attempt only (including its Analyzer request when
+live), excludes Judge and replaced/failed generation attempts, takes provider
+actual USD first, and estimates a missing amount from frozen model prices and
+input/output/cache tokens.  Judge and campaign account deltas are reported in
+separate columns and are never added to selected-generation theoretical cost.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import random
+import stat
+import sys
+import tempfile
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+PLAN_SCHEMA = "opensquilla.draco-p0-p05-campaign-plan/v1"
+STATUS_SCHEMA = "opensquilla.draco-p0-p05-controller-status/v1"
+DERIVED_SCHEMA = "opensquilla.draco-p0-p05-derived-plan/v1"
+REPORT_SCHEMA = "opensquilla.draco-p0-p05-comprehensive-report/v1"
+GROUP_REPORT_SCHEMA = "opensquilla.draco-p0-p05-experiment-report/v1"
+TERMINAL_STATUS_INPUT_SCHEMA = "opensquilla.draco-p0-p05-terminal-status-input/v1"
+BOOTSTRAP_SEED = 20260803
+BOOTSTRAP_SAMPLES = 20_000
+TERMINAL_PHASES = {"succeeded", "completed_with_failures"}
+TERMINAL_ARM_STATES = {
+    "succeeded",
+    "failed",
+    "blocked_prerequisite",
+    "no_op_deleted",
+}
+PRICE_REGISTRY_RELATIVE = Path("src/opensquilla/provider/router_dynamic_model_profiles.json")
+LEGACY_EVIDENCE: dict[str, dict[str, str]] = {
+    "P0-01": {
+        "status": "completed_existing_experiment",
+        "path": (
+            "/home/codex/code/opensquilla-agentic-routing/reports/draco/"
+            "p0-mini-20260803-012853/P0-01/EXPERIMENT_RESULTS.md"
+        ),
+        "sha256": "2bb1bda791c226886875cde8ace9e64d3d9a3be8c5097b66a7ae52503c367e9b",
+    },
+    "P0-02": {
+        "status": "completed_existing_experiment",
+        "path": (
+            "/home/codex/code/opensquilla-agentic-routing/reports/draco/"
+            "p0-mini-20260803-012853/P0-02/EXPERIMENT_RESULTS.md"
+        ),
+        "sha256": "8926ef2884e13c0a80aa4f798c8ef0aa76fd46c25bf26415ebff942ef45ad20b",
+    },
+    "P0.5-31": {
+        "status": "completed_existing_experiment",
+        "path": (
+            "/home/codex/code/opensquilla-agentic-routing/reports/draco/"
+            "p0-mini-20260803-012853/P0-5-31/EXPERIMENT_RESULTS.md"
+        ),
+        "sha256": "8fe616ae1fa9a4c71cc44d0b29cb68b43a82f53d11240550bfb3ff16c0f98e6e",
+    },
+    "P0-15": {
+        "status": "stopped_existing_experiment",
+        "path": (
+            "/home/codex/code/opensquilla-agentic-routing/reports/draco/"
+            "p0-15-draco-mini-20260802-003324/EXPERIMENT_RESULTS.md"
+        ),
+        "sha256": "e08cdc3e10b0ba340ecf5096e187e391ba23799e5c9745ae1b7fac75b60abcfe",
+    },
+}
+
+
+class ReportError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ArmSpec:
+    arm_id: str
+    experiment_id: str
+    directory_name: str
+    title: str
+    variant: str
+    replicate: int
+    analyzer_mode: str
+    control_arm_id: str | None
+    override: dict[str, Any]
+    dynamic: dict[str, Any] | None
+    wire_gate: str | None
+    output_name: str
+
+
+@dataclass(frozen=True)
+class FrozenControllerVerifier:
+    """Authenticated, read-only verifier loaded from the campaign freeze."""
+
+    module: Any
+    path: Path
+    raw_sha256: str
+    arms: Mapping[str, Any]
+    snapshot: Path
+    snapshot_identity: Mapping[str, str]
+    derived: Mapping[str, Any] | None
+    artifact: Mapping[str, Any] | None
+    derived_error: str | None
+
+
+FROZEN_CONTROLLER_RELATIVE = Path("scripts/experiments/run_draco_p0_p05_tuning_campaign.py")
+
+
+def load_frozen_controller_verifier(
+    plan: Mapping[str, Any],
+    *,
+    plan_sha256: str,
+) -> FrozenControllerVerifier:
+    """Import only the hash-frozen controller and run its read-only gates."""
+
+    freeze = plan.get("freeze")
+    sources = freeze.get("sources") if isinstance(freeze, Mapping) else None
+    expected_sha = (
+        str(sources.get("controller_raw_sha256") or "").removeprefix("sha256:")
+        if isinstance(sources, Mapping)
+        else ""
+    )
+    if len(expected_sha) != 64 or any(char not in "0123456789abcdef" for char in expected_sha):
+        raise ReportError("plan.freeze.sources.controller_raw_sha256 is malformed")
+    snapshot_root = Path(str(plan.get("paths", {}).get("snapshot") or ""))
+    controller_path = snapshot_root / FROZEN_CONTROLLER_RELATIVE
+    regular_file(controller_path)
+    actual_sha = file_sha256(controller_path)
+    if actual_sha != expected_sha:
+        raise ReportError(
+            "frozen controller raw hash differs from plan.freeze.sources.controller_raw_sha256"
+        )
+    module_name = f"_draco_p0_p05_frozen_controller_{actual_sha}"
+    spec = importlib.util.spec_from_file_location(module_name, controller_path)
+    if spec is None or spec.loader is None:
+        raise ReportError("cannot create frozen controller import specification")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        sys.modules.pop(module_name, None)
+        raise ReportError(f"cannot import frozen controller: {exc}") from exc
+    required = (
+        "validate_plan",
+        "validate_snapshot",
+        "validate_runtime_freeze",
+        "output_dir",
+        "resolve_arm_override",
+        "arm_completion_identity",
+        "inspect_complete_arm",
+        "load_derived",
+    )
+    missing = [name for name in required if not callable(getattr(module, name, None))]
+    if missing:
+        raise ReportError("frozen controller verifier API is incomplete: " + ", ".join(missing))
+    try:
+        controller_arms = module.validate_plan(plan, allow_placeholders=False)
+        snapshot, snapshot_identity = module.validate_snapshot(plan)
+        module.validate_runtime_freeze(
+            plan,
+            snapshot=snapshot,
+            expected_snapshot_identity=snapshot_identity,
+        )
+    except Exception as exc:
+        raise ReportError(f"frozen controller validation failed: {exc}") from exc
+    if not isinstance(controller_arms, Sequence):
+        raise ReportError("frozen controller returned a malformed arm inventory")
+    arms: dict[str, Any] = {}
+    for arm in controller_arms:
+        arm_id = str(getattr(arm, "arm_id", "") or "")
+        if not arm_id or arm_id in arms:
+            raise ReportError("frozen controller returned invalid or duplicate arm ids")
+        arms[arm_id] = arm
+    reporter_ids = {arm.arm_id for arm in expand_arms(plan)}
+    if set(arms) != reporter_ids:
+        raise ReportError("reporter/controller expanded arm inventories differ")
+
+    derived: Mapping[str, Any] | None = None
+    artifact: Mapping[str, Any] | None = None
+    derived_error: str | None = None
+    derived_path = Path(str(plan["paths"]["run_root"])) / "derived-plan.json"
+    if derived_path.exists():
+        try:
+            loaded_derived, loaded_artifact = module.load_derived(plan, plan_sha256)
+            if not isinstance(loaded_derived, Mapping) or not isinstance(loaded_artifact, Mapping):
+                raise ReportError("frozen controller returned malformed derived evidence")
+            derived = loaded_derived
+            artifact = loaded_artifact
+        except Exception as exc:  # noqa: BLE001 - retained as partial evidence
+            derived_error = str(exc)
+    return FrozenControllerVerifier(
+        module=module,
+        path=controller_path.resolve(),
+        raw_sha256=actual_sha,
+        arms=arms,
+        snapshot=Path(snapshot).resolve(),
+        snapshot_identity=dict(snapshot_identity),
+        derived=derived,
+        artifact=artifact,
+        derived_error=derived_error,
+    )
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def regular_file(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        raise ReportError(f"missing artifact: {path}") from exc
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise ReportError(f"artifact is not a regular non-symlink file: {path}")
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    regular_file(path)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReportError(f"cannot read JSON {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReportError(f"JSON root is not an object: {path}")
+    return value
+
+
+def number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def integer(value: Any) -> int:
+    parsed = number(value)
+    return int(parsed) if parsed is not None else 0
+
+
+def mean(values: Iterable[Any]) -> float | None:
+    clean = [item for value in values if (item := number(value)) is not None]
+    return sum(clean) / len(clean) if clean else None
+
+
+def percentile(values: Sequence[float], q: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q
+    lower, upper = math.floor(position), math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def fmt(value: Any, digits: int = 4) -> str:
+    parsed = number(value)
+    return "—" if parsed is None else f"{parsed:.{digits}f}"
+
+
+def pct(value: Any) -> str:
+    parsed = number(value)
+    return "—" if parsed is None else f"{100.0 * parsed:.2f}%"
+
+
+def code_json(value: Any) -> str:
+    return "`" + json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "`"
+
+
+def validate_embedded_hash(
+    document: Mapping[str, Any],
+    field: str,
+    *,
+    prefixed: bool = True,
+) -> bool:
+    recorded = str(document.get(field) or "")
+    payload = {key: value for key, value in document.items() if key != field}
+    expected = canonical_sha256(payload)
+    # The campaign finalizer/controller contract uses an explicit algorithm
+    # prefix.  Accepting an unqualified digest would silently weaken that
+    # contract and make a malformed document look authenticated.
+    return recorded == (f"sha256:{expected}" if prefixed else expected)
+
+
+def result_evidence_valid(row: Mapping[str, Any]) -> bool:
+    schema = row.get("result_evidence_schema")
+    if not isinstance(schema, str) or not schema:
+        return False
+    payload = {
+        "schema": schema,
+        "result": {key: value for key, value in row.items() if key != "result_evidence_sha256"},
+    }
+    return row.get("result_evidence_sha256") == "sha256:" + canonical_sha256(payload)
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    atomic_write(
+        path,
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n",
+    )
+
+
+def expand_arms(plan: Mapping[str, Any]) -> list[ArmSpec]:
+    run_id = str(plan.get("run_id") or "")
+    result: list[ArmSpec] = []
+    for row in plan.get("common_e0") or []:
+        arm_id = str(row["arm_id"])
+        result.append(
+            ArmSpec(
+                arm_id=arm_id,
+                experiment_id="common-E0",
+                directory_name="common",
+                title="Current G1-C common control",
+                variant=str(row["variant"]),
+                replicate=int(row["replicate"]),
+                analyzer_mode=str(row["analyzer_mode"]),
+                control_arm_id=None,
+                override=dict(row.get("override") or {}),
+                dynamic=None,
+                wire_gate=None,
+                output_name=f"{arm_id}-{run_id}",
+            )
+        )
+    for experiment in plan.get("experiments") or []:
+        experiment_id = str(experiment["id"])
+        title = str(experiment.get("title") or experiment_id)
+        directory_name = str(experiment.get("directory_name") or experiment_id.replace(".", "-"))
+        for variant in experiment.get("variants") or []:
+            replicates = int(variant.get("replicates", 1))
+            for replicate in range(1, replicates + 1):
+                suffix = f"-R{replicate}" if replicates > 1 else ""
+                arm_id = f"{experiment_id}-{variant['id']}{suffix}"
+                control_ids = experiment.get("control_arm_ids")
+                if isinstance(control_ids, list) and replicates > 1:
+                    if len(control_ids) != replicates:
+                        raise ReportError(f"{experiment_id} control_arm_ids/replicates differ")
+                    default_control = control_ids[replicate - 1]
+                else:
+                    default_control = experiment.get("control_arm_id", "common-E0-R1")
+                control = variant.get("control_arm_id") or default_control
+                result.append(
+                    ArmSpec(
+                        arm_id=arm_id,
+                        experiment_id=experiment_id,
+                        directory_name=directory_name,
+                        title=title,
+                        variant=str(variant["id"]),
+                        replicate=replicate,
+                        analyzer_mode=str(variant.get("analyzer_mode", "frozen_replay")),
+                        control_arm_id=str(control) if control is not None else None,
+                        override=dict(variant.get("override") or {}),
+                        dynamic=(
+                            dict(variant["dynamic"])
+                            if isinstance(variant.get("dynamic"), Mapping)
+                            else None
+                        ),
+                        wire_gate=str(variant["wire_gate"]) if variant.get("wire_gate") else None,
+                        output_name=f"{arm_id}-{run_id}",
+                    )
+                )
+    ids = [arm.arm_id for arm in result]
+    if len(ids) != len(set(ids)):
+        raise ReportError("expanded arm ids are not unique")
+    return result
+
+
+Price = tuple[float, float, float | None, float | None]
+
+
+def registry_identities(models: Sequence[Any], *, label: str) -> list[str]:
+    identities: list[str] = []
+    for index, raw in enumerate(models):
+        if not isinstance(raw, Mapping):
+            raise ReportError(f"{label} registry model {index} is malformed")
+        facts = raw.get("registry_facts")
+        source = facts if isinstance(facts, Mapping) else raw
+        explicit = str(source.get("identity") or "").strip().casefold()
+        provider = str(source.get("provider") or "").strip().casefold()
+        model = str(source.get("model_id") or source.get("model") or "").strip().casefold()
+        identity = explicit or (f"{provider}:{model}" if provider and model else "")
+        if ":" not in identity:
+            raise ReportError(f"{label} registry model {index} has no canonical identity")
+        parsed_provider, parsed_model = identity.split(":", 1)
+        if not parsed_provider or not parsed_model:
+            raise ReportError(f"{label} registry model {index} has no canonical identity")
+        identities.append(f"{parsed_provider}:{parsed_model}")
+    if len(identities) != len(set(identities)):
+        raise ReportError(f"{label} registry identities are not unique")
+    return sorted(identities)
+
+
+def formal_registry_projection(registry: Mapping[str, Any]) -> dict[str, Any]:
+    projected = copy.deepcopy(dict(registry))
+    if projected.get("schema_version") != "step2-model-registry-v2":
+        return projected
+    projected["schema_version"] = "step2-model-registry-v1"
+    if projected.get("snapshot_version") == "curated-openrouter-step2-2026-07-27.1":
+        projected["snapshot_version"] = "curated-openrouter-step2-2026-07-24.3"
+    rows = projected.get("models")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            facts = row.get("registry_facts")
+            if isinstance(facts, dict):
+                facts.pop("thinking_levels", None)
+                facts.pop("thinking_level_mapping", None)
+    return projected
+
+
+def validate_registry_contract(
+    registry: Mapping[str, Any],
+    *,
+    path: Path,
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    models = registry.get("models")
+    if not isinstance(models, list):
+        raise ReportError("frozen price registry models are malformed")
+    formal = formal_registry_projection(registry)
+    formal_models = formal.get("models")
+    if not isinstance(formal_models, list):
+        raise ReportError("formal frozen price registry models are malformed")
+    full_ids = registry_identities(models, label="full")
+    formal_ids = registry_identities(formal_models, label="formal")
+    actual = {
+        "raw_sha256": file_sha256(path),
+        "full_snapshot_version": str(registry.get("snapshot_version") or ""),
+        "full_canonical_sha256": canonical_sha256(registry),
+        "formal_snapshot_version": str(formal.get("snapshot_version") or ""),
+        "formal_canonical_sha256": canonical_sha256(formal),
+        "model_count": len(models),
+        "full_model_count": len(full_ids),
+        "formal_model_count": len(formal_ids),
+        "full_identities_sha256": canonical_sha256(full_ids),
+        "formal_identities_sha256": canonical_sha256(formal_ids),
+    }
+    fields = tuple(actual)
+    differences = [field for field in fields if contract.get(field) != actual[field]]
+    if differences:
+        raise ReportError(
+            "frozen price registry differs from plan.freeze.model_registry: "
+            + ", ".join(differences)
+        )
+    return actual
+
+
+def load_prices(
+    path: Path,
+    contract: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Price], dict[str, Any]]:
+    registry = load_json(path)
+    if not isinstance(contract, Mapping):
+        raise ReportError("plan.freeze.model_registry contract is missing")
+    frozen_identity = validate_registry_contract(registry, path=path, contract=contract)
+    prices: dict[str, Price] = {}
+    for item in registry.get("models") or []:
+        if not isinstance(item, Mapping):
+            continue
+        facts = item.get("registry_facts")
+        price = facts.get("price") if isinstance(facts, Mapping) else None
+        model = (
+            str(facts.get("model_id") or "").strip().casefold()
+            if isinstance(facts, Mapping)
+            else ""
+        )
+        if not model or not isinstance(price, Mapping):
+            continue
+        input_rate = number(price.get("input_per_million"))
+        output_rate = number(price.get("output_per_million"))
+        if input_rate is None or output_rate is None or input_rate < 0 or output_rate < 0:
+            continue
+        cache_read = number(
+            price.get("cache_read_per_million", price.get("input_cache_read_per_million"))
+        )
+        cache_write = number(
+            price.get("cache_write_per_million", price.get("input_cache_write_per_million"))
+        )
+        prices[model] = (input_rate, output_rate, cache_read, cache_write)
+    metadata = {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "schema_version": registry.get("schema_version"),
+        "snapshot_version": registry.get("snapshot_version"),
+        "model_count": len(registry.get("models") or []),
+        "priced_model_count": len(prices),
+        "cache_price_model_count": sum(
+            read is not None or write is not None for _, _, read, write in prices.values()
+        ),
+        "freeze_contract": frozen_identity,
+        "freeze_contract_valid": True,
+    }
+    return prices, metadata
+
+
+def find_price(model: Any, prices: Mapping[str, Price]) -> Price | None:
+    normalized = str(model or "").strip().casefold()
+    aliases = [normalized]
+    if normalized.startswith("openrouter:"):
+        aliases.append(normalized.split(":", 1)[1])
+    return next((prices[key] for key in aliases if key in prices), None)
+
+
+def usage_tokens(unit: Mapping[str, Any]) -> tuple[int, int, int, int]:
+    provider = unit.get("provider_usage") if isinstance(unit.get("provider_usage"), Mapping) else {}
+    details = (
+        provider.get("prompt_tokens_details")
+        if isinstance(provider.get("prompt_tokens_details"), Mapping)
+        else {}
+    )
+    input_tokens = max(integer(unit.get("input_tokens")), integer(provider.get("prompt_tokens")))
+    output_tokens = max(
+        integer(unit.get("output_tokens")), integer(provider.get("completion_tokens"))
+    )
+    cache_read = max(
+        integer(unit.get("cache_read_tokens")),
+        integer(unit.get("cached_tokens")),
+        integer(details.get("cached_tokens")),
+    )
+    cache_write = max(
+        integer(unit.get("cache_write_tokens")), integer(details.get("cache_write_tokens"))
+    )
+    cache_read = min(max(0, cache_read), input_tokens)
+    cache_write = min(max(0, cache_write), max(0, input_tokens - cache_read))
+    return input_tokens, output_tokens, cache_read, cache_write
+
+
+def unit_actual_usd(unit: Mapping[str, Any]) -> float | None:
+    provider = unit.get("provider_usage") if isinstance(unit.get("provider_usage"), Mapping) else {}
+    billed = number(unit.get("billed_cost"))
+    if billed is None:
+        billed = number(provider.get("provider_reported_cost"))
+    # OpenRouter's zero-dollar BYOK receipt is not the underlying provider
+    # spend.  It is therefore estimated from tokens instead of called actual.
+    if provider.get("is_byok") is True and billed == 0:
+        return None
+    return billed if billed is not None and billed >= 0 else None
+
+
+def price_unit(unit: Mapping[str, Any], prices: Mapping[str, Price]) -> dict[str, Any]:
+    requests = max(0, integer(unit.get("request_count")) or 1)
+    actual = unit_actual_usd(unit)
+    if actual is not None:
+        return {"usd": actual, "requests": requests, "mode": "actual", "tokens": usage_tokens(unit)}
+    input_tokens, output_tokens, cache_read, cache_write = usage_tokens(unit)
+    price = find_price(unit.get("requested_model") or unit.get("model"), prices)
+    if price is None or not any((input_tokens, output_tokens, cache_read, cache_write)):
+        return {
+            "usd": None,
+            "requests": requests,
+            "mode": "ignored",
+            "tokens": (input_tokens, output_tokens, cache_read, cache_write),
+        }
+    input_rate, output_rate, cache_read_rate, cache_write_rate = price
+    fresh = max(0, input_tokens - cache_read - cache_write)
+    missing_cache_rate = bool(
+        (cache_read and cache_read_rate is None) or (cache_write and cache_write_rate is None)
+    )
+    effective_read_rate = input_rate if cache_read_rate is None else cache_read_rate
+    effective_write_rate = input_rate if cache_write_rate is None else cache_write_rate
+    estimated = (
+        fresh * input_rate
+        + cache_read * effective_read_rate
+        + cache_write * effective_write_rate
+        + output_tokens * output_rate
+    ) / 1_000_000
+    if missing_cache_rate:
+        mode = "estimated_cache_price_fallback"
+    elif cache_read or cache_write:
+        mode = "estimated_cache_aware"
+    else:
+        mode = "estimated_no_cache"
+    return {
+        "usd": estimated,
+        "requests": requests,
+        "mode": mode,
+        "tokens": (input_tokens, output_tokens, cache_read, cache_write),
+    }
+
+
+def aggregate_cost(
+    units: Sequence[Mapping[str, Any]],
+    prices: Mapping[str, Price],
+    accounting: Mapping[str, Any],
+    *,
+    selected_scope: bool,
+) -> dict[str, Any]:
+    expected_requests = integer(accounting.get("request_count"))
+    aggregate_actual = number(accounting.get("recorded_cost_usd"))
+    aggregate_claims_exact = bool(
+        aggregate_actual is not None
+        and aggregate_actual >= 0
+        and accounting.get("cost_complete") is True
+        and accounting.get("cost_exact") is True
+        and integer(accounting.get("unknown_request_count")) == 0
+    )
+    priced = [price_unit(unit, prices) for unit in units]
+    observed_requests = sum(item["requests"] for item in priced)
+    independently_exact = bool(
+        aggregate_claims_exact
+        and units
+        and observed_requests == expected_requests
+        and all(item["mode"] == "actual" for item in priced)
+        and math.isclose(
+            sum(float(item["usd"]) for item in priced if item["usd"] is not None),
+            float(aggregate_actual),
+            rel_tol=0,
+            abs_tol=1e-12,
+        )
+    )
+    if independently_exact:
+        return {
+            "usd": aggregate_actual,
+            "complete": True,
+            "exact": True,
+            "request_count": expected_requests,
+            "actual_requests": expected_requests,
+            "estimated_requests": 0,
+            "estimated_cache_aware_requests": 0,
+            "estimated_cache_price_fallback_requests": 0,
+            "estimated_no_cache_requests": 0,
+            "ignored_requests": 0,
+            "source": "selected_scope_exact_aggregate"
+            if selected_scope
+            else "judge_exact_aggregate",
+        }
+    if aggregate_claims_exact and not units:
+        # Preserve the recorded amount as a disclosed lower bound, but never
+        # claim every physical call was checked without its usage units.
+        return {
+            "usd": aggregate_actual,
+            "complete": False,
+            "exact": False,
+            "request_count": expected_requests,
+            "actual_requests": integer(accounting.get("exact_request_count")),
+            "estimated_requests": 0,
+            "estimated_cache_aware_requests": 0,
+            "estimated_cache_price_fallback_requests": 0,
+            "estimated_no_cache_requests": 0,
+            "ignored_requests": max(
+                0,
+                expected_requests - integer(accounting.get("exact_request_count")),
+            ),
+            "source": "exact_aggregate_without_physical_units_lower_bound",
+        }
+    # Extra units make selected-attempt scope ambiguous and risk including a
+    # replaced retry.  Never guess which paid request to retain.
+    if selected_scope and expected_requests and observed_requests > expected_requests:
+        return {
+            "usd": None,
+            "complete": False,
+            "exact": False,
+            "request_count": expected_requests,
+            "actual_requests": 0,
+            "estimated_requests": 0,
+            "estimated_cache_aware_requests": 0,
+            "estimated_cache_price_fallback_requests": 0,
+            "estimated_no_cache_requests": 0,
+            "ignored_requests": expected_requests,
+            "source": "ambiguous_selected_scope_ignored",
+        }
+    known = [item for item in priced if item["usd"] is not None]
+    missing_units = max(0, expected_requests - observed_requests)
+    mode_counts = Counter()
+    for item in priced:
+        mode_counts[item["mode"]] += item["requests"]
+    ignored = mode_counts["ignored"] + missing_units
+    total = sum(float(item["usd"]) for item in known)
+    effective_requests = expected_requests or observed_requests
+    actual_requests = mode_counts["actual"]
+    estimated_requests = sum(
+        count for mode, count in mode_counts.items() if mode.startswith("estimated_")
+    )
+    if aggregate_actual is not None and aggregate_actual >= 0 and not units:
+        total = aggregate_actual
+        actual_requests = integer(accounting.get("exact_request_count"))
+        ignored = max(0, effective_requests - actual_requests)
+    return {
+        "usd": total if known or aggregate_actual is not None else None,
+        "complete": bool(
+            effective_requests
+            and ignored == 0
+            and actual_requests + estimated_requests == effective_requests
+        ),
+        "exact": bool(effective_requests and actual_requests == effective_requests),
+        "request_count": effective_requests,
+        "actual_requests": actual_requests,
+        "estimated_requests": estimated_requests,
+        "estimated_cache_aware_requests": mode_counts["estimated_cache_aware"],
+        "estimated_cache_price_fallback_requests": mode_counts["estimated_cache_price_fallback"],
+        "estimated_no_cache_requests": mode_counts["estimated_no_cache"],
+        "ignored_requests": ignored,
+        "source": "physical_usage_units",
+    }
+
+
+def selected_attempt_usage_binding(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind root usage to the finalizer-selected generation attempt."""
+
+    finalization = (
+        row.get("campaign_finalization")
+        if isinstance(row.get("campaign_finalization"), Mapping)
+        else {}
+    )
+    selection = (
+        finalization.get("selection") if isinstance(finalization.get("selection"), Mapping) else {}
+    )
+    selected_id = str(selection.get("selected_generation_attempt_id") or "")
+    execution = row.get("execution") if isinstance(row.get("execution"), Mapping) else {}
+    attempts = [
+        attempt
+        for attempt in execution.get("generation_attempts") or []
+        if isinstance(attempt, Mapping) and str(attempt.get("attempt_id") or "") == selected_id
+    ]
+    accounting_root = (
+        row.get("cost_accounting") if isinstance(row.get("cost_accounting"), Mapping) else {}
+    )
+    accounting = (
+        accounting_root.get("selected_generation_attempt")
+        if isinstance(accounting_root.get("selected_generation_attempt"), Mapping)
+        else {}
+    )
+    reasons: list[str] = []
+    if len(selected_id) != 32 or any(char not in "0123456789abcdef" for char in selected_id):
+        reasons.append("selected generation attempt identity is missing or malformed")
+    if len(attempts) != 1:
+        reasons.append("selected generation attempt identity is not unique in execution evidence")
+    if accounting.get("scope") != "selected_generation_attempt":
+        reasons.append("cost accounting lacks selected_generation_attempt scope")
+    root_usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else None
+    selected_usage: Mapping[str, Any] | None = None
+    if len(attempts) == 1:
+        run = attempts[0].get("run") if isinstance(attempts[0].get("run"), Mapping) else {}
+        selected_usage = run.get("usage") if isinstance(run.get("usage"), Mapping) else None
+        if attempts[0].get("attempt_kind") != "generation":
+            reasons.append("selected attempt kind is not generation")
+    if root_usage is None or selected_usage is None:
+        reasons.append("selected generation attempt lacks bound usage")
+    elif canonical_bytes(root_usage) != canonical_bytes(selected_usage):
+        reasons.append("root usage differs from selected generation attempt usage")
+    if row.get("selected_generation_succeeded") is not True:
+        reasons.append("selected generation attempt is not marked succeeded")
+    return {
+        "valid": not reasons,
+        "attempt_id": selected_id or None,
+        "usage": root_usage if not reasons else None,
+        "reasons": reasons,
+    }
+
+
+def ignored_selected_scope(accounting: Mapping[str, Any], reason: str) -> dict[str, Any]:
+    request_count = max(0, integer(accounting.get("request_count")))
+    return {
+        "usd": None,
+        "complete": False,
+        "exact": False,
+        "request_count": request_count,
+        "actual_requests": 0,
+        "estimated_requests": 0,
+        "estimated_cache_aware_requests": 0,
+        "estimated_cache_price_fallback_requests": 0,
+        "estimated_no_cache_requests": 0,
+        "ignored_requests": request_count,
+        "source": reason,
+    }
+
+
+def selected_generation_cost(row: Mapping[str, Any], prices: Mapping[str, Price]) -> dict[str, Any]:
+    cost = row.get("cost_accounting") if isinstance(row.get("cost_accounting"), Mapping) else {}
+    accounting = (
+        cost.get("selected_generation_attempt")
+        if isinstance(cost.get("selected_generation_attempt"), Mapping)
+        else {}
+    )
+    binding = selected_attempt_usage_binding(row)
+    if binding.get("valid") is not True:
+        return ignored_selected_scope(accounting, "selected_attempt_identity_unverified_ignored")
+    usage = binding.get("usage") if isinstance(binding.get("usage"), Mapping) else {}
+    breakdown = usage.get("model_usage_breakdown")
+    units: list[Mapping[str, Any]] = []
+    if isinstance(breakdown, list):
+        for item in breakdown:
+            if not isinstance(item, Mapping):
+                continue
+            role = str(item.get("role") or "").casefold()
+            if "judge" in role:
+                continue
+            if item.get("selected") is False:
+                continue
+            units.append(item)
+    elif usage:
+        units = [usage]
+    return aggregate_cost(units, prices, accounting, selected_scope=True)
+
+
+def selected_model_usage(
+    row: Mapping[str, Any], prices: Mapping[str, Price]
+) -> dict[str, dict[str, Any]]:
+    """Compact final-selected proposer/aggregator physical units by model."""
+    binding = selected_attempt_usage_binding(row)
+    if binding.get("valid") is not True:
+        return {}
+    usage = binding.get("usage") if isinstance(binding.get("usage"), Mapping) else {}
+    breakdown = usage.get("model_usage_breakdown")
+    result: dict[str, dict[str, Any]] = {}
+    for unit in breakdown if isinstance(breakdown, list) else []:
+        if not isinstance(unit, Mapping) or unit.get("selected") is False:
+            continue
+        role = str(unit.get("role") or "").casefold()
+        if role not in {"proposer", "aggregator"}:
+            continue
+        model = normalize_model(unit.get("requested_model") or unit.get("model"))
+        if not model:
+            continue
+        priced = price_unit(unit, prices)
+        input_tokens, output_tokens, cache_read, cache_write = priced["tokens"]
+        target = result.setdefault(
+            model,
+            {
+                "model": model,
+                "roles": set(),
+                "request_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cost_counted_usd": 0.0,
+                "actual_requests": 0,
+                "estimated_requests": 0,
+                "ignored_requests": 0,
+            },
+        )
+        requests = integer(priced["requests"])
+        target["roles"].add(role)
+        target["request_count"] += requests
+        target["input_tokens"] += input_tokens
+        target["output_tokens"] += output_tokens
+        target["cache_read_tokens"] += cache_read
+        target["cache_write_tokens"] += cache_write
+        if priced["usd"] is not None:
+            target["cost_counted_usd"] += float(priced["usd"])
+        if priced["mode"] == "actual":
+            target["actual_requests"] += requests
+        elif str(priced["mode"]).startswith("estimated_"):
+            target["estimated_requests"] += requests
+        else:
+            target["ignored_requests"] += requests
+    for value in result.values():
+        value["roles"] = sorted(value["roles"])
+    return result
+
+
+def judge_usage_units(row: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    judge = row.get("judge") if isinstance(row.get("judge"), Mapping) else {}
+    result: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for criterion in judge.get("criterion_judgments") or []:
+        if not isinstance(criterion, Mapping):
+            continue
+        for attempt in criterion.get("judge_attempts") or []:
+            if not isinstance(attempt, Mapping):
+                continue
+            run = attempt.get("run") if isinstance(attempt.get("run"), Mapping) else {}
+            usage = run.get("usage") if isinstance(run.get("usage"), Mapping) else {}
+            breakdown = usage.get("model_usage_breakdown")
+            candidates = breakdown if isinstance(breakdown, list) else [usage] if usage else []
+            for unit in candidates:
+                if not isinstance(unit, Mapping):
+                    continue
+                provider = (
+                    unit.get("provider_usage")
+                    if isinstance(unit.get("provider_usage"), Mapping)
+                    else {}
+                )
+                identity = str(
+                    unit.get("physical_attempt_id")
+                    or provider.get("physical_attempt_id")
+                    or attempt.get("attempt_id")
+                    or ""
+                )
+                if identity and identity in seen:
+                    continue
+                if identity:
+                    seen.add(identity)
+                result.append(unit)
+    return result
+
+
+def judge_cost(row: Mapping[str, Any], prices: Mapping[str, Price]) -> dict[str, Any]:
+    cost = row.get("cost_accounting") if isinstance(row.get("cost_accounting"), Mapping) else {}
+    accounting = cost.get("judge") if isinstance(cost.get("judge"), Mapping) else {}
+    return aggregate_cost(judge_usage_units(row), prices, accounting, selected_scope=False)
+
+
+def selection_plan(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    for trace_key in ("routing_trace", "ensemble_trace"):
+        trace = row.get(trace_key)
+        if isinstance(trace, Mapping) and isinstance(trace.get("selection_plan"), Mapping):
+            return trace["selection_plan"]
+    ensemble = row.get("ensemble_trace")
+    if isinstance(ensemble, Mapping):
+        for call in ensemble.get("calls") or []:
+            if isinstance(call, Mapping) and isinstance(call.get("selection_plan"), Mapping):
+                return call["selection_plan"]
+    return {}
+
+
+def normalize_model(value: Any) -> str:
+    model = str(value or "").strip().casefold()
+    return model.split(":", 1)[1] if model.startswith("openrouter:") else model
+
+
+def compact_row(row: Mapping[str, Any], prices: Mapping[str, Price]) -> dict[str, Any]:
+    judge = row.get("judge") if isinstance(row.get("judge"), Mapping) else {}
+    usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
+    metrics = (
+        row.get("selected_attempt_metrics")
+        if isinstance(row.get("selected_attempt_metrics"), Mapping)
+        else {}
+    )
+    execution = (
+        row.get("execution_status") if isinstance(row.get("execution_status"), Mapping) else {}
+    )
+    completion = (
+        row.get("completion_status") if isinstance(row.get("completion_status"), Mapping) else {}
+    )
+    ensemble = row.get("ensemble_trace") if isinstance(row.get("ensemble_trace"), Mapping) else {}
+    plan = selection_plan(row)
+    pass_rate = number(judge.get("valid_pass_rate"))
+    if pass_rate is None:
+        pass_rate = number(judge.get("pass_rate"))
+    if pass_rate is not None and pass_rate > 1:
+        pass_rate /= 100.0
+    generation_cost = selected_generation_cost(row, prices)
+    separated_judge_cost = judge_cost(row, prices)
+    selected_binding = selected_attempt_usage_binding(row)
+    input_tokens = number(usage.get("input_tokens"))
+    output_tokens = number(usage.get("output_tokens"))
+    reasoning_tokens = number(usage.get("reasoning_tokens"))
+    selected_p = list(plan.get("selected_P") or [])
+    selected_a = (
+        plan.get("selected_A") or plan.get("aggregator_model") or ensemble.get("executed_A")
+    )
+    analyzer = plan.get("task_analyzer") if isinstance(plan.get("task_analyzer"), Mapping) else {}
+    routing = row.get("routing_trace") if isinstance(row.get("routing_trace"), Mapping) else {}
+    routing_analyzer = (
+        routing.get("task_analyzer") if isinstance(routing.get("task_analyzer"), Mapping) else {}
+    )
+    execution_ok = bool(
+        execution.get("success") is True
+        or row.get("selected_generation_succeeded") is True
+        or completion.get("execution_pass") is True
+    )
+    judge_complete = bool(
+        completion.get("judge_complete") is True or judge.get("score_status") == "complete"
+    )
+    proposer_recovery = (
+        ensemble.get("proposer_recovery")
+        if isinstance(ensemble.get("proposer_recovery"), Mapping)
+        else {}
+    )
+    aggregator_recovery = (
+        ensemble.get("aggregator_recovery")
+        if isinstance(ensemble.get("aggregator_recovery"), Mapping)
+        else {}
+    )
+    assembled = (
+        ensemble.get("assembled_output")
+        if isinstance(ensemble.get("assembled_output"), Mapping)
+        else {}
+    )
+    nonbyok = (
+        row.get("openrouter_non_byok_audit")
+        if isinstance(row.get("openrouter_non_byok_audit"), Mapping)
+        else {}
+    )
+    analyzer_usage = analyzer.get("usage") if isinstance(analyzer.get("usage"), Mapping) else {}
+    analyzer_config = (
+        plan.get("ranking_parameters", {}).get("task_analyzer", {})
+        if isinstance(plan.get("ranking_parameters"), Mapping)
+        and isinstance(plan.get("ranking_parameters", {}).get("task_analyzer"), Mapping)
+        else {}
+    )
+    analyzer_stop_reasons: list[str] = []
+    for attempt in analyzer_usage.get("physical_attempts") or []:
+        if not isinstance(attempt, Mapping):
+            continue
+        provider_usage = (
+            attempt.get("provider_usage")
+            if isinstance(attempt.get("provider_usage"), Mapping)
+            else {}
+        )
+        stop = (
+            str(attempt.get("stop_reason") or provider_usage.get("stop_reason") or "")
+            .strip()
+            .casefold()
+        )
+        if stop:
+            analyzer_stop_reasons.append(stop)
+    root_analyzer_stop = str(analyzer_usage.get("stop_reason") or "").strip().casefold()
+    if root_analyzer_stop:
+        analyzer_stop_reasons.append(root_analyzer_stop)
+    length_markers = {"length", "max_tokens", "max_output_tokens", "token_limit", "max_token_limit"}
+    analyzer_output_tokens = integer(analyzer_usage.get("output_tokens"))
+    analyzer_max_output_tokens = integer(analyzer_config.get("max_output_tokens"))
+    analyzer_explicit_truncated = bool(
+        analyzer.get("truncated") is True
+        or analyzer_usage.get("truncated") is True
+        or any(
+            isinstance(attempt, Mapping) and attempt.get("truncated") is True
+            for attempt in analyzer_usage.get("physical_attempts") or []
+        )
+    )
+    analyzer_length_stop = any(
+        stop in length_markers or "length" in stop or "max_token" in stop
+        for stop in analyzer_stop_reasons
+    )
+    return {
+        "task_id": str(row.get("task_id") or ""),
+        "group": str(row.get("group") or ""),
+        "domain": str(row.get("domain") or ""),
+        "quality": number(row.get("quality_total")),
+        "pass_rate": pass_rate,
+        "judge_errors": integer(judge.get("judge_error_count")),
+        "done": execution_ok and judge_complete,
+        "execution_ok": execution_ok,
+        "judge_complete": judge_complete,
+        "input": input_tokens,
+        "output": output_tokens,
+        "reason": reasoning_tokens,
+        "cache": number(usage.get("cached_tokens")),
+        "visible": max(0.0, output_tokens - reasoning_tokens)
+        if output_tokens is not None and reasoning_tokens is not None
+        else None,
+        "tokens": input_tokens + output_tokens
+        if input_tokens is not None and output_tokens is not None
+        else None,
+        "tools": number(metrics.get("total_tool_call_count")),
+        "tool_used": integer(metrics.get("total_tool_call_count")) > 0,
+        "steps": number(metrics.get("trajectory_steps")),
+        "llm_req": number(metrics.get("llm_request_count")),
+        "latency": number(metrics.get("latency_ms") or row.get("latency_ms")),
+        "generation_cost": generation_cost,
+        "selected_attempt_binding_valid": selected_binding.get("valid") is True,
+        "selected_attempt_id": selected_binding.get("attempt_id"),
+        "selected_attempt_binding_reasons": selected_binding.get("reasons") or [],
+        "judge_cost": separated_judge_cost,
+        "model_generation": selected_model_usage(row, prices),
+        "selected_p": selected_p,
+        "selected_a": str(selected_a or ""),
+        "ap_overlap": bool(
+            str(selected_a or "") and str(selected_a or "") in {str(item) for item in selected_p}
+        ),
+        "n": len(selected_p) or integer(plan.get("proposer_count")),
+        "stop_reason": str(plan.get("stop_reason") or "unknown"),
+        "fallback": bool(
+            ensemble.get("fallback_used") or ensemble.get("any_intermediate_fallback")
+        ),
+        "outer_retry": max(0, integer(row.get("generation_attempt_count")) - 1),
+        "proposer_recovery": integer(proposer_recovery.get("additional_physical_requests_started")),
+        "aggregator_attempts": len(aggregator_recovery.get("attempts") or []),
+        "partial_proposers": integer(ensemble.get("partial_proposers")),
+        "degraded": execution.get("status") == "degraded_success",
+        "assembled_truncated": assembled.get("truncated") is True,
+        "request_context_hash": str(
+            plan.get("request_context_hash") or routing_analyzer.get("request_context_hash") or ""
+        ),
+        "task_profile_hash": str(plan.get("task_profile_hash") or ""),
+        "analyzer_source": str(analyzer.get("source") or routing_analyzer.get("source") or ""),
+        "analyzer_output_tokens": analyzer_output_tokens,
+        "analyzer_max_output_tokens": analyzer_max_output_tokens,
+        "analyzer_stop_reasons": sorted(set(analyzer_stop_reasons)),
+        "analyzer_length_stop": analyzer_length_stop,
+        "analyzer_truncated": analyzer_explicit_truncated or analyzer_length_stop,
+        "analyzer_at_or_above_cap": bool(
+            analyzer_max_output_tokens and analyzer_output_tokens >= analyzer_max_output_tokens
+        ),
+        "row_policy_pass": nonbyok.get("pass"),
+        "explicit_byok_requests": integer(nonbyok.get("explicit_byok_request_count")),
+        "error": str(row.get("error") or ""),
+    }
+
+
+def artifact_entry(manifest: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        return None
+    entry = artifacts.get(name)
+    return entry if isinstance(entry, Mapping) else None
+
+
+def artifact_binding_valid(root: Path, manifest: Mapping[str, Any], name: str) -> tuple[bool, str]:
+    path = root / name
+    try:
+        regular_file(path)
+    except ReportError as exc:
+        return False, str(exc)
+    entry = artifact_entry(manifest, name)
+    if entry is None:
+        return False, f"manifest omits {name}"
+    if entry.get("path") != name:
+        return False, f"manifest path binding differs for {name}"
+    recorded_size = entry.get("size_bytes")
+    if (
+        isinstance(recorded_size, bool)
+        or not isinstance(recorded_size, int)
+        or recorded_size != path.stat().st_size
+    ):
+        return False, f"manifest size differs for {name}"
+    expected = str(entry.get("sha256") or "").removeprefix("sha256:")
+    if expected != file_sha256(path):
+        return False, f"manifest sha256 differs for {name}"
+    return True, "ok"
+
+
+def read_compact_rows(
+    path: Path,
+    prices: Mapping[str, Price],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    regular_file(path)
+    rows: list[dict[str, Any]] = []
+    reasons: list[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            if not raw.strip():
+                raise ReportError(f"empty JSONL record {path}:{line_number}")
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ReportError(f"invalid JSONL {path}:{line_number}: {exc}") from exc
+            if not isinstance(row, dict):
+                raise ReportError(f"non-object JSONL row {path}:{line_number}")
+            if not result_evidence_valid(row):
+                reasons.append(f"result evidence hash invalid at line {line_number}")
+            compact = compact_row(row, prices)
+            compact["result_evidence_schema"] = row.get("result_evidence_schema")
+            compact["result_evidence_sha256"] = row.get("result_evidence_sha256")
+            rows.append(compact)
+    return rows, reasons
+
+
+def read_trace_evidence(path: Path) -> tuple[dict[str, str], list[str]]:
+    """Stream trace JSONL and retain only task/result-evidence bindings.
+
+    Trace files are large, and U+2028/U+2029 are valid characters inside JSON
+    strings rather than JSONL record separators.  Iterating the text handle is
+    therefore intentional; this function must never be rewritten with
+    ``read_text().splitlines()``.
+    """
+
+    regular_file(path)
+    bindings: dict[str, str] = {}
+    reasons: list[str] = []
+    row_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            if not raw.strip():
+                raise ReportError(f"empty JSONL record {path}:{line_number}")
+            row_count += 1
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ReportError(f"invalid JSONL {path}:{line_number}: {exc}") from exc
+            if not isinstance(row, dict):
+                raise ReportError(f"non-object JSONL row {path}:{line_number}")
+            if row.get("result_evidence_schema") is not None and not result_evidence_valid(row):
+                reasons.append(f"trace result evidence hash invalid at line {line_number}")
+            task_id = str(row.get("task_id") or "")
+            evidence_sha = str(row.get("result_evidence_sha256") or "")
+            if not task_id:
+                reasons.append(f"trace task id missing at line {line_number}")
+                continue
+            if task_id in bindings:
+                reasons.append(f"duplicate trace task id {task_id}")
+                continue
+            bindings[task_id] = evidence_sha
+    if row_count != 10:
+        reasons.append(f"trace row count is {row_count}, expected 10")
+    return bindings, reasons
+
+
+def status_dimension(values: Sequence[Any], *, warning_status: str = "warning") -> str:
+    present = [value for value in values if value is not None]
+    if any(value is False for value in present):
+        return warning_status
+    if present and all(value is True for value in present):
+        return "pass"
+    return "unknown"
+
+
+def account_evidence(manifest: Mapping[str, Any], proof: Mapping[str, Any]) -> dict[str, Any]:
+    attribution = (
+        manifest.get("cost_attribution")
+        if isinstance(manifest.get("cost_attribution"), Mapping)
+        else {}
+    )
+    proof_account = proof.get("account") if isinstance(proof.get("account"), Mapping) else {}
+    reconciliation = (
+        manifest.get("reconciliation")
+        if isinstance(manifest.get("reconciliation"), Mapping)
+        else {}
+    )
+    account_delta = number(attribution.get("campaign_bound_account_window_total_usd"))
+    if account_delta is None:
+        account_delta = number(attribution.get("account_window_delta_usd"))
+    if account_delta is None:
+        account_delta = number(proof_account.get("campaign_usage_delta_usd"))
+    byok_delta = number(proof_account.get("campaign_byok_usage_delta_usd"))
+    if byok_delta is None:
+        byok_delta = number(proof_account.get("byok_usage_delta_usd"))
+    stable = reconciliation.get("stable")
+    if stable is None:
+        windows = attribution.get("account_windows")
+        stable = bool(windows) and all(
+            isinstance(item, Mapping)
+            and integer(item.get("stable_poll_count"))
+            >= integer(item.get("required_stable_poll_count"))
+            for item in windows or []
+        )
+    return {
+        "account_delta_usd": account_delta,
+        "byok_delta_usd": byok_delta,
+        "reconciliation_status": str(
+            reconciliation.get("status") or proof.get("status") or "unknown"
+        ),
+        "reconciliation_stable": bool(stable),
+        "account_window_count": len(attribution.get("account_windows") or []),
+        "scope": "campaign account delta including Judge; separate from selected generation",
+    }
+
+
+def summarize_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    generation_known = [
+        number(row["generation_cost"].get("usd"))
+        for row in rows
+        if number(row["generation_cost"].get("usd")) is not None
+    ]
+    judge_known = [
+        number(row["judge_cost"].get("usd"))
+        for row in rows
+        if number(row["judge_cost"].get("usd")) is not None
+    ]
+    generation_total = sum(value for value in generation_known if value is not None)
+    judge_total = sum(value for value in judge_known if value is not None)
+    generation_request_count = sum(
+        integer(row["generation_cost"].get("request_count")) for row in rows
+    )
+    generation_actual_requests = sum(
+        integer(row["generation_cost"].get("actual_requests")) for row in rows
+    )
+    generation_estimated_requests = sum(
+        integer(row["generation_cost"].get("estimated_requests")) for row in rows
+    )
+    generation_ignored_requests = sum(
+        integer(row["generation_cost"].get("ignored_requests")) for row in rows
+    )
+    generation_complete = bool(rows) and all(
+        row["generation_cost"].get("complete") is True for row in rows
+    )
+    judge_complete = bool(rows) and all(row["judge_cost"].get("complete") is True for row in rows)
+    latencies = [value for row in rows if (value := number(row.get("latency"))) is not None]
+    model_generation: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        for model, source in (row.get("model_generation") or {}).items():
+            target = model_generation.setdefault(
+                model,
+                {
+                    "model": model,
+                    "roles": set(),
+                    "request_count": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "cost_counted_usd": 0.0,
+                    "actual_requests": 0,
+                    "estimated_requests": 0,
+                    "ignored_requests": 0,
+                },
+            )
+            target["roles"].update(source.get("roles") or [])
+            for field in (
+                "request_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "cost_counted_usd",
+                "actual_requests",
+                "estimated_requests",
+                "ignored_requests",
+            ):
+                target[field] += source.get(field) or 0
+    for value in model_generation.values():
+        value["roles"] = sorted(value["roles"])
+    return {
+        "row_count": len(rows),
+        "done_count": sum(bool(row.get("done")) for row in rows),
+        "execution_success_count": sum(bool(row.get("execution_ok")) for row in rows),
+        "judge_complete_count": sum(bool(row.get("judge_complete")) for row in rows),
+        "avg_quality_total": mean(row.get("quality") for row in rows),
+        "avg_pass_rate": mean(row.get("pass_rate") for row in rows),
+        "judge_error_count": sum(integer(row.get("judge_errors")) for row in rows),
+        "avg_input_tokens": mean(row.get("input") for row in rows),
+        "avg_output_tokens": mean(row.get("output") for row in rows),
+        "avg_reasoning_tokens": mean(row.get("reason") for row in rows),
+        "avg_cached_tokens": mean(row.get("cache") for row in rows),
+        "avg_visible_tokens": mean(row.get("visible") for row in rows),
+        "avg_total_tokens": mean(row.get("tokens") for row in rows),
+        "avg_tool_calls": mean(row.get("tools") for row in rows),
+        "tool_task_rate": mean(1.0 if row.get("tool_used") else 0.0 for row in rows),
+        "avg_trajectory_steps": mean(row.get("steps") for row in rows),
+        "avg_llm_requests": mean(row.get("llm_req") for row in rows),
+        "latency_p50_ms": percentile(latencies, 0.50),
+        "latency_p95_ms": percentile(latencies, 0.95),
+        "selected_generation_cost_counted_usd": generation_total if generation_known else None,
+        "avg_selected_generation_cost_usd": generation_total / len(rows)
+        if generation_known and rows
+        else None,
+        "selected_generation_cost_complete": generation_complete,
+        "selected_generation_cost_is_lower_bound": bool(rows and not generation_complete),
+        "selected_generation_cost_exact_task_count": sum(
+            row["generation_cost"].get("exact") is True for row in rows
+        ),
+        "selected_generation_cost_reported_task_count": len(generation_known),
+        "selected_generation_cost_request_count": generation_request_count,
+        "selected_generation_cost_actual_request_count": generation_actual_requests,
+        "selected_generation_cost_estimated_request_count": generation_estimated_requests,
+        "selected_generation_cost_cache_aware_estimated_request_count": sum(
+            integer(row["generation_cost"].get("estimated_cache_aware_requests")) for row in rows
+        ),
+        "selected_generation_cost_cache_price_fallback_request_count": sum(
+            integer(row["generation_cost"].get("estimated_cache_price_fallback_requests"))
+            for row in rows
+        ),
+        "selected_generation_cost_no_cache_estimated_request_count": sum(
+            integer(row["generation_cost"].get("estimated_no_cache_requests")) for row in rows
+        ),
+        "selected_generation_cost_ignored_request_count": generation_ignored_requests,
+        "selected_attempt_binding_valid_task_count": sum(
+            row.get("selected_attempt_binding_valid") is True for row in rows
+        ),
+        "judge_cost_counted_usd": judge_total if judge_known else None,
+        "avg_judge_cost_usd": judge_total / len(rows) if judge_known and rows else None,
+        "judge_cost_complete": judge_complete,
+        "judge_cost_is_lower_bound": bool(rows and not judge_complete),
+        "judge_cost_request_count": sum(
+            integer(row["judge_cost"].get("request_count")) for row in rows
+        ),
+        "judge_cost_actual_request_count": sum(
+            integer(row["judge_cost"].get("actual_requests")) for row in rows
+        ),
+        "judge_cost_estimated_request_count": sum(
+            integer(row["judge_cost"].get("estimated_requests")) for row in rows
+        ),
+        "judge_cost_ignored_request_count": sum(
+            integer(row["judge_cost"].get("ignored_requests")) for row in rows
+        ),
+        "fallback_task_count": sum(bool(row.get("fallback")) for row in rows),
+        "outer_retry_count": sum(integer(row.get("outer_retry")) for row in rows),
+        "proposer_recovery_request_count": sum(
+            integer(row.get("proposer_recovery")) for row in rows
+        ),
+        "partial_proposer_task_count": sum(
+            integer(row.get("partial_proposers")) > 0 for row in rows
+        ),
+        "degraded_task_count": sum(bool(row.get("degraded")) for row in rows),
+        "assembly_truncated_task_count": sum(bool(row.get("assembled_truncated")) for row in rows),
+        "n_distribution": dict(sorted(Counter(str(integer(row.get("n"))) for row in rows).items())),
+        "selected_proposer_sets": dict(
+            sorted(
+                Counter(
+                    json.dumps(
+                        row.get("selected_p") or [], ensure_ascii=False, separators=(",", ":")
+                    )
+                    for row in rows
+                ).items()
+            )
+        ),
+        "selected_aggregators": dict(
+            sorted(Counter(str(row.get("selected_a") or "") for row in rows).items())
+        ),
+        "analyzer_sources": dict(
+            sorted(Counter(str(row.get("analyzer_source") or "") for row in rows).items())
+        ),
+        "analyzer_output_tokens": [
+            integer(row.get("analyzer_output_tokens"))
+            for row in rows
+            if integer(row.get("analyzer_output_tokens")) > 0
+        ],
+        "analyzer_max_output_token_values": dict(
+            sorted(
+                Counter(
+                    str(integer(row.get("analyzer_max_output_tokens")))
+                    for row in rows
+                    if integer(row.get("analyzer_max_output_tokens")) > 0
+                ).items()
+            )
+        ),
+        "analyzer_length_stop_count": sum(bool(row.get("analyzer_length_stop")) for row in rows),
+        "analyzer_truncated_count": sum(bool(row.get("analyzer_truncated")) for row in rows),
+        "analyzer_at_or_above_cap_count": sum(
+            bool(row.get("analyzer_at_or_above_cap")) for row in rows
+        ),
+        "analyzer_length_stop_task_ids": sorted(
+            str(row.get("task_id") or "") for row in rows if row.get("analyzer_length_stop")
+        ),
+        "analyzer_truncated_task_ids": sorted(
+            str(row.get("task_id") or "") for row in rows if row.get("analyzer_truncated")
+        ),
+        "analyzer_at_or_above_cap_task_ids": sorted(
+            str(row.get("task_id") or "") for row in rows if row.get("analyzer_at_or_above_cap")
+        ),
+        "analyzer_stop_reasons": dict(
+            sorted(
+                Counter(
+                    stop for row in rows for stop in row.get("analyzer_stop_reasons") or []
+                ).items()
+            )
+        ),
+        "row_policy_warning_count": sum(row.get("row_policy_pass") is False for row in rows),
+        "explicit_byok_request_count": sum(
+            integer(row.get("explicit_byok_requests")) for row in rows
+        ),
+        "selected_model_generation": dict(sorted(model_generation.items())),
+        "failed_tasks": [
+            {"task_id": row.get("task_id"), "error": row.get("error")}
+            for row in rows
+            if not row.get("done")
+        ],
+    }
+
+
+def load_formal_arm(
+    spec: ArmSpec,
+    state: Mapping[str, Any],
+    prices: Mapping[str, Price],
+    plan: Mapping[str, Any],
+    derived: Mapping[str, Any],
+    verifier: FrozenControllerVerifier,
+) -> dict[str, Any]:
+    controller_arm = verifier.arms[spec.arm_id]
+    root = Path(verifier.module.output_dir(plan, controller_arm)).resolve()
+    declared_root = Path(str(state.get("output_dir") or ""))
+    initial_reasons: list[str] = []
+    identity_mismatch = False
+    if not str(state.get("output_dir") or "") or declared_root.resolve() != root.resolve():
+        initial_reasons.append("terminal status arm output_dir differs from frozen controller")
+        identity_mismatch = True
+    expected_identity: Mapping[str, Any] | None = None
+    try:
+        override = verifier.module.resolve_arm_override(
+            plan,
+            controller_arm,
+            artifact=verifier.artifact,
+            p99_receipt=(
+                verifier.derived.get("p0_5_06") if isinstance(verifier.derived, Mapping) else None
+            ),
+        )
+        expected_identity = verifier.module.arm_completion_identity(
+            plan,
+            controller_arm,
+            snapshot=verifier.snapshot,
+            snapshot_identity=verifier.snapshot_identity,
+            override=override,
+        )
+    except Exception as exc:  # noqa: BLE001 - failed prerequisites are reportable
+        initial_reasons.append("frozen controller could not resolve arm identity: " + str(exc))
+    try:
+        independently_complete, independent_evidence = verifier.module.inspect_complete_arm(
+            root,
+            expected_task_ids={
+                str(value) for value in plan.get("benchmark", {}).get("task_ids") or []
+            },
+            expected_task_concurrency=int(plan.get("execution", {}).get("task_concurrency") or 0),
+            expected_identity=expected_identity,
+        )
+    except Exception as exc:  # noqa: BLE001 - frozen verifier is authoritative
+        independently_complete = False
+        independent_evidence = {
+            "reason": "frozen_controller_inspection_failed",
+            "detail": str(exc),
+        }
+    declared_state = str(state.get("state") or "unknown")
+    declared_evidence = state.get("completion_evidence")
+    evidence_matches = isinstance(declared_evidence, Mapping) and dict(declared_evidence) == dict(
+        independent_evidence
+    )
+    if isinstance(declared_evidence, Mapping) and not evidence_matches:
+        initial_reasons.append(
+            "terminal status completion evidence differs from frozen controller reinspection"
+        )
+        identity_mismatch = True
+    if declared_state == "succeeded":
+        if not independently_complete:
+            initial_reasons.append(
+                "terminal status labels arm succeeded but frozen controller does not"
+            )
+            identity_mismatch = True
+        if not evidence_matches:
+            initial_reasons.append(
+                "succeeded arm lacks matching frozen controller completion evidence"
+            )
+            identity_mismatch = True
+    elif independently_complete:
+        initial_reasons.append(
+            "frozen controller finds a complete arm under a non-succeeded status label"
+        )
+        identity_mismatch = True
+    authenticated_state = "controller_identity_mismatch" if identity_mismatch else declared_state
+    result: dict[str, Any] = {
+        "spec": asdict(spec),
+        "state": authenticated_state,
+        "declared_state": declared_state,
+        "output_dir": str(root),
+        "completion_evidence": declared_evidence,
+        "controller_reinspection": {
+            "complete": bool(independently_complete),
+            "evidence": independent_evidence,
+            "terminal_evidence_matches": evidence_matches,
+        },
+        "failure": state.get("failure"),
+        "formal": False,
+        "formal_evidence_valid": False,
+        "formal_evidence_reasons": initial_reasons,
+        "rows": [],
+        "metrics": summarize_rows([]),
+        "manifest": {},
+        "audit": {},
+        "proof": {},
+        "statuses": {"execution": "unknown", "policy": "unknown", "audit": "unknown"},
+        "account": {},
+    }
+    if declared_state == "no_op_deleted" and not initial_reasons:
+        result["no_op_receipt"] = state.get("offline_effect_receipt")
+        return result
+    if not independently_complete or declared_state != "succeeded":
+        return result
+    required = [
+        root / name
+        for name in (
+            "manifest.json",
+            "results.jsonl",
+            "trace.jsonl",
+            "audit.json",
+            "openrouter-non-byok-campaign-proof.json",
+        )
+    ]
+    if not all(path.is_file() and not path.is_symlink() for path in required):
+        result["formal_evidence_reasons"].append("formal root artifacts are missing")
+        return result
+    manifest = load_json(root / "manifest.json")
+    audit = load_json(root / "audit.json")
+    proof = load_json(root / "openrouter-non-byok-campaign-proof.json")
+    reasons: list[str] = list(initial_reasons)
+    if not validate_embedded_hash(manifest, "manifest_sha256"):
+        reasons.append("manifest self-hash differs")
+    if not validate_embedded_hash(audit, "audit_sha256"):
+        reasons.append("audit self-hash differs")
+    if not validate_embedded_hash(proof, "proof_sha256"):
+        reasons.append("non-BYOK proof self-hash differs")
+    for name in (
+        "results.jsonl",
+        "trace.jsonl",
+        "audit.json",
+        "openrouter-non-byok-campaign-proof.json",
+    ):
+        valid, detail = artifact_binding_valid(root, manifest, name)
+        if not valid:
+            reasons.append(detail)
+    try:
+        rows, row_reasons = read_compact_rows(root / "results.jsonl", prices)
+    except ReportError as exc:
+        rows, row_reasons = [], [str(exc)]
+    reasons.extend(row_reasons)
+    try:
+        trace_bindings, trace_reasons = read_trace_evidence(root / "trace.jsonl")
+    except ReportError as exc:
+        trace_bindings, trace_reasons = {}, [str(exc)]
+    reasons.extend(trace_reasons)
+    task_ids = [str(row.get("task_id") or "") for row in rows]
+    expected_task_ids = [str(value) for value in plan.get("benchmark", {}).get("task_ids") or []]
+    if len(rows) != 10:
+        reasons.append(f"results row count is {len(rows)}, expected 10")
+    if len(task_ids) != len(set(task_ids)):
+        reasons.append("result task ids are not unique")
+    if expected_task_ids and set(task_ids) != set(expected_task_ids):
+        reasons.append("result task ids differ from frozen benchmark")
+    if {row.get("group") for row in rows} != {"G1"}:
+        reasons.append("results are not exactly G1")
+    invalid_selected_bindings = [
+        str(row.get("task_id") or "")
+        for row in rows
+        if row.get("selected_attempt_binding_valid") is not True
+    ]
+    if invalid_selected_bindings:
+        reasons.append(
+            "selected generation attempt usage binding invalid for tasks: "
+            + ",".join(sorted(invalid_selected_bindings))
+        )
+    selected_ids = [str(row.get("selected_attempt_id") or "") for row in rows]
+    if len(selected_ids) != len(set(selected_ids)):
+        reasons.append("selected generation attempt ids are not unique by task")
+    expected_selected_bindings = {
+        f"G1/{row.get('task_id')}": row.get("selected_attempt_id") for row in rows
+    }
+    if manifest.get("selected_generation_attempt_bindings") != expected_selected_bindings:
+        reasons.append("manifest/result selected generation attempt bindings differ")
+    result_bindings = {
+        str(row.get("task_id") or ""): str(row.get("result_evidence_sha256") or "") for row in rows
+    }
+    if trace_bindings != result_bindings:
+        reasons.append("trace/result evidence bindings differ")
+    if manifest.get("schema") != "opensquilla.draco.campaign-final-manifest/v1":
+        reasons.append("manifest schema differs")
+    if manifest.get("status") != "complete":
+        reasons.append("manifest status is not complete")
+    if manifest.get("execution_pass") is not True:
+        reasons.append("manifest execution_pass is not true")
+    if manifest.get("result_count") != 10 or manifest.get("task_count") != 10:
+        reasons.append("manifest result/task counts differ from 10")
+    if manifest.get("groups") != ["G1"]:
+        reasons.append("manifest groups differ from [G1]")
+    source_manifests = manifest.get("source_manifests")
+    scheduling_ok = bool(source_manifests) and all(
+        isinstance(source, Mapping)
+        and isinstance(source.get("execution_scheduling"), Mapping)
+        and source["execution_scheduling"].get("task_concurrency") == 6
+        for source in source_manifests or []
+    )
+    if not scheduling_ok:
+        reasons.append("source manifest task_concurrency is not uniformly 6")
+    audit_binding = str(manifest.get("audit_sha256") or "")
+    if audit_binding != audit.get("audit_sha256"):
+        reasons.append("manifest/audit hash binding differs")
+    proof_binding = str(manifest.get("openrouter_non_byok_campaign_proof_sha256") or "")
+    if proof_binding != proof.get("proof_sha256"):
+        reasons.append("manifest/non-BYOK proof hash binding differs")
+    execution_status = status_dimension(
+        [manifest.get("execution_pass"), audit.get("execution_pass"), proof.get("execution_pass")],
+        warning_status="fail",
+    )
+    policy_status = status_dimension(
+        [manifest.get("policy_pass"), audit.get("policy_pass"), proof.get("policy_pass")],
+        warning_status="warning",
+    )
+    audit_status = (
+        "pass"
+        if manifest.get("audit_pass") is True and audit.get("pass") is True
+        else "warning"
+        if execution_status == "pass"
+        else "fail"
+    )
+    result.update(
+        {
+            "formal": True,
+            "formal_evidence_valid": not reasons,
+            "formal_evidence_reasons": reasons,
+            "rows": rows,
+            "metrics": summarize_rows(rows),
+            "manifest": {
+                "schema": manifest.get("schema"),
+                "status": manifest.get("status"),
+                "execution_pass": manifest.get("execution_pass"),
+                "policy_pass": manifest.get("policy_pass"),
+                "audit_pass": manifest.get("audit_pass"),
+                "manifest_sha256": manifest.get("manifest_sha256"),
+                "warnings": manifest.get("warnings") or [],
+            },
+            "audit": {
+                "schema": audit.get("schema"),
+                "status": audit.get("status"),
+                "pass": audit.get("pass"),
+                "execution_pass": audit.get("execution_pass"),
+                "policy_pass": audit.get("policy_pass"),
+                "audit_sha256": audit.get("audit_sha256"),
+                "warnings": audit.get("warnings") or [],
+            },
+            "proof": {
+                "schema": proof.get("schema"),
+                "status": proof.get("status"),
+                "pass": proof.get("pass"),
+                "execution_pass": proof.get("execution_pass"),
+                "policy_pass": proof.get("policy_pass"),
+                "proof_sha256": proof.get("proof_sha256"),
+                "warnings": proof.get("warnings") or [],
+            },
+            "statuses": {
+                "execution": execution_status,
+                "policy": policy_status,
+                "audit": audit_status,
+            },
+            "account": account_evidence(manifest, proof),
+        }
+    )
+    return result
+
+
+def bootstrap_ci(deltas: Sequence[float]) -> tuple[float | None, float | None]:
+    if not deltas:
+        return None, None
+    rng = random.Random(BOOTSTRAP_SEED)
+    count = len(deltas)
+    samples = [
+        sum(deltas[rng.randrange(count)] for _ in range(count)) / count
+        for _ in range(BOOTSTRAP_SAMPLES)
+    ]
+    return percentile(samples, 0.025), percentile(samples, 0.975)
+
+
+def paired(
+    control: Mapping[str, Any],
+    variant: Mapping[str, Any],
+    *,
+    scope: str = "all_tasks",
+    allowed_task_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    control_rows = {row["task_id"]: row for row in control.get("rows") or []}
+    variant_rows = {row["task_id"]: row for row in variant.get("rows") or []}
+    common_ids = sorted(set(control_rows) & set(variant_rows))
+    task_rows: list[dict[str, Any]] = []
+    deltas: list[float] = []
+    paired_ids: list[str] = []
+    for task_id in common_ids:
+        left, right = control_rows[task_id], variant_rows[task_id]
+        if allowed_task_ids is not None and task_id not in allowed_task_ids:
+            continue
+        if scope == "ap_non_overlap" and (left.get("ap_overlap") or right.get("ap_overlap")):
+            continue
+        before, after = number(left.get("quality")), number(right.get("quality"))
+        if before is None or after is None:
+            continue
+        delta = after - before
+        deltas.append(delta)
+        paired_ids.append(task_id)
+        task_rows.append(
+            {
+                "task_id": task_id,
+                "domain": right.get("domain") or left.get("domain"),
+                "control_quality": before,
+                "variant_quality": after,
+                "delta_quality": delta,
+            }
+        )
+    ci_low, ci_high = bootstrap_ci(deltas)
+    route_ids = paired_ids
+    return {
+        "control_arm_id": control.get("spec", {}).get("arm_id"),
+        "variant_arm_id": variant.get("spec", {}).get("arm_id"),
+        "scope": scope,
+        "pair_count": len(deltas),
+        "complete_task_id_pairing": len(deltas) == 10,
+        "missing_from_control": sorted(set(variant_rows) - set(control_rows)),
+        "missing_from_variant": sorted(set(control_rows) - set(variant_rows)),
+        "mean_delta_quality": mean(deltas),
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_samples": BOOTSTRAP_SAMPLES,
+        "bootstrap_ci95": [ci_low, ci_high],
+        "wins": sum(delta > 1e-12 for delta in deltas),
+        "ties": sum(abs(delta) <= 1e-12 for delta in deltas),
+        "losses": sum(delta < -1e-12 for delta in deltas),
+        "request_context_match_count": sum(
+            bool(control_rows[task_id].get("request_context_hash"))
+            and control_rows[task_id].get("request_context_hash")
+            == variant_rows[task_id].get("request_context_hash")
+            for task_id in route_ids
+        ),
+        "task_profile_match_count": sum(
+            bool(control_rows[task_id].get("task_profile_hash"))
+            and control_rows[task_id].get("task_profile_hash")
+            == variant_rows[task_id].get("task_profile_hash")
+            for task_id in route_ids
+        ),
+        "proposer_changed_count": sum(
+            control_rows[task_id].get("selected_p") != variant_rows[task_id].get("selected_p")
+            for task_id in route_ids
+        ),
+        "aggregator_changed_count": sum(
+            control_rows[task_id].get("selected_a") != variant_rows[task_id].get("selected_a")
+            for task_id in route_ids
+        ),
+        "n_changed_count": sum(
+            control_rows[task_id].get("n") != variant_rows[task_id].get("n")
+            for task_id in route_ids
+        ),
+        "task_rows": task_rows,
+    }
+
+
+def repeated_pairing(comparisons: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    usable = [
+        comparison for comparison in comparisons if isinstance(comparison.get("task_rows"), list)
+    ]
+    if len(usable) < 2:
+        return None
+    by_task: dict[str, list[float]] = {}
+    for comparison in usable:
+        for row in comparison.get("task_rows") or []:
+            by_task.setdefault(str(row["task_id"]), []).append(float(row["delta_quality"]))
+    expected_repeats = len(usable)
+    averaged = {
+        task_id: sum(values) / len(values)
+        for task_id, values in by_task.items()
+        if len(values) == expected_repeats
+    }
+    deltas = [averaged[task_id] for task_id in sorted(averaged)]
+    low, high = bootstrap_ci(deltas)
+    return {
+        "kind": "repeat_task_mean_pairing",
+        "replicate_count": expected_repeats,
+        "task_count": len(deltas),
+        "complete_task_id_pairing": len(deltas) == 10,
+        "mean_delta_quality": mean(deltas),
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_samples": BOOTSTRAP_SAMPLES,
+        "bootstrap_ci95": [low, high],
+        "wins": sum(delta > 1e-12 for delta in deltas),
+        "ties": sum(abs(delta) <= 1e-12 for delta in deltas),
+        "losses": sum(delta < -1e-12 for delta in deltas),
+        "per_task_mean_delta": averaged,
+    }
+
+
+def receipt_hash_valid(receipt: Mapping[str, Any]) -> bool:
+    recorded = str(receipt.get("receipt_sha256") or "").removeprefix("sha256:")
+    payload = {
+        key: value for key, value in receipt.items() if key not in {"receipt_sha256", "path"}
+    }
+    return bool(recorded) and recorded == canonical_sha256(payload)
+
+
+def parse_temperature_wire_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    task_ids: set[str],
+    arm_ids: set[str],
+) -> dict[str, Any]:
+    """Extract exact per-task/member wire facts without inferring from config."""
+
+    records: list[dict[str, Any]] = []
+    receipt_arms = [str(value) for value in receipt.get("arm_ids") or [] if str(value) in arm_ids]
+
+    # Current controller receipts expose this exact production-compatibility
+    # projection.  Parse it directly so ``role`` and every selected/recovery
+    # member remain distinguishable.  The recursive fallback below only
+    # supports older authenticated receipts.
+    temperature_scope = receipt.get("temperature_analysis_scope")
+    tasks = (
+        temperature_scope.get("tasks")
+        if isinstance(temperature_scope, Mapping)
+        and isinstance(temperature_scope.get("tasks"), list)
+        else receipt.get("tasks")
+        if isinstance(receipt.get("tasks"), list)
+        else None
+    )
+    if isinstance(tasks, list):
+        for task in tasks:
+            if not isinstance(task, Mapping):
+                records.append(
+                    {
+                        "task_id": None,
+                        "arm_id": None,
+                        "model": None,
+                        "role": None,
+                        "temperature_parameter_sent": None,
+                        "wire_temperature": None,
+                        "state": "unknown",
+                    }
+                )
+                continue
+            task_id = str(task.get("task_id") or "") or None
+            members = task.get("members")
+            if not isinstance(members, list):
+                members = []
+            for member in members:
+                if not isinstance(member, Mapping):
+                    continue
+                sent = member.get("temperature_parameter_sent")
+                wire_temperature = number(member.get("wire_temperature"))
+                if sent is True and wire_temperature is not None:
+                    state = "sent"
+                elif sent is False and member.get("wire_temperature") is None:
+                    state = "omitted"
+                else:
+                    state = "unknown"
+                targets = receipt_arms or [None]
+                for arm_id in targets:
+                    records.append(
+                        {
+                            "task_id": task_id,
+                            "arm_id": arm_id,
+                            "model": normalize_model(
+                                member.get("requested_model")
+                                or member.get("model")
+                                or member.get("identity")
+                            )
+                            or None,
+                            "role": str(member.get("role") or "") or None,
+                            "temperature_parameter_sent": (
+                                sent if isinstance(sent, bool) else None
+                            ),
+                            "wire_temperature": wire_temperature,
+                            "state": state,
+                        }
+                    )
+
+    def walk(
+        value: Any,
+        *,
+        task_id: str | None = None,
+        arm_id: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        if isinstance(value, Mapping):
+            local_task = str(value.get("task_id") or task_id or "") or None
+            local_arm = str(value.get("arm_id") or arm_id or "") or None
+            local_model = (
+                normalize_model(
+                    value.get("requested_model")
+                    or value.get("model")
+                    or value.get("identity")
+                    or model
+                )
+                or None
+            )
+            if "temperature_parameter_sent" in value:
+                sent = value.get("temperature_parameter_sent")
+                wire_temperature = number(value.get("wire_temperature"))
+                if sent is True and wire_temperature is not None:
+                    state = "sent"
+                elif sent is False and value.get("wire_temperature") is None:
+                    state = "omitted"
+                else:
+                    state = "unknown"
+                records.append(
+                    {
+                        "task_id": local_task,
+                        "arm_id": local_arm,
+                        "model": local_model,
+                        "role": value.get("role"),
+                        "recovery": value.get("recovery") or value.get("kind") == "recovery",
+                        "temperature_parameter_sent": sent if isinstance(sent, bool) else None,
+                        "wire_temperature": wire_temperature,
+                        "state": state,
+                    }
+                )
+            for key, child in value.items():
+                if key in {"temperature_parameter_sent", "wire_temperature"}:
+                    continue
+                key_text = str(key)
+                next_task = key_text if key_text in task_ids else local_task
+                next_arm = key_text if key_text in arm_ids else local_arm
+                next_model = normalize_model(key_text) if "/" in key_text else local_model
+                walk(
+                    child,
+                    task_id=next_task,
+                    arm_id=next_arm,
+                    model=next_model,
+                )
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, task_id=task_id, arm_id=arm_id, model=model)
+
+    if not isinstance(tasks, list):
+        walk(receipt)
+    by_arm_task_model: dict[str, dict[str, dict[str, str]]] = {}
+    by_arm_task_members: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    model_states: dict[str, Counter[str]] = {}
+    unresolved_records = 0
+    for record in records:
+        arm_id = str(record.get("arm_id") or "")
+        task_id = str(record.get("task_id") or "")
+        model = normalize_model(record.get("model"))
+        state = str(record.get("state") or "unknown")
+        if (
+            not arm_id
+            or arm_id not in arm_ids
+            or not task_id
+            or task_id not in task_ids
+            or not model
+        ):
+            unresolved_records += 1
+            continue
+        normalized_record = {
+            **record,
+            "arm_id": arm_id,
+            "task_id": task_id,
+            "model": model,
+        }
+        by_arm_task_members.setdefault(arm_id, {}).setdefault(task_id, []).append(normalized_record)
+        prior = by_arm_task_model.setdefault(arm_id, {}).setdefault(task_id, {}).get(model)
+        if prior is None or prior == state:
+            resolved = state
+        else:
+            resolved = "unknown"
+        by_arm_task_model[arm_id][task_id][model] = resolved
+        model_states.setdefault(model, Counter())[state] += 1
+    return {
+        "record_count": len(records),
+        "unresolved_record_count": unresolved_records,
+        "by_arm_task_model": by_arm_task_model,
+        "by_arm_task_members": by_arm_task_members,
+        "model_state_counts": {
+            model: dict(sorted(counter.items())) for model, counter in sorted(model_states.items())
+        },
+        "scope_verifiable": bool(records) and unresolved_records == 0,
+    }
+
+
+def offline_receipt_change_slice(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    comparisons = receipt.get("comparison_by_proposer_cap_explicitness")
+    by_context: dict[str, list[str]] = {}
+    count_mismatches: list[str] = []
+    if isinstance(comparisons, Mapping):
+        for context, comparison in comparisons.items():
+            if not isinstance(comparison, Mapping):
+                continue
+            task_ids = sorted(
+                {
+                    str(item.get("task_id"))
+                    for item in comparison.get("changed_tasks") or []
+                    if isinstance(item, Mapping) and item.get("task_id")
+                }
+            )
+            by_context[str(context)] = task_ids
+            if integer(comparison.get("changed_task_count")) != len(task_ids):
+                count_mismatches.append(str(context))
+    effective = sorted({task_id for values in by_context.values() for task_id in values})
+    return {
+        "changed_task_ids_by_context": dict(sorted(by_context.items())),
+        "effective_changed_task_ids": effective,
+        "effective_changed_task_count": len(effective),
+        "declared_count_mismatch_contexts": sorted(count_mismatches),
+    }
+
+
+def load_offline_effect_receipts(
+    derived: Mapping[str, Any],
+    *,
+    specs: Sequence[ArmSpec],
+    task_ids: set[str],
+) -> tuple[dict[str, dict[str, Any]], list[str], dict[str, Any] | None]:
+    """Load and bind every controller ``offline_effect`` receipt."""
+
+    raw_inventory = derived.get("offline_effect")
+    if not isinstance(raw_inventory, Mapping):
+        return {}, ["derived plan lacks offline_effect receipt inventory"], None
+    specs_by_id = {spec.arm_id: spec for spec in specs}
+    expected_ids = {spec.arm_id for spec in specs if spec.analyzer_mode == "frozen_replay"}
+    actual_ids = {str(value) for value in raw_inventory}
+    reasons: list[str] = []
+    if actual_ids != expected_ids:
+        reasons.append(
+            "offline-effect receipt inventory differs: "
+            f"missing={sorted(expected_ids - actual_ids)}, "
+            f"extra={sorted(actual_ids - expected_ids)}"
+        )
+    unique = (
+        derived.get("offline_unique_overlays")
+        if isinstance(derived.get("offline_unique_overlays"), Mapping)
+        else {}
+    )
+    loaded_by_path: dict[str, Mapping[str, Any]] = {}
+    inventory: dict[str, dict[str, Any]] = {}
+    temperature_scopes: dict[str, dict[str, Any]] = {}
+    for arm_id, raw in raw_inventory.items():
+        arm_id = str(arm_id)
+        if not isinstance(raw, Mapping):
+            reasons.append(f"offline-effect descriptor is not an object: {arm_id}")
+            continue
+        receipt_path_text = str(raw.get("receipt_path") or raw.get("path") or "")
+        receipt: Mapping[str, Any] | None = None
+        if not receipt_path_text:
+            reasons.append(f"offline-effect receipt path missing: {arm_id}")
+        elif receipt_path_text in loaded_by_path:
+            receipt = loaded_by_path[receipt_path_text]
+        else:
+            receipt_path = Path(receipt_path_text)
+            try:
+                receipt = load_json(receipt_path)
+            except ReportError as exc:
+                reasons.append(f"offline-effect receipt unavailable for {arm_id}: {exc}")
+            else:
+                loaded_by_path[receipt_path_text] = receipt
+        descriptor_hash = str(raw.get("receipt_sha256") or "").removeprefix("sha256:")
+        overlay_sha = str(raw.get("overlay_sha256") or "").removeprefix("sha256:")
+        valid = receipt is not None
+        if receipt is not None:
+            receipt_hash = str(receipt.get("receipt_sha256") or "").removeprefix("sha256:")
+            if not receipt_hash_valid(receipt):
+                reasons.append(f"offline-effect receipt self-hash differs: {arm_id}")
+                valid = False
+            if not descriptor_hash or descriptor_hash != receipt_hash:
+                reasons.append(f"offline-effect descriptor/receipt hash differs: {arm_id}")
+                valid = False
+            if str(raw.get("decision") or "") != str(receipt.get("decision") or ""):
+                reasons.append(f"offline-effect descriptor/receipt decision differs: {arm_id}")
+                valid = False
+            receipt_arms = {str(value) for value in receipt.get("arm_ids") or []}
+            if arm_id not in receipt_arms:
+                reasons.append(f"offline-effect receipt arm binding differs: {arm_id}")
+                valid = False
+            spec = specs_by_id.get(arm_id)
+            receipt_experiments = {str(value) for value in receipt.get("experiment_ids") or []}
+            if spec is None or spec.experiment_id not in receipt_experiments:
+                reasons.append(f"offline-effect receipt experiment binding differs: {arm_id}")
+                valid = False
+            if overlay_sha != str(receipt.get("overlay_sha256") or "").removeprefix("sha256:"):
+                reasons.append(f"offline-effect overlay binding differs: {arm_id}")
+                valid = False
+            embedded = unique.get(overlay_sha)
+            if not isinstance(embedded, Mapping):
+                reasons.append(f"offline unique-overlay binding missing: {arm_id}")
+                valid = False
+            elif str(embedded.get("receipt_sha256") or "").removeprefix(
+                "sha256:"
+            ) != receipt_hash or not receipt_hash_valid(embedded):
+                reasons.append(f"offline unique-overlay receipt binding differs: {arm_id}")
+                valid = False
+        change_slice = offline_receipt_change_slice(receipt or {})
+        if change_slice["declared_count_mismatch_contexts"]:
+            reasons.append(f"offline-effect changed-task count differs: {arm_id}")
+            valid = False
+        normalized = {
+            "valid": valid,
+            "path": receipt_path_text or None,
+            "decision": raw.get("decision"),
+            "overlay_sha256": raw.get("overlay_sha256"),
+            "receipt_sha256": raw.get("receipt_sha256"),
+            **change_slice,
+        }
+        inventory[arm_id] = normalized
+        spec = specs_by_id.get(arm_id)
+        if receipt is not None and spec is not None and spec.experiment_id == "P0.5-11":
+            scope = parse_temperature_wire_receipt(
+                receipt,
+                task_ids=task_ids,
+                arm_ids=set(specs_by_id),
+            )
+            normalized["temperature_scope_verifiable"] = scope.get("scope_verifiable")
+            temperature_scopes.setdefault(descriptor_hash, scope)
+            if scope.get("scope_verifiable") is not True:
+                reasons.append(
+                    f"P0.5-11 temperature wire scope contains missing/unknown identity: {arm_id}"
+                )
+                normalized["valid"] = False
+
+    merged_temperature: dict[str, Any] | None = None
+    if temperature_scopes:
+        merged_members: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        merged_models: dict[str, dict[str, dict[str, str]]] = {}
+        model_states: dict[str, Counter[str]] = {}
+        record_count = 0
+        unresolved = 0
+        for scope in temperature_scopes.values():
+            record_count += integer(scope.get("record_count"))
+            unresolved += integer(scope.get("unresolved_record_count"))
+            for arm_id, tasks_by_id in (scope.get("by_arm_task_members") or {}).items():
+                for task_id, members in tasks_by_id.items():
+                    target = merged_members.setdefault(str(arm_id), {}).setdefault(str(task_id), [])
+                    for member in members:
+                        if member not in target:
+                            target.append(member)
+            for arm_id, tasks_by_id in (scope.get("by_arm_task_model") or {}).items():
+                for task_id, models in tasks_by_id.items():
+                    target = merged_models.setdefault(str(arm_id), {}).setdefault(str(task_id), {})
+                    for model, state in models.items():
+                        prior = target.get(str(model))
+                        target[str(model)] = (
+                            str(state) if prior in {None, str(state)} else "unknown"
+                        )
+                        model_states.setdefault(str(model), Counter())[str(state)] += 1
+        merged_temperature = {
+            "record_count": record_count,
+            "unresolved_record_count": unresolved,
+            "by_arm_task_members": merged_members,
+            "by_arm_task_model": merged_models,
+            "model_state_counts": {
+                model: dict(sorted(states.items()))
+                for model, states in sorted(model_states.items())
+            },
+            "scope_verifiable": unresolved == 0 and bool(record_count),
+            "receipt_sha256s": sorted(
+                {
+                    str(inventory[arm_id].get("receipt_sha256") or "")
+                    for arm_id in inventory
+                    if specs_by_id.get(arm_id) and specs_by_id[arm_id].experiment_id == "P0.5-11"
+                }
+            ),
+        }
+    return inventory, reasons, merged_temperature
+
+
+def load_derived_evidence(
+    plan: Mapping[str, Any],
+    status: Mapping[str, Any],
+    *,
+    verifier: FrozenControllerVerifier,
+) -> dict[str, Any]:
+    run_root = Path(str(plan["paths"]["run_root"]))
+    descriptor = (
+        status.get("derived_plan") if isinstance(status.get("derived_plan"), Mapping) else {}
+    )
+    path = run_root / "derived-plan.json"
+    result: dict[str, Any] = {
+        "available": False,
+        "valid": False,
+        "path": str(path),
+        "reasons": [],
+        "p0_5_06": None,
+        "p0_5_07": None,
+        "p0_5_11": None,
+        "p0_5_11_scope": None,
+        "offline_effect": {},
+        "frozen_analyzer_artifact": None,
+    }
+    declared_path = str(descriptor.get("path") or "")
+    if declared_path and Path(declared_path).resolve() != path.resolve():
+        result["reasons"].append("status derived plan path differs from frozen controller location")
+    if not path.is_file() or path.is_symlink():
+        result["reasons"].append("derived-plan.json is unavailable")
+        return result
+    derived = load_json(path)
+    result["available"] = True
+    if verifier.derived_error is not None:
+        result["reasons"].append(
+            "frozen controller rejected derived plan: " + verifier.derived_error
+        )
+    elif verifier.derived is None:
+        result["reasons"].append(
+            "frozen controller did not authenticate the available derived plan"
+        )
+    elif dict(verifier.derived) != derived:
+        result["reasons"].append("reporter/controller derived plan views differ")
+    if derived.get("schema") != DERIVED_SCHEMA:
+        result["reasons"].append("derived plan schema differs")
+    if derived.get("campaign_plan_sha256") != canonical_sha256(plan):
+        result["reasons"].append("derived plan/campaign plan binding differs")
+    if not validate_embedded_hash(derived, "derived_plan_sha256", prefixed=False):
+        result["reasons"].append("derived plan self-hash differs")
+    expected_hash = str(descriptor.get("sha256") or "").removeprefix("sha256:")
+    if expected_hash and expected_hash != str(
+        derived.get("derived_plan_sha256") or ""
+    ).removeprefix("sha256:"):
+        result["reasons"].append("status/derived plan hash binding differs")
+    p99 = derived.get("p0_5_06") if isinstance(derived.get("p0_5_06"), Mapping) else None
+    experiment_ids = {
+        str(item.get("id")) for item in plan.get("experiments") or [] if isinstance(item, Mapping)
+    }
+    if "P0.5-06" in experiment_ids and p99 is None:
+        result["reasons"].append("P0.5-06 derivation receipt is missing")
+    if p99 is not None and not receipt_hash_valid(p99):
+        result["reasons"].append("P0.5-06 receipt hash differs")
+    noop = derived.get("p0_5_07") if isinstance(derived.get("p0_5_07"), Mapping) else None
+    noop_ids = {
+        str(item.get("id"))
+        for item in plan.get("no_op_experiments") or []
+        if isinstance(item, Mapping)
+    }
+    if "P0.5-07" in noop_ids and noop is None:
+        result["reasons"].append("P0.5-07 no-op receipt is missing")
+    if noop is not None and not receipt_hash_valid(noop):
+        result["reasons"].append("P0.5-07 receipt hash differs")
+    specs = expand_arms(plan)
+    offline_effect, offline_reasons, temperature_scope = load_offline_effect_receipts(
+        derived,
+        specs=specs,
+        task_ids={str(value) for value in plan.get("benchmark", {}).get("task_ids") or []},
+    )
+    result["reasons"].extend(offline_reasons)
+    if "P0.5-11" in experiment_ids and temperature_scope is None:
+        result["reasons"].append("P0.5-11 temperature wire receipt is missing")
+    frozen = (
+        derived.get("frozen_analyzer_artifact")
+        if isinstance(derived.get("frozen_analyzer_artifact"), Mapping)
+        else None
+    )
+    if any(arm.analyzer_mode == "frozen_replay" for arm in specs) and frozen is None:
+        result["reasons"].append("frozen Analyzer artifact descriptor is missing")
+    if frozen is not None:
+        artifact_path = Path(str(frozen.get("path") or ""))
+        if not artifact_path.is_file() or artifact_path.is_symlink():
+            result["reasons"].append("frozen Analyzer artifact is unavailable")
+        elif str(frozen.get("file_sha256") or "").removeprefix("sha256:") != file_sha256(
+            artifact_path
+        ):
+            result["reasons"].append("frozen Analyzer artifact raw hash differs")
+        else:
+            artifact = load_json(artifact_path)
+            recorded_artifact_hash = str(artifact.get("artifact_sha256") or "").removeprefix(
+                "sha256:"
+            )
+            if recorded_artifact_hash != str(frozen.get("artifact_sha256") or "").removeprefix(
+                "sha256:"
+            ):
+                result["reasons"].append("derived/frozen Analyzer semantic hash binding differs")
+            if not validate_embedded_hash(artifact, "artifact_sha256", prefixed=False):
+                result["reasons"].append("frozen Analyzer artifact self-hash differs")
+    result.update(
+        {
+            "valid": not result["reasons"],
+            "derived_plan_sha256": derived.get("derived_plan_sha256"),
+            "source_arm_id": derived.get("source_arm_id"),
+            "source_output_dir": derived.get("source_output_dir"),
+            "p0_5_06": dict(p99) if p99 is not None else None,
+            "p0_5_07": dict(noop) if noop is not None else None,
+            "p0_5_11": (
+                {
+                    "receipt_sha256s": temperature_scope.get("receipt_sha256s") or [],
+                    "scope_verifiable": temperature_scope.get("scope_verifiable"),
+                }
+                if temperature_scope is not None
+                else None
+            ),
+            "p0_5_11_scope": temperature_scope,
+            "offline_effect": offline_effect,
+            "frozen_analyzer_artifact": dict(frozen) if frozen is not None else None,
+        }
+    )
+    return result
+
+
+def validate_legacy_evidence(
+    plan: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    configured = (
+        plan.get("reporting", {}).get("legacy_evidence")
+        if isinstance(plan.get("reporting"), Mapping)
+        else None
+    )
+    inventory = configured if isinstance(configured, Mapping) else LEGACY_EVIDENCE
+    result: dict[str, dict[str, Any]] = {}
+    excluded = {
+        str(item.get("id")): str(item.get("reason") or "")
+        for item in plan.get("excluded") or []
+        if isinstance(item, Mapping)
+    }
+    for experiment_id, reason in excluded.items():
+        raw = inventory.get(experiment_id) if isinstance(inventory, Mapping) else None
+        entry = dict(raw) if isinstance(raw, Mapping) else {}
+        path = Path(str(entry.get("path") or ""))
+        expected = str(entry.get("sha256") or "").removeprefix("sha256:")
+        exists = bool(str(path)) and path.is_file() and not path.is_symlink()
+        actual = file_sha256(path) if exists else None
+        result[experiment_id] = {
+            "experiment_id": experiment_id,
+            "reason": reason,
+            "status": entry.get("status") or "excluded_existing_evidence",
+            "path": str(path) if str(path) else None,
+            "expected_sha256": expected or None,
+            "actual_sha256": actual,
+            "valid": bool(exists and expected and actual == expected),
+        }
+    return result
+
+
+def temperature_member_state(
+    scope: Mapping[str, Any],
+    *,
+    arm_id: str,
+    task_id: str,
+    model: str,
+) -> str:
+    inventory = (
+        scope.get("by_arm_task_model")
+        if isinstance(scope.get("by_arm_task_model"), Mapping)
+        else {}
+    )
+    normalized = normalize_model(model)
+    tasks = inventory.get(arm_id) if isinstance(inventory.get(arm_id), Mapping) else {}
+    models = tasks.get(task_id) if isinstance(tasks.get(task_id), Mapping) else {}
+    return str(models.get(normalized) or "unknown")
+
+
+def temperature_task_members(
+    scope: Mapping[str, Any], *, arm_id: str, task_id: str
+) -> list[Mapping[str, Any]]:
+    inventory = (
+        scope.get("by_arm_task_members")
+        if isinstance(scope.get("by_arm_task_members"), Mapping)
+        else {}
+    )
+    tasks = inventory.get(arm_id) if isinstance(inventory.get(arm_id), Mapping) else {}
+    members = tasks.get(task_id)
+    return [item for item in members or [] if isinstance(item, Mapping)]
+
+
+def temperature_task_all_selected_sent(
+    scope: Mapping[str, Any],
+    arm: Mapping[str, Any],
+    row: Mapping[str, Any],
+) -> bool:
+    arm_id = str(arm.get("spec", {}).get("arm_id") or "")
+    task_id = str(row.get("task_id") or "")
+    expected = Counter(
+        model
+        for model in (
+            [normalize_model(value) for value in row.get("selected_p") or []]
+            + [normalize_model(row.get("selected_a"))]
+        )
+        if model
+    )
+    selected_members = [
+        member
+        for member in temperature_task_members(scope, arm_id=arm_id, task_id=task_id)
+        if str(member.get("role") or "") in {"proposer", "aggregator"}
+    ]
+    observed = Counter(normalize_model(member.get("model")) for member in selected_members)
+    return (
+        bool(expected)
+        and observed == expected
+        and all(member.get("state") == "sent" for member in selected_members)
+    )
+
+
+def temperature_model_subanalysis(
+    scope: Mapping[str, Any],
+    arm: Mapping[str, Any],
+) -> dict[str, Any]:
+    arm_id = str(arm.get("spec", {}).get("arm_id") or "")
+    rows = arm.get("rows") or []
+    model_states: dict[str, Counter[str]] = {}
+    wire_temperatures: dict[str, Counter[str]] = {}
+    sent_usage: dict[str, dict[str, Any]] = {}
+    all_sent_tasks: list[str] = []
+    for row in rows:
+        if temperature_task_all_selected_sent(scope, arm, row):
+            all_sent_tasks.append(str(row.get("task_id") or ""))
+        task_id = str(row.get("task_id") or "")
+        members = temperature_task_members(scope, arm_id=arm_id, task_id=task_id)
+        for model, usage in (row.get("model_generation") or {}).items():
+            normalized = normalize_model(model)
+            matching = [
+                member for member in members if normalize_model(member.get("model")) == normalized
+            ]
+            states = {str(member.get("state") or "unknown") for member in matching}
+            state = next(iter(states)) if len(states) == 1 else "unknown"
+            model_states.setdefault(normalized, Counter())[state] += 1
+            for member in matching:
+                if member.get("state") == "sent":
+                    wire_temperatures.setdefault(normalized, Counter())[
+                        str(member.get("wire_temperature"))
+                    ] += 1
+            if state != "sent":
+                continue
+            target = sent_usage.setdefault(
+                normalized,
+                {
+                    "model": normalized,
+                    "roles": set(),
+                    "request_count": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "cost_counted_usd": 0.0,
+                    "actual_requests": 0,
+                    "estimated_requests": 0,
+                    "ignored_requests": 0,
+                    "sent_task_count": 0,
+                },
+            )
+            target["roles"].update(usage.get("roles") or [])
+            for field in (
+                "request_count",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "cost_counted_usd",
+                "actual_requests",
+                "estimated_requests",
+                "ignored_requests",
+            ):
+                target[field] += usage.get(field) or 0
+            target["sent_task_count"] += 1
+    models: dict[str, Any] = {}
+    for model, usage in sent_usage.items():
+        models[model] = {
+            **usage,
+            "roles": sorted(usage["roles"]),
+            "temperature_scope": "sent_task_member_slices_only",
+            "temperature_state_counts": dict(sorted(model_states.get(model, {}).items())),
+            "wire_temperature_counts": dict(sorted(wire_temperatures.get(model, {}).items())),
+            "included_in_formal_temperature_subanalysis": True,
+            "quality_score_fields_present": False,
+        }
+    coverage = {
+        model: {
+            "temperature_state_counts": dict(sorted(states.items())),
+            "wire_temperature_counts": dict(sorted(wire_temperatures.get(model, {}).items())),
+        }
+        for model, states in sorted(model_states.items())
+    }
+    included = list(models.values())
+    return {
+        "arm_id": arm_id,
+        "scope_verifiable": scope.get("scope_verifiable") is True,
+        "models": dict(sorted(models.items())),
+        "wire_coverage": coverage,
+        "formal_sent_model_count": len(included),
+        "formal_sent_request_count": sum(integer(value.get("request_count")) for value in included),
+        "formal_sent_input_tokens": sum(integer(value.get("input_tokens")) for value in included),
+        "formal_sent_output_tokens": sum(integer(value.get("output_tokens")) for value in included),
+        "formal_sent_cache_read_tokens": sum(
+            integer(value.get("cache_read_tokens")) for value in included
+        ),
+        "formal_sent_cache_write_tokens": sum(
+            integer(value.get("cache_write_tokens")) for value in included
+        ),
+        "formal_sent_cost_counted_usd": sum(
+            number(value.get("cost_counted_usd")) or 0.0 for value in included
+        ),
+        "formal_sent_ignored_request_count": sum(
+            integer(value.get("ignored_requests")) for value in included
+        ),
+        "all_selected_pa_temperature_sent_task_ids": sorted(all_sent_tasks),
+        "all_selected_pa_temperature_sent_task_count": len(all_sent_tasks),
+        "quality_attribution_note": "task quality cannot be decomposed into model-level causal scores",
+    }
+
+
+def display_arm(arm: Mapping[str, Any]) -> str:
+    spec = arm.get("spec") if isinstance(arm.get("spec"), Mapping) else arm
+    arm_id = str(spec.get("arm_id") or "")
+    if arm_id.startswith("common-E0-"):
+        return arm_id.removeprefix("common-")
+    experiment = str(spec.get("experiment_id") or "")
+    return arm_id.removeprefix(experiment + "-") if experiment else arm_id
+
+
+def arm_artifact_label(arm: Mapping[str, Any]) -> str:
+    if arm.get("state") == "no_op_deleted":
+        return "no live (wire no-op)"
+    if arm.get("formal") and arm.get("formal_evidence_valid"):
+        return "formal complete"
+    if arm.get("formal"):
+        return "formal invalid"
+    return str(arm.get("state") or "unavailable")
+
+
+def offline_noop_evidence_valid(arm: Mapping[str, Any], derived: Mapping[str, Any]) -> bool:
+    arm_id = str(arm.get("spec", {}).get("arm_id") or "")
+    receipt = derived.get("offline_effect", {}).get(arm_id, {})
+    return bool(
+        isinstance(receipt, Mapping)
+        and receipt.get("valid") is True
+        and receipt.get("decision") == "deleted_no_live_run"
+        and str(arm.get("no_op_receipt") or "") == str(receipt.get("path") or "")
+    )
+
+
+def build_experiment_inventory(
+    plan: Mapping[str, Any],
+    status: Mapping[str, Any],
+    arms: Mapping[str, Mapping[str, Any]],
+    derived: Mapping[str, Any],
+    legacy: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for experiment in plan.get("experiments") or []:
+        experiment_id = str(experiment["id"])
+        variant_arms = [
+            arm
+            for arm in arms.values()
+            if arm.get("spec", {}).get("experiment_id") == experiment_id
+        ]
+        variant_arms.sort(
+            key=lambda arm: (
+                str(arm.get("spec", {}).get("variant")),
+                integer(arm.get("spec", {}).get("replicate")),
+            )
+        )
+        control_ids: list[str] = []
+        for arm in variant_arms:
+            control_id = arm.get("spec", {}).get("control_arm_id")
+            if control_id and control_id not in control_ids:
+                control_ids.append(str(control_id))
+        controls = [arms[arm_id] for arm_id in control_ids if arm_id in arms]
+        comparisons: list[dict[str, Any]] = []
+        scoped_comparisons: list[dict[str, Any]] = []
+        for variant in variant_arms:
+            control_id = variant.get("spec", {}).get("control_arm_id")
+            control = arms.get(str(control_id)) if control_id else None
+            if (
+                control is not None
+                and control.get("formal")
+                and variant.get("formal")
+                and control.get("formal_evidence_valid") is True
+                and variant.get("formal_evidence_valid") is True
+                and control.get("rows")
+                and variant.get("rows")
+            ):
+                comparisons.append(paired(control, variant))
+                if experiment_id == "P0.5-36":
+                    scoped_comparisons.append(paired(control, variant, scope="ap_non_overlap"))
+        temperature_subanalysis: dict[str, Any] | None = None
+        if experiment_id == "P0.5-11":
+            temperature_scope = derived.get("p0_5_11_scope")
+            if isinstance(temperature_scope, Mapping):
+                per_arm = {
+                    str(arm.get("spec", {}).get("arm_id")): temperature_model_subanalysis(
+                        temperature_scope, arm
+                    )
+                    for arm in variant_arms
+                    if arm.get("formal_evidence_valid") is True
+                }
+                for variant in variant_arms:
+                    control_id = str(variant.get("spec", {}).get("control_arm_id") or "")
+                    control = arms.get(control_id)
+                    if (
+                        not control
+                        or control.get("formal_evidence_valid") is not True
+                        or variant.get("formal_evidence_valid") is not True
+                    ):
+                        continue
+                    variant_id = str(variant.get("spec", {}).get("arm_id") or "")
+                    variant_scope = per_arm.get(variant_id) or {}
+                    allowed = set(
+                        variant_scope.get("all_selected_pa_temperature_sent_task_ids") or []
+                    )
+                    scoped_comparisons.append(
+                        paired(
+                            control,
+                            variant,
+                            scope="all_selected_pa_temperature_sent",
+                            allowed_task_ids=allowed,
+                        )
+                    )
+                temperature_subanalysis = {
+                    "receipt_valid": all(
+                        (
+                            derived.get("offline_effect", {}).get(
+                                str(arm.get("spec", {}).get("arm_id") or ""), {}
+                            )
+                            or {}
+                        ).get("valid")
+                        is True
+                        for arm in variant_arms
+                    ),
+                    "receipt_sha256s": (derived.get("p0_5_11") or {}).get("receipt_sha256s") or [],
+                    "scope_verifiable": temperature_scope.get("scope_verifiable") is True,
+                    "receipt_record_count": temperature_scope.get("record_count"),
+                    "unresolved_receipt_record_count": temperature_scope.get(
+                        "unresolved_record_count"
+                    ),
+                    "per_arm": per_arm,
+                    "quality_attribution_note": (
+                        "model-level request/usage/cost is reported only for temperature_parameter_sent=true; "
+                        "task score cannot be causally assigned to one model"
+                    ),
+                }
+        if experiment_id in {"P0.5-10", "P0.5-38", "P0.5-39"}:
+            for variant in variant_arms:
+                if variant.get("formal_evidence_valid") is not True:
+                    continue
+                variant_id = str(variant.get("spec", {}).get("arm_id") or "")
+                control_id = str(variant.get("spec", {}).get("control_arm_id") or "")
+                control = arms.get(control_id)
+                receipt = derived.get("offline_effect", {}).get(variant_id, {})
+                if (
+                    not control
+                    or control.get("formal_evidence_valid") is not True
+                    or receipt.get("valid") is not True
+                ):
+                    continue
+                allowed = set(receipt.get("effective_changed_task_ids") or [])
+                scoped_comparisons.append(
+                    paired(
+                        control,
+                        variant,
+                        scope="offline_effective_wire_changed_tasks",
+                        allowed_task_ids=allowed,
+                    )
+                )
+        replicated_variant = bool(
+            len(variant_arms) > 1
+            and len({str(arm.get("spec", {}).get("variant") or "") for arm in variant_arms}) == 1
+            and len({integer(arm.get("spec", {}).get("replicate")) for arm in variant_arms})
+            == len(variant_arms)
+        )
+        repeat_summary = repeated_pairing(comparisons) if replicated_variant else None
+        scoped_repeat_summary = repeated_pairing(scoped_comparisons) if replicated_variant else None
+        analyzer_effect: dict[str, Any] | None = None
+        if experiment_id == "P0.5-06":
+            evidence = {}
+            for arm in controls + variant_arms:
+                if not arm.get("formal") or not arm.get("rows"):
+                    continue
+                metric = arm.get("metrics") or {}
+                evidence[str(arm.get("spec", {}).get("arm_id") or "")] = {
+                    "max_output_token_values": metric.get("analyzer_max_output_token_values") or {},
+                    "observed_output_tokens": metric.get("analyzer_output_tokens") or [],
+                    "length_stop_count": integer(metric.get("analyzer_length_stop_count")),
+                    "truncated_count": integer(metric.get("analyzer_truncated_count")),
+                    "at_or_above_cap_count": integer(metric.get("analyzer_at_or_above_cap_count")),
+                    "length_stop_task_ids": metric.get("analyzer_length_stop_task_ids") or [],
+                    "truncated_task_ids": metric.get("analyzer_truncated_task_ids") or [],
+                    "at_or_above_cap_task_ids": metric.get("analyzer_at_or_above_cap_task_ids")
+                    or [],
+                    "stop_reasons": metric.get("analyzer_stop_reasons") or {},
+                }
+            signatures = {
+                (
+                    tuple(row["length_stop_task_ids"]),
+                    tuple(row["truncated_task_ids"]),
+                    tuple(row["at_or_above_cap_task_ids"]),
+                )
+                for row in evidence.values()
+            }
+            evidence_complete = bool(controls and variant_arms) and all(
+                arm.get("formal_evidence_valid") is True
+                and integer(arm.get("metrics", {}).get("row_count")) == 10
+                for arm in controls + variant_arms
+            )
+            unchanged = evidence_complete and len(signatures) == 1
+            analyzer_effect = {
+                "decision": (
+                    "delete_no_observed_effect"
+                    if unchanged
+                    else "observed_effect_keep_for_analysis"
+                    if evidence_complete
+                    else "insufficient_evidence_no_delete_decision"
+                ),
+                "evidence_complete": evidence_complete,
+                "truncation_length_stop_signature_unchanged": unchanged,
+                "arms": evidence,
+                "note": "already-run artifacts are retained regardless of the tuning decision",
+            }
+        states = [str(arm.get("state") or "unknown") for arm in variant_arms]
+        evidence_valid = all(
+            (arm.get("formal_evidence_valid") is True if arm.get("state") == "succeeded" else True)
+            and (
+                offline_noop_evidence_valid(arm, derived)
+                if arm.get("state") == "no_op_deleted"
+                else True
+            )
+            for arm in variant_arms
+        )
+        if any(state in {"failed", "blocked_prerequisite"} for state in states):
+            state = "partial_or_failed"
+        elif (
+            states
+            and all(item in {"succeeded", "no_op_deleted"} for item in states)
+            and evidence_valid
+        ):
+            state = "complete"
+        else:
+            state = "incomplete"
+        result[experiment_id] = {
+            "experiment_id": experiment_id,
+            "directory_name": str(
+                experiment.get("directory_name") or experiment_id.replace(".", "-")
+            ),
+            "title": str(experiment.get("title") or experiment_id),
+            "analysis_scope": experiment.get("analysis_scope"),
+            "state": state,
+            "controls": controls,
+            "variants": variant_arms,
+            "comparisons": comparisons,
+            "repeated_pairing": repeat_summary,
+            "scoped_comparisons": scoped_comparisons,
+            "scoped_repeated_pairing": scoped_repeat_summary,
+            "temperature_subanalysis": temperature_subanalysis,
+            "analyzer_effect": analyzer_effect,
+        }
+    noop_status = derived.get("p0_5_07") if isinstance(derived.get("p0_5_07"), Mapping) else None
+    controller_noops = (
+        status.get("no_op_experiments")
+        if isinstance(status.get("no_op_experiments"), Mapping)
+        else {}
+    )
+    for experiment in plan.get("no_op_experiments") or []:
+        experiment_id = str(experiment["id"])
+        controller_noop = (
+            controller_noops.get(experiment_id)
+            if isinstance(controller_noops.get(experiment_id), Mapping)
+            else {}
+        )
+        controller_receipt = (
+            controller_noop.get("receipt")
+            if isinstance(controller_noop.get("receipt"), Mapping)
+            else None
+        )
+        receipt_binding_ok = bool(
+            noop_status
+            and controller_receipt
+            and controller_receipt.get("receipt_sha256") == noop_status.get("receipt_sha256")
+        )
+        result[experiment_id] = {
+            "experiment_id": experiment_id,
+            "directory_name": experiment_id.replace(".", "-"),
+            "title": str(experiment.get("title") or experiment_id),
+            "state": (
+                "no_op_deleted"
+                if noop_status
+                and receipt_hash_valid(noop_status)
+                and controller_noop.get("state") == "no_op_deleted"
+                and receipt_binding_ok
+                else "incomplete_no_op_evidence"
+            ),
+            "controls": [arms["common-E0-R1"]] if "common-E0-R1" in arms else [],
+            "variants": [],
+            "comparisons": [],
+            "repeated_pairing": None,
+            "scoped_comparisons": [],
+            "scoped_repeated_pairing": None,
+            "temperature_subanalysis": None,
+            "analyzer_effect": None,
+            "no_op_declaration": dict(experiment),
+            "no_op_receipt": dict(noop_status) if noop_status else None,
+            "controller_no_op": dict(controller_noop),
+            "controller_receipt_binding_valid": receipt_binding_ok,
+        }
+    for experiment_id, evidence in legacy.items():
+        result[experiment_id] = {
+            "experiment_id": experiment_id,
+            "directory_name": experiment_id.replace(".", "-"),
+            "title": experiment_id,
+            "state": "excluded_with_valid_evidence"
+            if evidence.get("valid")
+            else "excluded_evidence_invalid",
+            "controls": [],
+            "variants": [],
+            "comparisons": [],
+            "repeated_pairing": None,
+            "scoped_comparisons": [],
+            "scoped_repeated_pairing": None,
+            "temperature_subanalysis": None,
+            "analyzer_effect": None,
+            "legacy_evidence": dict(evidence),
+        }
+    return result
+
+
+def metric_cost_text(metric: Mapping[str, Any], prefix: str) -> str:
+    value = metric.get(prefix + "_counted_usd")
+    if value is None:
+        return "—"
+    marker = ""
+    if metric.get(prefix + "_is_lower_bound") is True:
+        marker = "≥"
+    elif integer(metric.get(prefix + "_estimated_request_count")) > 0:
+        marker = "≈"
+    return marker + fmt(value, 6)
+
+
+def metric_avg_generation_text(metric: Mapping[str, Any]) -> str:
+    value = metric.get("avg_selected_generation_cost_usd")
+    if value is None:
+        return "—"
+    marker = ""
+    if metric.get("selected_generation_cost_is_lower_bound") is True:
+        marker = "≥"
+    elif integer(metric.get("selected_generation_cost_estimated_request_count")) > 0:
+        marker = "≈"
+    return marker + fmt(value, 6)
+
+
+def metric_table_row(arm: Mapping[str, Any]) -> str:
+    if arm.get("formal_evidence_valid") is not True:
+        return "| " + display_arm(arm) + " | " + " | ".join(["—"] * 20) + " |"
+    metric = arm.get("metrics") or {}
+    return (
+        "| "
+        + " | ".join(
+            [
+                display_arm(arm),
+                str(integer(metric.get("row_count"))),
+                str(integer(metric.get("done_count"))),
+                fmt(metric.get("avg_quality_total"), 4),
+                pct(metric.get("avg_pass_rate")),
+                str(integer(metric.get("judge_error_count"))),
+                metric_avg_generation_text(metric),
+                metric_cost_text(metric, "selected_generation_cost"),
+                f"{integer(metric.get('selected_generation_cost_exact_task_count'))}/{integer(metric.get('row_count'))}",
+                fmt(metric.get("avg_input_tokens"), 1),
+                fmt(metric.get("avg_output_tokens"), 1),
+                fmt(metric.get("avg_reasoning_tokens"), 1),
+                fmt(metric.get("avg_cached_tokens"), 1),
+                fmt(metric.get("avg_visible_tokens"), 1),
+                fmt(metric.get("avg_total_tokens"), 1),
+                fmt(metric.get("avg_tool_calls"), 2),
+                pct(metric.get("tool_task_rate")),
+                fmt(metric.get("avg_trajectory_steps"), 2),
+                fmt(metric.get("avg_llm_requests"), 2),
+                fmt(metric.get("latency_p50_ms"), 0),
+                fmt(metric.get("latency_p95_ms"), 0),
+            ]
+        )
+        + " |"
+    )
+
+
+METRIC_HEADER = (
+    "| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | Total Gen$ | Gen exact | "
+    "Avg Input | Avg Output | Avg Reason | Avg Cache | Avg Visible | Avg Tokens | Avg Tools | Tool% | "
+    "Avg Steps | Avg LLMReq | p50 ms | p95 ms |\n"
+    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+)
+
+
+def build_group_markdown(
+    experiment: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    status: Mapping[str, Any],
+    derived: Mapping[str, Any],
+) -> str:
+    experiment_id = str(experiment["experiment_id"])
+    title = str(experiment.get("title") or experiment_id)
+    lines = [f"# {experiment_id} DRACO Mini 实验结果", "", "## 结论与范围", ""]
+    if experiment.get("legacy_evidence"):
+        evidence = experiment["legacy_evidence"]
+        lines.extend(
+            [
+                f"- 本组按冻结计划不重跑：`{evidence.get('reason')}`。",
+                f"- 既有证据状态：`{evidence.get('status')}`；hash 校验：`{'pass' if evidence.get('valid') else 'FAIL'}`。",
+                f"- 既有报告：`{evidence.get('path')}`；SHA-256=`{evidence.get('actual_sha256') or 'missing'}`。",
+                "- 本文件只作新 campaign 的不可重复执行/来源索引，不把旧结果伪装成新运行。",
+                "- DRACO mini 只有 10 题且没有独立 SafetyGate；不能据此自动推广 winner。",
+                "",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+    if experiment.get("no_op_declaration"):
+        declaration = experiment["no_op_declaration"]
+        receipt = experiment.get("no_op_receipt") or {}
+        lines.extend(
+            [
+                f"- 状态：`{experiment.get('state')}`；该变量在当前 provider/model 兼容策略下不会进入 wire，因此没有 live arm。",
+                f"- 请求值：{code_json(declaration.get('requested_values'))}；provider/model=`{declaration.get('provider_kind')}:{declaration.get('model')}`。",
+                f"- no-op receipt：`{receipt.get('receipt_sha256', 'missing')}`；原因：{receipt.get('reason') or declaration.get('reason')}。",
+                "- 删除 no-op 实验避免为字节等价请求付费；这不是零分、失败或缺失运行。",
+                "- DRACO mini 没有独立 SafetyGate；10 题仅作诊断，不自动推广 winner。",
+                "",
+                "## 冻结取证",
+                "",
+                f"- Campaign plan：`{plan['paths']['run_root']}/campaign-plan.json`",
+                f"- Derived plan：`{derived.get('path')}`",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+    controls = list(experiment.get("controls") or [])
+    variants = list(experiment.get("variants") or [])
+    display_arms = controls + variants
+    lines.extend(
+        [
+            f"- 变量：{title}；组状态：`{experiment.get('state')}`；controller=`{status.get('phase')}`。",
+            "- 所有质量比较只按 `task_id` 配对；缺题不会伪装成完整均值。",
+            f"- 固定 seed `{BOOTSTRAP_SEED}`，每个 paired bootstrap 使用 `{BOOTSTRAP_SAMPLES}` 次重采样。",
+            "- execution、policy、audit 三条状态彼此独立；BYOK/费用缺口不自动改判已有答案执行失败。",
+            "- DRACO mini 没有独立 SafetyGate；10 题是调参诊断，不自动推广 winner。",
+            "",
+            "## 实验臂与配置",
+            "",
+            "| Arm | Role | Analyzer | Override / dynamic | Artifact | Root |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
+    for arm in display_arms:
+        spec = arm.get("spec") or {}
+        role = "control" if spec.get("experiment_id") == "common-E0" else "variant"
+        configuration: Any = spec.get("override") or spec.get("dynamic") or {}
+        lines.append(
+            f"| {display_arm(arm)} | {role} | `{spec.get('analyzer_mode')}` | {code_json(configuration)} | "
+            f"{arm_artifact_label(arm)} | `{arm.get('output_dir')}` |"
+        )
+    if experiment.get("analysis_scope"):
+        lines.extend(
+            [
+                "",
+                f"- 冻结 analysis scope：`{experiment.get('analysis_scope')}`。",
+            ]
+        )
+    if isinstance(experiment.get("analyzer_effect"), Mapping):
+        analyzer_effect = experiment["analyzer_effect"]
+        lines.append(
+            f"- Analyzer truncation/length-stop 决策：`{analyzer_effect.get('decision')}`；已运行证据始终保留。"
+        )
+    wire_noops = [arm for arm in variants if arm.get("state") == "no_op_deleted"]
+    if wire_noops:
+        lines.extend(
+            [
+                "",
+                "### Wire-effect no-op receipts",
+                "",
+                "| Arm | Decision | Changed tasks | Receipt SHA | Receipt path |",
+                "|---|---|---:|---|---|",
+            ]
+        )
+        for arm in wire_noops:
+            arm_id = str(arm.get("spec", {}).get("arm_id") or "")
+            receipt = derived.get("offline_effect", {}).get(arm_id, {})
+            lines.append(
+                f"| {display_arm(arm)} | `{receipt.get('decision', 'missing')}` | "
+                f"{integer(receipt.get('effective_changed_task_count'))} | `{receipt.get('receipt_sha256', 'missing')}` | "
+                f"`{receipt.get('path', 'missing')}` |"
+            )
+        lines.extend(
+            [
+                "",
+                "这些 arm 只在冻结 E0 的 selected/recovery P/A 上投影生产 output-budget 解析；零 changed task 才删除 live run。",
+            ]
+        )
+    if experiment_id == "P0.5-06" and isinstance(derived.get("p0_5_06"), Mapping):
+        p99 = derived["p0_5_06"]
+        lines.extend(
+            [
+                "",
+                "### Analyzer p99 动态参数 receipt",
+                "",
+                f"- method=`{p99.get('method')}`；p99=`{p99.get('p99')}`；derived max output={code_json(p99.get('derived_max_output_tokens'))}。",
+                f"- receipt SHA=`{p99.get('receipt_sha256')}`；source Analyzer artifact=`{p99.get('source_artifact_sha256')}`。",
+            ]
+        )
+        analyzer_effect = experiment.get("analyzer_effect") or {}
+        lines.extend(
+            [
+                "",
+                "| Arm | Length-stop | Truncated | At/above cap | Max-output values | Stop reasons |",
+                "|---|---:|---:|---:|---|---|",
+            ]
+        )
+        for arm_id, evidence in (analyzer_effect.get("arms") or {}).items():
+            lines.append(
+                f"| {arm_id} | {integer(evidence.get('length_stop_count'))} | "
+                f"{integer(evidence.get('truncated_count'))} | "
+                f"{integer(evidence.get('at_or_above_cap_count'))} | "
+                f"{code_json(evidence.get('max_output_token_values') or {})} | "
+                f"{code_json(evidence.get('stop_reasons') or {})} |"
+            )
+    if experiment_id in {"P0.5-10", "P0.5-38", "P0.5-39"}:
+        lines.extend(
+            [
+                "",
+                "### Offline effective-change task receipts",
+                "",
+                "只有下表 union task slice 进入 primary paired analysis；全 10 题仅保留为 diagnostic。",
+                "",
+                "| Arm | Decision | Effective tasks | By cap-explicitness | Receipt SHA |",
+                "|---|---|---|---|---|",
+            ]
+        )
+        for arm in variants:
+            arm_id = str(arm.get("spec", {}).get("arm_id") or "")
+            receipt = derived.get("offline_effect", {}).get(arm_id, {})
+            lines.append(
+                f"| {display_arm(arm)} | `{receipt.get('decision', 'missing')}` | "
+                f"{code_json(receipt.get('effective_changed_task_ids') or [])} | "
+                f"{code_json(receipt.get('changed_task_ids_by_context') or {})} | "
+                f"`{receipt.get('receipt_sha256', 'missing')}` |"
+            )
+    temperature = experiment.get("temperature_subanalysis")
+    if isinstance(temperature, Mapping):
+        lines.extend(
+            [
+                "",
+                "### Temperature wire 正式子分析",
+                "",
+                f"- receipt SHA list={code_json(temperature.get('receipt_sha256s') or [])}；scope verifiable=`{temperature.get('scope_verifiable')}`；records={integer(temperature.get('receipt_record_count'))}，unresolved={integer(temperature.get('unresolved_receipt_record_count'))}。",
+                "- 只有 offline receipt 明确 `temperature_parameter_sent=true` 且给出 `wire_temperature` 的模型进入正式子分析。模型级 usage/cost 可统计，但 task score 无法拆分归因到单个模型，因此不伪造模型级质量分。",
+                "",
+                "| Arm | Model | Wire scope | Wire temperatures | Requests | Input | Output | Cache read/write | Cost$ | Actual/estimated/ignored |",
+                "|---|---|---|---|---:|---:|---:|---:|---:|---|",
+            ]
+        )
+        model_rows = 0
+        for arm_id, arm_scope in (temperature.get("per_arm") or {}).items():
+            for model, model_row in (arm_scope.get("models") or {}).items():
+                if not model_row.get("included_in_formal_temperature_subanalysis"):
+                    continue
+                model_rows += 1
+                lines.append(
+                    f"| {arm_id} | `{model}` | `sent-only slices` | {code_json(model_row.get('wire_temperature_counts') or {})} | {integer(model_row.get('request_count'))} | "
+                    f"{integer(model_row.get('input_tokens'))} | {integer(model_row.get('output_tokens'))} | "
+                    f"{integer(model_row.get('cache_read_tokens'))}/{integer(model_row.get('cache_write_tokens'))} | "
+                    f"{fmt(model_row.get('cost_counted_usd'), 6)} | {integer(model_row.get('actual_requests'))}/"
+                    f"{integer(model_row.get('estimated_requests'))}/{integer(model_row.get('ignored_requests'))} |"
+                )
+        if model_rows == 0:
+            lines.append(
+                "| — | — | `scope_unverifiable_or_no_sent_model` | — | 0 | 0 | 0 | 0/0 | — | — |"
+            )
+    lines.extend(["", "## 总表", "", METRIC_HEADER])
+    for arm in display_arms:
+        lines.append(metric_table_row(arm))
+    lines.extend(
+        [
+            "",
+            "Gen$ 只统计最终成功且 selected 的 generation attempt（live Analyzer + proposer + aggregator）；排除 Judge、失败/被替换 retry。provider actual USD 优先；缺 USD 且有 tokens 时按冻结 79 模型价格拆分 fresh/cache-read/cache-write/output 后估算。冻结表若没有 cache 专属单价，则缓存 token 以普通 input 单价作保守回退并单独披露。费用和 tokens 都缺失的物理请求忽略金额、计入 ignored，Total/Avg 标记为下界，绝不写成 $0。",
+            "",
+            "### Selected generation 与 Judge 计费证据（分列）",
+            "",
+            "| Arm | Gen req | Gen actual | Gen estimated | Cache-aware est | Cache-rate fallback | No-cache est | Gen ignored | Judge$ | Judge req | Judge ignored |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for arm in display_arms:
+        if arm.get("formal_evidence_valid") is not True:
+            lines.append(f"| {display_arm(arm)} | — | — | — | — | — | — | — | — | — | — |")
+            continue
+        metric = arm.get("metrics") or {}
+        lines.append(
+            f"| {display_arm(arm)} | {integer(metric.get('selected_generation_cost_request_count'))} | "
+            f"{integer(metric.get('selected_generation_cost_actual_request_count'))} | "
+            f"{integer(metric.get('selected_generation_cost_estimated_request_count'))} | "
+            f"{integer(metric.get('selected_generation_cost_cache_aware_estimated_request_count'))} | "
+            f"{integer(metric.get('selected_generation_cost_cache_price_fallback_request_count'))} | "
+            f"{integer(metric.get('selected_generation_cost_no_cache_estimated_request_count'))} | "
+            f"{integer(metric.get('selected_generation_cost_ignored_request_count'))} | "
+            f"{metric_cost_text(metric, 'judge_cost')} | {integer(metric.get('judge_cost_request_count'))} | "
+            f"{integer(metric.get('judge_cost_ignored_request_count'))} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Judge$ 是独立 Judge 调用成本，不进入 Gen$。账户 Δ 包含实际 campaign 窗口内的 generation、Judge 及其他可归属调用；它与 Gen$ 理论口径不能相加。",
+            "",
+            "## Completion、Execution、Policy、Audit 与账户",
+            "",
+            "| Arm | Artifact | Execution | Policy | Audit | Account Δ$ | BYOK Δ$ | Reconciliation | Formal evidence |",
+            "|---|---|---|---|---|---:|---:|---|---|",
+        ]
+    )
+    for arm in display_arms:
+        statuses, account = arm.get("statuses") or {}, arm.get("account") or {}
+        reasons = arm.get("formal_evidence_reasons") or []
+        lines.append(
+            f"| {display_arm(arm)} | `{arm_artifact_label(arm)}` | `{statuses.get('execution', 'unknown')}` | "
+            f"`{statuses.get('policy', 'unknown')}` | `{statuses.get('audit', 'unknown')}` | "
+            f"{fmt(account.get('account_delta_usd'), 9)} | {fmt(account.get('byok_delta_usd'), 9)} | "
+            f"`{account.get('reconciliation_status', 'unknown')}` / stable={account.get('reconciliation_stable', 'unknown')} | "
+            f"{'pass' if arm.get('formal_evidence_valid') else code_json(reasons)} |"
+        )
+    primary_comparisons = list(
+        experiment.get("scoped_comparisons") or experiment.get("comparisons") or []
+    )
+    primary_repeated = experiment.get("scoped_repeated_pairing") or experiment.get(
+        "repeated_pairing"
+    )
+    primary_scope = (
+        str(primary_comparisons[0].get("scope") or "all_tasks")
+        if primary_comparisons
+        else "all_tasks"
+    )
+    lines.extend(
+        [
+            "",
+            f"## 同题配对质量（primary scope: `{primary_scope}`）",
+            "",
+            "| Variant - control | Pairs | Mean ΔQ | Paired bootstrap 95% CI | W/T/L | Request context match | Task profile match | Route P/A/N changed |",
+            "|---|---:|---:|---|---|---:|---:|---|",
+        ]
+    )
+    for comparison in primary_comparisons:
+        low, high = comparison.get("bootstrap_ci95") or [None, None]
+        lines.append(
+            f"| {comparison.get('variant_arm_id')} - {comparison.get('control_arm_id')} | {integer(comparison.get('pair_count'))} | "
+            f"{fmt(comparison.get('mean_delta_quality'), 4)} | [{fmt(low, 4)}, {fmt(high, 4)}] | "
+            f"{integer(comparison.get('wins'))}/{integer(comparison.get('ties'))}/{integer(comparison.get('losses'))} | "
+            f"{integer(comparison.get('request_context_match_count'))}/{integer(comparison.get('pair_count'))} | "
+            f"{integer(comparison.get('task_profile_match_count'))}/{integer(comparison.get('pair_count'))} | "
+            f"{integer(comparison.get('proposer_changed_count'))}/{integer(comparison.get('aggregator_changed_count'))}/{integer(comparison.get('n_changed_count'))} |"
+        )
+    repeated = primary_repeated
+    if isinstance(repeated, Mapping):
+        low, high = repeated.get("bootstrap_ci95") or [None, None]
+        lines.append(
+            f"| R1–R3 task mean | {integer(repeated.get('task_count'))} | {fmt(repeated.get('mean_delta_quality'), 4)} | "
+            f"[{fmt(low, 4)}, {fmt(high, 4)}] | {integer(repeated.get('wins'))}/{integer(repeated.get('ties'))}/{integer(repeated.get('losses'))} | — | — | — |"
+        )
+    if not primary_comparisons:
+        lines.append("| — | 0 | — | — | — | — | — | — |")
+    if experiment.get("scoped_comparisons"):
+        lines.extend(
+            [
+                "",
+                "### 全 10 题 diagnostic 配对（非受限主分析）",
+                "",
+                "| Variant - control | Pairs | Mean ΔQ | 95% CI | W/T/L |",
+                "|---|---:|---:|---|---|",
+            ]
+        )
+        for comparison in experiment.get("comparisons") or []:
+            low, high = comparison.get("bootstrap_ci95") or [None, None]
+            lines.append(
+                f"| {comparison.get('variant_arm_id')} - {comparison.get('control_arm_id')} | {integer(comparison.get('pair_count'))} | "
+                f"{fmt(comparison.get('mean_delta_quality'), 4)} | [{fmt(low, 4)}, {fmt(high, 4)}] | "
+                f"{integer(comparison.get('wins'))}/{integer(comparison.get('ties'))}/{integer(comparison.get('losses'))} |"
+            )
+    lines.extend(
+        [
+            "",
+            "### 逐题质量差",
+            "",
+            "| Variant | Domain | Task | Control Q | Variant Q | ΔQ |",
+            "|---|---|---|---:|---:|---:|",
+        ]
+    )
+    for comparison in primary_comparisons:
+        for row in comparison.get("task_rows") or []:
+            lines.append(
+                f"| {comparison.get('variant_arm_id')} | {row.get('domain')} | `{str(row.get('task_id'))[:8]}…` | "
+                f"{fmt(row.get('control_quality'), 4)} | {fmt(row.get('variant_quality'), 4)} | {fmt(row.get('delta_quality'), 4)} |"
+            )
+    if not primary_comparisons:
+        lines.append("| — | — | — | — | — | — |")
+    lines.extend(
+        [
+            "",
+            "## 路由与容错摘要",
+            "",
+            "| Arm | N distribution | Selected A | Retry | Fallback tasks | Proposer recovery | Partial/degraded/truncated | Analyzer source |",
+            "|---|---|---|---:|---:|---:|---|---|",
+        ]
+    )
+    for arm in display_arms:
+        if arm.get("formal_evidence_valid") is not True:
+            lines.append(f"| {display_arm(arm)} | — | — | — | — | — | — | — | — |")
+            continue
+        metric = arm.get("metrics") or {}
+        lines.append(
+            f"| {display_arm(arm)} | {code_json(metric.get('n_distribution') or {})} | "
+            f"{code_json(metric.get('selected_aggregators') or {})} | {integer(metric.get('outer_retry_count'))} | "
+            f"{integer(metric.get('fallback_task_count'))} | {integer(metric.get('proposer_recovery_request_count'))} | "
+            f"{integer(metric.get('partial_proposer_task_count'))}/{integer(metric.get('degraded_task_count'))}/{integer(metric.get('assembly_truncated_task_count'))} | "
+            f"{code_json(metric.get('analyzer_sources') or {})} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 证据路径",
+            "",
+            f"- Campaign plan：`{plan['paths']['run_root']}/campaign-plan.json`",
+            f"- Immutable terminal status input：`{plan['paths']['run_root']}/terminal-status-input.json`",
+            f"- Derived plan：`{derived.get('path')}`；valid=`{derived.get('valid')}`。",
+            "",
+            "本报告由终态只读生成器离线构建；没有调用模型、没有修改 Wave，也没有把 mini 结果自动推广为正式默认配置。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def experiment_summary_line(experiment: Mapping[str, Any]) -> str:
+    comparisons = experiment.get("scoped_comparisons") or experiment.get("comparisons") or []
+    complete_pairs = [
+        comparison for comparison in comparisons if comparison.get("complete_task_id_pairing")
+    ]
+    deltas = [comparison.get("mean_delta_quality") for comparison in complete_pairs]
+    variant_states = Counter(
+        str(arm.get("state") or "unknown") for arm in experiment.get("variants") or []
+    )
+    return (
+        f"| {experiment.get('experiment_id')} | {experiment.get('title')} | `{experiment.get('state')}` | "
+        f"{len(experiment.get('variants') or [])} | {code_json(dict(sorted(variant_states.items())))} | "
+        f"{len(complete_pairs)}/{len(comparisons)} | {code_json([round(float(value), 4) for value in deltas if number(value) is not None])} | "
+        f"[MD]({experiment.get('directory_name')}/EXPERIMENT_RESULTS.md) / "
+        f"[JSON]({experiment.get('directory_name')}/EXPERIMENT_RESULTS.json) |"
+    )
+
+
+def build_root_markdown(report: Mapping[str, Any]) -> str:
+    experiments = report["experiments"]
+    arms = report["arms"]
+    completion = report["completion"]
+    costs = report["unique_arm_costs"]
+    lines = [
+        "# P0 / P0.5 DRACO Mini 综合实验结果",
+        "",
+        "## 总结",
+        "",
+        f"- Campaign：`{report['run_id']}`；controller phase=`{report['controller_phase']}`；报告状态=`{completion['status']}`。",
+        f"- 冻结提交/tree：`{report['freeze'].get('snapshot_commit')}` / `{report['freeze'].get('snapshot_tree')}`；DRACO mini 10 题，task concurrency=`{report['execution'].get('task_concurrency')}`。",
+        f"- 计划候选 live arms={completion['planned_arm_count']}；formal succeeded={completion['formal_succeeded_arm_count']}；wire no-op={completion['wire_no_op_arm_count']}；failed/blocked={completion['failed_or_blocked_arm_count']}。",
+        "- 31 个新 live experiment groups、P0.5-07 formal no-op，以及 P0-01/P0-02/P0.5-31/P0-15 既有证据均单独索引；任何缺失/失败均保持显式，不伪装完整。",
+        "- 本任务集没有独立 SafetyGate。所有结果只是固定 10 题 mini 调参诊断，不能自动推广 winner 或直接改写默认配置。",
+        "",
+        "## 全组完成矩阵",
+        "",
+        "| Group | Variable | State | Variant arms | Arm states | Complete pairings | Mean ΔQ list | Report |",
+        "|---|---|---|---:|---|---:|---|---|",
+    ]
+    for experiment_id in sorted(
+        experiments, key=lambda item: (item.replace("P0.5", "P0.50"), item)
+    ):
+        lines.append(experiment_summary_line(experiments[experiment_id]))
+    lines.extend(
+        [
+            "",
+            "## 所有唯一 live arm 总表",
+            "",
+            METRIC_HEADER,
+        ]
+    )
+    for arm_id in sorted(arms):
+        lines.append(metric_table_row(arms[arm_id]))
+    lines.extend(
+        [
+            "",
+            "Selected generation 费用严格采用最终 selected attempt：actual USD 优先，缺 USD 才用冻结 79 模型 input/output/cache token 补价；Judge、失败/被替换 generation retry 排除。无 USD 且无 token 的请求金额忽略并计入下界。Judge 理论费用、账户实际窗口增量与 selected generation 分列，互不叠加。",
+            "",
+            "## 唯一 arm 成本（不重复累计共享 E0）",
+            "",
+            "| Scope | Counted USD | Complete | Estimated requests | Ignored requests | Note |",
+            "|---|---:|---|---:|---:|---|",
+            f"| Selected generation theoretical | {fmt(costs.get('selected_generation_counted_usd'), 6)} | `{costs.get('selected_generation_complete')}` | {integer(costs.get('selected_generation_estimated_requests'))} | {integer(costs.get('selected_generation_ignored_requests'))} | final selected only; Judge/replaced retry excluded |",
+            f"| Judge theoretical | {fmt(costs.get('judge_counted_usd'), 6)} | `{costs.get('judge_complete')}` | {integer(costs.get('judge_estimated_requests'))} | {integer(costs.get('judge_ignored_requests'))} | all Judge physical attempts, separate |",
+            f"| Campaign account actual | {fmt(costs.get('account_delta_usd'), 6)} | `{costs.get('account_windows_complete')}` | — | — | includes Judge; never add to theoretical totals |",
+            f"| Campaign BYOK delta | {fmt(costs.get('byok_delta_usd'), 6)} | — | — | — | policy/audit evidence, not execution status |",
+            "",
+            "## 重复实验配对",
+            "",
+            "P0.5-11 和 P0.5-36 的 E1-R1/R2/R3 分别配对 common-E0-R1/R2/R3；另以每题三次 ΔQ 的均值形成 10 个独立 task-level delta，再做固定 seed、20,000 次 paired bootstrap。没有把 30 个相关观测伪装成 30 个独立题目。",
+            "",
+            "| Group | Replicates | Tasks | Mean ΔQ | 95% CI | W/T/L |",
+            "|---|---:|---:|---:|---|---|",
+        ]
+    )
+    for experiment_id, experiment in experiments.items():
+        repeated = experiment.get("repeated_pairing")
+        if not isinstance(repeated, Mapping):
+            continue
+        low, high = repeated.get("bootstrap_ci95") or [None, None]
+        lines.append(
+            f"| {experiment_id} | {integer(repeated.get('replicate_count'))} | {integer(repeated.get('task_count'))} | "
+            f"{fmt(repeated.get('mean_delta_quality'), 4)} | [{fmt(low, 4)}, {fmt(high, 4)}] | "
+            f"{integer(repeated.get('wins'))}/{integer(repeated.get('ties'))}/{integer(repeated.get('losses'))} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Execution / Policy / Audit",
+            "",
+            "- `execution` 只回答是否形成可 Judge 的可用答案；`policy` 记录 BYOK/provider/路由政策；`audit` 记录物理请求、usage、费用与 artifact 完整性。三者不会互相覆盖。",
+            "- BYOK 或缺失美元金额不会单独把任务判为 execution failure；有 token 时按冻结价格估算，无 token 时忽略金额并披露。",
+            "- no-op receipt 证明 wire 字节等价的组不发 live 请求；它不是失败，也不产生虚构的 0 美元实验结果。",
+            "",
+            "## 冻结与取证",
+            "",
+            f"- Campaign plan：`{report['paths']['campaign_plan']}`；SHA-256=`{report['campaign_plan_file_sha256']}`；canonical=`{report['campaign_plan_sha256']}`。",
+            f"- Immutable terminal status input：`{report['paths']['terminal_status_input']}`；raw SHA-256=`{report['terminal_status_input_file_sha256']}`；semantic=`{report['terminal_status_input_sha256']}`。",
+            f"- Derived plan：`{report['paths'].get('derived_plan')}`；valid=`{report['derived'].get('valid')}`；reasons={code_json(report['derived'].get('reasons') or [])}。",
+            f"- Frozen price registry：`{report['price_registry']['path']}`；SHA-256=`{report['price_registry']['sha256']}`；models={report['price_registry']['model_count']}。",
+            "",
+            "机器可读综合结果见同目录 `EXPERIMENT_RESULTS.json`。本报告离线生成，不调用模型，不修改任何 Wave/arm 正式 artifact。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def compact_arm_for_json(arm: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in arm.items() if key not in {"manifest", "audit", "proof"}}
+
+
+def build_group_json(
+    experiment: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    status: Mapping[str, Any],
+    derived: Mapping[str, Any],
+    generated_at: str,
+) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "schema": GROUP_REPORT_SCHEMA,
+        "generated_at": generated_at,
+        "run_id": plan.get("run_id"),
+        "experiment_id": experiment.get("experiment_id"),
+        "controller_phase": status.get("phase"),
+        "campaign_plan_sha256": canonical_sha256(plan),
+        "derived_plan_sha256": derived.get("derived_plan_sha256"),
+        "mini_is_diagnostic_only": True,
+        "independent_safety_gate_available": False,
+        "experiment": experiment,
+    }
+    document["group_report_sha256"] = "sha256:" + canonical_sha256(document)
+    return document
+
+
+def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    formal = [
+        arm for arm in arms.values() if arm.get("formal_evidence_valid") is True and arm.get("rows")
+    ]
+    generation_values = [
+        number(arm.get("metrics", {}).get("selected_generation_cost_counted_usd"))
+        for arm in formal
+        if number(arm.get("metrics", {}).get("selected_generation_cost_counted_usd")) is not None
+    ]
+    judge_values = [
+        number(arm.get("metrics", {}).get("judge_cost_counted_usd"))
+        for arm in formal
+        if number(arm.get("metrics", {}).get("judge_cost_counted_usd")) is not None
+    ]
+    account_values = [
+        number(arm.get("account", {}).get("account_delta_usd"))
+        for arm in formal
+        if number(arm.get("account", {}).get("account_delta_usd")) is not None
+    ]
+    byok_values = [
+        number(arm.get("account", {}).get("byok_delta_usd"))
+        for arm in formal
+        if number(arm.get("account", {}).get("byok_delta_usd")) is not None
+    ]
+    return {
+        "unique_formal_arm_count": len(formal),
+        "selected_generation_counted_usd": sum(
+            value for value in generation_values if value is not None
+        )
+        if generation_values
+        else None,
+        "selected_generation_complete": bool(formal)
+        and all(
+            arm.get("metrics", {}).get("selected_generation_cost_complete") is True
+            for arm in formal
+        ),
+        "selected_generation_estimated_requests": sum(
+            integer(arm.get("metrics", {}).get("selected_generation_cost_estimated_request_count"))
+            for arm in formal
+        ),
+        "selected_generation_ignored_requests": sum(
+            integer(arm.get("metrics", {}).get("selected_generation_cost_ignored_request_count"))
+            for arm in formal
+        ),
+        "judge_counted_usd": sum(value for value in judge_values if value is not None)
+        if judge_values
+        else None,
+        "judge_complete": bool(formal)
+        and all(arm.get("metrics", {}).get("judge_cost_complete") is True for arm in formal),
+        "judge_estimated_requests": sum(
+            integer(arm.get("metrics", {}).get("judge_cost_estimated_request_count"))
+            for arm in formal
+        ),
+        "judge_ignored_requests": sum(
+            integer(arm.get("metrics", {}).get("judge_cost_ignored_request_count"))
+            for arm in formal
+        ),
+        "account_delta_usd": sum(value for value in account_values if value is not None)
+        if account_values
+        else None,
+        "byok_delta_usd": sum(value for value in byok_values if value is not None)
+        if byok_values
+        else None,
+        "account_windows_complete": bool(formal)
+        and len(account_values) == len(formal)
+        and all(arm.get("account", {}).get("reconciliation_stable") is True for arm in formal),
+        "note": "unique arms only; shared common E0 is counted once; account actual includes Judge and is never added to theoretical cost",
+    }
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        default=Path("/home/codex/draco-runs/p0-p05-20260804-234508/campaign-plan.json"),
+    )
+    parser.add_argument("--status", type=Path)
+    parser.add_argument("--derived-plan", type=Path)
+    parser.add_argument("--price-registry", type=Path)
+    parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--allow-nonterminal", action="store_true")
+    parser.add_argument(
+        "--strict", action="store_true", help="return 2 when completion/evidence is partial"
+    )
+    return parser.parse_args(argv)
+
+
+def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    plan = load_json(args.plan)
+    if plan.get("schema") != PLAN_SCHEMA:
+        raise ReportError(f"campaign plan schema differs: {plan.get('schema')}")
+    plan_sha = canonical_sha256(plan)
+    run_root = Path(str(plan["paths"]["run_root"]))
+    status_path = args.status or run_root / (
+        "status.json" if args.allow_nonterminal else "terminal-status-input.json"
+    )
+    status = load_json(status_path)
+    if status.get("schema") != STATUS_SCHEMA:
+        raise ReportError(f"controller status schema differs: {status.get('schema')}")
+    if status.get("campaign_plan_sha256") != plan_sha:
+        raise ReportError("controller status is bound to another campaign plan")
+    phase = str(status.get("phase") or "unknown")
+    if phase not in TERMINAL_PHASES and not args.allow_nonterminal:
+        raise ReportError(f"controller is not terminal: {phase}")
+    if not args.allow_nonterminal:
+        terminal_freeze = (
+            status.get("terminal_freeze")
+            if isinstance(status.get("terminal_freeze"), Mapping)
+            else {}
+        )
+        if not validate_embedded_hash(status, "terminal_status_input_sha256", prefixed=False):
+            raise ReportError("terminal status input self-hash differs")
+        if (
+            terminal_freeze.get("schema") != TERMINAL_STATUS_INPUT_SCHEMA
+            or terminal_freeze.get("campaign_plan_sha256") != plan_sha
+            or terminal_freeze.get("run_id") != plan.get("run_id")
+            or terminal_freeze.get("phase") != phase
+        ):
+            raise ReportError("terminal status input freeze contract differs")
+    specs = expand_arms(plan)
+    canonical_derived_path = run_root / "derived-plan.json"
+    if (
+        args.derived_plan is not None
+        and args.derived_plan.resolve() != canonical_derived_path.resolve()
+    ):
+        raise ReportError(
+            "--derived-plan must name the frozen controller run_root/derived-plan.json"
+        )
+    verifier = load_frozen_controller_verifier(plan, plan_sha256=plan_sha)
+    derived = load_derived_evidence(plan, status, verifier=verifier)
+    state_map = status.get("arms") if isinstance(status.get("arms"), Mapping) else {}
+    registry_path = (
+        args.price_registry or Path(str(plan["paths"]["snapshot"])) / PRICE_REGISTRY_RELATIVE
+    )
+    registry_contract = (
+        plan.get("freeze", {}).get("model_registry")
+        if isinstance(plan.get("freeze"), Mapping)
+        else None
+    )
+    prices, price_metadata = load_prices(registry_path, registry_contract)
+    if price_metadata["model_count"] != 79:
+        raise ReportError(
+            f"frozen price registry must contain 79 models, got {price_metadata['model_count']}"
+        )
+    arms: dict[str, dict[str, Any]] = {}
+    for spec in specs:
+        raw_state = state_map.get(spec.arm_id)
+        if not isinstance(raw_state, Mapping):
+            raw_state = {"state": "missing_from_status"}
+        arms[spec.arm_id] = load_formal_arm(
+            spec,
+            raw_state,
+            prices,
+            plan,
+            derived,
+            verifier,
+        )
+    legacy = validate_legacy_evidence(plan)
+    experiments = build_experiment_inventory(plan, status, arms, derived, legacy)
+    arm_states = [str(arm.get("state") or "unknown") for arm in arms.values()]
+    terminal_arms = all(state in TERMINAL_ARM_STATES for state in arm_states)
+    succeeded = [arm for arm in arms.values() if arm.get("state") == "succeeded"]
+    formal_valid = all(arm.get("formal_evidence_valid") is True for arm in succeeded)
+    no_op_arms = [arm for arm in arms.values() if arm.get("state") == "no_op_deleted"]
+    no_op_valid = all(offline_noop_evidence_valid(arm, derived) for arm in no_op_arms)
+    declared_noop_valid = all(
+        experiments.get(str(item.get("id")), {}).get("state") == "no_op_deleted"
+        for item in plan.get("no_op_experiments") or []
+        if isinstance(item, Mapping)
+    )
+    legacy_valid = all(entry.get("valid") is True for entry in legacy.values())
+    failures = sum(state in {"failed", "blocked_prerequisite"} for state in arm_states)
+    report_status = (
+        "complete"
+        if phase == "succeeded"
+        and terminal_arms
+        and formal_valid
+        and no_op_valid
+        and declared_noop_valid
+        and legacy_valid
+        and derived.get("valid") is True
+        else "partial_or_failed"
+        if phase in TERMINAL_PHASES
+        else "nonterminal_snapshot"
+    )
+    output_root = args.output_root or Path(str(plan["paths"]["report_root"]))
+    completion = {
+        "status": report_status,
+        "controller_terminal": phase in TERMINAL_PHASES,
+        "all_arms_terminal": terminal_arms,
+        "formal_evidence_valid": formal_valid,
+        "no_op_evidence_valid": no_op_valid and declared_noop_valid,
+        "legacy_evidence_valid": legacy_valid,
+        "derived_evidence_valid": derived.get("valid") is True,
+        "planned_arm_count": len(arms),
+        "formal_succeeded_arm_count": len(succeeded),
+        "wire_no_op_arm_count": len(no_op_arms),
+        "failed_or_blocked_arm_count": failures,
+        "pending_or_running_arm_count": sum(
+            state not in TERMINAL_ARM_STATES for state in arm_states
+        ),
+    }
+    report: dict[str, Any] = {
+        "schema": REPORT_SCHEMA,
+        "generated_at": now_iso(),
+        "run_id": plan.get("run_id"),
+        "controller_phase": phase,
+        "campaign_plan_sha256": plan_sha,
+        "campaign_plan_file_sha256": file_sha256(args.plan),
+        "frozen_controller": {
+            "path": str(verifier.path),
+            "raw_sha256": verifier.raw_sha256,
+            "runtime_freeze_valid": True,
+            "derived_authenticated": verifier.derived is not None,
+            "derived_error": verifier.derived_error,
+        },
+        "terminal_status_input_file_sha256": file_sha256(status_path),
+        "terminal_status_input_sha256": status.get("terminal_status_input_sha256"),
+        "freeze": dict(plan.get("freeze") or {}),
+        "execution": dict(plan.get("execution") or {}),
+        "benchmark": dict(plan.get("benchmark") or {}),
+        "paths": {
+            "campaign_plan": str(args.plan),
+            "terminal_status_input": str(status_path),
+            "mutable_status": str(run_root / "status.json"),
+            "derived_plan": derived.get("path"),
+            "output_root": str(output_root),
+        },
+        "price_registry": price_metadata,
+        "cost_policy": {
+            "selected_generation": "final selected attempt only; actual USD then cache-aware token estimate; ignore and disclose no-money/no-token units",
+            "includes_live_analyzer": True,
+            "excludes_judge": True,
+            "excludes_failed_or_replaced_generation_retries": True,
+            "judge_separate": True,
+            "account_actual_separate": True,
+            "cache_price_fallback": "when frozen registry lacks a cache-specific rate, use normal input rate conservatively and label it",
+        },
+        "safety_gate": {
+            "independent_available": False,
+            "note": "DRACO mini does not expose an independent SafetyGate field",
+        },
+        "promotion": {
+            "mini_is_diagnostic_only": True,
+            "automatic_winner_promotion": False,
+        },
+        "completion": completion,
+        "derived": derived,
+        "legacy_evidence": legacy,
+        "arms": {arm_id: compact_arm_for_json(arm) for arm_id, arm in arms.items()},
+        "experiments": experiments,
+        "unique_arm_costs": compute_unique_costs(arms),
+    }
+    # Group Markdown is written first so the root report can link only to
+    # artifacts produced by this exact in-memory evidence snapshot.
+    group_artifacts: dict[str, Any] = {}
+    for experiment_id, experiment in experiments.items():
+        group_root = output_root / str(experiment["directory_name"])
+        destination = group_root / "EXPERIMENT_RESULTS.md"
+        json_group_destination = group_root / "EXPERIMENT_RESULTS.json"
+        content = build_group_markdown(experiment, plan, status, derived)
+        atomic_write(destination, content)
+        atomic_write_json(
+            json_group_destination,
+            build_group_json(
+                experiment,
+                plan=plan,
+                status=status,
+                derived=derived,
+                generated_at=report["generated_at"],
+            ),
+        )
+        group_artifacts[experiment_id] = {
+            "markdown": {
+                "path": str(destination),
+                "sha256": file_sha256(destination),
+                "size_bytes": destination.stat().st_size,
+            },
+            "json": {
+                "path": str(json_group_destination),
+                "sha256": file_sha256(json_group_destination),
+                "size_bytes": json_group_destination.stat().st_size,
+            },
+        }
+    report["group_report_artifacts"] = group_artifacts
+    json_destination = output_root / "EXPERIMENT_RESULTS.json"
+    markdown_destination = output_root / "EXPERIMENT_RESULTS.md"
+    atomic_write(markdown_destination, build_root_markdown(report))
+    report["root_artifacts"] = {
+        "markdown": {
+            "path": str(markdown_destination),
+            "sha256": file_sha256(markdown_destination),
+            "size_bytes": markdown_destination.stat().st_size,
+        },
+    }
+    report["report_sha256"] = "sha256:" + canonical_sha256(report)
+    atomic_write_json(json_destination, report)
+    exit_code = 2 if args.strict and report_status != "complete" else 0
+    return report, exit_code
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    report, exit_code = generate(args)
+    print(
+        json.dumps(
+            {
+                "status": report["completion"]["status"],
+                "run_id": report["run_id"],
+                "planned_arm_count": report["completion"]["planned_arm_count"],
+                "formal_succeeded_arm_count": report["completion"]["formal_succeeded_arm_count"],
+                "output_root": report["paths"]["output_root"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return exit_code
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ReportError as exc:
+        print(f"report error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
