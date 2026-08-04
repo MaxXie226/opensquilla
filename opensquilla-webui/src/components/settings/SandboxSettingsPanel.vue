@@ -264,56 +264,21 @@
 
     </template>
 
-    <Teleport to="body">
-      <div
-        v-if="sandboxSetupConfirmOpen"
-        class="sandbox-setup-overlay"
-        data-testid="sandbox-setup-confirm"
-        @click.self="cancelSandboxSetup"
-      >
-        <div
-          class="sandbox-setup-dialog"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="sandbox-setup-dialog-title"
-          aria-describedby="sandbox-setup-dialog-description"
-        >
-          <h4 id="sandbox-setup-dialog-title">{{ t('settings.sandbox.setup.title') }}</h4>
-          <p id="sandbox-setup-dialog-description">{{ t('settings.sandbox.setup.description') }}</p>
-          <p
-            v-if="sandboxSetupProgressMessage"
-            class="sandbox-setup-progress"
-            data-testid="sandbox-setup-progress"
-            role="status"
-          >
-            {{ sandboxSetupProgressMessage }}
-          </p>
-          <div class="sandbox-setup-dialog__actions">
-            <button type="button" class="btn" @click="cancelSandboxSetup">
-              {{ t('common.cancel') }}
-            </button>
-            <button
-              type="button"
-              class="btn btn--primary"
-              data-testid="sandbox-setup-continue"
-              :disabled="sandboxSetupPending"
-              @click="void continueSandboxSetup()"
-            >
-              {{ sandboxSetupPending
-                ? t('settings.sandbox.setup.configuring')
-                : t('settings.sandbox.setup.continue') }}
-            </button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
+    <SandboxSetupDialog
+      :open="sandboxSetupConfirmOpen"
+      :pending="sandboxSetupPending"
+      :outcome="sandboxSetupOutcome"
+      @cancel="cancelSandboxSetup"
+      @confirm="void continueSandboxSetup()"
+    />
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, defineComponent, h, onMounted, onUnmounted, ref } from 'vue'
+import { computed, defineComponent, h, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
+import SandboxSetupDialog from '@/components/sandbox/SandboxSetupDialog.vue'
 import { useSandboxSettings } from '@/composables/settings/useSandboxSettings'
 
 const { t } = useI18n()
@@ -353,8 +318,6 @@ const denyDomain = ref('')
 type SandboxView = 'overview' | 'files' | 'commands' | 'network' | 'runtimes'
 const activeView = ref<SandboxView>('overview')
 const sandboxSetupConfirmOpen = ref(false)
-const sandboxSetupElapsedSeconds = ref(0)
-let sandboxSetupProgressInterval: ReturnType<typeof setInterval> | null = null
 
 const sandboxSetupOutcomeMessage = computed(() => {
   if (sandboxSetupOutcome.value === 'cancelled') return t('settings.sandbox.setup.cancelled')
@@ -364,26 +327,6 @@ const sandboxSetupOutcomeMessage = computed(() => {
   }
   return ''
 })
-
-const sandboxSetupProgressMessage = computed(() => {
-  if (!sandboxSetupPending.value) return ''
-  if (sandboxSetupElapsedSeconds.value >= 15) return t('settings.sandbox.setup.takingLonger')
-  if (sandboxSetupElapsedSeconds.value >= 5) return t('settings.sandbox.setup.configuringProtection')
-  return t('settings.sandbox.setup.requestingApproval')
-})
-
-function startSandboxSetupProgress(): void {
-  clearSandboxSetupProgress()
-  sandboxSetupProgressInterval = setInterval(() => {
-    sandboxSetupElapsedSeconds.value += 1
-  }, 1_000)
-}
-
-function clearSandboxSetupProgress(): void {
-  if (sandboxSetupProgressInterval !== null) clearInterval(sandboxSetupProgressInterval)
-  sandboxSetupProgressInterval = null
-  sandboxSetupElapsedSeconds.value = 0
-}
 
 function selectSafeMode(): void {
   sandboxSetupOutcome.value = 'idle'
@@ -401,17 +344,12 @@ function cancelSandboxSetup(): void {
 
 async function continueSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
-  startSandboxSetupProgress()
-  try {
-    const ready = await ensureSandboxSetupForSafeMode()
+  const ready = await ensureSandboxSetupForSafeMode()
+  if (ready) {
     sandboxSetupConfirmOpen.value = false
-    if (ready) defaultRunMode.value = 'safe'
-  } finally {
-    clearSandboxSetupProgress()
+    defaultRunMode.value = 'safe'
   }
 }
-
-onUnmounted(clearSandboxSetupProgress)
 
 const backupQuotaGiB = computed({
   get: () => Number(((draft.value?.files.backupQuotaBytes ?? 3 * 1024 ** 3) / 1024 ** 3).toFixed(2)),
@@ -689,48 +627,6 @@ onMounted(() => void load())
   color: var(--text-muted);
   font-size: 0.76rem;
   line-height: 1.45;
-}
-
-.sandbox-setup-overlay {
-  position: fixed;
-  z-index: 1200;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 1.5rem;
-  background: var(--scrim);
-}
-
-.sandbox-setup-dialog {
-  width: min(420px, 100%);
-  padding: 1.25rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-modal);
-  background: var(--bg-surface);
-  box-shadow: 0 18px 48px color-mix(in srgb, var(--scrim) 26%, transparent);
-}
-
-.sandbox-setup-dialog h4,
-.sandbox-setup-dialog p {
-  margin: 0;
-}
-
-.sandbox-setup-progress {
-  min-height: 1.25rem;
-}
-
-.sandbox-setup-dialog p {
-  margin-top: 0.6rem;
-  color: var(--text-muted);
-  font-size: 0.82rem;
-  line-height: 1.55;
-}
-
-.sandbox-setup-dialog__actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.65rem;
-  margin-top: 1.15rem;
 }
 
 .sandbox-settings__state,
