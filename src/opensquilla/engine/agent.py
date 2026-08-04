@@ -9395,6 +9395,7 @@ class Agent:
                                     )
                                 }
                             )
+                            stable_live_recovery: CompactionOutcome | None = None
                             if durable_consumer_overflow_proven is True:
                                 durable_next_projection = (
                                     self._project_durable_consumer_final_request(
@@ -9408,17 +9409,165 @@ class Agent:
                                     or durable_next_projection is None
                                     or not durable_next_projection.fits
                                 ):
-                                    self._last_compaction_refusal_reason = (
-                                        "compaction_consumer_admission_failed"
+                                    stable_protected_start = (
+                                        overflow_outcome.protected_turn_start_index
+                                        if (
+                                            overflow_outcome
+                                            .protected_turn_start_index
+                                            is not None
+                                        )
+                                        else current_turn_start_index
                                     )
-                                    self._terminalize_pending_durable_compaction(
-                                        status="failed",
-                                        reason="compaction_consumer_admission_failed",
-                                    )
-                                    yield self._transition(AgentState.ERROR)
-                                    terminal_error = self._context_overflow_error()
-                                    yield terminal_error
-                                    break
+                                    if (
+                                        not overflow_outcome.ephemeral_only
+                                        and next_active_user_index is not None
+                                        and durable_next_projection is not None
+                                        and self._live_turn_compaction_boundary(
+                                            overflow_outcome.messages,
+                                            protected_turn_start_index=(
+                                                stable_protected_start
+                                            ),
+                                        )
+                                        is not None
+                                    ):
+                                        try:
+                                            stable_live_recovery = (
+                                                await self._recover_live_turn_request_overflow(
+                                                    overflow_outcome.messages,
+                                                    protected_turn_start_index=(
+                                                        stable_protected_start
+                                                    ),
+                                                    context_window_tokens=max(
+                                                        1,
+                                                        int(
+                                                            self._durable_consumer_window_tokens
+                                                            or self.config.context_window_tokens
+                                                        ),
+                                                    ),
+                                                    request_context_insert_index=(
+                                                        next_request_context_insert_index
+                                                    ),
+                                                    runtime_context_insert_index=(
+                                                        next_runtime_context_insert_index
+                                                    ),
+                                                    shared_compaction_config=(
+                                                        overflow_outcome
+                                                        .runtime_compaction_config
+                                                    ),
+                                                )
+                                            )
+                                        except asyncio.CancelledError:
+                                            raise
+                                        except Exception as exc:  # noqa: BLE001
+                                            logger.warning(
+                                                "compaction.stable_live_turn_projection_failed",
+                                                error_type=type(exc).__name__,
+                                                error=str(exc),
+                                            )
+                                    if stable_live_recovery is not None:
+                                        stable_live_request_index = (
+                                            stable_live_recovery
+                                            .request_context_insert_index
+                                            if (
+                                                stable_live_recovery
+                                                .request_context_insert_index
+                                                is not None
+                                            )
+                                            else next_request_context_insert_index
+                                        )
+                                        stable_live_runtime_index = (
+                                            stable_live_recovery
+                                            .runtime_context_insert_index
+                                            if (
+                                                stable_live_recovery
+                                                .runtime_context_insert_index
+                                                is not None
+                                            )
+                                            else next_runtime_context_insert_index
+                                        )
+                                        stable_live_request_messages = (
+                                            await self._provider_request_messages_async(
+                                                stable_live_recovery.messages,
+                                                request_context_message=(
+                                                    request_context_message
+                                                ),
+                                                request_context_insert_index=(
+                                                    stable_live_request_index
+                                                ),
+                                                runtime_context_message=(
+                                                    runtime_context_message
+                                                ),
+                                                runtime_context_insert_index=(
+                                                    stable_live_runtime_index
+                                                ),
+                                                turn_objective_message=(
+                                                    turn_objective_message
+                                                ),
+                                            )
+                                        )
+                                        stable_live_active_user_index = (
+                                            _active_user_message_index_for_request(
+                                                stable_live_request_messages,
+                                                current_user_text=(
+                                                    self._current_turn_message or ""
+                                                ),
+                                            )
+                                        )
+                                        stable_live_chat_cfg = (
+                                            call_chat_cfg.model_copy(
+                                                update={
+                                                    "active_user_message_index": (
+                                                        stable_live_active_user_index
+                                                    )
+                                                }
+                                            )
+                                        )
+                                        stable_live_projection = (
+                                            self._project_durable_consumer_final_request(
+                                                stable_live_request_messages,
+                                                tools=provider_tools_for_call,
+                                                active_config=(
+                                                    stable_live_chat_cfg
+                                                ),
+                                            )
+                                        )
+                                        if (
+                                            stable_live_active_user_index is not None
+                                            and stable_live_projection is not None
+                                            and stable_live_projection.fits
+                                        ):
+                                            next_request_messages = (
+                                                stable_live_request_messages
+                                            )
+                                            next_active_user_index = (
+                                                stable_live_active_user_index
+                                            )
+                                            next_chat_cfg = stable_live_chat_cfg
+                                            durable_next_projection = (
+                                                stable_live_projection
+                                            )
+                                        else:
+                                            stable_live_recovery = None
+                                    if (
+                                        next_active_user_index is None
+                                        or durable_next_projection is None
+                                        or not durable_next_projection.fits
+                                    ):
+                                        self._last_compaction_refusal_reason = (
+                                            "compaction_consumer_admission_failed"
+                                        )
+                                        self._terminalize_pending_durable_compaction(
+                                            status="failed",
+                                            reason=(
+                                                "compaction_consumer_admission_failed"
+                                            ),
+                                        )
+                                        yield self._transition(AgentState.ERROR)
+                                        terminal_error = (
+                                            self._context_overflow_error()
+                                        )
+                                        yield terminal_error
+                                        break
                                 if not overflow_outcome.ephemeral_only:
                                     pending_event = (
                                         self._pending_durable_compaction_event
@@ -9460,11 +9609,56 @@ class Agent:
                                 next_chat_cfg,
                             )
                             if (
+                                stable_live_recovery is not None
+                                and next_active_user_index is not None
+                                and next_projection is not None
+                                and next_projection.fits
+                            ):
+                                message_count_request_view = (
+                                    _MessageCountRequestView(
+                                        messages=stable_live_recovery.messages,
+                                        canonical_tail_start=len(turn_messages),
+                                        request_context_insert_index=(
+                                            stable_live_recovery
+                                            .request_context_insert_index
+                                            if (
+                                                stable_live_recovery
+                                                .request_context_insert_index
+                                                is not None
+                                            )
+                                            else next_request_context_insert_index
+                                        ),
+                                        runtime_context_insert_index=(
+                                            stable_live_recovery
+                                            .runtime_context_insert_index
+                                            if (
+                                                stable_live_recovery
+                                                .runtime_context_insert_index
+                                                is not None
+                                            )
+                                            else next_runtime_context_insert_index
+                                        ),
+                                        protected_turn_start_index=(
+                                            stable_live_recovery
+                                            .protected_turn_start_index
+                                            if (
+                                                stable_live_recovery
+                                                .protected_turn_start_index
+                                                is not None
+                                            )
+                                            else current_turn_start_index
+                                        ),
+                                    )
+                                )
+                                self._last_compaction_refusal_reason = None
+                                _call_attempt += 1
+                                continue
+                            if (
                                 next_active_user_index is None
                                 or next_projection is None
                                 or not next_projection.fits
                             ):
-                                routed_recovery: CompactionOutcome | None = None
+                                routed_recovery = stable_live_recovery
                                 routed_protected_start = (
                                     overflow_outcome.protected_turn_start_index
                                     if overflow_outcome.protected_turn_start_index
@@ -9472,7 +9666,8 @@ class Agent:
                                     else current_turn_start_index
                                 )
                                 if (
-                                    durable_consumer_overflow_proven is True
+                                    routed_recovery is None
+                                    and durable_consumer_overflow_proven is True
                                     and not overflow_outcome.ephemeral_only
                                     and next_active_user_index is not None
                                     and next_projection is not None
@@ -9608,17 +9803,6 @@ class Agent:
                                             )
                                         )
                                         self._last_compaction_refusal_reason = None
-                                        yield WarningEvent(
-                                            code=(
-                                                "context_auto_compaction_retry"
-                                            ),
-                                            message=(
-                                                "Stable context compacted and "
-                                                "the routed request was reduced "
-                                                "without changing durable history; "
-                                                "retrying the provider request."
-                                            ),
-                                        )
                                         _call_attempt += 1
                                         continue
                                 self._last_compaction_refusal_reason = (
@@ -9665,12 +9849,8 @@ class Agent:
                                 ):
                                     current_turn_start_index = (
                                         overflow_outcome.protected_turn_start_index
-                                    )
+                                )
                                 message_count_request_view = None
-                            yield WarningEvent(
-                                code="context_auto_compaction_retry",
-                                message="Context compacted; retrying the provider request.",
-                            )
                             _call_attempt += 1
                             continue
                         should_retry = _fallback.should_retry(kind, _retry_attempt)

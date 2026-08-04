@@ -137,16 +137,12 @@ describe('useChatCompaction replay compatibility', () => {
     }
   })
 
-  it('keeps legacy compacted-only terminal payloads replayable', () => {
+  it('keeps unknown replayed legacy terminals invisible until an owner is known', () => {
     const h = createHarness()
     try {
-      h.api.showCompactionToast({ compacted: false }, { replayed: true })
+      expect(h.api.showCompactionToast({ compacted: false }, { replayed: true })).toBe(false)
 
-      expect(h.api.compactStatus.value).toMatchObject({
-        visible: true,
-        status: 'skipped',
-        isBusy: false,
-      })
+      expect(h.api.compactStatus.value.visible).toBe(false)
     } finally {
       h.api.cleanup()
       h.stop()
@@ -271,6 +267,107 @@ describe('useChatCompaction replay compatibility', () => {
         isBusy: false,
       })
       expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it('keeps an activity compaction on the activity surface through terminal delivery', () => {
+    const h = createHarness()
+    try {
+      expect(h.api.showCompactionToast({
+        status: 'started',
+        source: 'automatic',
+        compaction_id: 'cmp-activity',
+        sequence: 1,
+      }, { placement: 'activity' })).toBe('activity')
+
+      expect(h.api.showCompactionToast({
+        status: 'completed',
+        source: 'automatic',
+        compaction_id: 'cmp-activity',
+        sequence: 2,
+        user_visible: false,
+      }, { placement: 'standalone' })).toBe('activity')
+      expect(h.api.compactStatus.value.visible).toBe(false)
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it('settles a standalone compaction in place when streaming starts meanwhile', () => {
+    const h = createHarness()
+    try {
+      expect(h.api.showCompactionToast({
+        status: 'started',
+        source: 'automatic',
+        compaction_id: 'cmp-standalone',
+        sequence: 1,
+      }, { placement: 'standalone' })).toBe('standalone')
+
+      expect(h.api.showCompactionToast({
+        status: 'completed',
+        source: 'automatic',
+        compaction_id: 'cmp-standalone',
+        sequence: 2,
+        user_visible: false,
+      }, { placement: 'activity' })).toBe('standalone')
+      expect(h.api.compactStatus.value).toMatchObject({
+        visible: true,
+        status: 'completed',
+        isBusy: false,
+        compactionId: 'cmp-standalone',
+      })
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it('does not create feedback for an untracked hidden terminal', () => {
+    const h = createHarness()
+    try {
+      expect(h.api.showCompactionToast({
+        status: 'completed',
+        source: 'automatic',
+        compaction_id: 'cmp-hidden',
+        sequence: 1,
+        user_visible: false,
+      }, { placement: 'standalone' })).toBe(false)
+
+      expect(h.api.getCompactionPlacement('cmp-hidden')).toBeNull()
+      expect(h.api.compactStatus.value.visible).toBe(false)
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it('promotes a provisional replay owner on an authoritative duplicate terminal', () => {
+    const h = createHarness()
+    try {
+      const terminal = {
+        status: 'completed',
+        source: 'automatic',
+        compaction_id: 'cmp-replay-owner',
+        sequence: 2,
+      }
+
+      expect(h.api.showCompactionToast(terminal, {
+        replayed: true,
+        placement: 'standalone',
+      })).toBe(false)
+      expect(h.api.getCompactionPlacement('cmp-replay-owner')).toBe('standalone')
+      expect(h.api.compactStatus.value.visible).toBe(false)
+
+      expect(h.api.showCompactionToast(terminal, {
+        authoritativeLive: true,
+        placement: 'activity',
+      })).toBe('activity')
+      expect(h.api.getCompactionPlacement('cmp-replay-owner')).toBe('activity')
+      expect(h.api.compactStatus.value.visible).toBe(false)
     } finally {
       h.api.cleanup()
       h.stop()

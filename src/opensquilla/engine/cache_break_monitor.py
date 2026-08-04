@@ -382,7 +382,24 @@ def notify_compaction(
         "source": str(payload.pop("source", "automatic") or "automatic"),
         **payload,
     }
+    # TaskRuntime creates one turn context around the shared runner.  Reuse
+    # that identity here so every compaction lifecycle frame can be correlated
+    # with the live assistant activity without widening every compaction call.
+    from opensquilla.session.turn_context import (
+        append_current_turn_activity_marker,
+        current_turn_context,
+    )
+
+    turn_context = current_turn_context()
+    if turn_context is not None:
+        turn_id = str(turn_context.get("turn_id") or turn_context.get("task_id") or "").strip()
+        task_id = str(turn_context.get("task_id") or turn_id).strip()
+        if turn_id:
+            event_payload.setdefault("turn_id", turn_id)
+        if task_id:
+            event_payload.setdefault("task_id", task_id)
     status = str(event_payload["status"]).lower()
+    source = str(event_payload["source"]).lower()
     compaction_id = str(
         event_payload.get("compaction_id")
         or event_payload.get("compactionId")
@@ -447,6 +464,22 @@ def notify_compaction(
                 current = None
             if heartbeat_task is not None and heartbeat_task is not current:
                 heartbeat_task.cancel()
+
+    if (
+        compaction_id
+        and source == "automatic"
+        and status == "completed"
+        and event_payload.get("applied") is True
+        and str(event_payload.get("durability") or "").lower() == "durable"
+    ):
+        append_current_turn_activity_marker(
+            {
+                "kind": "context_compaction",
+                "id": compaction_id,
+                "status": "completed",
+                "at": time.time_ns() // 1_000_000,
+            }
+        )
 
     if status == "completed":
         default_cache_break_monitor.notify_compaction(session_key)

@@ -519,6 +519,20 @@ export interface ChatHistoryMessage {
   output_tokens?: number
 }
 
+export interface ChatCompactionSummary {
+  id?: string | number | null
+  compaction_id?: string | null
+  compaction_index?: number | null
+  trigger_reason?: string | null
+  summary_text?: string
+  summary_format?: string
+  coverage_status?: string
+  removed_count?: number | null
+  kept_count?: number | null
+  covered_through_id?: number | null
+  created_at?: string | number | null
+}
+
 export interface ChatHistoryResponse {
   messages?: ChatHistoryMessage[]
   has_more?: boolean
@@ -535,6 +549,8 @@ export interface ChatHistoryResponse {
   canonicalComplete?: boolean
   limit?: number
   returned?: number
+  compaction_summaries?: ChatCompactionSummary[]
+  compactionSummaries?: ChatCompactionSummary[]
   turn_outcomes?: ChatHistoryTurnOutcome[]
 }
 
@@ -602,6 +618,10 @@ export interface CompactionPayload extends SessionEventPayload {
   refused?: boolean
   safe_to_send?: boolean
   safeToSend?: boolean
+  applied?: boolean
+  durability?: 'durable' | 'request_scoped' | (string & {})
+  user_visible?: boolean
+  userVisible?: boolean
 }
 
 /* ── MetaSkill run events ──────────────────────────────────────────────

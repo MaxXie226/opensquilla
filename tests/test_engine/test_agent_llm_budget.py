@@ -5783,6 +5783,169 @@ async def test_durable_and_live_turn_recovery_share_one_compaction_call_budget(
 
 
 @pytest.mark.asyncio
+async def test_stable_consumer_retries_with_completed_live_round_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _StableToolLoopBudgetProvider:
+        provider_name = "fake"
+
+        def __init__(self, max_message_chars: int) -> None:
+            self.max_message_chars = max_message_chars
+            self.calls: list[list[Message]] = []
+            self.tool_rounds_emitted = 0
+
+        def project_final_request(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+            *,
+            message_limit: int | None = None,
+        ) -> ProviderFinalRequestProjection:
+            del tools, config
+            estimated_chars = session_payload_chars(messages)
+            fits_message_count = (
+                None if message_limit is None else len(messages) <= message_limit
+            )
+            fits = (
+                estimated_chars <= self.max_message_chars
+                and fits_message_count is not False
+            )
+            proof = {
+                "fits": fits,
+                "estimated_chars": estimated_chars,
+                "fallback_reason": (
+                    None if fits else "provider_request_budget_exhausted"
+                ),
+            }
+            return ProviderFinalRequestProjection(
+                payload={"messages": [message.model_dump() for message in messages]},
+                proof=proof,
+                wire_message_count=len(messages),
+                message_limit=message_limit,
+                fits_message_count=fits_message_count,
+                fits=fits,
+            )
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            self.calls.append(messages)
+            projection = self.project_final_request(messages, tools, config)
+            return self._stream(projection)
+
+        async def _stream(
+            self,
+            projection: ProviderFinalRequestProjection,
+        ) -> AsyncIterator[Any]:
+            if not projection.fits:
+                yield ProviderError(
+                    message=json.dumps(projection.proof),
+                    code="provider_request_budget_exhausted",
+                )
+                return
+            if self.tool_rounds_emitted < 3:
+                self.tool_rounds_emitted += 1
+                tool_id = f"live-round-{self.tool_rounds_emitted}"
+                yield ProviderToolUseStart(
+                    tool_use_id=tool_id,
+                    tool_name="read_file",
+                )
+                yield ProviderToolUseEnd(
+                    tool_use_id=tool_id,
+                    tool_name="read_file",
+                    arguments={"path": f"part-{self.tool_rounds_emitted}.txt"},
+                )
+                yield ProviderDone(
+                    stop_reason="tool_calls",
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+                return
+            yield ProviderText(text="finished after live-turn recovery")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    compact_requests: list[Any] = []
+
+    async def _compact(request: Any) -> CompactionResult:
+        compact_requests.append(request)
+        if request.forced_prefix_cut is not None:
+            cut = int(request.forced_prefix_cut)
+            summary = "completed live tool round"
+        else:
+            protected = int(request.config.protected_recent_messages or 0)
+            cut = max(0, len(request.entries) - protected)
+            summary = "older durable history"
+        return CompactionResult(
+            summary=summary,
+            kept_entries=request.entries[cut:],
+            removed_count=cut,
+            kept_start_index=cut,
+            chunks_processed=1,
+            tokens_before=10_001,
+            tokens_after=100,
+        )
+
+    async def _tool(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="result " + ("x" * 6_000),
+        )
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
+    provider = _StableToolLoopBudgetProvider(max_message_chars=17_000)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            context_window_tokens=10_000,
+            context_overflow_threshold=0.85,
+            max_overflow_retries=1,
+            max_provider_retries=0,
+            flush_enabled=False,
+        ),
+        tool_handler=_tool,
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old question " + ("q" * 2_000)),
+            Message(role="assistant", content="old answer " + ("a" * 2_000)),
+        ]
+    )
+
+    events = [event async for event in agent.run_turn("finish the active task")]
+
+    assert any(
+        isinstance(event, DoneEvent)
+        and event.text == "finished after live-turn recovery"
+        for event in events
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(
+        isinstance(event, WarningEvent)
+        and event.code == "context_auto_compaction_retry"
+        for event in events
+    )
+    assert len([event for event in events if isinstance(event, CompactionEvent)]) == 1
+    assert len(compact_requests) == 2
+    assert compact_requests[0].forced_prefix_cut is None
+    assert compact_requests[1].forced_prefix_cut is not None
+    history = agent.history_snapshot()
+    assert sum(
+        1
+        for message in history
+        if isinstance(message.content, list)
+        and any(isinstance(block, ContentBlockToolResult) for block in message.content)
+    ) == 3
+
+
+@pytest.mark.asyncio
 async def test_inline_overflow_rejects_compactor_cut_through_protected_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

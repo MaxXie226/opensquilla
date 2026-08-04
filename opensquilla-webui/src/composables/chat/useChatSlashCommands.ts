@@ -69,7 +69,11 @@ export interface UseChatSlashCommandsOptions {
   newSession: () => void
   resetCurrentSession: () => void
   setCompactInFlight: (active: boolean, key?: string) => void
-  showCompactStatus: (status: string, message: string, options?: { tone?: string; detail?: string; dismissMs?: number }) => void
+  showCompactStatus: (
+    status: string,
+    message: string,
+    options?: { tone?: string; detail?: string; dismissMs?: number; source?: string },
+  ) => void
   showCompactionToast: (payload: Record<string, unknown>, meta?: Record<string, unknown>) => void
   // Surface a short, client-side notice (e.g. the meta-skill list). No provider call.
   notify: (message: string) => void
@@ -389,7 +393,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case '/compact': {
         const compactKey = options.sessionKey.value
         options.setCompactInFlight(true, compactKey)
-        options.showCompactStatus('started', i18n.global.t('chat.compact.compacting'), { tone: 'info' })
+        options.showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
+          tone: 'info',
+          source: 'manual',
+        })
         options.rpc.call<Record<string, unknown>>('sessions.contextCompact', {
           key: compactKey,
           wait: false,

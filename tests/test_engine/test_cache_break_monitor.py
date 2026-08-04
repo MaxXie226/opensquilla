@@ -8,6 +8,7 @@ import pytest
 from opensquilla.engine import cache_break_monitor
 from opensquilla.engine.cache_break_monitor import CacheBreakMonitor
 from opensquilla.provider import ChatConfig, Message, ToolDefinition, ToolInputSchema
+from opensquilla.session.turn_context import current_turn_context, turn_context_scope
 
 
 def _tool(name: str) -> ToolDefinition:
@@ -168,6 +169,82 @@ def test_notify_compaction_notifies_registered_listeners() -> None:
             },
         )
     ]
+
+
+def test_notify_compaction_records_durable_automatic_activity_on_current_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    events: list[dict] = []
+    remove = cache_break_monitor.add_compaction_listener(
+        lambda _session_key, payload: events.append(payload)
+    )
+    try:
+        with turn_context_scope({"turn_id": "turn-compaction-activity"}):
+            started = cache_break_monitor.notify_compaction(
+                "agent:main:activity",
+                status="started",
+                source="automatic",
+                compaction_id="compaction-activity-1",
+                applied=False,
+                durability="none",
+            )
+            completed = cache_break_monitor.notify_compaction(
+                "agent:main:activity",
+                status="completed",
+                source="automatic",
+                compaction_id="compaction-activity-1",
+                applied=True,
+                durability="durable",
+            )
+            context = current_turn_context()
+    finally:
+        remove()
+
+    assert started is not None
+    assert completed is not None
+    assert started["turn_id"] == "turn-compaction-activity"
+    assert started["task_id"] == "turn-compaction-activity"
+    assert completed["turn_id"] == "turn-compaction-activity"
+    assert completed["task_id"] == "turn-compaction-activity"
+    assert context is not None
+    assert len(context["activity_markers"]) == 1
+    marker = context["activity_markers"][0]
+    assert marker == {
+        "kind": "context_compaction",
+        "id": "compaction-activity-1",
+        "status": "completed",
+        "at": marker["at"],
+    }
+    assert isinstance(marker["at"], int)
+    assert [event["sequence"] for event in events] == [1, 2]
+    assert current_turn_context() is None
+
+
+def test_notify_compaction_does_not_record_non_durable_or_manual_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+
+    with turn_context_scope({"turn_id": "turn-compaction-filter"}):
+        cache_break_monitor.notify_compaction(
+            "agent:main:activity-filter",
+            status="completed",
+            source="automatic",
+            compaction_id="compaction-request-scoped",
+            applied=True,
+            durability="request_scoped",
+        )
+        cache_break_monitor.notify_compaction(
+            "agent:main:activity-filter",
+            status="completed",
+            source="manual",
+            compaction_id="compaction-manual",
+            applied=True,
+            durability="durable",
+        )
+
+        assert current_turn_context() == {"turn_id": "turn-compaction-filter"}
 
 
 def test_notify_compaction_resets_cache_only_after_completed_status(

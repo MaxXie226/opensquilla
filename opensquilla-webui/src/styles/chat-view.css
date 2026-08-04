@@ -395,171 +395,54 @@
   line-height: 1.5;
 }
 
-/* Compaction is lightweight background maintenance, so its surface follows the
-   compact recovery pill rather than competing with the conversation as a card. */
-.chat-compact-status {
-  --compact-tone: var(--info);
-  position: relative;
+/* A session-level maintenance boundary: deliberately aligned with transcript
+   content and styled below task activity, never as a floating success card. */
+.chat-compaction-event {
   display: flex;
   align-items: center;
-  flex-shrink: 0;
-  gap: var(--sp-2);
-  width: fit-content;
-  max-width: min(620px, calc(100% - var(--sp-8)));
-  min-height: 36px;
-  margin: var(--sp-2) auto;
-  padding: 7px var(--sp-3) 8px;
-  overflow: hidden;
-  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  box-shadow: var(--shadow-xs);
+  gap: 0.625rem;
+  width: var(--chat-col);
+  max-width: calc(100% - 48px);
+  min-height: 1.75rem;
+  margin: 0.125rem auto 0.625rem;
+  padding: 0.25rem 0.125rem;
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
 }
 
-.chat-compact-status--ok {
-  --compact-tone: var(--ok);
-  background: color-mix(in srgb, var(--ok) 5%, var(--bg-elevated));
-  border-color: color-mix(in srgb, var(--ok) 22%, var(--border));
-}
-
-.chat-compact-status--warn {
-  --compact-tone: var(--warn);
-  background: color-mix(in srgb, var(--warn) 5%, var(--bg-elevated));
-}
-
-.chat-compact-status--err {
-  --compact-tone: var(--danger);
-  background: color-mix(in srgb, var(--danger) 5%, var(--bg-elevated));
-}
-
-.chat-compact-status__indicator {
-  display: inline-grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
+.chat-compaction-event__marker {
+  width: 0.5rem;
+  height: 0.5rem;
   flex: 0 0 auto;
-  color: var(--compact-tone);
-  background: color-mix(in srgb, var(--compact-tone) 10%, var(--bg-surface));
+  margin: 0 0.1875rem;
+  border: 1px solid currentColor;
   border-radius: var(--radius-full);
 }
 
-.chat-compact-status__indicator--busy {
-  background: color-mix(in srgb, var(--compact-tone) 8%, var(--bg-surface));
+.chat-compaction-event--running .chat-compaction-event__marker {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  animation: compactionEventSpin 0.9s linear infinite;
 }
 
-.chat-compact-status__dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 12%, transparent);
+@keyframes compactionEventSpin {
+  to { transform: rotate(360deg); }
 }
 
-.chat-compact-status__copy {
-  display: flex;
-  align-items: baseline;
-  flex: 1 1 auto;
-  flex-wrap: wrap;
-  gap: 0 var(--sp-2);
-  min-width: 0;
+.chat-compaction-event--failed {
+  color: var(--danger);
 }
 
-.chat-compact-status__title {
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  color: var(--text);
-}
-
-.chat-compact-status__elapsed {
-  flex: 0 0 auto;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-}
-
-.chat-compact-status__detail {
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
-
-.chat-compact-status__detail::before,
-.chat-compact-status__legend::before {
-  content: "·";
-  margin-right: var(--sp-2);
-  color: var(--text-dim);
-}
-
-.chat-compact-status__gauge {
-  position: absolute;
-  right: var(--sp-3);
-  bottom: 0;
-  left: var(--sp-3);
-  height: 2px;
-  border-radius: var(--radius-full);
-  overflow: hidden;
-}
-
-.chat-compact-status__gauge-fill {
-  display: block;
-  height: 100%;
-  width: 100%;
-  border-radius: var(--radius-full);
-  background: var(--compact-tone);
-  transform: translateX(0);
-  transition: width var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
-}
-
-/* A thin light sweep conveys unmeasured work without introducing a second,
-   card-sized progress surface or fabricating a percentage. */
-.chat-compact-status__gauge-fill--indeterminate {
-  width: 42%;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    color-mix(in srgb, var(--compact-tone) 35%, transparent) 22%,
-    var(--compact-tone) 50%,
-    color-mix(in srgb, var(--compact-tone) 35%, transparent) 78%,
-    transparent
-  );
-  animation: compactGaugeIndeterminate 1.35s linear infinite;
-}
-
-@keyframes compactGaugeIndeterminate {
-  from { transform: translateX(-110%); }
-  to { transform: translateX(240%); }
-}
-
-.chat-compact-status__gauge-fill--done {
-  width: 100%;
-  background: color-mix(in srgb, var(--ok) 72%, transparent);
-  transform: translateX(0);
-  transition: none;
-}
-
-.chat-compact-status__legend {
-  display: inline-flex;
-  gap: var(--sp-1);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
+.chat-compaction-event__detail {
+  margin-left: auto;
+  color: color-mix(in srgb, var(--text) 46%, transparent);
+  font-size: 0.75rem;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .chat-compact-status__gauge-fill--indeterminate {
+  .chat-compaction-event--running .chat-compaction-event__marker {
     animation: none;
-  }
-
-  .chat-compact-status__gauge-fill--indeterminate {
-    width: 100%;
-    background: color-mix(in srgb, var(--compact-tone) 42%, transparent);
-    transform: translateX(0);
-  }
-
-  .chat-compact-status__gauge-fill {
-    transition: none;
   }
 }
 
