@@ -27,6 +27,7 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 from opensquilla import __version__
 from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
+    ConfigParseError,
     backup_and_write_migrated_config,
     migrate_config_payload,
 )
@@ -3072,7 +3073,10 @@ class GatewayConfig(BaseSettings):
 
         target = Path(path)
         with open(native_io_path(target), "rb") as f:
-            data = tomllib.load(f)
+            try:
+                data = tomllib.load(f)
+            except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+                raise ConfigParseError(target, exc) from exc
         migration = migrate_config_payload(data)
         cfg = cls(**migration.payload)
         cfg._mark_env_absorbed_secrets(data)
@@ -3111,7 +3115,10 @@ class GatewayConfig(BaseSettings):
             native_path = native_io_path(path)
             if native_path.is_file():
                 with open(native_path, "rb") as f:
-                    data = tomllib.load(f)
+                    try:
+                        data = tomllib.load(f)
+                    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+                        raise ConfigParseError(path, exc) from exc
                 migration = migrate_config_payload(data, emit_diagnostics=not read_only)
                 cfg = cls(**migration.payload)
                 cls._apply_profile_path_overrides(cfg, path)
