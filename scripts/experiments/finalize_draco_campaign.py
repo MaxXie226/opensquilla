@@ -76,7 +76,7 @@ LEGACY_MANAGED_V3_SOURCE_IDENTITY = {
 JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
-FINALIZER_VERSION = 8
+FINALIZER_VERSION = 9
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -84,15 +84,15 @@ FORMAL_POLL_INTERVAL_SECONDS = 15
 FORMAL_MINIMUM_SETTLEMENT_SECONDS = 180
 FORMAL_MINIMUM_STABLE_TAIL_SECONDS = 75
 FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256 = (
-    "bd2e6632ad09e84619cf497eb266c45faaa8716eff4d870ba930c3f4eae4b473"
+    "9f76c7f96e5cb22c05b615f69b71ca633965e5039fbec9673f0a5edf9b45078a"
 )
 # Backwards-compatible public name used by historical fixtures and callers.
 FORMAL_G1_SOURCE_REGISTRY_SNAPSHOT_SHA256 = (
     FORMAL_G1_LEGACY_SOURCE_REGISTRY_SNAPSHOT_SHA256
 )
-FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-30.2"
+FORMAL_G1_FULL_REGISTRY_SNAPSHOT_VERSION = "curated-openrouter-step2-2026-07-31.1"
 FORMAL_G1_FULL_REGISTRY_SNAPSHOT_SHA256 = (
-    "8680e55997e22a029c8708abd77a4ede638a32d92638af44c45a61b8fe689eae"
+    "b51b64d7880472e47f8a5f954b1a76eaee440d6cd59d28f9dc2579f876bac1ea"
 )
 # Serving aliases are part of the authenticated historical/full registry
 # identities above. Keep this projection immutable so finalization never
@@ -188,7 +188,7 @@ FORMAL_TASK_ANALYZER_EXECUTION_POLICY = {
     "max_retries": 3,
 }
 FORMAL_G1_PROPOSER_COUNT_MAX = 5
-FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT = 80
+FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT = 79
 FORMAL_TASK_CONCURRENCY = 5
 FORMAL_JUDGE_CONCURRENCY = 6
 FORMAL_TASK_TIMEOUT_SECONDS = Decimal("10800")
@@ -2695,6 +2695,29 @@ def validate_formal_campaign_contracts(
             raise FinalizationError(
                 "G1 formal contract must use router_dynamic with a resolved frozen candidate pool"
             )
+        replay_contract = registry.get("task_analysis_execution")
+        if replay_contract is not None:
+            from opensquilla.provider.ranking_router import (
+                frozen_task_analysis_contract_reasons,
+            )
+
+            benchmark = policy.profile.get("benchmark_input")
+            task_ids = (
+                benchmark.get("task_ids") if isinstance(benchmark, Mapping) else None
+            )
+            replay_reasons = frozen_task_analysis_contract_reasons(
+                replay_contract,
+                expected_task_ids=(
+                    [str(task_id) for task_id in task_ids]
+                    if isinstance(task_ids, list)
+                    else []
+                ),
+            )
+            if replay_reasons:
+                raise FinalizationError(
+                    "G1 frozen task analysis contract is invalid: "
+                    + ",".join(replay_reasons)
+                )
     for group, contract in contracts.items():
         gateway = contract.get("gateway_execution")
         ensemble = gateway.get("llm_ensemble") if isinstance(gateway, Mapping) else None
@@ -6862,6 +6885,15 @@ def g1_registry_plan_reasons(
         )
     except Exception:  # noqa: BLE001 - malformed evidence must fail closed
         reasons.append("g1_frozen_ranker_replay_failed")
+    replay_contract = contract.get("task_analysis_execution")
+    if replay_contract is not None:
+        from opensquilla.provider.ranking_router import (
+            frozen_task_analysis_plan_reasons,
+        )
+
+        reasons.extend(
+            frozen_task_analysis_plan_reasons(plan, replay_contract)
+        )
     return list(dict.fromkeys(reasons)), proposer_models, aggregator_model
 
 
@@ -7793,6 +7825,13 @@ def validate_g1_paid_attempt_plan_history(
         raise FinalizationError("G1 paid-attempt audit lacks an authenticated analyzer policy")
     analyzer_provider = str(analyzer_policy["provider"])
     analyzer_model = str(analyzer_policy["model"])
+    replay_contract = registry.get("task_analysis_execution")
+    if replay_contract is not None:
+        from opensquilla.provider.ranking_router import (
+            frozen_task_analysis_plan_reasons,
+        )
+    else:
+        frozen_task_analysis_plan_reasons = None
     violations: list[dict[str, Any]] = []
     selected_only_reasons = {
         "ambiguous_g1_selected_generation_attempt",
@@ -7986,56 +8025,82 @@ def validate_g1_paid_attempt_plan_history(
             ):
                 analyzer_occurrences.append((ordinal, unit))
         analyzer_reasons: list[str] = []
-        if not analyzer_occurrences:
-            analyzer_reasons.append("missing_g1_task_analyzer_request")
+        if replay_contract is not None:
+            if analyzer_occurrences:
+                analyzer_reasons.append(
+                    "unexpected_g1_task_analyzer_request_in_frozen_replay"
+                )
+            first_plan = ordered_attempts[0].get("selection_plan")
+            assert frozen_task_analysis_plan_reasons is not None
+            source_row = task_history[-1].row
+            analyzer_reasons.extend(
+                frozen_task_analysis_plan_reasons(
+                    first_plan,
+                    replay_contract,
+                    expected_task_id=task_key[1],
+                    expected_task_input_sha256=str(
+                        source_row.get("task_input_sha256") or ""
+                    ),
+                    expected_prompt_sha256=str(
+                        source_row.get("prompt_sha256") or ""
+                    ),
+                )
+            )
         else:
-            if any(ordinal != 1 for ordinal, _ in analyzer_occurrences):
-                analyzer_reasons.append("g1_task_analyzer_not_in_first_attempt")
-            analyzer_attempts = [
-                nonnegative_int(analyzer.get("attempt")) for _, analyzer in analyzer_occurrences
-            ]
-            if analyzer_attempts != list(range(1, len(analyzer_occurrences) + 1)):
-                analyzer_reasons.append("invalid_g1_task_analyzer_retry_sequence")
-            if len(analyzer_occurrences) > (int(analyzer_policy["max_retries"]) + 1):
-                analyzer_reasons.append("g1_task_analyzer_retry_budget_exceeded")
-            physical_attempt_ids = [
-                str(analyzer.get("physical_attempt_id") or "")
-                for _, analyzer in analyzer_occurrences
-            ]
-            if any(not HEX32.fullmatch(value) for value in physical_attempt_ids) or len(
-                physical_attempt_ids
-            ) != len(set(physical_attempt_ids)):
-                analyzer_reasons.append("invalid_g1_task_analyzer_physical_attempt_identity")
-            requested_routes = {
-                (
-                    str(analyzer.get("requested_provider") or "").strip().casefold(),
-                    str(analyzer.get("requested_model") or "").strip(),
-                )
-                for _, analyzer in analyzer_occurrences
-            }
-            if (
-                len(requested_routes) != 1
-                or next(iter(requested_routes))[0] != analyzer_provider
-                or not _formal_openrouter_models_equivalent(
-                    next(iter(requested_routes))[1],
-                    analyzer_model,
-                )
-            ):
-                analyzer_reasons.append("wrong_g1_task_analyzer_route")
-            for _, analyzer in analyzer_occurrences:
-                if not _is_unknown_task_analyzer_placeholder(
-                    analyzer,
-                    expected_provider=analyzer_provider,
-                    expected_model=analyzer_model,
-                ) and (
-                    str(analyzer.get("provider") or "").strip().casefold() != analyzer_provider
+            if not analyzer_occurrences:
+                analyzer_reasons.append("missing_g1_task_analyzer_request")
+            else:
+                if any(ordinal != 1 for ordinal, _ in analyzer_occurrences):
+                    analyzer_reasons.append("g1_task_analyzer_not_in_first_attempt")
+                analyzer_attempts = [
+                    nonnegative_int(analyzer.get("attempt"))
+                    for _, analyzer in analyzer_occurrences
+                ]
+                if analyzer_attempts != list(range(1, len(analyzer_occurrences) + 1)):
+                    analyzer_reasons.append("invalid_g1_task_analyzer_retry_sequence")
+                if len(analyzer_occurrences) > (int(analyzer_policy["max_retries"]) + 1):
+                    analyzer_reasons.append("g1_task_analyzer_retry_budget_exceeded")
+                physical_attempt_ids = [
+                    str(analyzer.get("physical_attempt_id") or "")
+                    for _, analyzer in analyzer_occurrences
+                ]
+                if any(not HEX32.fullmatch(value) for value in physical_attempt_ids) or len(
+                    physical_attempt_ids
+                ) != len(set(physical_attempt_ids)):
+                    analyzer_reasons.append(
+                        "invalid_g1_task_analyzer_physical_attempt_identity"
+                    )
+                requested_routes = {
+                    (
+                        str(analyzer.get("requested_provider") or "").strip().casefold(),
+                        str(analyzer.get("requested_model") or "").strip(),
+                    )
+                    for _, analyzer in analyzer_occurrences
+                }
+                if (
+                    len(requested_routes) != 1
+                    or next(iter(requested_routes))[0] != analyzer_provider
                     or not _formal_openrouter_models_equivalent(
-                        analyzer.get("model"),
+                        next(iter(requested_routes))[1],
                         analyzer_model,
                     )
                 ):
                     analyzer_reasons.append("wrong_g1_task_analyzer_route")
-                    break
+                for _, analyzer in analyzer_occurrences:
+                    if not _is_unknown_task_analyzer_placeholder(
+                        analyzer,
+                        expected_provider=analyzer_provider,
+                        expected_model=analyzer_model,
+                    ) and (
+                        str(analyzer.get("provider") or "").strip().casefold()
+                        != analyzer_provider
+                        or not _formal_openrouter_models_equivalent(
+                            analyzer.get("model"),
+                            analyzer_model,
+                        )
+                    ):
+                        analyzer_reasons.append("wrong_g1_task_analyzer_route")
+                        break
         if analyzer_reasons:
             violations.append(
                 task_history[-1].reference
@@ -8093,8 +8158,11 @@ def g1_provider_lifecycle_analyzer_reasons(
     *,
     allow_unknown_placeholder: bool = False,
     analyzer_policy: Mapping[str, Any] | None = None,
+    replay_contract: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Require the setup-bearing attempt to contain one frozen task analyzer."""
+
+    from opensquilla.provider.ranking_router import frozen_task_analysis_plan_reasons
 
     analyzer_provider = str((analyzer_policy or {}).get("provider") or "openrouter")
     analyzer_model = str((analyzer_policy or {}).get("model") or TASK_ANALYZER_MODEL)
@@ -8113,6 +8181,34 @@ def g1_provider_lifecycle_analyzer_reasons(
     ]
     if not request_attempts:
         return ["missing_g1_provider_lifecycle_attempt"]
+    if replay_contract is not None:
+        first_routing = request_attempts[0]["run"].get("routing_trace")
+        first_plan = (
+            first_routing.get("selection_plan")
+            if isinstance(first_routing, Mapping)
+            else None
+        )
+        reasons = frozen_task_analysis_plan_reasons(
+            first_plan,
+            replay_contract,
+            expected_task_id=str(row.get("task_id") or ""),
+            expected_task_input_sha256=str(row.get("task_input_sha256") or ""),
+            expected_prompt_sha256=str(row.get("prompt_sha256") or ""),
+        )
+        for attempt in request_attempts:
+            try:
+                analyzers = _canonical_task_analyzer_setup_units(
+                    attempt["run"],
+                    identity_seed="finalizer-frozen-task-analysis",
+                )
+            except FinalizationError:
+                reasons.append("invalid_g1_task_analyzer_replay_usage_evidence")
+                continue
+            if analyzers:
+                reasons.append(
+                    "unexpected_g1_task_analyzer_request_in_frozen_replay"
+                )
+        return list(dict.fromkeys(reasons))
     first_attempt_id = str(request_attempts[0].get("attempt_id") or "")
     try:
         first_units = _canonical_task_analyzer_setup_units(
@@ -8285,6 +8381,27 @@ def route_reasons(
                 )
             )
         row_plan = routing.get("selection_plan")
+        replay_contract = registry.get("task_analysis_execution")
+        if replay_contract is not None and isinstance(row_plan, Mapping):
+            from opensquilla.provider.ranking_router import (
+                frozen_task_analysis_plan_reasons,
+            )
+
+            reasons.extend(
+                frozen_task_analysis_plan_reasons(
+                    row_plan,
+                    replay_contract,
+                    expected_task_id=str(row.get("task_id") or ""),
+                    expected_task_input_sha256=str(row.get("task_input_sha256") or ""),
+                    expected_prompt_sha256=str(row.get("prompt_sha256") or ""),
+                )
+            )
+            reasons.extend(
+                g1_provider_lifecycle_analyzer_reasons(
+                    row,
+                    replay_contract=replay_contract,
+                )
+            )
         plan_reasons, proposers, aggregator = g1_registry_plan_reasons(
             row_plan,
             contract=registry,
@@ -8301,6 +8418,18 @@ def route_reasons(
             )
             reasons.extend(call_sequence_reasons)
             for call in calls:
+                if replay_contract is not None:
+                    reasons.extend(
+                        frozen_task_analysis_plan_reasons(
+                            call.get("selection_plan"),
+                            replay_contract,
+                            expected_task_id=str(row.get("task_id") or ""),
+                            expected_task_input_sha256=str(
+                                row.get("task_input_sha256") or ""
+                            ),
+                            expected_prompt_sha256=str(row.get("prompt_sha256") or ""),
+                        )
+                    )
                 physical_reasons, physical_p, physical_a = g1_registry_plan_reasons(
                     call.get("selection_plan"),
                     contract=registry,

@@ -47,6 +47,9 @@ TASK_ANALYZER_PROVIDER_ID = "openrouter"
 TASK_ANALYZER_MODEL_ID = "anthropic/claude-opus-4.8"
 TASK_ANALYZER_UPSTREAM_PROVIDER = "anthropic"
 TASK_ANALYZER_VERSION = "opus-4.8-json-v3"
+FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
+FROZEN_TASK_ANALYSIS_MODE = "frozen_replay"
+FROZEN_TASK_ANALYZER_SOURCE = "frozen_replay"
 TASK_PROFILE_SCHEMA_VERSION = "step2-task-profile-v1"
 THINKING_POLICY_VERSION = "thinking-policy-v1"
 GENERATION_POLICY_FILTER_REASON_PREFIX = "generation_policy_"
@@ -192,6 +195,7 @@ class TaskAnalysisResult:
     provider_id: str = ""
     model_id: str = ""
     normalization_warnings: tuple[str, ...] = ()
+    replay: dict[str, Any] = field(default_factory=dict)
 
     def trace(self, ranking_config: Mapping[str, Any] | None = None) -> dict[str, Any]:
         decimal_places = _ranking_int(
@@ -209,6 +213,7 @@ class TaskAnalysisResult:
             "fallback_reason": self.fallback_reason,
             "usage": copy.deepcopy(self.usage),
             "normalization_warnings": list(self.normalization_warnings),
+            **({"replay": copy.deepcopy(self.replay)} if self.replay else {}),
         }
 
 
@@ -446,6 +451,10 @@ _TRACE_SECRET_KEY_FRAGMENTS = (
     "proxy_auth",
     "proxy_password",
 )
+_TRACE_SECRET_VALUE_RE = re.compile(
+    r"(?:^|[^a-z0-9])sk-[a-z0-9_-]{8,}",
+    flags=re.IGNORECASE,
+)
 
 
 def _assert_public_ranking_trace_payload(
@@ -486,7 +495,7 @@ def _assert_public_ranking_trace_payload(
     if isinstance(value, str):
         normalized = value.strip().casefold()
         if (
-            "sk-" in normalized
+            _TRACE_SECRET_VALUE_RE.search(normalized) is not None
             or normalized.startswith("bearer ")
             or ("://" in normalized and "@" in normalized.partition("://")[2].partition("/")[0])
         ):
@@ -3364,6 +3373,325 @@ def normalize_task_profile(
     }
     required_valid = not fatal_errors
     return profile, required_valid, list(dict.fromkeys([*fatal_errors, *warnings]))
+
+
+_FROZEN_TASK_ANALYSIS_FIELDS = frozenset(
+    {
+        "schema",
+        "mode",
+        "source_experiment",
+        "source_manifest_sha256",
+        "source_results_sha256",
+        "source_task_analyzer_config",
+        "source_task_analyzer_config_sha256",
+        "entries",
+        "entries_sha256",
+    }
+)
+_FROZEN_TASK_ANALYSIS_ENTRY_FIELDS = frozenset(
+    {
+        "task_input_sha256",
+        "prompt_sha256",
+        "task_profile_pre_escalation",
+        "task_profile_pre_escalation_sha256",
+        "task_analyzer",
+    }
+)
+_FROZEN_TASK_ANALYZER_TRACE_FIELDS = frozenset(
+    {
+        "source",
+        "schema_valid",
+        "confidence",
+        "analyzer_version",
+        "provider",
+        "model",
+        "fallback_reason",
+        "usage",
+        "normalization_warnings",
+    }
+)
+
+
+def frozen_task_analysis_contract_reasons(
+    value: Any,
+    *,
+    expected_task_ids: Sequence[str] | None = None,
+) -> list[str]:
+    """Authenticate an inline ten-task Analyzer replay bundle."""
+
+    reasons: list[str] = []
+    if not isinstance(value, Mapping) or set(value) != _FROZEN_TASK_ANALYSIS_FIELDS:
+        return ["invalid_frozen_task_analysis_contract"]
+    if (
+        value.get("schema") != FROZEN_TASK_ANALYSIS_SCHEMA
+        or value.get("mode") != FROZEN_TASK_ANALYSIS_MODE
+        or not str(value.get("source_experiment") or "").strip()
+    ):
+        reasons.append("invalid_frozen_task_analysis_identity")
+    for field_name in (
+        "source_manifest_sha256",
+        "source_results_sha256",
+        "source_task_analyzer_config_sha256",
+        "entries_sha256",
+    ):
+        raw_hash = str(value.get(field_name) or "")
+        if len(raw_hash) != 64 or any(char not in "0123456789abcdef" for char in raw_hash):
+            reasons.append(f"invalid_frozen_task_analysis_{field_name}")
+    source_config = value.get("source_task_analyzer_config")
+    if (
+        not isinstance(source_config, Mapping)
+        or not source_config
+        or _canonical_hash(source_config)
+        != str(value.get("source_task_analyzer_config_sha256") or "")
+    ):
+        reasons.append("invalid_frozen_task_analysis_source_analyzer_config")
+    elif any(
+        not str(source_config.get(field_name) or "").strip()
+        for field_name in ("provider", "model", "upstream_provider")
+    ):
+        reasons.append("invalid_frozen_task_analysis_source_analyzer_identity")
+    entries = value.get("entries")
+    if not isinstance(entries, Mapping) or len(entries) != 10:
+        reasons.append("invalid_frozen_task_analysis_entries")
+        return list(dict.fromkeys(reasons))
+    task_ids = [str(task_id) for task_id in entries]
+    if any(not task_id or task_id != task_id.strip() for task_id in task_ids):
+        reasons.append("invalid_frozen_task_analysis_task_ids")
+    if expected_task_ids is not None and (
+        len(expected_task_ids) != 10
+        or len(set(str(task_id) for task_id in expected_task_ids)) != 10
+        or set(task_ids) != set(str(task_id) for task_id in expected_task_ids)
+    ):
+        reasons.append("wrong_frozen_task_analysis_task_set")
+    for raw_entry in entries.values():
+        if (
+            not isinstance(raw_entry, Mapping)
+            or set(raw_entry) != _FROZEN_TASK_ANALYSIS_ENTRY_FIELDS
+        ):
+            reasons.append("invalid_frozen_task_analysis_entry")
+            continue
+        profile = raw_entry.get("task_profile_pre_escalation")
+        profile_hash = str(
+            raw_entry.get("task_profile_pre_escalation_sha256") or ""
+        )
+        analyzer = raw_entry.get("task_analyzer")
+        task_input_hash = str(raw_entry.get("task_input_sha256") or "")
+        prompt_hash = str(raw_entry.get("prompt_sha256") or "")
+        if (
+            not task_input_hash.startswith("sha256:")
+            or len(task_input_hash) != 71
+            or any(char not in "0123456789abcdef" for char in task_input_hash[7:])
+            or len(prompt_hash) != 64
+            or any(char not in "0123456789abcdef" for char in prompt_hash)
+        ):
+            reasons.append("invalid_frozen_task_analysis_input_hash")
+        if (
+            not isinstance(profile, Mapping)
+            or not profile
+            or _canonical_hash(profile) != profile_hash
+        ):
+            reasons.append("invalid_frozen_task_profile_hash")
+        if (
+            not isinstance(analyzer, Mapping)
+            or set(analyzer) != _FROZEN_TASK_ANALYZER_TRACE_FIELDS
+        ):
+            reasons.append("invalid_frozen_task_analyzer_trace")
+            continue
+        confidence = analyzer.get("confidence")
+        warnings = analyzer.get("normalization_warnings")
+        if (
+            analyzer.get("source") != FROZEN_TASK_ANALYZER_SOURCE
+            or analyzer.get("schema_valid") is not True
+            or isinstance(confidence, bool)
+            or not isinstance(confidence, int | float)
+            or not math.isfinite(float(confidence))
+            or not 0.0 <= float(confidence) <= 1.0
+            or not str(analyzer.get("analyzer_version") or "").strip()
+            or not str(analyzer.get("provider") or "").strip()
+            or not str(analyzer.get("model") or "").strip()
+            or analyzer.get("fallback_reason") != ""
+            or analyzer.get("usage") != {}
+            or not isinstance(warnings, list)
+            or any(not isinstance(warning, str) or not warning.strip() for warning in warnings)
+            or len(warnings) != len(set(warnings))
+        ):
+            reasons.append("invalid_frozen_task_analyzer_trace")
+        elif isinstance(source_config, Mapping) and (
+            str(analyzer.get("provider") or "")
+            != str(source_config.get("provider") or "")
+            or str(analyzer.get("model") or "")
+            != str(source_config.get("model") or "")
+            or str(analyzer.get("analyzer_version") or "") != TASK_ANALYZER_VERSION
+        ):
+            reasons.append("wrong_frozen_task_analyzer_identity")
+    try:
+        entries_hash = _canonical_hash(entries)
+        _assert_public_ranking_trace_payload(value, label="frozen_task_analysis")
+    except (DynamicRankingError, TypeError, ValueError):
+        reasons.append("unsafe_frozen_task_analysis_evidence")
+    else:
+        if entries_hash != str(value.get("entries_sha256") or ""):
+            reasons.append("invalid_frozen_task_analysis_entries_sha256")
+    return list(dict.fromkeys(reasons))
+
+
+def frozen_task_analysis_plan_reasons(
+    plan: Any,
+    contract: Any,
+    *,
+    expected_task_id: str | None = None,
+    expected_task_input_sha256: str | None = None,
+    expected_prompt_sha256: str | None = None,
+) -> list[str]:
+    """Bind one ranker plan to exactly one entry in the replay bundle."""
+
+    reasons = frozen_task_analysis_contract_reasons(contract)
+    if reasons:
+        return reasons
+    if not isinstance(plan, Mapping) or not isinstance(contract, Mapping):
+        return ["invalid_frozen_task_analysis_plan"]
+    analyzer = plan.get("task_analyzer")
+    proof = analyzer.get("replay") if isinstance(analyzer, Mapping) else None
+    if not isinstance(proof, Mapping):
+        return ["missing_frozen_task_analysis_replay_proof"]
+    task_id = str(proof.get("task_id") or "")
+    if expected_task_id is not None and task_id != str(expected_task_id):
+        reasons.append("wrong_frozen_task_analysis_task_id")
+    entries = contract["entries"]
+    entry = entries.get(task_id) if isinstance(entries, Mapping) else None
+    if not isinstance(entry, Mapping):
+        reasons.append("unknown_frozen_task_analysis_task_id")
+        return list(dict.fromkeys(reasons))
+    if (
+        expected_task_input_sha256 is not None
+        and str(entry.get("task_input_sha256") or "") != expected_task_input_sha256
+    ):
+        reasons.append("wrong_frozen_task_analysis_task_input_sha256")
+    if (
+        expected_prompt_sha256 is not None
+        and str(entry.get("prompt_sha256") or "") != expected_prompt_sha256
+    ):
+        reasons.append("wrong_frozen_task_analysis_prompt_sha256")
+    expected_proof = {
+        "schema": FROZEN_TASK_ANALYSIS_SCHEMA,
+        "mode": FROZEN_TASK_ANALYSIS_MODE,
+        "task_id": task_id,
+        "source_experiment": contract["source_experiment"],
+        "source_manifest_sha256": contract["source_manifest_sha256"],
+        "source_results_sha256": contract["source_results_sha256"],
+        "source_task_analyzer_config_sha256": contract[
+            "source_task_analyzer_config_sha256"
+        ],
+        "entries_sha256": contract["entries_sha256"],
+        "task_input_sha256": entry["task_input_sha256"],
+        "prompt_sha256": entry["prompt_sha256"],
+        "task_profile_pre_escalation_sha256": entry[
+            "task_profile_pre_escalation_sha256"
+        ],
+        "physical_request_count": 0,
+    }
+    if dict(proof) != expected_proof:
+        reasons.append("wrong_frozen_task_analysis_replay_proof")
+    expected_analyzer = copy.deepcopy(dict(entry["task_analyzer"]))
+    observed_analyzer = copy.deepcopy(dict(analyzer)) if isinstance(analyzer, Mapping) else {}
+    observed_analyzer.pop("replay", None)
+    if observed_analyzer != expected_analyzer:
+        reasons.append("wrong_frozen_task_analyzer_provenance")
+    profile = plan.get("task_profile_pre_escalation")
+    if (
+        not isinstance(profile, Mapping)
+        or dict(profile) != dict(entry["task_profile_pre_escalation"])
+        or _canonical_hash(profile)
+        != entry["task_profile_pre_escalation_sha256"]
+    ):
+        reasons.append("wrong_frozen_task_profile")
+    ranking_parameters = plan.get("ranking_parameters")
+    analyzer_config = (
+        ranking_parameters.get("task_analyzer")
+        if isinstance(ranking_parameters, Mapping)
+        else None
+    )
+    if (
+        not isinstance(analyzer_config, Mapping)
+        or dict(analyzer_config) != dict(contract["source_task_analyzer_config"])
+    ):
+        reasons.append("wrong_frozen_task_analysis_source_analyzer_config")
+    return list(dict.fromkeys(reasons))
+
+
+def frozen_task_analysis_result(
+    contract: Mapping[str, Any],
+    *,
+    task_id: str,
+    task_input_sha256: str,
+    prompt_sha256: str,
+    routed_tier: str,
+    request_context: Mapping[str, Any],
+    ranking_config: Mapping[str, Any] | None = None,
+) -> TaskAnalysisResult:
+    """Materialize a validated frozen profile without starting an LLM request."""
+
+    reasons = frozen_task_analysis_contract_reasons(contract)
+    entry = contract.get("entries", {}).get(task_id)
+    if reasons or not isinstance(entry, Mapping):
+        detail = ",".join(reasons or ["unknown_frozen_task_analysis_task_id"])
+        raise DynamicRankingError(f"invalid frozen task analysis replay: {detail}")
+    if (
+        str(entry.get("task_input_sha256") or "") != task_input_sha256
+        or str(entry.get("prompt_sha256") or "") != prompt_sha256
+    ):
+        raise DynamicRankingError(
+            f"frozen task analysis input binding differs for task {task_id!r}"
+        )
+    profile = entry.get("task_profile_pre_escalation")
+    normalized, schema_valid, _ = normalize_task_profile(
+        profile,
+        routed_tier=routed_tier,
+        request_context=request_context,
+        ranking_config=ranking_config,
+    )
+    if (
+        not schema_valid
+        or not isinstance(profile, Mapping)
+        or normalized != dict(profile)
+        or _canonical_hash(normalized)
+        != str(entry.get("task_profile_pre_escalation_sha256") or "")
+    ):
+        raise DynamicRankingError(
+            f"frozen task analysis profile {task_id!r} is invalid for this request"
+        )
+    analyzer = entry["task_analyzer"]
+    proof = {
+        "schema": FROZEN_TASK_ANALYSIS_SCHEMA,
+        "mode": FROZEN_TASK_ANALYSIS_MODE,
+        "task_id": task_id,
+        "source_experiment": contract["source_experiment"],
+        "source_manifest_sha256": contract["source_manifest_sha256"],
+        "source_results_sha256": contract["source_results_sha256"],
+        "source_task_analyzer_config_sha256": contract[
+            "source_task_analyzer_config_sha256"
+        ],
+        "entries_sha256": contract["entries_sha256"],
+        "task_input_sha256": entry["task_input_sha256"],
+        "prompt_sha256": entry["prompt_sha256"],
+        "task_profile_pre_escalation_sha256": entry[
+            "task_profile_pre_escalation_sha256"
+        ],
+        "physical_request_count": 0,
+    }
+    return TaskAnalysisResult(
+        profile=copy.deepcopy(normalized),
+        source=FROZEN_TASK_ANALYZER_SOURCE,
+        schema_valid=True,
+        confidence=float(analyzer["confidence"]),
+        analyzer_version=str(analyzer["analyzer_version"]),
+        fallback_reason="",
+        usage={},
+        provider_id=str(analyzer["provider"]),
+        model_id=str(analyzer["model"]),
+        normalization_warnings=tuple(analyzer["normalization_warnings"]),
+        replay=proof,
+    )
 
 
 def _extract_json_object(text: str) -> Any:
@@ -6990,6 +7318,11 @@ def ranking_trace_replay_reasons(
             model_id=str(analyzer.get("model") or ""),
             normalization_warnings=tuple(
                 str(value) for value in analyzer.get("normalization_warnings") or []
+            ),
+            replay=(
+                copy.deepcopy(dict(analyzer["replay"]))
+                if isinstance(analyzer.get("replay"), Mapping)
+                else {}
             ),
         )
         replayed = rank_models(

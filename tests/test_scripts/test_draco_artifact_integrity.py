@@ -616,7 +616,7 @@ def test_v3_route_preflight_accepts_one_unavailable_dynamic_candidate(
         config=config,
         config_sha256=config_sha256,
     )
-    model = "mistralai/devstral-2512"
+    model = "mistralai/ministral-14b-2512"
     row = payload["models"][model]
     row.update(
         {
@@ -636,7 +636,7 @@ def test_v3_route_preflight_accepts_one_unavailable_dynamic_candidate(
         label="v3 evidence",
     )
 
-    assert payload["proposer_compatible_candidate_count"] == 79
+    assert payload["proposer_compatible_candidate_count"] == 78
     assert payload["unavailable_models"] == [model]
     assert validation["groups"] == ["G1"]
     assert validation["availability_policy"] == "registry_capacity"
@@ -796,7 +796,7 @@ def test_v3_route_preflight_accepts_explicit_model_endpoint_404(
         config=config,
         config_sha256=config_sha256,
     )
-    model = "mistralai/devstral-2512"
+    model = "mistralai/ministral-14b-2512"
     row = payload["models"][model]
     row.update(
         {
@@ -835,7 +835,7 @@ def test_v3_route_preflight_rejects_tampered_availability_or_fixed_route(
         config=config,
         config_sha256=config_sha256,
     )
-    model = "mistralai/devstral-2512"
+    model = "mistralai/ministral-14b-2512"
     payload["models"][model]["availability_status"] = "no_matching_endpoint"
     with pytest.raises(ValueError, match="precomputed availability"):
         module.validate_route_preflight_payload(
@@ -955,7 +955,7 @@ def test_route_preflight_reasoning_requirements_follow_frozen_registry(
         reasoning_ineligible_models=ineligible,
     )
 
-    assert len(ineligible) == 15
+    assert len(ineligible) == 14
     assert "qwen/qwen3-coder-next" in ineligible
     assert "reasoning" not in required["qwen/qwen3-coder-next"]
     assert "reasoning" in required["deepseek/deepseek-v4-pro"]

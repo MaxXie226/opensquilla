@@ -86,7 +86,7 @@ def test_formal_model_thinking_levels_match_campaign_config(module) -> None:
 
 
 def test_finalizer_version_covers_canonical_usage_evidence(module) -> None:
-    assert module.FINALIZER_VERSION == 8
+    assert module.FINALIZER_VERSION == 9
 
 
 def test_legacy_managed_v3_source_requires_exact_external_identity(
@@ -715,7 +715,7 @@ def test_registry_all_contract_authenticates_its_frozen_route_projection(module)
     routes = module.authenticated_registry_all_routes(contract)
 
     assert routes is not None
-    assert len(routes) == module.FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT == 80
+    assert len(routes) == module.FORMAL_G1_REGISTRY_ALL_CANDIDATE_COUNT == 79
     assert set(routes.values()) == {"auto"}
     assert all(model == model.strip().lower() and "/" in model for model in routes)
 
@@ -747,7 +747,7 @@ def test_registry_all_contract_never_loads_the_mutable_packaged_profile(
 def test_registry_all_contract_rejects_frozen_route_tampering(module, mutation: str) -> None:
     contract = _registry_all_contract(module)
     if mutation == "count":
-        contract["expected_candidate_count"] = 79
+        contract["expected_candidate_count"] = 78
     elif mutation == "routes_hash":
         contract["expected_routes_sha256"] = "0" * 64
     elif mutation == "source_hash":

@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 FORMAL_DRACO_OPENROUTER_PROVIDER = "openrouter"
 FORMAL_DRACO_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 FORMAL_DRACO_OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
+FROZEN_TASK_ANALYSIS_MODE = "frozen_replay"
 FORMAL_DRACO_WEB_SEARCH_API_KEY_ENVS = {
     "brave": "BRAVE_SEARCH_API_KEY",
     "duckduckgo": "",
@@ -70,6 +72,99 @@ def _canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+class DracoFrozenTaskAnalyzerTraceConfig(_StrictConfig):
+    """Public Analyzer provenance retained by a zero-request profile replay."""
+
+    source: Literal["frozen_replay"]
+    schema_valid: Literal[True]
+    confidence: float = Field(ge=0.0, le=1.0)
+    analyzer_version: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    fallback_reason: Literal[""]
+    usage: dict[str, Any]
+    normalization_warnings: list[str]
+
+    @model_validator(mode="after")
+    def _validate_zero_request_trace(self) -> DracoFrozenTaskAnalyzerTraceConfig:
+        if self.usage:
+            raise ValueError("frozen task analyzer replay usage must be empty")
+        if any(not value.strip() for value in self.normalization_warnings):
+            raise ValueError("frozen task analyzer warnings must be non-empty strings")
+        if len(set(self.normalization_warnings)) != len(self.normalization_warnings):
+            raise ValueError("frozen task analyzer warnings must be unique")
+        return self
+
+
+class DracoFrozenTaskAnalysisEntryConfig(_StrictConfig):
+    task_input_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_profile_pre_escalation: dict[str, Any]
+    task_profile_pre_escalation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_analyzer: DracoFrozenTaskAnalyzerTraceConfig
+
+    @model_validator(mode="after")
+    def _validate_profile_hash(self) -> DracoFrozenTaskAnalysisEntryConfig:
+        if not self.task_profile_pre_escalation:
+            raise ValueError("frozen pre-escalation task profile must be non-empty")
+        if (
+            _canonical_json_sha256(self.task_profile_pre_escalation)
+            != self.task_profile_pre_escalation_sha256
+        ):
+            raise ValueError(
+                "frozen task_profile_pre_escalation_sha256 does not match "
+                "task_profile_pre_escalation"
+            )
+        return self
+
+
+class DracoFrozenTaskAnalysisExecutionConfig(_StrictConfig):
+    """Ten inline E0 Analyzer outputs reused without another physical request."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        allow_inf_nan=False,
+        hide_input_in_errors=True,
+        serialize_by_alias=True,
+    )
+
+    schema_id: Literal["opensquilla.draco.frozen-task-analysis/v1"] = Field(
+        alias="schema"
+    )
+    mode: Literal["frozen_replay"]
+    source_experiment: str = Field(min_length=1)
+    source_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_results_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_task_analyzer_config: dict[str, Any]
+    source_task_analyzer_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    entries: dict[str, DracoFrozenTaskAnalysisEntryConfig]
+    entries_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_bundle_hashes(self) -> DracoFrozenTaskAnalysisExecutionConfig:
+        if len(self.entries) != 10 or any(
+            not task_id or task_id != task_id.strip() for task_id in self.entries
+        ):
+            raise ValueError("frozen task analysis must contain exactly 10 canonical task ids")
+        if not self.source_experiment.strip():
+            raise ValueError("source_experiment must be a non-empty canonical id")
+        if not self.source_task_analyzer_config:
+            raise ValueError("source_task_analyzer_config must be non-empty")
+        if (
+            _canonical_json_sha256(self.source_task_analyzer_config)
+            != self.source_task_analyzer_config_sha256
+        ):
+            raise ValueError("source_task_analyzer_config_sha256 does not match")
+        entries = {
+            task_id: entry.model_dump(mode="json")
+            for task_id, entry in self.entries.items()
+        }
+        if _canonical_json_sha256(entries) != self.entries_sha256:
+            raise ValueError("frozen task analysis entries_sha256 does not match entries")
+        return self
+
+
 class DracoG1RoutingConfig(_StrictConfig):
     """Versioned, fail-closed candidate contract for the formal G1 router."""
 
@@ -85,6 +180,7 @@ class DracoG1RoutingConfig(_StrictConfig):
     expected_candidate_count: int | None = Field(default=None, gt=0)
     expected_routes: dict[str, str] | None = None
     expected_routes_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    task_analysis_execution: DracoFrozenTaskAnalysisExecutionConfig | None = None
 
     @model_validator(mode="after")
     def _validate_expected_routes(self) -> DracoG1RoutingConfig:
@@ -316,6 +412,59 @@ class DracoExperimentConfig(_StrictConfig):
             "router_dynamic_ranking_override",
             copy.deepcopy(normalized),
         )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_frozen_task_analysis(self) -> DracoExperimentConfig:
+        """Bind all ten inline profiles to the benchmark and effective Analyzer."""
+
+        replay = (
+            self.g1_routing.task_analysis_execution
+            if self.g1_routing is not None
+            else None
+        )
+        if replay is None:
+            return self
+        expected_task_ids = self.benchmark_input.task_ids
+        if self.benchmark_input.task_count != 10 or set(replay.entries) != set(
+            expected_task_ids
+        ):
+            raise ValueError(
+                "g1_routing.task_analysis_execution entries must exactly match "
+                "the 10 benchmark task ids"
+            )
+        from opensquilla.provider.ranking_router import (
+            TASK_ANALYZER_VERSION,
+            ranking_config_resolution,
+            task_analyzer_policy,
+        )
+
+        resolution = ranking_config_resolution(
+            override=(self.router_dynamic_ranking_override or None),
+        )
+        effective = resolution.get("effective_config")
+        effective_analyzer = (
+            effective.get("task_analyzer") if isinstance(effective, dict) else None
+        )
+        if not isinstance(effective_analyzer, dict) or effective_analyzer != (
+            replay.source_task_analyzer_config
+        ):
+            raise ValueError(
+                "frozen task analysis source Analyzer config differs from the "
+                "effective ranking config"
+            )
+        policy = task_analyzer_policy(effective)
+        for task_id, entry in replay.entries.items():
+            analyzer = entry.task_analyzer
+            if (
+                analyzer.provider != str(policy["provider"])
+                or analyzer.model != str(policy["model"])
+                or analyzer.analyzer_version != TASK_ANALYZER_VERSION
+            ):
+                raise ValueError(
+                    f"frozen task analysis entry {task_id!r} differs from the "
+                    "effective Analyzer identity"
+                )
         return self
 
     @model_validator(mode="after")

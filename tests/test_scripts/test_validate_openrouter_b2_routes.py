@@ -288,7 +288,7 @@ def test_formal_routes_are_a_valid_subset_of_router_dynamic_registry() -> None:
     payload = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     registry_models = {str(row["registry_facts"]["model_id"]) for row in payload["models"]}
 
-    assert len(registry_models) == 80
+    assert len(registry_models) == 79
     assert set(validator.FORMAL_EXPECTED_ROUTES) <= registry_models
     assert set(validator.B2_EXPECTED_ROUTES) <= set(validator.FORMAL_EXPECTED_ROUTES)
     experiment = load_draco_experiment_config(validator.DEFAULT_EXPERIMENT_CONFIG_PATH).config
@@ -347,7 +347,7 @@ def test_formal_routes_match_runtime_pins_and_capability_contract() -> None:
             if row["registry_facts"]["provider"] == "openrouter"
             and row["registry_facts"]["supports_reasoning"] is not True
         }
-        assert len(validator.FORMAL_REASONING_INELIGIBLE_MODELS) == 15
+        assert len(validator.FORMAL_REASONING_INELIGIBLE_MODELS) == 14
     else:
         assert validator.FORMAL_EXPECTED_ROUTES["google/gemini-3.5-flash"] == ("google-ai-studio")
         assert "openai/gpt-5.6-luna" not in validator.FORMAL_EXPECTED_ROUTES

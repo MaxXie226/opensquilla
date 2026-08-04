@@ -836,7 +836,7 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     model_ids = [model["registry_facts"]["model_id"] for model in snapshot["models"]]
 
     assert snapshot["snapshot_version"].startswith("curated-openrouter-step2-")
-    assert len(snapshot["models"]) == 80
+    assert len(snapshot["models"]) == 79
     assert len(set(model_ids)) == len(model_ids)
     assert {
         "poolside/laguna-xs-2.1",
@@ -857,7 +857,6 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
         "openai/gpt-oss-120b",
         "qwen/qwen3.6-27b",
         "inclusionai/ling-2.6-1t",
-        "mistralai/devstral-2512",
         "openai/gpt-oss-20b",
     }.issubset(model_ids)
     for model in snapshot["models"]:
@@ -887,7 +886,7 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     curated_models = [
         model for model in snapshot["models"] if model["source"] == "curated_openrouter_profile"
     ]
-    assert len(curated_models) == 80
+    assert len(curated_models) == 79
     by_model_id = {model["registry_facts"]["model_id"]: model for model in curated_models}
     assert by_model_id["deepseek/deepseek-v4-flash"]["registry_facts"][
         "supported_thinking_levels"

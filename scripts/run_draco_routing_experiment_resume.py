@@ -3940,6 +3940,9 @@ async def build_experiment_provider(
     inherited: ProviderConfig,
     group: str,
     prompt: str,
+    task_id: str = "",
+    task_input_sha256: str = "",
+    prompt_sha256: str = "",
     dry_run: bool,
     enable_proposer_tools: bool,
     ensemble_proposer_timeout: float | None,
@@ -4118,6 +4121,7 @@ async def build_experiment_provider(
                 build_request_context,
                 dynamic_output_token_budgets,
                 fallback_task_profile,
+                frozen_task_analysis_result,
             )
 
             ranking_resolution = (
@@ -4162,20 +4166,35 @@ async def build_experiment_provider(
                 aggregator_output_tokens=aggregator_output_tokens,
                 ranking_config=ranking_config,
             )
-            task_profile = fallback_task_profile(
-                routed_tier="c1",
-                request_context=request_context,
-                ranking_config=ranking_config,
-            )
-            dry_ranking_inputs = {
-                "decision_id": ("dry-" + hashlib.sha256(prompt.encode()).hexdigest()[:24]),
-                "task_analysis": TaskAnalysisResult(
+            replay = g1_routing.task_analysis_execution
+            if replay is not None:
+                if not task_id:
+                    raise ValueError("frozen task analysis replay requires task_id")
+                task_analysis = frozen_task_analysis_result(
+                    replay.model_dump(mode="json"),
+                    task_id=task_id,
+                    task_input_sha256=task_input_sha256,
+                    prompt_sha256=prompt_sha256,
+                    routed_tier="c1",
+                    request_context=request_context,
+                    ranking_config=ranking_config,
+                )
+            else:
+                task_profile = fallback_task_profile(
+                    routed_tier="c1",
+                    request_context=request_context,
+                    ranking_config=ranking_config,
+                )
+                task_analysis = TaskAnalysisResult(
                     profile=task_profile,
                     source="dry_run_fallback",
                     schema_valid=False,
                     confidence=0.0,
                     fallback_reason="dry_run_no_analyzer_call",
-                ),
+                )
+            dry_ranking_inputs = {
+                "decision_id": ("dry-" + hashlib.sha256(prompt.encode()).hexdigest()[:24]),
+                "task_analysis": task_analysis,
                 "user_profile": None,
                 "request_context": request_context,
                 "ranking_config": ranking_config,
@@ -4406,6 +4425,7 @@ async def build_experiment_provider(
             analyze_task_with_provider,
             build_request_context,
             dynamic_output_token_budgets,
+            frozen_task_analysis_result,
             mock_user_profile,
             task_analyzer_policy,
         )
@@ -4521,6 +4541,11 @@ async def build_experiment_provider(
                     str(value)
                     for value in analyzer.get("normalization_warnings") or []
                 ),
+                replay=(
+                    copy.deepcopy(dict(analyzer["replay"]))
+                    if isinstance(analyzer.get("replay"), Mapping)
+                    else {}
+                ),
             )
             decision_id = str(target_plan.get("decision_id") or "")
             if not decision_id:
@@ -4605,25 +4630,44 @@ async def build_experiment_provider(
                 if user_profile_enabled
                 else None
             )
-            analyzer_provider = build_task_analyzer_provider(
-                routed_config,
-                provider_id=analyzer_provider_id,
-                model_id=analyzer_model_id,
-                upstream_provider=analyzer_upstream_provider,
+            replay = g1_routing.task_analysis_execution if g1_routing is not None else None
+            replay_contract = replay.model_dump(mode="json") if replay is not None else None
+            analyzer_provider = (
+                None
+                if replay_contract is not None
+                else build_task_analyzer_provider(
+                    routed_config,
+                    provider_id=analyzer_provider_id,
+                    model_id=analyzer_model_id,
+                    upstream_provider=analyzer_upstream_provider,
+                )
             )
             try:
-                task_analysis = await analyze_task_with_provider(
-                    provider=analyzer_provider,
-                    message=turn.semantic_message,
-                    user_profile_enabled=user_profile_enabled,
-                    request_context=request_context,
-                    routed_tier=routed_tier,
-                    routing_confidence=routing_confidence,
-                    analyzer_provider_id=analyzer_provider_id,
-                    analyzer_model_id=analyzer_model_id,
-                    ranking_config=ranking_config,
-                    decision_id=decision_id,
-                )
+                if replay_contract is not None:
+                    if not task_id:
+                        raise ValueError("frozen task analysis replay requires task_id")
+                    task_analysis = frozen_task_analysis_result(
+                        replay_contract,
+                        task_id=task_id,
+                        task_input_sha256=task_input_sha256,
+                        prompt_sha256=prompt_sha256,
+                        routed_tier=routed_tier,
+                        request_context=request_context,
+                        ranking_config=ranking_config,
+                    )
+                else:
+                    task_analysis = await analyze_task_with_provider(
+                        provider=analyzer_provider,
+                        message=turn.semantic_message,
+                        user_profile_enabled=user_profile_enabled,
+                        request_context=request_context,
+                        routed_tier=routed_tier,
+                        routing_confidence=routing_confidence,
+                        analyzer_provider_id=analyzer_provider_id,
+                        analyzer_model_id=analyzer_model_id,
+                        ranking_config=ranking_config,
+                        decision_id=decision_id,
+                    )
             except TaskAnalyzerStreamCleanupError as exc:
                 setup_usage.extend(
                     task_analyzer_usage_rows(
@@ -4680,7 +4724,11 @@ async def build_experiment_provider(
                 analyzer_source = "analyzer_postprocess_failed"
                 analyzer_fallback_reason = type(exc).__name__
             try:
-                if analyzer_usage_materialization_failed:
+                if replay_contract is not None:
+                    # Empty replay usage means no physical Analyzer request;
+                    # do not let the live-accounting fallback invent one.
+                    analyzer_usage_rows = []
+                elif analyzer_usage_materialization_failed:
                     analyzer_usage_rows = (
                         conservative_task_analyzer_usage_rows(
                             (
@@ -4763,18 +4811,28 @@ async def build_experiment_provider(
                 }
                 if thinking_assignment_enabled:
                     ranking_inputs["request_tools_present"] = bool(tools)
-                routing_trace["task_analyzer"] = {
-                    "provider": analyzer_provider_id,
-                    "model": analyzer_model_id,
-                    "source": analyzer_source,
-                    "schema_valid": task_analysis.schema_valid,
-                    "confidence": task_analysis.confidence,
-                    "fallback_reason": analyzer_fallback_reason,
-                    "request_context_hash": request_context.get(
-                        "snapshot_hash"
-                    ),
-                    "user_profile_enabled": user_profile_enabled,
-                }
+                routing_trace["task_analyzer"] = (
+                    {
+                        **task_analysis.trace(ranking_config),
+                        "request_context_hash": request_context.get(
+                            "snapshot_hash"
+                        ),
+                        "user_profile_enabled": user_profile_enabled,
+                    }
+                    if replay_contract is not None
+                    else {
+                        "provider": analyzer_provider_id,
+                        "model": analyzer_model_id,
+                        "source": analyzer_source,
+                        "schema_valid": task_analysis.schema_valid,
+                        "confidence": task_analysis.confidence,
+                        "fallback_reason": analyzer_fallback_reason,
+                        "request_context_hash": request_context.get(
+                            "snapshot_hash"
+                        ),
+                        "user_profile_enabled": user_profile_enabled,
+                    }
+                )
             except Exception as exc:  # noqa: BLE001 - preserve a paid analyzer call
                 if not setup_usage:
                     raise
@@ -8186,6 +8244,15 @@ def g1_registry_contract_reasons(
         reasons.extend(ranking_trace_replay_reasons(executed_plan))
     except Exception:  # noqa: BLE001 - completion evidence must fail closed
         reasons.append("g1_frozen_ranker_replay_failed")
+    replay_contract = contract.get("task_analysis_execution")
+    if replay_contract is not None:
+        from opensquilla.provider.ranking_router import (
+            frozen_task_analysis_plan_reasons,
+        )
+
+        reasons.extend(
+            frozen_task_analysis_plan_reasons(executed_plan, replay_contract)
+        )
     return list(dict.fromkeys(reasons))
 
 
@@ -11869,6 +11936,9 @@ async def run_one(
             inherited=inherited,
             group=group,
             prompt=effective_prompt,
+            task_id=str(task["id"]),
+            task_input_sha256=canonical_json_sha256(task),
+            prompt_sha256=text_sha256(str(task["prompt"])),
             dry_run=dry_run,
             enable_proposer_tools=bool(
                 tool_policy.get("tools_enabled")
@@ -16810,10 +16880,17 @@ def g1_provider_lifecycle_routing_evidence(
     return dict(recovered), evidence, list(dict.fromkeys(reasons))
 
 
-def g1_provider_lifecycle_analyzer_reasons(row: Mapping[str, Any]) -> list[str]:
+def g1_provider_lifecycle_analyzer_reasons(
+    row: Mapping[str, Any],
+    *,
+    contract: Mapping[str, Any] | None = None,
+) -> list[str]:
     """Require one valid analyzer in the setup-bearing attempt of each G1 lifecycle."""
 
-    from opensquilla.provider.ranking_router import task_analyzer_policy
+    from opensquilla.provider.ranking_router import (
+        frozen_task_analysis_plan_reasons,
+        task_analyzer_policy,
+    )
 
     if str(row.get("group") or "") != "G1":
         return []
@@ -16838,6 +16915,30 @@ def g1_provider_lifecycle_analyzer_reasons(row: Mapping[str, Any]) -> list[str]:
         if isinstance(first_routing, Mapping)
         else None
     )
+    registry = contract.get("g1_registry_contract") if isinstance(contract, Mapping) else None
+    replay_contract = (
+        registry.get("task_analysis_execution") if isinstance(registry, Mapping) else None
+    )
+    if replay_contract is not None:
+        reasons = frozen_task_analysis_plan_reasons(
+            first_plan,
+            replay_contract,
+            expected_task_id=str(row.get("task_id") or ""),
+            expected_task_input_sha256=str(row.get("task_input_sha256") or ""),
+            expected_prompt_sha256=str(row.get("prompt_sha256") or ""),
+        )
+        for index, attempt in enumerate(request_attempts):
+            try:
+                analyzers = _g1_canonical_task_analyzer_setup_units(
+                    attempt["run"],
+                    identity_seed=f"frozen-replay-lifecycle:{index}",
+                )
+            except Exception:  # noqa: BLE001 - contradictory evidence fails closed
+                reasons.append("invalid_g1_task_analyzer_replay_usage_evidence")
+                continue
+            if analyzers:
+                reasons.append("unexpected_g1_task_analyzer_request_in_frozen_replay")
+        return list(dict.fromkeys(reasons))
     ranking_parameters = (
         first_plan.get("ranking_parameters")
         if isinstance(first_plan, Mapping)
@@ -16929,13 +17030,34 @@ def _g1_frozen_lifecycle_analyzer_reasons(
     attempts: Sequence[Mapping[str, Any]],
     *,
     initial_plan: Mapping[str, Any],
+    g1_contract: Mapping[str, Any],
 ) -> list[str]:
     """Require analyzer receipts only on the first paid lifecycle attempt."""
 
-    from opensquilla.provider.ranking_router import task_analyzer_policy
+    from opensquilla.provider.ranking_router import (
+        frozen_task_analysis_plan_reasons,
+        task_analyzer_policy,
+    )
 
     if not attempts:
         return ["missing_g1_provider_lifecycle_attempt"]
+    replay_contract = g1_contract.get("task_analysis_execution")
+    if replay_contract is not None:
+        reasons = frozen_task_analysis_plan_reasons(initial_plan, replay_contract)
+        for index, attempt in enumerate(attempts):
+            run = attempt.get("run")
+            try:
+                analyzers = _g1_canonical_task_analyzer_setup_units(
+                    run if isinstance(run, Mapping) else {},
+                    identity_seed=f"frozen-replay-cross-wave:{index}",
+                )
+            except Exception:  # noqa: BLE001 - contradictory evidence fails closed
+                reasons.append("invalid_g1_task_analyzer_replay_usage_evidence")
+                continue
+            if analyzers:
+                reasons.append("unexpected_g1_task_analyzer_request_in_frozen_replay")
+        return list(dict.fromkeys(reasons))
+
     def analyzer_units_from_usage(run: Mapping[str, Any]) -> list[dict[str, Any]]:
         return [
             unit
@@ -17585,6 +17707,7 @@ def reconstruct_g1_cross_wave_frozen_lifecycle(
             _g1_frozen_lifecycle_analyzer_reasons(
                 ordered,
                 initial_plan=initial_plan,
+                g1_contract=g1_contract,
             )
         )
     if initial_plan is None or last_plan is None:
@@ -17717,7 +17840,12 @@ def ensemble_generation_completion_reasons(
         )
         reasons.extend(lifecycle_reasons)
         routing_trace = lifecycle_routing
-        reasons.extend(g1_provider_lifecycle_analyzer_reasons(row))
+        reasons.extend(
+            g1_provider_lifecycle_analyzer_reasons(
+                row,
+                contract=expected_run_compatibility_contract,
+            )
+        )
     expected_plan = (
         routing_trace.get("selection_plan") if isinstance(routing_trace, Mapping) else None
     )
