@@ -30,11 +30,33 @@ from .qwen_token_plan import (
     QWEN_TOKEN_PLAN_PRESERVE_THINKING_MODEL_IDS,
 )
 
-TextToolDialect = Literal["qwen_tag", "minimax_xml", "plain_json"]
+TextToolDialect = Literal["qwen_tag", "minimax_xml", "plain_json", "deepseek_dsml"]
 
 TEXT_TOOL_DIALECT_QWEN_TAG: TextToolDialect = "qwen_tag"
 TEXT_TOOL_DIALECT_MINIMAX_XML: TextToolDialect = "minimax_xml"
 TEXT_TOOL_DIALECT_PLAIN_JSON: TextToolDialect = "plain_json"
+TEXT_TOOL_DIALECT_DEEPSEEK_DSML: TextToolDialect = "deepseek_dsml"
+
+
+# DSML is executable syntax, so its authorization stays independent from
+# reasoning/model-family helpers and names every trusted wire identity exactly.
+_DEEPSEEK_DSML_MODEL_IDS = (
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-0731",
+    "deepseek-v4-pro",
+)
+_TOKENRHYTHM_DSML_MODEL_IDS = (
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-0731",
+    "deepseek-v4-pro",
+    "tokenrhythm/deepseek-v4-flash",
+    "tokenrhythm/deepseek-v4-flash-0731",
+    "tokenrhythm/deepseek-v4-pro",
+)
+_OPENROUTER_DSML_MODEL_IDS = (
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+)
 
 
 @dataclass(frozen=True)
@@ -287,6 +309,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                     model_patterns=("minimax/*",),
                     dialects=frozenset({TEXT_TOOL_DIALECT_MINIMAX_XML}),
                 ),
+                TextToolModelRule(
+                    model_patterns=_OPENROUTER_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                ),
             ),
         ),
         trust_billed_cost=True,
@@ -307,6 +333,14 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         default_reasoning_format="deepseek",
         supports_native_json_schema_output=False,
         supports_json_object_output=True,
+        text_tool_profile=TextToolCompatProfile(
+            model_rules=(
+                TextToolModelRule(
+                    model_patterns=_DEEPSEEK_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
+                ),
+            ),
+        ),
         # Reasoning replay is gated on the exact V4 ids (below), not on the
         # capability format: non-V4 DeepSeek models must not get replay.
         thinking_toggle_model_ids=DEEPSEEK_V4_MODEL_IDS,
@@ -410,6 +444,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                 TextToolModelRule(
                     model_patterns=("qwen*",),
                     dialects=frozenset({TEXT_TOOL_DIALECT_QWEN_TAG}),
+                ),
+                TextToolModelRule(
+                    model_patterns=_TOKENRHYTHM_DSML_MODEL_IDS,
+                    dialects=frozenset({TEXT_TOOL_DIALECT_DEEPSEEK_DSML}),
                 ),
             ),
         ),

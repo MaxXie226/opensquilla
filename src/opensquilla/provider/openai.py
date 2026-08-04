@@ -28,9 +28,11 @@ from .app_attribution import is_provider_app_host, provider_app_headers
 from .candidate_artifact import (
     CandidateArtifactBuilder,
     CandidateArtifactLimitError,
+    InertCandidateTextNormalizer,
     strip_candidate_tool_identity,
 )
 from .compat_policy import (
+    TEXT_TOOL_DIALECT_DEEPSEEK_DSML,
     TEXT_TOOL_DIALECT_MINIMAX_XML,
     TEXT_TOOL_DIALECT_PLAIN_JSON,
     TEXT_TOOL_DIALECT_QWEN_TAG,
@@ -64,7 +66,9 @@ from .stream_assembly import (
     ToolStreamProtocolError,
 )
 from .text_tool_normalizer import (
+    InertDsmlSegment,
     LiteralTextSegment,
+    RejectedTextToolSegment,
     TextToolSegment,
     TextToolStreamNormalizer,
     classify_text_tool_segments,
@@ -115,33 +119,13 @@ _MARKDOWN_JSON_FENCE_RE = re.compile(
 )
 
 
-class _InertCandidateTextPassthrough:
-    """Keep textual tool syntax literal for non-executable proposer output."""
-
-    native_lifecycle_deferred = False
-    held_chars = 0
-    held_event_count = 0
-
-    def push(self, text: str) -> list[str]:
-        return [text] if text else []
-
-    def observe_native_tool_start(self, _tool_name: str) -> list[TextToolSegment]:
-        return []
-
-    def abandon_native_lifecycle_defer(self) -> list[TextToolSegment]:
-        return []
-
-    def finish(
-        self,
-        *,
-        successful_text_tool_terminal: bool,
-        native_calls: list[tuple[str, dict[str, Any]]] | None = None,
-    ) -> list[TextToolSegment]:
-        del successful_text_tool_terminal, native_calls
-        return []
-
-
 _MAX_CANDIDATE_WIRE_ID_CHARS = 4096
+
+
+def _has_native_tool_payload(value: object) -> bool:
+    """Distinguish absent/null/empty arrays from explicit malformed wrappers."""
+
+    return value is not None and (not isinstance(value, list) or bool(value))
 
 
 def _candidate_wire_digest(value: str) -> bytes | None:
@@ -1818,18 +1802,24 @@ def _segment_text_tool_events(
             if segment.text:
                 events.append(TextDeltaEvent(text=segment.text))
             continue
+        if isinstance(segment, RejectedTextToolSegment):
+            continue
+        if isinstance(segment, InertDsmlSegment):
+            raise AssertionError("inert DSML reached executable event conversion")
         for call in segment.calls:
             id_prefix = {
                 TEXT_TOOL_DIALECT_QWEN_TAG: "qwen_text",
                 TEXT_TOOL_DIALECT_MINIMAX_XML: "minimax_compat",
                 TEXT_TOOL_DIALECT_PLAIN_JSON: "text_compat",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: "deepseek_dsml",
             }[call.dialect]
             tool_use_id = f"{id_prefix}_{uuid4().hex[:12]}"
-            event_name = (
-                "provider.qwen_text_tool_call_parsed"
-                if call.dialect == TEXT_TOOL_DIALECT_QWEN_TAG
-                else "provider.text_tool_call_parsed"
-            )
+            event_name = {
+                TEXT_TOOL_DIALECT_QWEN_TAG: "provider.qwen_text_tool_call_parsed",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: (
+                    "provider.deepseek_dsml_tool_call_parsed"
+                ),
+            }.get(call.dialect, "provider.text_tool_call_parsed")
             log.warning(
                 event_name,
                 provider=provider_kind,
@@ -1855,6 +1845,65 @@ def _segment_text_tool_events(
                 )
             )
     return events
+
+
+def _text_tool_rejection_details(
+    segments: list[TextToolSegment],
+) -> tuple[tuple[str, ...], int] | None:
+    """Return bounded rejection metadata without retaining provider payloads."""
+
+    rejected = [
+        segment
+        for segment in segments
+        if isinstance(segment, RejectedTextToolSegment)
+    ]
+    if not rejected:
+        return None
+    reasons = tuple(sorted({segment.reason for segment in rejected}))
+    call_count = sum(max(0, segment.call_count) for segment in rejected)
+    return reasons, call_count
+
+
+def _text_tool_rejection_error(
+    segments: list[TextToolSegment],
+    *,
+    display_name: str,
+    provider_kind: str,
+    model: str,
+    phase: str,
+    cache_shape: Mapping[str, Any],
+    trace: LLMTraceRecorder,
+) -> ErrorEvent | None:
+    """Convert one rejected DSML response into a payload-free terminal error."""
+
+    details = _text_tool_rejection_details(segments)
+    if details is None:
+        return None
+    reasons, call_count = details
+    log.warning(
+        "provider.deepseek_dsml_tool_call_rejected",
+        provider=provider_kind,
+        model=model,
+        reasons=reasons,
+        call_count=call_count,
+    )
+    trace.record_error(
+        code="incomplete_tool_call",
+        message="Provider returned rejected DeepSeek DSML tool-call text",
+        metadata={
+            "phase": phase,
+            "cache_shape": cache_shape,
+            "reasons": reasons,
+            "call_count": call_count,
+        },
+    )
+    return ErrorEvent(
+        message=(
+            f"{display_name} returned an invalid DeepSeek DSML tool call; "
+            "no text-encoded tools were executed"
+        ),
+        code="incomplete_tool_call",
+    )
 
 
 def _synthesize_text_tool_events(
@@ -3249,11 +3298,13 @@ class OpenAIProvider:
         reasoning = ReasoningAccumulator()
         tools_by_name = _tool_by_name(tools)
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
-        text_tool_normalizer: (
-            TextToolStreamNormalizer | _InertCandidateTextPassthrough
-        )
+        text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
-            text_tool_normalizer = _InertCandidateTextPassthrough()
+            assert candidate_artifact is not None
+            text_tool_normalizer = InertCandidateTextNormalizer(
+                artifact=candidate_artifact,
+                dialects=text_tool_dialects,
+            )
         else:
             text_tool_normalizer = TextToolStreamNormalizer(
                 tools=tools,
@@ -3894,7 +3945,27 @@ class OpenAIProvider:
                                 streamed_thought_signature = ts_delta
 
                             # Tool calls (may stream over multiple chunks)
-                            raw_tool_calls = delta.get("tool_calls") or []
+                            raw_tool_calls_value = delta.get("tool_calls")
+                            if _has_native_tool_payload(raw_tool_calls_value):
+                                pending_segments = (
+                                    text_tool_normalizer.observe_native_tool_start("")
+                                )
+                                for pending_event in _segment_text_tool_events(
+                                    pending_segments,
+                                    provider_kind=self._provider_kind,
+                                    model=self._model,
+                                ):
+                                    if isinstance(pending_event, TextDeltaEvent):
+                                        visible_assistant_text_parts.append(
+                                            pending_event.text
+                                        )
+                                        emitted_stream_event = True
+                                        yield pending_event
+                            raw_tool_calls = (
+                                []
+                                if raw_tool_calls_value is None
+                                else raw_tool_calls_value
+                            )
                             if not isinstance(raw_tool_calls, list):
                                 if inert_candidate_output:
                                     assert candidate_artifact is not None
@@ -3904,6 +3975,7 @@ class OpenAIProvider:
                                             raw_tool_calls
                                         ),
                                     )
+                                    text_tool_normalizer.observe_native_tool_start("")
                                     emitted_stream_event = True
                                 else:
                                     invalid_native_structure += 1
@@ -3922,6 +3994,7 @@ class OpenAIProvider:
                                             ("invalid_tool_call", candidate_artifact.call_count),
                                             arguments=strip_candidate_tool_identity(tc),
                                         )
+                                        text_tool_normalizer.observe_native_tool_start("")
                                         emitted_stream_event = True
                                     else:
                                         invalid_native_structure += 1
@@ -4016,6 +4089,7 @@ class OpenAIProvider:
                                         name_fragment=name_fragment,
                                         arguments_fragment=arguments_fragment,
                                     )
+                                    text_tool_normalizer.observe_native_tool_start("")
                                     candidate_artifact_open_keys.add(artifact_key)
                                     emitted_stream_event = True
                                     continue
@@ -4500,6 +4574,18 @@ class OpenAIProvider:
                         successful_text_tool_terminal=successful_text_tool_terminal,
                         native_calls=native_calls,
                     )
+                    rejection_error = _text_tool_rejection_error(
+                        normalized_segments,
+                        display_name=self._compat.display_name,
+                        provider_kind=self._provider_kind,
+                        model=self._model,
+                        phase="stream",
+                        cache_shape=cache_shape,
+                        trace=trace,
+                    )
+                    if rejection_error is not None:
+                        yield rejection_error
+                        return
                     for event in _segment_text_tool_events(
                         normalized_segments,
                         provider_kind=self._provider_kind,
@@ -4529,7 +4615,7 @@ class OpenAIProvider:
                     deferred_post_native_events.clear()
 
                     candidate_artifact_text = ""
-                    if candidate_artifact is not None and candidate_artifact.has_calls:
+                    if candidate_artifact is not None and candidate_artifact.has_content:
                         if successful_text_tool_terminal:
                             for artifact_key in candidate_artifact_open_keys:
                                 candidate_artifact.finish(artifact_key)
@@ -5155,11 +5241,13 @@ class OpenAIProvider:
         tools_by_name = _tool_by_name(tools)
         finish_reasons: list[str] = []
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
-        text_tool_normalizer: (
-            TextToolStreamNormalizer | _InertCandidateTextPassthrough
-        )
+        text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
-            text_tool_normalizer = _InertCandidateTextPassthrough()
+            assert candidate_artifact is not None
+            text_tool_normalizer = InertCandidateTextNormalizer(
+                artifact=candidate_artifact,
+                dialects=text_tool_dialects,
+            )
         else:
             text_tool_normalizer = TextToolStreamNormalizer(
                 tools=tools,
@@ -5199,7 +5287,19 @@ class OpenAIProvider:
                     if reasoning_event is not None:
                         yield reasoning_event
 
-            raw_tool_calls = message.get("tool_calls") or []
+            raw_tool_calls_value = message.get("tool_calls")
+            if _has_native_tool_payload(raw_tool_calls_value):
+                for pending_event in _segment_text_tool_events(
+                    text_tool_normalizer.observe_native_tool_start(""),
+                    provider_kind=self._provider_kind,
+                    model=self._model,
+                ):
+                    if isinstance(pending_event, TextDeltaEvent):
+                        visible_assistant_text_parts.append(pending_event.text)
+                        yield pending_event
+            raw_tool_calls = (
+                [] if raw_tool_calls_value is None else raw_tool_calls_value
+            )
             if not isinstance(raw_tool_calls, list):
                 if inert_candidate_output:
                     assert candidate_artifact is not None
@@ -5207,6 +5307,7 @@ class OpenAIProvider:
                         ("invalid_tool_calls", candidate_artifact.call_count),
                         arguments=strip_candidate_tool_identity(raw_tool_calls),
                     )
+                    text_tool_normalizer.observe_native_tool_start("")
                 else:
                     invalid_native_arguments += 1
                     log.warning(
@@ -5224,6 +5325,7 @@ class OpenAIProvider:
                             ("invalid_tool_call", call_position),
                             arguments=strip_candidate_tool_identity(tc),
                         )
+                        text_tool_normalizer.observe_native_tool_start("")
                     else:
                         invalid_native_arguments += 1
                         log.warning(
@@ -5258,6 +5360,7 @@ class OpenAIProvider:
                         name_text=raw_name,
                         arguments=raw_arguments,
                     )
+                    text_tool_normalizer.observe_native_tool_start("")
                     continue
                 raw_function = tc.get("function") or {}
                 if not isinstance(raw_function, Mapping):
@@ -5465,6 +5568,18 @@ class OpenAIProvider:
             successful_text_tool_terminal=successful_text_tool_terminal,
             native_calls=native_calls,
         )
+        rejection_error = _text_tool_rejection_error(
+            normalized_segments,
+            display_name=self._compat.display_name,
+            provider_kind=self._provider_kind,
+            model=self._model,
+            phase="non_stream",
+            cache_shape=cache_shape,
+            trace=trace,
+        )
+        if rejection_error is not None:
+            yield rejection_error
+            return
         for event in _segment_text_tool_events(
             normalized_segments,
             provider_kind=self._provider_kind,
@@ -5487,7 +5602,7 @@ class OpenAIProvider:
             yield deferred_event
 
         candidate_artifact_text = ""
-        if candidate_artifact is not None and candidate_artifact.has_calls:
+        if candidate_artifact is not None and candidate_artifact.has_content:
             candidate_artifact_text = candidate_artifact.render_text()
             if candidate_artifact_text:
                 visible_assistant_text_parts.append(candidate_artifact_text)
