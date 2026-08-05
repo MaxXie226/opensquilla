@@ -2992,6 +2992,11 @@ async def test_trusted_shell_delete_under_rw_mount_still_requires_destructive_ap
 
     monkeypatch.setattr(shell, "run_under_backend", fake_backend)
     monkeypatch.setattr(shell, "_windows_sandbox_backend_active", lambda runtime=None: True)
+    # This test simulates the Windows backend on a POSIX host while keeping
+    # the target as a real host fixture.  Do not remap Linux ``/tmp`` into the
+    # synthetic Windows session temp root before destructive-action parsing.
+    monkeypatch.setattr(shell, "_windows_translate_posix_tmp_references", lambda command: command)
+    monkeypatch.setattr(shell, "_windows_translate_posix_tmp_path", lambda path: path)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
