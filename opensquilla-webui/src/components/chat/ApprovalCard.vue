@@ -16,44 +16,54 @@
   <article
     v-else
     class="approval-card"
-    :class="{ 'approval-card--timeline': timeline }"
     data-testid="approval-card"
     :data-approval-id="approval.id"
     tabindex="-1"
     role="group"
-    :aria-label="t('chat.approval.requiredFor', { tool: approval.toolName })"
+    :aria-label="t('chat.approval.requiredFor', { action: semanticTitle })"
+    :class="{
+      'approval-card--timeline': timeline,
+      'approval-card--danger': approval.irreversible,
+    }"
   >
     <!-- Concise live announcement: screen readers hear only this line, not the full card body -->
     <div
       class="approval-card__announce"
       aria-live="assertive"
       aria-atomic="true"
-    >{{ t('chat.approval.neededFor', { tool: approval.toolName }) }}</div>
+    >{{ t('chat.approval.neededFor', { action: semanticTitle }) }}</div>
     <header class="approval-card__head">
-      <span class="approval-card__eyebrow">{{ t('chat.approval.required') }}</span>
-      <span class="approval-card__tool">{{ approval.toolName }}</span>
-      <span v-if="approval.namespace && approval.namespace !== 'exec'" class="approval-card__ns">
-        {{ approval.namespace }}
+      <span class="approval-card__icon" aria-hidden="true">
+        <Icon name="shield" :size="18" />
       </span>
-      <span v-if="approval.agent" class="approval-card__agent">{{ approval.agent }}</span>
+      <div class="approval-card__heading">
+        <span class="approval-card__eyebrow">{{ t('chat.approval.required') }}</span>
+        <h3 class="approval-card__title">{{ semanticTitle }}</h3>
+      </div>
     </header>
 
     <div class="approval-card__body">
-      <template v-if="approval.command">
+      <dl v-if="showTarget" class="approval-card__context">
+        <div class="approval-card__context-row">
+          <dt>{{ t('chat.approval.target') }}</dt>
+          <dd>{{ approval.displayTarget }}</dd>
+        </div>
+      </dl>
+      <template v-if="showCommand">
         <div class="approval-card__label">{{ t('chat.approval.command') }}</div>
         <pre class="approval-card__pre approval-card__pre--cmd">{{ approval.command }}</pre>
       </template>
-      <dl v-if="sandboxContextRows.length" class="approval-card__context">
-        <div v-for="row in sandboxContextRows" :key="row.key" class="approval-card__context-row">
-          <dt>{{ t(row.labelKey) }}</dt>
-          <dd>{{ row.value }}</dd>
-        </div>
-      </dl>
-      <template v-else-if="!approval.command && formattedArgs">
-        <div class="approval-card__label">{{ t('chat.approval.arguments') }}</div>
-        <pre class="approval-card__pre">{{ formattedArgs }}</pre>
-      </template>
-      <p v-if="approval.warning" class="approval-card__warning">{{ approval.warning }}</p>
+      <section
+        v-if="riskTitle"
+        class="approval-card__risk"
+        :class="riskClass"
+        role="note"
+      >
+        <strong>{{ riskTitle }}</strong>
+        <p v-if="riskBody">{{ riskBody }}</p>
+        <p v-if="riskSecondary">{{ riskSecondary }}</p>
+      </section>
+      <p v-if="visibleWarning" class="approval-card__warning">{{ visibleWarning }}</p>
     </div>
 
     <footer class="approval-card__footer">
@@ -76,17 +86,9 @@
           {{ t('chat.approval.extend') }}
         </button>
       </div>
-      <input
-        v-model="denyNote"
-        class="approval-card__note"
-        type="text"
-        :placeholder="t('chat.approval.denyReasonPlaceholder')"
-        :aria-label="t('chat.approval.denyReasonLabel')"
-        :disabled="busy"
-      />
       <div class="approval-card__actions">
         <button class="btn btn--primary" type="button" :disabled="busy" @click="$emit('allow-once')">
-          {{ t('chat.approval.allowOnce') }}
+          {{ allowLabel }}
         </button>
         <button
           v-if="isSandboxApproval"
@@ -133,11 +135,10 @@ const props = defineProps<{
 const emit = defineEmits<{
   'allow-once': []
   'allow-always': []
-  deny: [note: string]
+  deny: []
   extend: []
 }>()
 
-const denyNote = ref('')
 const now = ref(Date.now())
 let mounted = false
 let tick: ReturnType<typeof setInterval> | null = null
@@ -199,34 +200,72 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 
+const DISPLAY_KIND_KEYS: Record<string, string> = {
+  delete: 'delete',
+  modify: 'modify',
+  create: 'create',
+  run_command: 'runCommand',
+  run_code: 'runCode',
+  network_access: 'networkAccess',
+  path_access: 'pathAccess',
+  plugin_permission: 'pluginPermission',
+  sensitive_operation: 'sensitiveOperation',
+}
+
+const semanticTitle = computed(() => {
+  const key = DISPLAY_KIND_KEYS[String(props.approval.displayKind || '')]
+    || 'sensitiveOperation'
+  return t(`chat.approval.kinds.${key}`)
+})
+
+const showTarget = computed(() =>
+  Boolean(props.approval.displayTarget)
+  && props.approval.displayKind !== 'run_command')
+
+const showCommand = computed(() =>
+  props.approval.displayKind === 'run_command' && Boolean(props.approval.command))
+
 const isSandboxApproval = computed(() =>
-  String(props.approval.approvalKind || props.approval.args?.approvalKind || '').startsWith('sandbox_'))
+  !props.approval.destructive
+  && String(props.approval.approvalKind || '').startsWith('sandbox_'))
 
-const sandboxContextRows = computed(() => {
-  const args = props.approval.args
-  const kind = String(props.approval.approvalKind || args?.approvalKind || '')
-  if (!args || !kind.startsWith('sandbox_')) return []
-  const target = kind === 'sandbox_network'
-    ? [args.host, args.bundle_id]
-        .filter(value => value != null && ['string', 'number', 'boolean'].includes(typeof value))
-        .join(' · ')
-    : args.path
-  return [
-    { key: 'target', labelKey: 'chat.approval.target', value: target },
-    { key: 'access', labelKey: 'chat.approval.access', value: args.access },
-    { key: 'workspace', labelKey: 'chat.approval.workspace', value: args.workspace },
-  ].filter((row): row is { key: string; labelKey: string; value: string | number | boolean } =>
-    row.value != null && ['string', 'number', 'boolean'].includes(typeof row.value))
-})
-
-const formattedArgs = computed(() => {
-  if (!props.approval.args) return ''
-  try {
-    return JSON.stringify(props.approval.args, null, 2)
-  } catch {
-    return String(props.approval.args)
+const riskTitle = computed(() => {
+  if (props.approval.backupState === 'enabled') return t('chat.approval.backup.enabledTitle')
+  if (props.approval.backupState === 'disabled') return t('chat.approval.backup.disabledTitle')
+  if (props.approval.backupState === 'unavailable_requires_confirmation') {
+    return t('chat.approval.backup.unavailableTitle')
   }
+  if (props.approval.irreversible) return t('chat.approval.irreversibleTitle')
+  return ''
 })
+
+const riskBody = computed(() => {
+  if (props.approval.backupState === 'enabled') return t('chat.approval.backup.enabledBody')
+  if (props.approval.backupState === 'disabled') return t('chat.approval.backup.disabledBody')
+  if (props.approval.backupState === 'unavailable_requires_confirmation') {
+    return t('chat.approval.backup.unavailableBody')
+  }
+  if (props.approval.irreversible) return t('chat.approval.irreversibleBody')
+  return ''
+})
+
+const riskSecondary = computed(() =>
+  props.approval.backupState === 'disabled'
+    ? t('chat.approval.backup.settingsHint')
+    : '')
+
+const riskClass = computed(() =>
+  props.approval.backupState === 'enabled'
+    ? 'approval-card__risk--backup'
+    : 'approval-card__risk--danger')
+
+const visibleWarning = computed(() =>
+  props.approval.destructive ? '' : props.approval.warning)
+
+const allowLabel = computed(() =>
+  props.approval.backupState === 'unavailable_requires_confirmation'
+    ? t('chat.approval.continueWithoutBackup')
+    : t('chat.approval.allowOnce'))
 
 const outcomeText = computed(() => {
   if (props.resolution === 'unavailable') return t('chat.approval.outcomeUnavailable')
@@ -250,13 +289,14 @@ const outcomeIcon = computed(() => {
 })
 
 const summary = computed(() => {
-  const text = props.approval.command || props.approval.toolName || ''
+  const text = props.approval.displayTarget
+    || (props.approval.displayKind === 'run_command' ? props.approval.command : '')
   return text.length > 60 ? text.slice(0, 60) + '…' : text
 })
 
 function emitDeny() {
   if (props.busy) return
-  emit('deny', denyNote.value)
+  emit('deny')
 }
 </script>
 
@@ -288,7 +328,10 @@ function emitDeny() {
      automatic min-height, so without this the card collapses when the thread
      scrolls. */
   flex-shrink: 0;
-  animation: card-enter var(--dur-enter) var(--ease-out) both;
+}
+
+.approval-card--danger {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
 }
 
 .approval-card:focus-visible {
@@ -298,10 +341,31 @@ function emitDeny() {
 
 .approval-card__head {
   display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: var(--sp-2);
-  padding: var(--sp-3) var(--sp-4) 0;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-4) 0;
+}
+
+.approval-card__icon {
+  align-items: center;
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--warn) 28%, var(--border));
+  border-radius: var(--radius-md);
+  color: var(--warn);
+  display: inline-flex;
+  height: 34px;
+  justify-content: center;
+  width: 34px;
+}
+
+.approval-card--danger .approval-card__icon {
+  background: color-mix(in srgb, var(--danger) 10%, var(--bg));
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+  color: var(--danger);
+}
+
+.approval-card__heading {
+  min-width: 0;
 }
 
 .approval-card__eyebrow {
@@ -312,25 +376,16 @@ function emitDeny() {
   text-transform: uppercase;
 }
 
-.approval-card__tool {
+.approval-card__title {
   color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--fs-sm);
-  font-weight: 600;
+  font-size: var(--fs-md);
+  font-weight: 650;
+  line-height: 1.35;
+  margin: 2px 0 0;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.approval-card__ns,
-.approval-card__agent {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-  padding: 1px var(--sp-2);
 }
 
 .approval-card__body {
@@ -374,6 +429,40 @@ function emitDeny() {
   margin: 0;
 }
 
+.approval-card__risk {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  padding: var(--sp-3);
+}
+
+.approval-card__risk strong {
+  display: block;
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+}
+
+.approval-card__risk p {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  margin: var(--sp-1) 0 0;
+}
+
+.approval-card__risk--backup {
+  background: color-mix(in srgb, var(--ok) 7%, var(--bg));
+  border-color: color-mix(in srgb, var(--ok) 30%, var(--border));
+}
+
+.approval-card__risk--danger {
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg));
+  border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
+}
+
+.approval-card__risk--danger strong {
+  color: var(--danger);
+}
+
 .approval-card__context {
   display: grid;
   gap: var(--sp-2);
@@ -398,6 +487,7 @@ function emitDeny() {
   font-size: var(--fs-xs);
   margin: 0;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 /* Sticky action bar: the body above scrolls, this footer stays visible. */
@@ -441,22 +531,6 @@ function emitDeny() {
 
 .approval-card__extend:hover:not(:disabled) {
   background: color-mix(in srgb, var(--warn) 10%, var(--bg-surface));
-}
-
-.approval-card__note {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  color: var(--text);
-  font-size: var(--fs-sm);
-  padding: var(--sp-2) var(--sp-3);
-  width: 100%;
-}
-
-.approval-card__note:focus-visible {
-  border-color: var(--border-focus);
-  box-shadow: var(--focus-ring);
-  outline: none;
 }
 
 .approval-card__actions {
@@ -535,17 +609,6 @@ function emitDeny() {
   box-shadow: none;
 }
 
-@keyframes card-enter {
-  from {
-    opacity: 0;
-    transform: translateY(7px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 @media (max-width: 768px) {
   .approval-card__actions {
     flex-direction: column;
@@ -557,9 +620,4 @@ function emitDeny() {
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .approval-card {
-    animation: none;
-  }
-}
 </style>

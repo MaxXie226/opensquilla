@@ -495,10 +495,10 @@
         "readsAllowed": "读取不拦截",
         "customPath": "自定义受保护路径",
         "pathPlaceholder": "添加受保护路径",
-        "backupTitle": "递归删除前先备份",
-        "backupDescription": "保留可恢复副本，达到空间上限后自动清理最旧的备份。",
+        "backupTitle": "破坏性文件变更前先备份",
+        "backupDescription": "删除或修改已有文件前创建可恢复副本；需要腾出空间时会自动清理最旧的备份。",
         "quota": "备份空间上限",
-        "recursiveWarning": "递归删除不可撤回。OpenSquilla 执行前会显示专门的强提醒，并默认选择取消。"
+        "recursiveWarning": "没有备份时，删除和覆盖可能无法恢复。如果清理旧备份后仍无法创建新备份，OpenSquilla 会再次询问后才继续。"
       },
       "commands": {
         "title": "命令安全",
@@ -3419,24 +3419,45 @@
     },
     "approval": {
       "required": "需要审批",
-      "requiredFor": "需要审批：{tool}",
-      "neededFor": "需要审批：{tool}",
+      "requiredFor": "需要审批：{action}",
+      "neededFor": "需要审批：{action}",
       "command": "命令",
       "arguments": "参数",
       "extend": "延长",
-      "denyReasonPlaceholder": "拒绝原因（可选）——将发送给智能体",
-      "denyReasonLabel": "拒绝原因，可选，将发送给智能体",
       "allowOnce": "允许一次",
+      "continueWithoutBackup": "无备份继续",
       "allowSameType": "允许同类型",
       "deny": "拒绝",
       "expiresIn": "{time} 后过期",
-      "outcomeExpired": "已过期 — 未运行",
+      "outcomeExpired": "已过期，未运行",
       "outcomeDenied": "已拒绝",
-      "outcomeApproved": "已批准 · 已恢复运行",
+      "outcomeApproved": "已批准，任务已继续",
       "target": "目标",
       "access": "访问权限",
       "workspace": "工作区",
-      "outcomeUnavailable": "该审批已不可用"
+      "outcomeUnavailable": "该审批已不可用",
+      "irreversibleTitle": "此操作无法撤销",
+      "irreversibleBody": "继续前请核对准确目标。",
+      "kinds": {
+        "delete": "删除文件或文件夹",
+        "modify": "修改已有文件",
+        "create": "创建文件",
+        "runCommand": "运行命令",
+        "runCode": "运行代码",
+        "networkAccess": "访问网络",
+        "pathAccess": "访问文件或文件夹",
+        "pluginPermission": "授予扩展权限",
+        "sensitiveOperation": "敏感操作"
+      },
+      "backup": {
+        "enabledTitle": "此变更执行前会创建可恢复备份。",
+        "enabledBody": "为了腾出空间，系统可能自动删除最旧的备份。",
+        "disabledTitle": "不会创建备份",
+        "disabledBody": "此操作可能无法恢复。",
+        "settingsHint": "可前往“设置 > 沙箱 > 文件安全”开启备份。",
+        "unavailableTitle": "当前没有可用备份",
+        "unavailableBody": "此操作将无法恢复。只有在你接受永久丢失数据时才继续。"
+      }
     },
     "plan": {
       "label": "实施方案",

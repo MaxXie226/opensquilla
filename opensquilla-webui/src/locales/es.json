@@ -469,9 +469,9 @@
       },
       "files": {
         "title": "Seguridad de archivos", "description": "Los archivos normales son legibles. Los cambios en rutas protegidas requieren aprobación.", "readsAllowed": "Lectura permitida",
-        "customPath": "Ruta protegida personalizada", "pathPlaceholder": "Añadir ruta protegida", "backupTitle": "Crear copia antes del borrado recursivo",
-        "backupDescription": "Conserva copias recuperables y elimina las más antiguas al alcanzar el límite.", "quota": "Límite de copias",
-        "recursiveWarning": "El borrado recursivo es irreversible. OpenSquilla mostrará un aviso específico y elegirá Cancelar por defecto."
+        "customPath": "Ruta protegida personalizada", "pathPlaceholder": "Añadir ruta protegida", "backupTitle": "Crear copia antes de cambios destructivos",
+        "backupDescription": "Crea copias recuperables antes de eliminar o modificar archivos existentes y borra automáticamente las más antiguas cuando hace falta espacio.", "quota": "Límite de copias",
+        "recursiveWarning": "Sin copia, eliminar o reemplazar puede ser irrecuperable. Si la copia sigue fallando tras borrar las antiguas, OpenSquilla vuelve a pedir confirmación."
       },
       "commands": {
         "title": "Seguridad de comandos", "description": "Los comandos se ejecutan automáticamente; operaciones como git push requieren aprobación.",
@@ -3368,24 +3368,45 @@
     },
     "approval": {
       "required": "Aprobación requerida",
-      "requiredFor": "Aprobación requerida: {tool}",
-      "neededFor": "Aprobación necesaria: {tool}",
+      "requiredFor": "Aprobación requerida: {action}",
+      "neededFor": "Aprobación necesaria: {action}",
       "command": "Comando",
       "arguments": "Argumentos",
       "extend": "Extender",
-      "denyReasonPlaceholder": "Motivo de la denegación (opcional) — se envía al agente",
-      "denyReasonLabel": "Motivo de la denegación, opcional, se envía al agente",
       "allowOnce": "Permitir una vez",
+      "continueWithoutBackup": "Continuar sin copia",
       "allowSameType": "Permitir el mismo tipo",
       "deny": "Denegar",
       "expiresIn": "Caduca en {time}",
-      "outcomeExpired": "Caducada — no ejecutada",
+      "outcomeExpired": "Caducada, no ejecutada",
       "outcomeDenied": "Denegada",
-      "outcomeApproved": "Aprobada · ejecución reanudada",
+      "outcomeApproved": "Aprobada. Ejecución reanudada",
       "target": "Objetivo",
       "access": "Acceso",
       "workspace": "Espacio de trabajo",
-      "outcomeUnavailable": "La aprobación ya no está disponible"
+      "outcomeUnavailable": "La aprobación ya no está disponible",
+      "irreversibleTitle": "Esta acción no se puede deshacer",
+      "irreversibleBody": "Comprueba el objetivo exacto antes de continuar.",
+      "kinds": {
+        "delete": "Eliminar archivos o carpetas",
+        "modify": "Modificar un archivo existente",
+        "create": "Crear un archivo",
+        "runCommand": "Ejecutar un comando",
+        "runCode": "Ejecutar código",
+        "networkAccess": "Acceder a la red",
+        "pathAccess": "Acceder a archivos o carpetas",
+        "pluginPermission": "Conceder permiso a una extensión",
+        "sensitiveOperation": "Operación sensible"
+      },
+      "backup": {
+        "enabledTitle": "Se creará una copia recuperable antes de este cambio.",
+        "enabledBody": "Las copias más antiguas pueden borrarse automáticamente para liberar espacio.",
+        "disabledTitle": "No se creará ninguna copia",
+        "disabledBody": "Puede que esta acción no se pueda recuperar.",
+        "settingsHint": "Activa las copias en Ajustes > Sandbox > Seguridad de archivos.",
+        "unavailableTitle": "No hay ninguna copia disponible",
+        "unavailableBody": "Esta acción no se podrá recuperar. Continúa solo si aceptas una pérdida permanente de datos."
+      }
     },
     "plan": {
       "label": "Plan",

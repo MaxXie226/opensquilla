@@ -300,12 +300,6 @@ test.describe('Vue behavior contracts', () => {
     })
     await openChat(page)
 
-    const approvalNote = page.locator('.approval-card__note')
-    await expect(approvalNote).toBeVisible({ timeout: 10000 })
-    await approvalNote.focus()
-    await page.keyboard.press('Escape')
-    expect(abortCalls).toHaveLength(0)
-
     const clarifyInput = page.locator('.clarify-field__input')
     await expect(clarifyInput).toBeVisible({ timeout: 10000 })
     await clarifyInput.focus()

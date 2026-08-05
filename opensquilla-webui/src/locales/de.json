@@ -469,9 +469,9 @@
       },
       "files": {
         "title": "Dateisicherheit", "description": "Normale Dateien sind lesbar. Änderungen an geschützten Pfaden erfordern eine Freigabe.", "readsAllowed": "Lesen erlaubt",
-        "customPath": "Eigener geschützter Pfad", "pathPlaceholder": "Geschützten Pfad hinzufügen", "backupTitle": "Vor rekursivem Löschen sichern",
-        "backupDescription": "Wiederherstellbare Kopien behalten und bei Erreichen des Limits die ältesten löschen.", "quota": "Backup-Speicherlimit",
-        "recursiveWarning": "Rekursives Löschen ist nicht rückgängig zu machen. OpenSquilla warnt gesondert und wählt standardmäßig Abbrechen."
+        "customPath": "Eigener geschützter Pfad", "pathPlaceholder": "Geschützten Pfad hinzufügen", "backupTitle": "Vor destruktiven Dateiänderungen sichern",
+        "backupDescription": "Vor dem Löschen oder Ändern vorhandener Dateien wiederherstellbare Kopien anlegen und bei Bedarf die ältesten automatisch entfernen.", "quota": "Backup-Speicherlimit",
+        "recursiveWarning": "Ohne Backup können Löschen und Ersetzen unwiederbringlich sein. Schlägt das Backup nach dem Entfernen alter Kopien weiter fehl, fragt OpenSquilla vor dem Fortfahren erneut."
       },
       "commands": {
         "title": "Befehlssicherheit", "description": "Befehle laufen standardmäßig automatisch. Riskante Aktionen wie git push brauchen eine Freigabe.",
@@ -3368,24 +3368,45 @@
     },
     "approval": {
       "required": "Genehmigung erforderlich",
-      "requiredFor": "Genehmigung erforderlich: {tool}",
-      "neededFor": "Genehmigung benötigt: {tool}",
+      "requiredFor": "Genehmigung erforderlich: {action}",
+      "neededFor": "Genehmigung benötigt: {action}",
       "command": "Befehl",
       "arguments": "Argumente",
       "extend": "Verlängern",
-      "denyReasonPlaceholder": "Ablehnungsgrund (optional) — an den Agenten gesendet",
-      "denyReasonLabel": "Ablehnungsgrund, optional, an den Agenten gesendet",
       "allowOnce": "Einmal zulassen",
+      "continueWithoutBackup": "Ohne Backup fortfahren",
       "allowSameType": "Gleichen Typ zulassen",
       "deny": "Ablehnen",
       "expiresIn": "Läuft ab in {time}",
-      "outcomeExpired": "Abgelaufen — nicht ausgeführt",
+      "outcomeExpired": "Abgelaufen, nicht ausgeführt",
       "outcomeDenied": "Abgelehnt",
-      "outcomeApproved": "Genehmigt · Lauf fortgesetzt",
+      "outcomeApproved": "Genehmigt. Lauf fortgesetzt",
       "target": "Ziel",
       "access": "Zugriff",
       "workspace": "Arbeitsbereich",
-      "outcomeUnavailable": "Genehmigung nicht mehr verfügbar"
+      "outcomeUnavailable": "Genehmigung nicht mehr verfügbar",
+      "irreversibleTitle": "Diese Aktion kann nicht rückgängig gemacht werden",
+      "irreversibleBody": "Prüfen Sie das genaue Ziel, bevor Sie fortfahren.",
+      "kinds": {
+        "delete": "Dateien oder Ordner löschen",
+        "modify": "Vorhandene Datei ändern",
+        "create": "Datei erstellen",
+        "runCommand": "Befehl ausführen",
+        "runCode": "Code ausführen",
+        "networkAccess": "Auf das Netzwerk zugreifen",
+        "pathAccess": "Auf Dateien oder Ordner zugreifen",
+        "pluginPermission": "Erweiterungsberechtigung erteilen",
+        "sensitiveOperation": "Sensible Aktion"
+      },
+      "backup": {
+        "enabledTitle": "Vor dieser Änderung wird ein wiederherstellbares Backup erstellt.",
+        "enabledBody": "Die ältesten Backups können automatisch entfernt werden, um Platz zu schaffen.",
+        "disabledTitle": "Es wird kein Backup erstellt",
+        "disabledBody": "Diese Aktion lässt sich möglicherweise nicht wiederherstellen.",
+        "settingsHint": "Aktivieren Sie Backups unter Einstellungen > Sandbox > Dateisicherheit.",
+        "unavailableTitle": "Kein Backup ist verfügbar",
+        "unavailableBody": "Diese Aktion kann nicht wiederhergestellt werden. Fahren Sie nur fort, wenn Sie dauerhaften Datenverlust akzeptieren."
+      }
     },
     "plan": {
       "label": "Plan",

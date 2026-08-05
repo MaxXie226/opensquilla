@@ -495,10 +495,10 @@
         "readsAllowed": "Reads allowed",
         "customPath": "Custom protected path",
         "pathPlaceholder": "Add a protected path",
-        "backupTitle": "Back up before recursive deletion",
-        "backupDescription": "Keep recoverable copies and evict the oldest backups when the quota is reached.",
+        "backupTitle": "Back up before destructive file changes",
+        "backupDescription": "Create recoverable copies before deleting or modifying existing files. Oldest backups are removed automatically when space is needed.",
         "quota": "Backup space limit",
-        "recursiveWarning": "Recursive deletion is irreversible. OpenSquilla will show a dedicated warning and default to Cancel before executing it."
+        "recursiveWarning": "Without a backup, deletion and replacement may be impossible to recover. If a backup still fails after old copies are removed, OpenSquilla asks again before continuing."
       },
       "commands": {
         "title": "Command safety",
@@ -3419,24 +3419,45 @@
     },
     "approval": {
       "required": "Approval required",
-      "requiredFor": "Approval required: {tool}",
-      "neededFor": "Approval needed: {tool}",
+      "requiredFor": "Approval required: {action}",
+      "neededFor": "Approval needed: {action}",
       "command": "Command",
       "arguments": "Arguments",
       "extend": "Extend",
-      "denyReasonPlaceholder": "Deny reason (optional) — sent to the agent",
-      "denyReasonLabel": "Deny reason, optional, sent to the agent",
       "allowOnce": "Allow once",
+      "continueWithoutBackup": "Continue without backup",
       "allowSameType": "Allow same type",
       "deny": "Deny",
       "expiresIn": "Expires in {time}",
-      "outcomeExpired": "Expired — not run",
+      "outcomeExpired": "Expired - not run",
       "outcomeDenied": "Denied",
-      "outcomeApproved": "Approved · run resumed",
+      "outcomeApproved": "Approved. Run resumed",
       "target": "Target",
       "access": "Access",
       "workspace": "Workspace",
-      "outcomeUnavailable": "Approval no longer available"
+      "outcomeUnavailable": "Approval no longer available",
+      "irreversibleTitle": "This action cannot be undone",
+      "irreversibleBody": "Review the exact target before you continue.",
+      "kinds": {
+        "delete": "Delete files or folders",
+        "modify": "Modify an existing file",
+        "create": "Create a file",
+        "runCommand": "Run a command",
+        "runCode": "Run code",
+        "networkAccess": "Access the network",
+        "pathAccess": "Access files or folders",
+        "pluginPermission": "Grant an extension permission",
+        "sensitiveOperation": "Sensitive operation"
+      },
+      "backup": {
+        "enabledTitle": "A recoverable backup will be created before this change.",
+        "enabledBody": "Older backups may be removed automatically to make room.",
+        "disabledTitle": "No backup will be created",
+        "disabledBody": "This action may be impossible to recover.",
+        "settingsHint": "Turn on backups in Settings > Sandbox > File safety.",
+        "unavailableTitle": "No backup is available",
+        "unavailableBody": "This action cannot be recovered. Continue only if you accept permanent data loss."
+      }
     },
     "plan": {
       "label": "Plan",

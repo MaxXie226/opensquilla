@@ -469,9 +469,9 @@
       },
       "files": {
         "title": "ファイル保護", "description": "通常のファイルは読み取り可能です。保護パスの変更には承認が必要です。", "readsAllowed": "読み取り許可",
-        "customPath": "カスタム保護パス", "pathPlaceholder": "保護パスを追加", "backupTitle": "再帰削除の前にバックアップ",
-        "backupDescription": "復元可能なコピーを保持し、上限到達時は古いものから削除します。", "quota": "バックアップ容量上限",
-        "recursiveWarning": "再帰削除は元に戻せません。OpenSquilla は専用の警告を表示し、既定でキャンセルを選びます。"
+        "customPath": "カスタム保護パス", "pathPlaceholder": "保護パスを追加", "backupTitle": "破壊的なファイル変更の前にバックアップ",
+        "backupDescription": "既存ファイルの削除や変更前に復元可能なコピーを作成し、必要に応じて古いバックアップを自動削除します。", "quota": "バックアップ容量上限",
+        "recursiveWarning": "バックアップがない削除や上書きは復元できない場合があります。古いコピーを削除してもバックアップできない場合は、続行前に再確認します。"
       },
       "commands": {
         "title": "コマンド保護", "description": "コマンドは原則自動実行され、git push など影響の大きい操作だけ承認を求めます。",
@@ -3368,24 +3368,45 @@
     },
     "approval": {
       "required": "承認が必要です",
-      "requiredFor": "承認が必要です: {tool}",
-      "neededFor": "承認が必要です: {tool}",
+      "requiredFor": "承認が必要です: {action}",
+      "neededFor": "承認が必要です: {action}",
       "command": "コマンド",
       "arguments": "引数",
       "extend": "延長",
-      "denyReasonPlaceholder": "拒否の理由（任意）— エージェントに送信されます",
-      "denyReasonLabel": "拒否の理由（任意、エージェントに送信）",
       "allowOnce": "1 回だけ許可",
+      "continueWithoutBackup": "バックアップなしで続行",
       "allowSameType": "同じ種類を許可",
       "deny": "拒否",
       "expiresIn": "{time} で期限切れ",
-      "outcomeExpired": "期限切れ — 未実行",
+      "outcomeExpired": "期限切れ、未実行",
       "outcomeDenied": "拒否済み",
-      "outcomeApproved": "承認済み · 実行を再開",
+      "outcomeApproved": "承認済み。実行を再開しました",
       "target": "対象",
       "access": "アクセス",
       "workspace": "ワークスペース",
-      "outcomeUnavailable": "この承認は利用できなくなりました"
+      "outcomeUnavailable": "この承認は利用できなくなりました",
+      "irreversibleTitle": "この操作は元に戻せません",
+      "irreversibleBody": "続行する前に対象を確認してください。",
+      "kinds": {
+        "delete": "ファイルまたはフォルダーを削除",
+        "modify": "既存ファイルを変更",
+        "create": "ファイルを作成",
+        "runCommand": "コマンドを実行",
+        "runCode": "コードを実行",
+        "networkAccess": "ネットワークにアクセス",
+        "pathAccess": "ファイルまたはフォルダーにアクセス",
+        "pluginPermission": "拡張機能に権限を付与",
+        "sensitiveOperation": "機密性の高い操作"
+      },
+      "backup": {
+        "enabledTitle": "変更前に復元可能なバックアップを作成します。",
+        "enabledBody": "空き容量を確保するため、古いバックアップを自動削除する場合があります。",
+        "disabledTitle": "バックアップは作成されません",
+        "disabledBody": "この操作は復元できない場合があります。",
+        "settingsHint": "設定 > サンドボックス > ファイル保護でバックアップを有効にできます。",
+        "unavailableTitle": "利用できるバックアップがありません",
+        "unavailableBody": "この操作は復元できません。データの完全な消失を許容する場合のみ続行してください。"
+      }
     },
     "plan": {
       "label": "プラン",

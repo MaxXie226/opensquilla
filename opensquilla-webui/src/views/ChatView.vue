@@ -372,7 +372,7 @@
             :error="entry.error"
             @allow-once="resolveApproval(entry, 'allow-once')"
             @allow-always="resolveApproval(entry, 'allow-always')"
-            @deny="note => resolveApproval(entry, 'deny', note)"
+            @deny="resolveApproval(entry, 'deny')"
             @extend="extendInterrupt(entry.approval.id)"
           />
 
@@ -2062,38 +2062,12 @@ async function steerPendingMessage(index: number) {
   }
 }
 
-// Deny notes are immutable queue payloads. They never borrow or clear the
-// operator's editable composer, even if project validation or live recovery
-// delays delivery.
-function queueDenyFeedback(note: string) {
-  const context = pendingQueueOwnerContext.value
-  const owner = context?.sessionKey === sessionKey.value
-    ? { ownerRequestId: context.ownerRequestId }
-    : undefined
-  const queued = enqueuePendingPayload({
-    text: note,
-    attachments: [],
-    intent: null,
-  }, owner)
-  if (!queued) {
-    inputText.value = [note, inputText.value].filter(text => text.trim()).join('\n')
-    autoResizeTextarea()
-    pushToast(t('chat.toast.queueFull'), { tone: 'info' })
-    return
-  }
-  if (!isStreaming.value && !isCompactInFlightForCurrentSession()) {
-    schedulePendingDrainAfterTerminal()
-    flushDeferredPendingDrain()
-  }
-}
-
 const chatApprovals = useChatApprovals({
   rpc,
   sessionKey,
   runStatus,
   stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },
   interruptState,
-  onDenyFeedback: queueDenyFeedback,
   onSnapshotCount: count => appStore.setApprovalCount(count),
 })
 const {
