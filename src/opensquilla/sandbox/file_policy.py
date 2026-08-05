@@ -351,6 +351,22 @@ def compile_safe_file_profile(
         FileSystemPermissionProfile,
     )
     target_platform = _platform_name(platform)
+
+    def compiled_entry(
+        root: str | os.PathLike[str] | PurePath,
+        access: FileSystemAccess,
+    ) -> FileSystemPermissionEntry:
+        pure_root = _pure_path(str(root), platform=target_platform)
+        if target_platform == "windows" or os.name == "nt":
+            return FileSystemPermissionEntry(pure_root, access)
+        logical = Path(os.path.abspath(os.fspath(pure_root))).expanduser()
+        canonical = logical.resolve(strict=False)
+        return FileSystemPermissionEntry(
+            canonical,
+            access,
+            logical_path=logical if logical != canonical else None,
+        )
+
     environment = dict(os.environ if env is None else env)
     if home is None:
         home = (
@@ -369,7 +385,7 @@ def compile_safe_file_profile(
         # OpenSquilla's own authority state.
         default_access = FileSystemAccess.READ
         entries.extend(
-            FileSystemPermissionEntry(root, FileSystemAccess.WRITE)
+            compiled_entry(root, FileSystemAccess.WRITE)
             for root in dict.fromkeys(
                 (
                     pure_home,
@@ -383,7 +399,7 @@ def compile_safe_file_profile(
     else:
         default_access = FileSystemAccess.WRITE
         entries.append(
-            FileSystemPermissionEntry(PurePosixPath("/"), FileSystemAccess.WRITE)
+            compiled_entry(PurePosixPath("/"), FileSystemAccess.WRITE)
         )
 
     deny_write_roots = list(
@@ -404,14 +420,11 @@ def compile_safe_file_profile(
             _pure_path(_pattern_root(expanded), platform=target_platform)
         )
     entries.extend(
-        FileSystemPermissionEntry(root, FileSystemAccess.READ)
+        compiled_entry(root, FileSystemAccess.READ)
         for root in dict.fromkeys(deny_write_roots)
     )
     entries.extend(
-        FileSystemPermissionEntry(
-            _pure_path(str(root), platform=target_platform),
-            FileSystemAccess.DENY,
-        )
+        compiled_entry(root, FileSystemAccess.DENY)
         for root in authority_roots
     )
     return FileSystemPermissionProfile(

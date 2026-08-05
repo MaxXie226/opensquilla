@@ -125,6 +125,35 @@ def test_safe_profile_compiles_write_baseline_and_read_only_carveouts(
     assert profile.resolve(authority / "sessions.db") is FileSystemAccess.DENY
 
 
+def test_safe_profile_freezes_posix_alias_and_canonical_protected_paths(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    authority = alias_root / "state"
+    authority.mkdir()
+    custom = alias_root / "custom-secret"
+    custom.mkdir()
+
+    profile = compile_safe_file_profile(
+        SandboxPolicy.model_validate(
+            {"files": {"customDenyWritePaths": [f"{custom}/**"]}}
+        ),
+        authority_roots=(authority,),
+        platform="linux",
+        home=tmp_path / "home",
+        env={"HOME": str(tmp_path / "home")},
+    )
+
+    assert profile.resolve(real_root / "state" / "sessions.db") is FileSystemAccess.DENY
+    assert profile.resolve(real_root / "custom-secret" / "token") is FileSystemAccess.READ
+    authority_variants = {str(path) for path in profile.protected_path_variants(authority)}
+    assert str(authority) in authority_variants
+    assert str(authority.resolve()) in authority_variants
+
+
 def test_windows_web_guest_profile_denies_credentials_and_writes_only_workspace() -> None:
     home = PureWindowsPath(r"C:\Users\alice")
     workspace = PureWindowsPath(r"D:\OpenSquilla\workspace")
