@@ -730,6 +730,10 @@ async def test_non_delete_leading_compound_fails_closed_when_approval_is_require
     assert target.read_text(encoding="utf-8") == "keep"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="intermediate symlink traversal uses POSIX path resolution semantics",
+)
 def test_intermediate_symlink_is_resolved_while_final_target_is_preserved(
     tmp_path: Path,
 ) -> None:
@@ -916,7 +920,10 @@ def test_saved_file_policy_compiles_into_the_live_safe_profile(tmp_path) -> None
         current_tool_context.reset(token)
 
     assert profile is not None
-    assert profile.default_access is FileSystemAccess.WRITE
+    expected_default = (
+        FileSystemAccess.READ if os.name == "nt" else FileSystemAccess.WRITE
+    )
+    assert profile.default_access is expected_default
     protected_write = decide_path_access(
         protected / "secret.txt",
         workspace=tmp_path,
