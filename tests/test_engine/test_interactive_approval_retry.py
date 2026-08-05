@@ -969,7 +969,7 @@ async def test_pending_approval_ignores_legacy_timeout_and_waits_for_decision(
 
 
 @pytest.mark.asyncio
-async def test_denied_approval_result_reaches_model_for_final_answer(
+async def test_denied_approval_ends_current_turn_without_another_model_call(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1043,19 +1043,79 @@ async def test_denied_approval_result_reaches_model_for_final_answer(
                 get_approval_queue().resolve(approval_id, False)
 
         assert len(denied_approval_ids) == 1
-        assert len(provider.calls) == 2
-        second_provider_request = provider.calls[1]
-        tool_result_blocks = [
-            block
-            for msg in second_provider_request
-            for block in msg.content
-            if getattr(block, "type", None) == "tool_result"
-        ]
-        assert len(tool_result_blocks) == 1
-        assert "approval_denied" in tool_result_blocks[0].content
+        assert len(provider.calls) == 1
         assert any(
-            getattr(event, "kind", "") == "text_delta"
-            and "用户拒绝访问" in event.text
+            isinstance(event, ToolResultEvent) and "approval_denied" in event.result
+            for event in events
+        )
+        assert not any(getattr(event, "kind", "") == "text_delta" for event in events)
+    finally:
+        reset_approval_queue()
+
+
+@pytest.mark.asyncio
+async def test_agent_waits_for_each_approval_in_one_chained_tool_execution() -> None:
+    reset_approval_queue()
+    approval_ids: list[str] = []
+    tool_calls: list[str | None] = []
+
+    async def _handler(call: ToolCall) -> ToolResult:
+        continuation_id = _continuation_approval_id(call)
+        tool_calls.append(continuation_id)
+        if len(tool_calls) <= 2:
+            approval_id = get_approval_queue().request(
+                "exec",
+                {
+                    "toolName": call.tool_name,
+                    "command": call.arguments["command"],
+                    "args": dict(call.arguments),
+                },
+            )
+            approval_ids.append(approval_id)
+            return ToolResult(
+                tool_use_id=call.tool_use_id,
+                tool_name=call.tool_name,
+                content=json.dumps(
+                    {
+                        "status": "approval_required",
+                        "approval_id": approval_id,
+                        "warning": f"approval step {len(tool_calls)}",
+                    }
+                ),
+            )
+        assert continuation_id == approval_ids[-1]
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="exit_code=0\ncompleted after both approvals\n",
+        )
+
+    provider = _OneApprovalToolProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=2),
+        tool_definitions=[_exec_definition()],
+        tool_handler=_handler,
+    )
+
+    events: list[Any] = []
+    try:
+        async for event in agent.run_turn("perform operation with fallback confirmation"):
+            events.append(event)
+            if isinstance(event, ToolResultEvent) and "approval_required" in event.result:
+                approval_id = str(json.loads(event.result)["approval_id"])
+                get_approval_queue().resolve(approval_id, True)
+
+        assert len(approval_ids) == 2
+        assert tool_calls == [None, approval_ids[0], approval_ids[1]]
+        assert len(provider.calls) == 2
+        assert sum(
+            isinstance(event, ToolResultEvent) and "approval_required" in event.result
+            for event in events
+        ) == 2
+        assert any(
+            isinstance(event, ToolResultEvent)
+            and event.result.startswith("exit_code=0\ncompleted after both approvals")
             for event in events
         )
     finally:

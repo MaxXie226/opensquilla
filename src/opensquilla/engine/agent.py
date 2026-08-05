@@ -11751,82 +11751,95 @@ class Agent:
                         if deferred_user_input_handled
                         else _pending_approval_payload(result.content)
                     )
-                    if pending_approval is not None and not tc.arguments.get("approval_id"):
-                        suspended = _suspend_tool_request(tc, pending_approval)
-                        assessment = await _review_pending_elevation_if_configured(
-                            pending_approval,
-                            transcript=turn_messages,
-                            runtime_events_path=self.config.runtime_events_path,
-                            suspended_action=suspended.action,
-                        )
-                        # Human-owned approvals need a lifecycle event so the UI can
-                        # render its card. Automatic rule reviews remain internal.
-                        if assessment is None:
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
+                    if pending_approval is not None:
+                        # One logical tool execution may intentionally have more
+                        # than one approval boundary (for example, a second
+                        # explicit confirmation after backup becomes unavailable).
+                        # Keep waiting and resuming the original tool call until it
+                        # completes, or until the user denies any step.
+                        while pending_approval is not None:
+                            suspended = _suspend_tool_request(tc, pending_approval)
+                            assessment = await _review_pending_elevation_if_configured(
+                                pending_approval,
+                                transcript=turn_messages,
+                                runtime_events_path=self.config.runtime_events_path,
+                                suspended_action=suspended.action,
                             )
-                        approval_wait_started = _loop.time()
-                        await _wait_for_pending_approval_resolution(pending_approval)
-                        approval_wait_duration = max(
-                            0.0,
-                            _loop.time() - approval_wait_started,
-                        )
-                        # Human review is a suspended state, not execution time.
-                        # Shift both active deadlines so an approval that arrives
-                        # much later still resumes with the same tool/turn budget.
-                        tool_deadline += approval_wait_duration
-                        if _total_deadline is not None:
-                            _total_deadline += approval_wait_duration
-                        approval_entry = None
-                        from opensquilla.gateway.approval_queue import get_approval_queue
-
-                        try:
-                            approval_entry = get_approval_queue().get(
-                                str(pending_approval["approval_id"])
+                            # Human-owned approvals need a lifecycle event so the UI
+                            # can render its card. Automatic reviews remain internal.
+                            if assessment is None:
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                )
+                            approval_wait_started = _loop.time()
+                            await _wait_for_pending_approval_resolution(pending_approval)
+                            approval_wait_duration = max(
+                                0.0,
+                                _loop.time() - approval_wait_started,
                             )
-                        except KeyError:
+                            # Human review is suspended state, not execution time.
+                            tool_deadline += approval_wait_duration
+                            if _total_deadline is not None:
+                                _total_deadline += approval_wait_duration
                             approval_entry = None
-                        if approval_entry is None or not approval_entry.resolved:
-                            turn_yielded = True
-                        elif not approval_entry.approved:
-                            suspended.deny(str(pending_approval["approval_id"]))
-                            rationale = str(
-                                approval_entry.params.get("reviewRationale") or ""
-                            ).strip()
-                            result = ToolResult(
-                                tool_use_id=tc.tool_use_id,
-                                tool_name=tc.tool_name,
-                                content=json.dumps(
-                                    {
-                                        "status": "approval_denied",
-                                        "approval_id": pending_approval["approval_id"],
-                                        "message": rationale
-                                        or "The exact elevated action was not approved.",
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                is_error=False,
+                            from opensquilla.gateway.approval_queue import (
+                                get_approval_queue,
                             )
-                            projected_result = await self._project_tool_result_for_delivery(
-                                result,
-                                tool_call=tc,
-                            )
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
-                            )
-                            if approval_entry.resolution == "expired":
+
+                            try:
+                                approval_entry = get_approval_queue().get(
+                                    str(pending_approval["approval_id"])
+                                )
+                            except KeyError:
+                                approval_entry = None
+                            if approval_entry is None or not approval_entry.resolved:
                                 turn_yielded = True
-                        else:
+                                break
+                            if not approval_entry.approved:
+                                suspended.deny(str(pending_approval["approval_id"]))
+                                rationale = str(
+                                    approval_entry.params.get("reviewRationale") or ""
+                                ).strip()
+                                result = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=json.dumps(
+                                        {
+                                            "status": "approval_denied",
+                                            "approval_id": pending_approval["approval_id"],
+                                            "message": rationale
+                                            or "The exact elevated action was not approved.",
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    is_error=False,
+                                    terminates_turn=True,
+                                )
+                                projected_result = (
+                                    await self._project_tool_result_for_delivery(
+                                        result,
+                                        tool_call=tc,
+                                    )
+                                )
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                )
+                                # A denial is the user's terminal decision for this
+                                # task. Never give the model another chance to retry
+                                # the same side effect through a different tool.
+                                turn_yielded = True
+                                break
+
                             resumed_call = suspended.approve(
                                 str(pending_approval["approval_id"])
                             )
@@ -11839,21 +11852,21 @@ class Agent:
                                 result,
                                 tool_call=result_tool_call,
                             )
-                            yield ToolResultEvent(
-                                tool_use_id=projected_result.tool_use_id,
-                                tool_name=projected_result.tool_name,
-                                result=projected_result.content,
-                                is_error=projected_result.is_error,
-                                arguments=tc.arguments,
-                                execution_status=projected_result.execution_status,
-                            )
-                            replay_event = router_control_replay_event_from_payload(
-                                result.content
-                            )
-                            if replay_event is not None:
-                                yield replay_event
-                            if _pending_approval_payload(result.content) is not None:
-                                turn_yielded = True
+                            pending_approval = _pending_approval_payload(result.content)
+                            if pending_approval is None:
+                                yield ToolResultEvent(
+                                    tool_use_id=projected_result.tool_use_id,
+                                    tool_name=projected_result.tool_name,
+                                    result=projected_result.content,
+                                    is_error=projected_result.is_error,
+                                    arguments=tc.arguments,
+                                    execution_status=projected_result.execution_status,
+                                )
+                                replay_event = router_control_replay_event_from_payload(
+                                    result.content
+                                )
+                                if replay_event is not None:
+                                    yield replay_event
                     elif not deferred_user_input_handled:
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
