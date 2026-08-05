@@ -667,7 +667,10 @@ import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLig
 import { useMetaRuns } from '@/composables/chat/useMetaRuns'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
-import { useChatSessionRoute } from '@/composables/chat/useChatSessionRoute'
+import {
+  shouldCanonicalizeInitialDraftRoute,
+  useChatSessionRoute,
+} from '@/composables/chat/useChatSessionRoute'
 import {
   useChatRunModePreference,
   type RunModePolicy,
@@ -3617,6 +3620,7 @@ function enterDraft() {
 
 onMounted(async () => {
   chatViewDisposed = false
+  const initialRouteFullPath = route.fullPath
   // Initialize session key. Without an explicit ?session= the view opens as a
   // draft instead of restoring a previous session.
   const initialSession = resolveInitialSession()
@@ -3686,8 +3690,14 @@ onMounted(async () => {
 
   if (initialDraftProjectGeneration !== null) {
     const synced = await initialDraftProjectSync
-    if (synced) {
-      if (!isDraftRoute() || hasLegacyNewChatQuery()) goToDraft({ replace: true })
+    if (synced && shouldCanonicalizeInitialDraftRoute({
+      disposed: chatViewDisposed,
+      initialFullPath: initialRouteFullPath,
+      currentFullPath: route.fullPath,
+      currentPathIsDraft: isDraftRoute(),
+      hasLegacyNewChatQuery: hasLegacyNewChatQuery(),
+    })) {
+      goToDraft({ replace: true })
     }
   }
 
