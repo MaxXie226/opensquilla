@@ -2461,6 +2461,18 @@ def test_desktop_gateway_ownership_control_dir_is_outside_profile_data_state() -
     assert "record.pid" not in launch_match
 
 
+def test_windows_process_start_identity_avoids_powershell_module_autoload() -> None:
+    ownership = _read("desktop/electron/src/desktop-gateway-ownership.ts")
+    windows_probe = _section(
+        ownership,
+        "function windowsProcessStartIdentity",
+        "function posixProcessStartIdentity",
+    )
+
+    assert "Get-Process" not in windows_probe
+    assert "[System.Diagnostics.Process]::GetProcessById" in windows_probe
+
+
 def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
     script = _read(
