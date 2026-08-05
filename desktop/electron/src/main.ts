@@ -51,6 +51,7 @@ import {
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
+import { freshDesktopSandboxConfigLines } from './desktop-sandbox-default.js'
 import {
   GITHUB_UPDATE_OWNER,
   GITHUB_UPDATE_REPO,
@@ -2562,6 +2563,7 @@ function renderDesktopConfigAfterPreflight(
     ...ensembleConfigTomlLines(credential),
     ...privacyConfigTomlLines(credential),
     '',
+    ...freshDesktopSandboxConfigLines(existingRaw, process.platform),
     '[control_ui]',
     'enabled = true',
     'base_path = "/control"',
