@@ -361,7 +361,7 @@ def _delete_target(
     try:
         segments = parse_shell_segments(
             analysis_command if native_windows else command,
-            platform="windows" if native_windows else None,
+            platform="windows" if native_windows else "linux",
         )
     except ValueError:
         segments = ()
@@ -609,7 +609,7 @@ def _delete_target(
         try:
             segments = parse_shell_segments(
                 analysis_command if native_windows else command,
-                platform="windows" if native_windows else None,
+                platform="windows" if native_windows else "linux",
             )
         except ValueError:
             segments = ()

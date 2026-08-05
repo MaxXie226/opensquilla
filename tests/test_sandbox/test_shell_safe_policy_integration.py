@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -173,7 +174,7 @@ def test_chdir_wrappers_require_an_explicit_tool_workdir(
     target = nested / "discard.txt"
     target.write_text("discard", encoding="utf-8")
 
-    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (None, False)
 
 
 def test_missing_chdir_wrapper_cannot_turn_failed_command_into_absolute_delete(
@@ -185,6 +186,7 @@ def test_missing_chdir_wrapper_cannot_turn_failed_command_into_absolute_delete(
     assert shell._delete_target(
         f"env -C missing rm {target}",
         str(tmp_path),
+        windows=False,
     ) == (None, False)
 
 
@@ -241,11 +243,19 @@ def test_posix_sh_c_only_treats_the_next_token_as_script(tmp_path: Path) -> None
     target = tmp_path / "important.txt"
     target.write_text("important", encoding="utf-8")
 
-    assert shell._delete_target("sh -c rm important.txt", str(tmp_path)) == (
+    assert shell._delete_target(
+        "sh -c rm important.txt",
+        str(tmp_path),
+        windows=False,
+    ) == (
         None,
         False,
     )
-    assert shell._delete_target("sh -c 'rm important.txt'", str(tmp_path)) == (
+    assert shell._delete_target(
+        "sh -c 'rm important.txt'",
+        str(tmp_path),
+        windows=False,
+    ) == (
         target.resolve(),
         False,
     )
@@ -266,12 +276,12 @@ def test_wrapper_help_or_unknown_options_never_become_brokered_deletes(
     target = tmp_path / "important.txt"
     target.write_text("important", encoding="utf-8")
 
-    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (None, False)
 
 
 def test_command_lookup_of_rm_is_not_treated_as_execution(tmp_path: Path) -> None:
-    assert shell._delete_target("command -v rm", str(tmp_path)) is None
-    assert shell._delete_target("command -V rm", str(tmp_path)) is None
+    assert shell._delete_target("command -v rm", str(tmp_path), windows=False) is None
+    assert shell._delete_target("command -V rm", str(tmp_path), windows=False) is None
 
 
 @pytest.mark.parametrize("command", ("env -i rm discard.txt", "sudo -n rm discard.txt"))
@@ -282,13 +292,17 @@ def test_supported_wrapper_options_still_reach_exact_delete(
     target = tmp_path / "discard.txt"
     target.write_text("discard", encoding="utf-8")
 
-    assert shell._delete_target(command, str(tmp_path)) == (
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (
         target.resolve(),
         False,
     )
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="backslash escaping inside command substitution is POSIX shell syntax",
+)
 async def test_escaped_delete_inside_command_substitution_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -319,7 +333,7 @@ def test_dynamic_executable_is_never_treated_as_a_non_delete(
     tmp_path: Path,
     command: str,
 ) -> None:
-    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (None, False)
 
 
 @pytest.mark.parametrize(
@@ -335,7 +349,7 @@ def test_dynamic_executable_behind_known_wrapper_fails_closed(
     tmp_path: Path,
     command: str,
 ) -> None:
-    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (None, False)
 
 
 @pytest.mark.parametrize(
@@ -403,6 +417,23 @@ def test_windows_quoted_data_is_not_treated_as_a_dynamic_delete(
     assert shell._delete_target(command, str(tmp_path), windows=True) is None
 
 
+def test_explicit_posix_delete_analysis_never_falls_back_to_host_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    platforms: list[str | None] = []
+    parse_segments = shell.parse_shell_segments
+
+    def _capture_platform(command: str, *, platform: str | None = None):
+        platforms.append(platform)
+        return parse_segments(command, platform=platform)
+
+    monkeypatch.setattr(shell, "parse_shell_segments", _capture_platform)
+
+    assert shell._delete_target("echo ok", str(tmp_path), windows=False) is None
+    assert platforms == ["linux"]
+
+
 def test_echo_of_fragmented_windows_variable_is_not_treated_as_execution(
     tmp_path: Path,
 ) -> None:
@@ -419,7 +450,7 @@ def test_known_wrappers_without_delete_or_dynamic_executable_are_ignored(
     tmp_path: Path,
     command: str,
 ) -> None:
-    assert shell._delete_target(command, str(tmp_path)) is None
+    assert shell._delete_target(command, str(tmp_path), windows=False) is None
 
 
 @pytest.mark.parametrize(
@@ -469,7 +500,7 @@ def test_delete_after_heredoc_terminator_fails_closed(
 def test_heredoc_marker_inside_comment_cannot_hide_later_delete(tmp_path: Path) -> None:
     command = "echo ok # <<EOF\nrm important.txt\nEOF"
 
-    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (None, False)
 
 
 @pytest.mark.parametrize(
@@ -484,7 +515,7 @@ def test_arithmetic_shift_cannot_hide_later_delete(
     tmp_path: Path,
     command: str,
 ) -> None:
-    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (None, False)
 
 
 @pytest.mark.parametrize(
@@ -519,7 +550,7 @@ def test_recursive_windows_directory_alias_is_parsed_exactly(tmp_path: Path) -> 
     target = tmp_path / "discard"
     target.mkdir()
 
-    parsed = shell._delete_target("rd /S discard", str(tmp_path))
+    parsed = shell._delete_target("rd /S discard", str(tmp_path), windows=True)
 
     assert parsed == (target.resolve(), True)
 
@@ -530,7 +561,7 @@ def test_rm_dir_flag_preserves_nonrecursive_empty_directory_semantics(
     target = tmp_path / "discard"
     target.mkdir()
 
-    assert shell._delete_target("rm -d discard", str(tmp_path)) == (
+    assert shell._delete_target("rm -d discard", str(tmp_path), windows=False) == (
         target.resolve(),
         False,
     )
@@ -597,7 +628,7 @@ def test_rm_dot_operands_are_never_converted_to_structured_deletes(
     tmp_path: Path,
     command: str,
 ) -> None:
-    assert shell._delete_target(command, str(tmp_path)) == (None, True)
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (None, True)
 
 
 @pytest.mark.parametrize("command", ("rmdir important.txt", "rd important.txt"))
@@ -710,7 +741,11 @@ def test_intermediate_symlink_is_resolved_while_final_target_is_preserved(
     link = tmp_path / "link"
     link.symlink_to(nested, target_is_directory=True)
 
-    assert shell._delete_target("rm link/../victim.txt", str(tmp_path)) == (
+    assert shell._delete_target(
+        "rm link/../victim.txt",
+        str(tmp_path),
+        windows=False,
+    ) == (
         victim.resolve(),
         False,
     )
