@@ -3101,6 +3101,8 @@
       "description": "Hält den bestätigten Provider-Präfix dieser Sitzung im Leerlauf warm.",
       "enable": "Für diese Sitzung aktivieren",
       "enableHint": "Standardmäßig aus; nach einem Gateway-Neustart wieder aus.",
+      "unavailableHint": "Nach dem Senden der ersten Nachricht verfügbar",
+      "sessionUnavailable": "Diese Sitzung ist noch nicht verfügbar. Senden Sie eine Nachricht oder laden Sie die Sitzung neu und versuchen Sie es erneut.",
       "ttlMinutes": "Provider-Cache-TTL (Minuten)",
       "intervalHint": "OpenSquilla prüft nach etwa {minutes} Minuten (80 % der TTL).",
       "costWarning": "Jede Prüfung ist eine echte Provider-Anfrage und kann Token-Kosten verursachen. Sie ändert den Chat nicht und führt keine Tools aus.",

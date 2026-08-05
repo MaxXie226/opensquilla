@@ -3152,6 +3152,8 @@
       "description": "Keep this session's proven provider prompt prefix warm while it is idle.",
       "enable": "Enable for this session",
       "enableHint": "Off by default and reset to off whenever the Gateway restarts.",
+      "unavailableHint": "Available after the first message is sent",
+      "sessionUnavailable": "This session is not available yet. Send a message or reload the session, then try again.",
       "ttlMinutes": "Provider cache TTL (minutes)",
       "intervalHint": "OpenSquilla probes at about {minutes} minutes (80% of TTL).",
       "costWarning": "Each probe is a real provider request and may incur input and output token charges. It never writes to the conversation or runs tools.",

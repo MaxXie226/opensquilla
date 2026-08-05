@@ -238,6 +238,26 @@
                   <Icon name="download" :size="16" />
                   <span>{{ t('chat.exportMarkdown') }}</span>
                 </button>
+                <button
+                  v-if="promptCacheKeepaliveAvailable"
+                  type="button"
+                  role="menuitem"
+                  data-testid="chat-composer-action-keepalive"
+                  :title="promptCacheKeepaliveSessionReady
+                    ? t('chat.promptCacheKeepalive.action')
+                    : t('chat.promptCacheKeepalive.unavailableHint')"
+                  :aria-label="t('chat.promptCacheKeepalive.action')"
+                  :disabled="!promptCacheKeepaliveSessionReady"
+                  @click="openPromptCacheKeepalive"
+                >
+                  <Icon name="clock" :size="16" />
+                  <span class="chat-more-actions-menu__copy">
+                    <span>{{ t('chat.promptCacheKeepalive.action') }}</span>
+                    <small v-if="!promptCacheKeepaliveSessionReady">
+                      {{ t('chat.promptCacheKeepalive.unavailableHint') }}
+                    </small>
+                  </span>
+                </button>
               </div>
             </div>
           </div>
@@ -359,6 +379,8 @@ const props = withDefaults(defineProps<{
   planModeDisabled?: boolean
   planModeAppliesNextTurn?: boolean
   replanActive?: boolean
+  promptCacheKeepaliveAvailable?: boolean
+  promptCacheKeepaliveSessionReady?: boolean
 }>(), {
   canChooseProject: true,
   codingModeEnabled: false,
@@ -388,6 +410,7 @@ const emit = defineEmits<{
   stop: []
   chooseProject: []
   closeProject: []
+  openPromptCacheKeepalive: []
 }>()
 
 const { t } = useI18n()
@@ -522,6 +545,12 @@ function triggerVoice() {
 function exportConversation() {
   moreActionsOpen.value = false
   emit('exportMarkdown')
+}
+
+function openPromptCacheKeepalive() {
+  if (!props.promptCacheKeepaliveSessionReady) return
+  moreActionsOpen.value = false
+  emit('openPromptCacheKeepalive')
 }
 
 function attachmentIcon(att: Attachment): IconName {
@@ -991,6 +1020,17 @@ defineExpose<ChatComposerExpose>({
 .chat-more-actions-menu button:disabled {
   cursor: default;
   opacity: var(--state-disabled-opacity);
+}
+
+.chat-more-actions-menu__copy,
+.chat-more-actions-menu__copy small {
+  display: block;
+}
+
+.chat-more-actions-menu__copy small {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
 }
 
 .chat-input-actions--right {

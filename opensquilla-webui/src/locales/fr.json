@@ -3101,6 +3101,8 @@
       "description": "Maintient à chaud le préfixe fournisseur confirmé de cette session pendant l'inactivité.",
       "enable": "Activer pour cette session",
       "enableHint": "Désactivé par défaut et réinitialisé à l'arrêt au redémarrage du Gateway.",
+      "unavailableHint": "Disponible après l'envoi du premier message",
+      "sessionUnavailable": "Cette session n'est pas encore disponible. Envoyez un message ou rechargez la session, puis réessayez.",
       "ttlMinutes": "TTL du cache fournisseur (minutes)",
       "intervalHint": "OpenSquilla sonde après environ {minutes} minutes (80 % du TTL).",
       "costWarning": "Chaque sonde est une vraie requête fournisseur et peut coûter des tokens. Elle ne modifie pas la discussion et n'exécute aucun outil.",

@@ -154,7 +154,10 @@ async function load() {
     draftEnabled.value = next.enabled
     draftTtlMinutes.value = Math.max(5, Math.round(next.ttlSeconds / 60))
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    error.value = /session not found/i.test(detail)
+      ? t('chat.promptCacheKeepalive.sessionUnavailable')
+      : detail
   } finally {
     loading.value = false
   }
@@ -178,7 +181,10 @@ async function save() {
     )
     emit('close')
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause)
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    error.value = /session not found/i.test(detail)
+      ? t('chat.promptCacheKeepalive.sessionUnavailable')
+      : detail
   } finally {
     saving.value = false
   }

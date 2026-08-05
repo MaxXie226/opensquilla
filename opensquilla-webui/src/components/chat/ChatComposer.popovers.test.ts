@@ -224,4 +224,38 @@ describe('ChatComposer popovers', () => {
 
     app.unmount()
   })
+
+  it('shows keepalive only when supported and enables it after the session is materialized', async () => {
+    const unsupported = await mountComposer()
+    await clickButton(unsupported.el, 'More')
+    expect(unsupported.el.querySelector('[data-testid="chat-composer-action-keepalive"]')).toBeNull()
+    unsupported.app.unmount()
+
+    const openKeepalive = vi.fn()
+    const draft = await mountComposer({
+      promptCacheKeepaliveAvailable: true,
+      promptCacheKeepaliveSessionReady: false,
+      onOpenPromptCacheKeepalive: openKeepalive,
+    })
+    await clickButton(draft.el, 'More')
+    const disabledAction = draft.el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-composer-action-keepalive"]',
+    )
+    expect(disabledAction?.disabled).toBe(true)
+    expect(disabledAction?.textContent).toContain('Available after the first message is sent')
+    disabledAction?.click()
+    expect(openKeepalive).not.toHaveBeenCalled()
+    expectPopover(draft.el, '.chat-more-actions-menu', true)
+    draft.app.unmount()
+
+    const ready = await mountComposer({
+      promptCacheKeepaliveAvailable: true,
+      promptCacheKeepaliveSessionReady: true,
+      onOpenPromptCacheKeepalive: openKeepalive,
+    })
+    await clickMoreAction(ready.el, 'Prompt cache keepalive')
+    expect(openKeepalive).toHaveBeenCalledTimes(1)
+    expectPopover(ready.el, '.chat-more-actions-menu', false)
+    ready.app.unmount()
+  })
 })

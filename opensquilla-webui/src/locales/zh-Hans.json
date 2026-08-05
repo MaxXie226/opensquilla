@@ -3152,6 +3152,8 @@
       "description": "会话空闲时，保活已被供应商处理过的稳定提示词前缀。",
       "enable": "为当前会话开启",
       "enableHint": "默认关闭；Gateway 重启后会自动恢复为关闭。",
+      "unavailableHint": "发送首条消息后可设置",
+      "sessionUnavailable": "当前会话尚不可用。请先发送一条消息，或重新加载会话后再试。",
       "ttlMinutes": "供应商缓存 TTL（分钟）",
       "intervalHint": "OpenSquilla 将约每 {minutes} 分钟探测一次（TTL 的 80%）。",
       "costWarning": "每次探测都是真实的供应商请求，可能产生输入和输出 token 费用；不会写入对话，也不会执行工具。",

@@ -38,11 +38,9 @@
         :deliverable-count="headerDeliverableCount"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
-        :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
         @open-deliverables="openDeliverables"
         @start-share="startShareMode"
         @copy-session-key="onSessionCopyClick"
-        @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
       />
     </Teleport>
 
@@ -514,6 +512,8 @@
       :plan-mode-disabled="planActionPending !== null"
       :plan-mode-applies-next-turn="planModeAppliesNextTurn"
       :replan-active="replanActive"
+      :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
+      :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -534,6 +534,7 @@
       @stop="onComposerStop"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
+      @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
     />
     <SandboxSetupDialog
       :open="composerSandboxSetupOpen"
@@ -889,7 +890,7 @@ const pendingAutoSend = ref('')
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
 type ChatHeaderActionsHandle = {
-  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'keepalive' | 'copy-session-key') => boolean
+  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
 }
 const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 
@@ -1036,6 +1037,7 @@ let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
+const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
 
 function activeSnapshot(workspace: ProjectWorkspaceItem): ActiveProjectWorkspaceSnapshot {
   return {

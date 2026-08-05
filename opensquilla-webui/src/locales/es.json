@@ -3101,6 +3101,8 @@
       "description": "Mantiene activo el prefijo de proveedor confirmado de esta sesión mientras está inactiva.",
       "enable": "Activar para esta sesión",
       "enableHint": "Desactivado por defecto; vuelve a desactivarse al reiniciar el Gateway.",
+      "unavailableHint": "Disponible después de enviar el primer mensaje",
+      "sessionUnavailable": "Esta sesión aún no está disponible. Envía un mensaje o vuelve a cargar la sesión y prueba de nuevo.",
       "ttlMinutes": "TTL de caché del proveedor (minutos)",
       "intervalHint": "OpenSquilla sondea aproximadamente a los {minutes} minutos (80 % del TTL).",
       "costWarning": "Cada sondeo es una solicitud real al proveedor y puede generar costes de tokens. No modifica el chat ni ejecuta herramientas.",
