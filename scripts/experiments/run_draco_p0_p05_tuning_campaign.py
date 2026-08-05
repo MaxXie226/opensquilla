@@ -3776,6 +3776,48 @@ def preexisting_source_identity(
     return expected, receipt
 
 
+def launcher_effective_config_projection(
+    plan: Mapping[str, Any],
+    config_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the exact runtime fields frozen by the production launcher."""
+
+    execution = plan.get("execution")
+    if not isinstance(execution, Mapping):
+        raise ControllerError("execution contract is missing from arm identity")
+    projected = copy.deepcopy(dict(config_payload))
+    bindings = (
+        ("runner", "concurrency", "task_concurrency"),
+        ("judge", "concurrency", "judge_concurrency"),
+        ("generation", "max_attempts", "generation_max_attempts"),
+    )
+    for section_name, field_name, execution_name in bindings:
+        section = projected.get(section_name)
+        expected = execution.get(execution_name)
+        current = section.get(field_name) if isinstance(section, Mapping) else None
+        if (
+            not isinstance(section, Mapping)
+            or field_name not in section
+            or isinstance(current, bool)
+            or not isinstance(current, int)
+            or current <= 0
+            or isinstance(expected, bool)
+            or not isinstance(expected, int)
+            or expected <= 0
+        ):
+            raise ControllerError(
+                f"arm identity cannot project {section_name}.{field_name}"
+            )
+        if section_name != "runner" and current != expected:
+            raise ControllerError(
+                f"effective {section_name}.{field_name} differs from the launcher contract"
+            )
+        section_copy = copy.deepcopy(dict(section))
+        section_copy[field_name] = expected
+        projected[section_name] = section_copy
+    return projected
+
+
 def arm_completion_identity(
     plan: Mapping[str, Any],
     arm: Arm,
@@ -3791,10 +3833,13 @@ def arm_completion_identity(
             return imported[0]
     base_config = snapshot / str(plan["paths"]["experiment_config_relative"])
     if isolated_config:
-        config_payload = load_effective_experiment_config_isolated(
-            snapshot,
-            base_config,
-            override,
+        config_payload = launcher_effective_config_projection(
+            plan,
+            load_effective_experiment_config_isolated(
+                snapshot,
+                base_config,
+                override,
+            ),
         )
         ensemble_payload = config_payload.get("ensemble")
         if not isinstance(ensemble_payload, Mapping):
@@ -3809,7 +3854,10 @@ def arm_completion_identity(
         config = load_effective_experiment_config(snapshot, base_config, override)
         if not hasattr(config, "model_dump"):
             raise ControllerError("effective experiment config cannot be authenticated")
-        config_payload = config.model_dump(mode="json")
+        config_payload = launcher_effective_config_projection(
+            plan,
+            config.model_dump(mode="json"),
+        )
         configured_candidate_order_seed = config.ensemble.candidate_order_seed
         effective_candidate_order_seed = (
             config.ensemble.candidate_order_seed if config.ensemble.shuffle_candidates else None

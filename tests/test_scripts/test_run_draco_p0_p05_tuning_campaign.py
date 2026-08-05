@@ -390,15 +390,25 @@ class ControllerTests(unittest.TestCase):
                 "", encoding="utf-8"
             )
             (module_dir / "__init__.py").write_text("", encoding="utf-8")
-            (module_dir / "draco_experiment_config.py").write_text(
+            config_module_path = module_dir / "draco_experiment_config.py"
+            config_module_source = (
                 "class Config:\n"
                 "    def model_dump(self, mode=None):\n"
-                "        return {'ensemble': {'candidate_order_seed': None, "
-                "'shuffle_candidates': False}}\n"
+                "        return {\n"
+                "            'runner': {'concurrency': 2, 'timeout_seconds': 111.0},\n"
+                "            'judge': {'concurrency': 6, 'model': 'judge-model'},\n"
+                "            'generation': {'max_attempts': 3, 'retry_backoff_s': 2.0},\n"
+                "            'ensemble': {'candidate_order_seed': None, "
+                "'shuffle_candidates': False},\n"
+                "            'audit_marker': 'source',\n"
+                "        }\n"
                 "class Loaded:\n"
                 "    config = Config()\n"
                 "def load_draco_experiment_config(*args, **kwargs):\n"
-                "    return Loaded()\n",
+                "    return Loaded()\n"
+            )
+            config_module_path.write_text(
+                config_module_source,
                 encoding="utf-8",
             )
             scripts = snapshot / "scripts"
@@ -484,6 +494,52 @@ class ControllerTests(unittest.TestCase):
                 override={},
                 isolated_config=True,
             )
+            expected_config_payload = {
+                "runner": {"concurrency": 6, "timeout_seconds": 111.0},
+                "judge": {"concurrency": 6, "model": "judge-model"},
+                "generation": {"max_attempts": 3, "retry_backoff_s": 2.0},
+                "ensemble": {
+                    "candidate_order_seed": None,
+                    "shuffle_candidates": False,
+                },
+                "audit_marker": "source",
+            }
+            self.assertEqual(
+                expected_identity["effective_config_sha256"],
+                controller.canonical_sha256(expected_config_payload),
+            )
+            for section_name, field_name, invalid_value in (
+                ("judge", "concurrency", 5),
+                ("generation", "max_attempts", 2),
+            ):
+                with self.subTest(runtime_field=f"{section_name}.{field_name}"):
+                    invalid_config = copy.deepcopy(expected_config_payload)
+                    invalid_config[section_name][field_name] = invalid_value
+                    with self.assertRaises(controller.ControllerError):
+                        controller.launcher_effective_config_projection(
+                            source_plan_payload,
+                            invalid_config,
+                        )
+            config_module_path.write_text(
+                config_module_source.replace(
+                    "'audit_marker': 'source'",
+                    "'audit_marker': 'drift'",
+                ),
+                encoding="utf-8",
+            )
+            drifted_identity = controller.arm_completion_identity(
+                source_plan_payload,
+                source_arm,
+                snapshot=snapshot,
+                snapshot_identity=git_state,
+                override={},
+                isolated_config=True,
+            )
+            self.assertNotEqual(
+                drifted_identity["effective_config_sha256"],
+                expected_identity["effective_config_sha256"],
+            )
+            config_module_path.write_text(config_module_source, encoding="utf-8")
             publication_evidence = {"reason": "complete"}
             authenticated = {
                 **contract,
