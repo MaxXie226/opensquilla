@@ -42,9 +42,9 @@ try {
     [
       '--force-local',
       '-xf',
-      String.raw`Z:\fixture\.runtime-cache\python.tar.gz`,
+      'Z:/fixture/.runtime-cache/python.tar.gz',
       '-C',
-      String.raw`Z:\fixture\runtime\python.staging`,
+      'Z:/fixture/runtime/python.staging',
       '--strip-components=1',
     ],
     'GNU tar must treat Windows drive-letter paths as local archives',

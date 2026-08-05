@@ -191,7 +191,9 @@ export function tarExtractArgs(
   platform = process.platform,
 ) {
   const args = platform === 'win32' ? ['--force-local'] : []
-  args.push('-xf', archive, '-C', destination)
+  const archivePath = platform === 'win32' ? archive.replaceAll('\\', '/') : archive
+  const destinationPath = platform === 'win32' ? destination.replaceAll('\\', '/') : destination
+  args.push('-xf', archivePath, '-C', destinationPath)
   if (stripComponents > 0) args.push(`--strip-components=${stripComponents}`)
   return args
 }
