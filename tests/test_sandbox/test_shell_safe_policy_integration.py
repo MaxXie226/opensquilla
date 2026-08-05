@@ -135,7 +135,7 @@ def test_assignment_and_process_wrappers_reach_the_exact_delete_target(
     target = tmp_path / "discard.txt"
     target.write_text("discard", encoding="utf-8")
 
-    assert shell._delete_target(command, str(tmp_path)) == (
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (
         target.resolve(),
         False,
     )
@@ -149,7 +149,7 @@ def test_shell_lexical_escapes_still_reach_the_exact_delete_target(
     target = tmp_path / "discard.txt"
     target.write_text("discard", encoding="utf-8")
 
-    assert shell._delete_target(command, str(tmp_path)) == (
+    assert shell._delete_target(command, str(tmp_path), windows=False) == (
         target.resolve(),
         False,
     )
