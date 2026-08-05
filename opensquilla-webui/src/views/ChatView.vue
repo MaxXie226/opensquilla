@@ -3824,15 +3824,15 @@ watch(() => [route.query.newChat, route.query.new], () => {
   if (hasLegacyNewChatQuery()) goToDraft({ replace: true })
 })
 
-watch(sessionKey, key => {
+watch(sessionKey, () => {
+  pendingForkBeforeMessageId.value = null
   // Retire any in-flight page walk and clear the old Session before starting
   // the new one, so a late response cannot leak deliverables across tabs/routes.
   resetSessionArtifacts()
-  pendingForkBeforeMessageId.value = null
   if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
-  if (key && pendingSessionIntent.value !== 'new_chat') void loadSessionArtifacts()
+  if (sessionKey.value && pendingSessionIntent.value !== 'new_chat') void loadSessionArtifacts()
 })
 
 // Hello refreshes method capabilities on reconnect. Retry the durable index
