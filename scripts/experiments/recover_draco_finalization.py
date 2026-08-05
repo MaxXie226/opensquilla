@@ -93,6 +93,9 @@ class RecoveryPlan:
     results: tuple[Path, ...]
     manifests: tuple[Path, ...]
     groups: tuple[str, ...]
+    expected_task_concurrency: int
+    expected_judge_concurrency: int
+    max_generation_attempts: int
     account_before: Path
     account_after: Path
     account_reconciliation: Path
@@ -195,9 +198,37 @@ def _wave_sources(archive_dir: Path) -> tuple[tuple[Path, ...], tuple[Path, ...]
     return tuple(results), tuple(manifests)
 
 
-def _manifest_input_and_groups(manifests: Sequence[Path]) -> tuple[Path, tuple[str, ...]]:
+def _manifest_execution_contract(
+    payload: Mapping[str, Any],
+    *,
+    manifest_index: int,
+) -> tuple[int, int, int]:
+    command = payload.get("command")
+    parsed = command.get("parsed_args") if isinstance(command, Mapping) else None
+    fields = (
+        "concurrency",
+        "judge_concurrency",
+        "generation_max_attempts",
+    )
+    values: list[int] = []
+    for field_name in fields:
+        value = parsed.get(field_name) if isinstance(parsed, Mapping) else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise RecoveryError(
+                "missing_execution_binding",
+                f"wave manifest {manifest_index} lacks a positive integer "
+                f"command.parsed_args.{field_name} binding",
+            )
+        values.append(value)
+    return values[0], values[1], values[2]
+
+
+def _manifest_input_and_groups(
+    manifests: Sequence[Path],
+) -> tuple[Path, tuple[str, ...], tuple[int, int, int]]:
     input_paths: set[Path] = set()
     group_sets: set[tuple[str, ...]] = set()
+    execution_contracts: set[tuple[int, int, int]] = set()
     for index, path in enumerate(manifests):
         payload = _load_json(path, label=f"wave manifest {index + 1}")
         args = payload.get("args")
@@ -228,20 +259,28 @@ def _manifest_input_and_groups(manifests: Sequence[Path]) -> tuple[Path, tuple[s
                 f"wave manifest {index + 1} has invalid groups",
             )
         group_sets.add(groups)
+        execution_contracts.add(
+            _manifest_execution_contract(payload, manifest_index=index + 1)
+        )
     if len(input_paths) != 1:
         raise RecoveryError("input_binding_changed", "wave manifests bind different inputs")
     if len(group_sets) != 1:
         raise RecoveryError("group_binding_changed", "wave manifests bind different groups")
+    if len(execution_contracts) != 1:
+        raise RecoveryError(
+            "execution_binding_changed",
+            "wave manifests bind different execution concurrency or attempt limits",
+        )
     input_path = next(iter(input_paths))
     _plain_file(input_path, label="frozen DRACO input", owner_only=False)
-    return input_path, next(iter(group_sets))
+    return input_path, next(iter(group_sets)), next(iter(execution_contracts))
 
 
 def discover_plan(campaign_dir: Path) -> RecoveryPlan:
     campaign = _plain_directory(campaign_dir, label="campaign directory")
     archive = _plain_directory(campaign / "archive", label="campaign archive")
     results, manifests = _wave_sources(archive)
-    input_path, groups = _manifest_input_and_groups(manifests)
+    input_path, groups, execution_contract = _manifest_input_and_groups(manifests)
 
     account_dir = _plain_directory(archive / "account", label="account archive")
     before = account_dir / "openrouter-account-before.json"
@@ -295,6 +334,9 @@ def discover_plan(campaign_dir: Path) -> RecoveryPlan:
         results=results,
         manifests=manifests,
         groups=groups,
+        expected_task_concurrency=execution_contract[0],
+        expected_judge_concurrency=execution_contract[1],
+        max_generation_attempts=execution_contract[2],
         account_before=before.resolve(),
         account_after=after.resolve(),
         account_reconciliation=reconciliation_path.resolve(),
@@ -1213,7 +1255,11 @@ def _run_finalizer(
         "--groups",
         ",".join(plan.groups),
         "--max-generation-attempts",
-        "3",
+        str(plan.max_generation_attempts),
+        "--expected-task-concurrency",
+        str(plan.expected_task_concurrency),
+        "--expected-judge-concurrency",
+        str(plan.expected_judge_concurrency),
     ]
     for prior_dir in plan.prior_account_window_dirs:
         argv.extend(("--prior-account-window-dir", str(prior_dir)))

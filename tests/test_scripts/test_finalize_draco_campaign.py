@@ -1615,6 +1615,196 @@ def test_provider_native_proposer_recovery_binds_receipt_and_fingerprint(
     assert recovery_ids == {"b" * 32}
 
 
+def test_provider_native_recovery_accepts_per_dispatch_attempt_ordinals(module) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    recovery_physical = call["candidates"][0]["execution"]["physical_attempts"][1]
+    recovery_physical["attempt"] = 1
+
+    final_identities, recovery_ids, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert reasons == []
+    assert final_identities[0] == "openrouter:model-a"
+    assert recovery_ids == {"b" * 32}
+
+    recovery_physical["attempt"] = 3
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+    assert "invalid_proposer_recovery_physical_attempt" in reasons
+
+
+def _provider_native_cumulative_recovery_call(
+    module,
+) -> tuple[dict[str, object], dict[str, object]]:
+    call, plan = _provider_native_recovery_call(module)
+    receipt = call["proposer_recovery"]
+    current_receipt = receipt["attempts"][0]
+    prior_receipt = deepcopy(current_receipt)
+    prior_receipt.update(
+        {
+            "sequence": 1,
+            "physical_attempt_id": "e" * 32,
+        }
+    )
+    current_receipt["sequence"] = 2
+    receipt["attempts"] = [prior_receipt, current_receipt]
+    receipt["additional_physical_requests_started"] = 2
+    receipt["remaining_additional_physical_requests"] = 1
+    recovery_physical = call["candidates"][0]["execution"]["physical_attempts"][1]
+    recovery_physical["attempt"] = 1
+    return call, plan
+
+
+def test_provider_native_local_attempt_ordinal_ignores_prior_cumulative_receipt_ids(
+    module,
+) -> None:
+    call, plan = _provider_native_cumulative_recovery_call(module)
+
+    final_identities, recovery_ids, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert reasons == []
+    assert final_identities[0] == "openrouter:model-a"
+    assert recovery_ids == {"b" * 32}
+
+
+@pytest.mark.parametrize("mutation", ["wrong_slot", "bool_attempt"])
+def test_provider_native_cumulative_receipt_keeps_current_local_attempt_strict(
+    module,
+    mutation: str,
+) -> None:
+    call, plan = _provider_native_cumulative_recovery_call(module)
+    if mutation == "wrong_slot":
+        call["proposer_recovery"]["attempts"][-1]["slot_index"] = 1
+    else:
+        call["candidates"][0]["execution"]["physical_attempts"][1]["attempt"] = True
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert "invalid_proposer_recovery_physical_attempt" in reasons
+
+
+def test_provider_native_local_attempt_ordinal_requires_receipt_slot_binding(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    recovery_physical = call["candidates"][0]["execution"]["physical_attempts"][1]
+    recovery_physical["attempt"] = 1
+    receipt_attempt = call["proposer_recovery"]["attempts"][0]
+    receipt_attempt["slot_index"] = 1
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert "invalid_proposer_recovery_physical_attempt" in reasons
+
+
+def test_provider_native_physical_attempt_ordinal_rejects_bool(module) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    recovery_physical = call["candidates"][0]["execution"]["physical_attempts"][1]
+    recovery_physical["attempt"] = True
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert "invalid_proposer_recovery_physical_attempt" in reasons
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("physical_request_count", True),
+        ("physical_request_count", "1"),
+        ("physical_attempt_id", "not-a-physical-id"),
+    ],
+)
+def test_provider_native_local_attempt_ordinal_rejects_malformed_receipt(
+    module,
+    field_name: str,
+    value: object,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    recovery_physical = call["candidates"][0]["execution"]["physical_attempts"][1]
+    recovery_physical["attempt"] = 1
+    receipt_attempt = call["proposer_recovery"]["attempts"][0]
+    receipt_attempt[field_name] = value
+
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert "invalid_proposer_recovery_physical_attempt" in reasons
+    assert "invalid_proposer_recovery_attempt" in reasons
+
+
+def _provider_native_outer_call_reasons(
+    module,
+    call: dict[str, object],
+    plan: dict[str, object],
+) -> list[str]:
+    call["final_request_role"] = "aggregator"
+    call["total_candidates"] = len(plan["proposer_models"])
+    plan["aggregator_model"] = "model-f"
+    return module.ensemble_physical_call_reasons(
+        call,
+        expected_proposers=plan["proposer_models"],
+        expected_aggregator="model-f",
+        final_text="",
+        require_output_binding=False,
+    )
+
+
+def test_ensemble_physical_call_accepts_receipt_bound_local_proposer_attempt(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    call["candidates"][0]["execution"]["physical_attempts"][1]["attempt"] = 1
+
+    reasons = _provider_native_outer_call_reasons(module, call, plan)
+
+    assert "invalid_proposer_physical_attempt" not in reasons
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong_slot", "bool_attempt", "bool_receipt_count", "malformed_receipt_id"],
+)
+def test_ensemble_physical_call_keeps_local_proposer_attempt_receipt_bound(
+    module,
+    mutation: str,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    recovery_physical = call["candidates"][0]["execution"]["physical_attempts"][1]
+    recovery_physical["attempt"] = 1
+    receipt_attempt = call["proposer_recovery"]["attempts"][0]
+    if mutation == "wrong_slot":
+        receipt_attempt["slot_index"] = 1
+    elif mutation == "bool_attempt":
+        recovery_physical["attempt"] = True
+    elif mutation == "bool_receipt_count":
+        receipt_attempt["physical_request_count"] = True
+    else:
+        receipt_attempt["physical_attempt_id"] = "not-a-physical-id"
+
+    reasons = _provider_native_outer_call_reasons(module, call, plan)
+
+    assert "invalid_proposer_physical_attempt" in reasons
+
+
 def test_provider_native_proposer_recovery_uses_authenticated_dynamic_policy(
     module,
 ) -> None:
@@ -5646,6 +5836,25 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         contracts=paid_attempt_contracts,
     )
 
+    duplicate_cross_task_analyzer = deepcopy(serialized)
+    duplicate_cross_task_analyzer["task_id"] = "task-2"
+    with pytest.raises(
+        module.FinalizationError,
+        match="invalid paid G1 attempt",
+    ):
+        module.validate_g1_paid_attempt_plan_history(
+            [
+                source_record,
+                module.SourceRecord(
+                    path=Path("cross-task-duplicate-analyzer.jsonl"),
+                    source_index=0,
+                    line=2,
+                    row=duplicate_cross_task_analyzer,
+                ),
+            ],
+            contracts=paid_attempt_contracts,
+        )
+
     pre_call_guard_then_success = deepcopy(serialized)
     guarded_attempt = pre_call_guard_then_success["execution"]["generation_attempts"][0]
     guarded_attempt["attempt_kind"] = "provider_build_after_paid_setup"
@@ -8980,6 +9189,82 @@ def test_skipped_preflight_requires_a_true_no_generation_repair(module, tmp_path
         os.close(lock_fd)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [None, "not_blocked", "model_started", "missing_terminal", "wrong_terminal_attempt"],
+)
+def test_skipped_preflight_accepts_only_blocked_regenerate_without_a_model_call(
+    module,
+    tmp_path: Path,
+    mutation: str | None,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path)
+    try:
+        rows = [json.loads(line) for line in args.result[1].read_text().splitlines()]
+        for row in rows:
+            attempt_id = row["execution"]["generation_attempts"][-1]["attempt_id"]
+            row["execution"].update(
+                {
+                    "resume_action": "regenerate",
+                    "generation_reused": True,
+                    "generation_auto_retry_blocked": mutation != "not_blocked",
+                    "generation_model_started": mutation == "model_started",
+                    "judge_reran": False,
+                    "metadata_repaired": False,
+                    "provider_native_proposer_recovery_terminal": {
+                        "schema": module.PROVIDER_NATIVE_PROPOSER_RECOVERY_TERMINAL_SCHEMA,
+                        "status": "receipt_invalid",
+                        "attempt_id": (
+                            "f" * 32 if mutation == "wrong_terminal_attempt" else attempt_id
+                        ),
+                        "automatic_generation_retry_allowed": False,
+                    },
+                }
+            )
+            if mutation == "missing_terminal":
+                row["execution"].pop("provider_native_proposer_recovery_terminal")
+            row["resume_completion"] = {
+                "action": "regenerate",
+                "generation_reused": True,
+                "metadata_repaired": False,
+                "judge_reran": False,
+                "post_repair_action": "regenerate",
+                "status": "incomplete",
+                "incomplete_reasons": ["generation_auto_retry_blocked"],
+            }
+            row["completion_status"] = {
+                "generation_accepted": False,
+                "cost_metadata_complete": False,
+                "judge_complete": False,
+                "status": "incomplete",
+                "incomplete_reasons": ["generation_auto_retry_blocked"],
+            }
+        rows = [module.seal_result_row(row) for row in rows]
+        args.result[1].write_text("".join(json.dumps(row) + "\n" for row in rows))
+        args.result[1].chmod(0o600)
+
+        manifest = json.loads(args.manifest[1].read_text())
+        manifest["resume_selection"]["model_regenerate_pair_count"] = 0
+        manifest["resume_selection"]["generation_auto_retry_blocked_pair_count"] = len(rows)
+        _owner_json(args.manifest[1], manifest)
+
+        if mutation is None:
+            final_manifest = module.run_finalization(args)
+            assert final_manifest["status"] == "complete"
+        else:
+            with pytest.raises(
+                module.FinalizationError,
+                match="no-generation repair shard",
+            ):
+                module.load_manifest_contracts(
+                    args.manifest,
+                    result_paths=args.result,
+                    groups=module.GROUPS,
+                )
+    finally:
+        os.close(lock_fd)
+
+
 def _set_nested_value(target: dict[str, object], path: tuple[str, ...], value: object) -> None:
     current = target
     for field_name in path[:-1]:
@@ -10312,6 +10597,114 @@ def test_audit_only_repair_evidence_is_explicit(
         }
     }
     assert module.repair_evidence(row, execution) is expected
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        None,
+        "not_blocked",
+        "missing_completion",
+        "complete_status",
+        "wrong_post_action",
+        "judge_reran",
+        "metadata_repaired",
+        "missing_reason",
+        "model_started",
+        "missing_terminal",
+        "wrong_terminal_schema",
+        "wrong_terminal_attempt",
+        "automatic_retry_allowed",
+    ],
+)
+def test_blocked_regenerate_repair_evidence_is_explicit(
+    module,
+    mutation: str | None,
+) -> None:
+    execution = {
+        "resume_action": "regenerate",
+        "generation_reused": True,
+        "generation_auto_retry_blocked": True,
+        "generation_model_started": False,
+        "generation_attempts": [{"attempt_id": "a" * 32}],
+        "provider_native_proposer_recovery_terminal": {
+            "schema": module.PROVIDER_NATIVE_PROPOSER_RECOVERY_TERMINAL_SCHEMA,
+            "status": "receipt_invalid",
+            "attempt_id": "a" * 32,
+            "automatic_generation_retry_allowed": False,
+        },
+    }
+    row = {
+        "resume_completion": {
+            "action": "regenerate",
+            "generation_reused": True,
+            "status": "incomplete",
+            "post_repair_action": "regenerate",
+            "judge_reran": False,
+            "metadata_repaired": False,
+            "incomplete_reasons": ["generation_auto_retry_blocked"],
+        }
+    }
+    if mutation == "not_blocked":
+        execution["generation_auto_retry_blocked"] = False
+    elif mutation == "missing_completion":
+        row.pop("resume_completion")
+    elif mutation == "complete_status":
+        row["resume_completion"]["status"] = "complete"
+    elif mutation == "wrong_post_action":
+        row["resume_completion"]["post_repair_action"] = "judge_only"
+    elif mutation == "judge_reran":
+        row["resume_completion"]["judge_reran"] = True
+    elif mutation == "metadata_repaired":
+        row["resume_completion"]["metadata_repaired"] = True
+    elif mutation == "missing_reason":
+        row["resume_completion"]["incomplete_reasons"] = []
+    elif mutation == "model_started":
+        execution["generation_model_started"] = True
+    elif mutation == "missing_terminal":
+        execution.pop("provider_native_proposer_recovery_terminal")
+    elif mutation == "wrong_terminal_schema":
+        execution["provider_native_proposer_recovery_terminal"]["schema"] = "wrong"
+    elif mutation == "wrong_terminal_attempt":
+        execution["provider_native_proposer_recovery_terminal"]["attempt_id"] = "b" * 32
+    elif mutation == "automatic_retry_allowed":
+        execution["provider_native_proposer_recovery_terminal"][
+            "automatic_generation_retry_allowed"
+        ] = True
+
+    assert module.repair_evidence(row, execution) is (mutation is None)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "schema_name"),
+    [
+        (
+            "generation_postprocessing_terminal",
+            "GENERATION_POSTPROCESSING_TERMINAL_SCHEMA",
+        ),
+        (
+            "provider_native_proposer_recovery_terminal",
+            "PROVIDER_NATIVE_PROPOSER_RECOVERY_TERMINAL_SCHEMA",
+        ),
+    ],
+)
+def test_blocked_regenerate_accepts_both_producer_terminal_schemas(
+    module,
+    field_name: str,
+    schema_name: str,
+) -> None:
+    attempt_id = "a" * 32
+    execution = {
+        "generation_model_started": False,
+        "generation_attempts": [{"attempt_id": attempt_id}],
+        field_name: {
+            "schema": getattr(module, schema_name),
+            "attempt_id": attempt_id,
+            "automatic_generation_retry_allowed": False,
+        },
+    }
+
+    assert module.blocked_regenerate_terminal_evidence(execution) is True
 
 
 @pytest.mark.parametrize("tamper", ["counter", "result_pair_set"])

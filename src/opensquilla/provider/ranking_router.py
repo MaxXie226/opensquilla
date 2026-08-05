@@ -48,8 +48,14 @@ TASK_ANALYZER_MODEL_ID = "anthropic/claude-opus-4.8"
 TASK_ANALYZER_UPSTREAM_PROVIDER = "anthropic"
 TASK_ANALYZER_VERSION = "opus-4.8-json-v3"
 FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
+FROZEN_TASK_ANALYSIS_SCHEMA_V2 = "opensquilla.draco.frozen-task-analysis/v2"
+FROZEN_TASK_ANALYSIS_SCHEMAS = frozenset(
+    {FROZEN_TASK_ANALYSIS_SCHEMA, FROZEN_TASK_ANALYSIS_SCHEMA_V2}
+)
 FROZEN_TASK_ANALYSIS_MODE = "frozen_replay"
 FROZEN_TASK_ANALYZER_SOURCE = "frozen_replay"
+FROZEN_TASK_ANALYSIS_LIVE_SUCCESS = "live_success"
+FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK = "deterministic_router_fallback"
 TASK_PROFILE_SCHEMA_VERSION = "step2-task-profile-v1"
 THINKING_POLICY_VERSION = "thinking-policy-v1"
 GENERATION_POLICY_FILTER_REASON_PREFIX = "generation_policy_"
@@ -3397,6 +3403,9 @@ _FROZEN_TASK_ANALYSIS_ENTRY_FIELDS = frozenset(
         "task_analyzer",
     }
 )
+_FROZEN_TASK_ANALYSIS_V2_ENTRY_FIELDS = frozenset(
+    {*_FROZEN_TASK_ANALYSIS_ENTRY_FIELDS, "origin_outcome"}
+)
 _FROZEN_TASK_ANALYZER_TRACE_FIELDS = frozenset(
     {
         "source",
@@ -3422,8 +3431,9 @@ def frozen_task_analysis_contract_reasons(
     reasons: list[str] = []
     if not isinstance(value, Mapping) or set(value) != _FROZEN_TASK_ANALYSIS_FIELDS:
         return ["invalid_frozen_task_analysis_contract"]
+    schema = value.get("schema")
     if (
-        value.get("schema") != FROZEN_TASK_ANALYSIS_SCHEMA
+        schema not in FROZEN_TASK_ANALYSIS_SCHEMAS
         or value.get("mode") != FROZEN_TASK_ANALYSIS_MODE
         or not str(value.get("source_experiment") or "").strip()
     ):
@@ -3463,10 +3473,15 @@ def frozen_task_analysis_contract_reasons(
         or set(task_ids) != set(str(task_id) for task_id in expected_task_ids)
     ):
         reasons.append("wrong_frozen_task_analysis_task_set")
+    expected_entry_fields = (
+        _FROZEN_TASK_ANALYSIS_V2_ENTRY_FIELDS
+        if schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+        else _FROZEN_TASK_ANALYSIS_ENTRY_FIELDS
+    )
     for raw_entry in entries.values():
         if (
             not isinstance(raw_entry, Mapping)
-            or set(raw_entry) != _FROZEN_TASK_ANALYSIS_ENTRY_FIELDS
+            or set(raw_entry) != expected_entry_fields
         ):
             reasons.append("invalid_frozen_task_analysis_entry")
             continue
@@ -3499,9 +3514,24 @@ def frozen_task_analysis_contract_reasons(
             continue
         confidence = analyzer.get("confidence")
         warnings = analyzer.get("normalization_warnings")
+        origin_outcome = (
+            raw_entry.get("origin_outcome")
+            if schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+            else FROZEN_TASK_ANALYSIS_LIVE_SUCCESS
+        )
+        outcome_valid = (
+            origin_outcome == FROZEN_TASK_ANALYSIS_LIVE_SUCCESS
+            and analyzer.get("schema_valid") is True
+            and analyzer.get("fallback_reason") == ""
+        ) or (
+            schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+            and origin_outcome == FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK
+            and analyzer.get("schema_valid") is False
+            and bool(str(analyzer.get("fallback_reason") or "").strip())
+        )
         if (
             analyzer.get("source") != FROZEN_TASK_ANALYZER_SOURCE
-            or analyzer.get("schema_valid") is not True
+            or not outcome_valid
             or isinstance(confidence, bool)
             or not isinstance(confidence, int | float)
             or not math.isfinite(float(confidence))
@@ -3509,7 +3539,6 @@ def frozen_task_analysis_contract_reasons(
             or not str(analyzer.get("analyzer_version") or "").strip()
             or not str(analyzer.get("provider") or "").strip()
             or not str(analyzer.get("model") or "").strip()
-            or analyzer.get("fallback_reason") != ""
             or analyzer.get("usage") != {}
             or not isinstance(warnings, list)
             or any(not isinstance(warning, str) or not warning.strip() for warning in warnings)
@@ -3572,8 +3601,9 @@ def frozen_task_analysis_plan_reasons(
         and str(entry.get("prompt_sha256") or "") != expected_prompt_sha256
     ):
         reasons.append("wrong_frozen_task_analysis_prompt_sha256")
+    contract_schema = str(contract["schema"])
     expected_proof = {
-        "schema": FROZEN_TASK_ANALYSIS_SCHEMA,
+        "schema": contract_schema,
         "mode": FROZEN_TASK_ANALYSIS_MODE,
         "task_id": task_id,
         "source_experiment": contract["source_experiment"],
@@ -3590,6 +3620,8 @@ def frozen_task_analysis_plan_reasons(
         ],
         "physical_request_count": 0,
     }
+    if contract_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2:
+        expected_proof["origin_outcome"] = entry["origin_outcome"]
     if dict(proof) != expected_proof:
         reasons.append("wrong_frozen_task_analysis_replay_proof")
     expected_analyzer = copy.deepcopy(dict(entry["task_analyzer"]))
@@ -3650,6 +3682,11 @@ def frozen_task_analysis_result(
         request_context=request_context,
         ranking_config=ranking_config,
     )
+    origin_outcome = (
+        entry.get("origin_outcome")
+        if contract.get("schema") == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+        else FROZEN_TASK_ANALYSIS_LIVE_SUCCESS
+    )
     if (
         not schema_valid
         or not isinstance(profile, Mapping)
@@ -3660,9 +3697,19 @@ def frozen_task_analysis_result(
         raise DynamicRankingError(
             f"frozen task analysis profile {task_id!r} is invalid for this request"
         )
+    if origin_outcome == FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK:
+        expected_fallback = fallback_task_profile(
+            routed_tier=routed_tier,
+            request_context=request_context,
+            ranking_config=ranking_config,
+        )
+        if expected_fallback != normalized:
+            raise DynamicRankingError(
+                f"frozen task analysis fallback profile {task_id!r} is not deterministic"
+            )
     analyzer = entry["task_analyzer"]
     proof = {
-        "schema": FROZEN_TASK_ANALYSIS_SCHEMA,
+        "schema": contract["schema"],
         "mode": FROZEN_TASK_ANALYSIS_MODE,
         "task_id": task_id,
         "source_experiment": contract["source_experiment"],
@@ -3679,13 +3726,15 @@ def frozen_task_analysis_result(
         ],
         "physical_request_count": 0,
     }
+    if contract.get("schema") == FROZEN_TASK_ANALYSIS_SCHEMA_V2:
+        proof["origin_outcome"] = origin_outcome
     return TaskAnalysisResult(
         profile=copy.deepcopy(normalized),
         source=FROZEN_TASK_ANALYZER_SOURCE,
-        schema_valid=True,
+        schema_valid=analyzer["schema_valid"] is True,
         confidence=float(analyzer["confidence"]),
         analyzer_version=str(analyzer["analyzer_version"]),
-        fallback_reason="",
+        fallback_reason=str(analyzer["fallback_reason"]),
         usage={},
         provider_id=str(analyzer["provider"]),
         model_id=str(analyzer["model"]),

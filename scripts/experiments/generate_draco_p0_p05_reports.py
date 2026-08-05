@@ -51,6 +51,9 @@ TERMINAL_ARM_STATES = {
     "no_op_deleted",
 }
 PRICE_REGISTRY_RELATIVE = Path("src/opensquilla/provider/router_dynamic_model_profiles.json")
+ANALYZER_ORIGIN_LIVE_SUCCESS = "live_success"
+ANALYZER_ORIGIN_ROUTER_FALLBACK = "deterministic_router_fallback"
+ANALYZER_ORIGIN_UNKNOWN = "unknown"
 LEGACY_EVIDENCE: dict[str, dict[str, str]] = {
     "P0-01": {
         "status": "completed_existing_experiment",
@@ -1254,6 +1257,61 @@ def normalize_model(value: Any) -> str:
     return model.split(":", 1)[1] if model.startswith("openrouter:") else model
 
 
+def task_analyzer_origin_evidence(analyzer: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose Analyzer origin without laundering legacy rows into fallbacks.
+
+    Frozen replay v2 is authoritative because it binds ``origin_outcome`` in
+    the replay proof.  A v1 replay (or a live Analyzer trace) may still be
+    classified as ``live_success`` when the row carries affirmative success
+    evidence.  Everything else remains ``unknown``: a legacy fallback reason
+    alone is useful reporting evidence, but it must not be used to invent a
+    deterministic-router-fallback provenance that the row did not bind.
+    """
+
+    replay = analyzer.get("replay") if isinstance(analyzer.get("replay"), Mapping) else {}
+    fallback_reason = str(analyzer.get("fallback_reason") or "").strip()
+    raw_origin = replay.get("origin_outcome")
+    explicit_origin = (
+        str(raw_origin).strip()
+        if isinstance(raw_origin, str) and str(raw_origin).strip()
+        else ""
+    )
+    if explicit_origin:
+        outcome = explicit_origin
+        evidence = "replay.origin_outcome"
+        explicit = True
+    else:
+        replay_schema = str(replay.get("schema") or "").strip()
+        v1_replay_success = bool(
+            replay_schema == "opensquilla.draco.frozen-task-analysis/v1"
+            and analyzer.get("schema_valid") is not False
+            and not fallback_reason
+        )
+        affirmative_live_success = bool(
+            analyzer.get("schema_valid") is True and not fallback_reason
+        )
+        if v1_replay_success or affirmative_live_success:
+            outcome = ANALYZER_ORIGIN_LIVE_SUCCESS
+            evidence = (
+                "legacy_v1_replay_success"
+                if v1_replay_success
+                else "legacy_live_success"
+            )
+        else:
+            outcome = ANALYZER_ORIGIN_UNKNOWN
+            evidence = "origin_outcome_missing"
+        explicit = False
+    return {
+        "origin_outcome": outcome,
+        "origin_outcome_explicit": explicit,
+        "origin_evidence": evidence,
+        "fallback_reason": fallback_reason,
+        "is_explicit_router_fallback": bool(
+            explicit and outcome == ANALYZER_ORIGIN_ROUTER_FALLBACK
+        ),
+    }
+
+
 def compact_row(row: Mapping[str, Any], prices: Mapping[str, Price]) -> dict[str, Any]:
     judge = row.get("judge") if isinstance(row.get("judge"), Mapping) else {}
     usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
@@ -1286,6 +1344,7 @@ def compact_row(row: Mapping[str, Any], prices: Mapping[str, Price]) -> dict[str
         plan.get("selected_A") or plan.get("aggregator_model") or ensemble.get("executed_A")
     )
     analyzer = plan.get("task_analyzer") if isinstance(plan.get("task_analyzer"), Mapping) else {}
+    analyzer_origin = task_analyzer_origin_evidence(analyzer)
     routing = row.get("routing_trace") if isinstance(row.get("routing_trace"), Mapping) else {}
     routing_analyzer = (
         routing.get("task_analyzer") if isinstance(routing.get("task_analyzer"), Mapping) else {}
@@ -1411,6 +1470,11 @@ def compact_row(row: Mapping[str, Any], prices: Mapping[str, Price]) -> dict[str
         ),
         "task_profile_hash": str(plan.get("task_profile_hash") or ""),
         "analyzer_source": str(analyzer.get("source") or routing_analyzer.get("source") or ""),
+        "analyzer_origin_outcome": analyzer_origin["origin_outcome"],
+        "analyzer_origin_outcome_explicit": analyzer_origin["origin_outcome_explicit"],
+        "analyzer_origin_evidence": analyzer_origin["origin_evidence"],
+        "analyzer_fallback_reason": analyzer_origin["fallback_reason"],
+        "analyzer_origin_is_fallback": analyzer_origin["is_explicit_router_fallback"],
         "analyzer_output_tokens": analyzer_output_tokens,
         "analyzer_max_output_tokens": analyzer_max_output_tokens,
         "analyzer_stop_reasons": sorted(set(analyzer_stop_reasons)),
@@ -1889,6 +1953,34 @@ def summarize_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
         "analyzer_sources": dict(
             sorted(Counter(str(row.get("analyzer_source") or "") for row in rows).items())
+        ),
+        "analyzer_origin_outcome_distribution": dict(
+            sorted(
+                Counter(
+                    str(row.get("analyzer_origin_outcome") or ANALYZER_ORIGIN_UNKNOWN)
+                    for row in rows
+                ).items()
+            )
+        ),
+        "analyzer_fallback_reason_distribution": dict(
+            sorted(
+                Counter(
+                    str(row.get("analyzer_fallback_reason") or "")
+                    for row in rows
+                    if str(row.get("analyzer_fallback_reason") or "").strip()
+                ).items()
+            )
+        ),
+        "analyzer_fallback_task_ids": sorted(
+            str(row.get("task_id") or "")
+            for row in rows
+            if row.get("analyzer_origin_is_fallback") is True
+        ),
+        "analyzer_unknown_origin_task_ids": sorted(
+            str(row.get("task_id") or "")
+            for row in rows
+            if str(row.get("analyzer_origin_outcome") or ANALYZER_ORIGIN_UNKNOWN)
+            == ANALYZER_ORIGIN_UNKNOWN
         ),
         "analyzer_output_tokens": [
             integer(row.get("analyzer_output_tokens"))
@@ -3942,6 +4034,29 @@ def build_group_markdown(
             f"{integer(metric.get('fallback_task_count'))} | {integer(metric.get('proposer_recovery_request_count'))} | "
             f"{integer(metric.get('partial_proposer_task_count'))}/{integer(metric.get('degraded_task_count'))}/{integer(metric.get('assembly_truncated_task_count'))} | "
             f"{code_json(metric.get('analyzer_sources') or {})} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### Analyzer origin / fallback 取证",
+            "",
+            "只有 `task_analyzer.replay.origin_outcome=deterministic_router_fallback` 的 v2 证据才计入 fallback task；旧行缺失 origin 时不会根据失败原因反向猜测 fallback。",
+            "",
+            "| Arm | Origin outcome distribution | Fallback reason distribution | Fallback task IDs | Unknown-origin task IDs |",
+            "|---|---|---|---|---|",
+        ]
+    )
+    for arm in display_arms:
+        if arm.get("formal_evidence_valid") is not True:
+            lines.append(f"| {display_arm(arm)} | — | — | — | — |")
+            continue
+        metric = arm.get("metrics") or {}
+        lines.append(
+            f"| {display_arm(arm)} | "
+            f"{code_json(metric.get('analyzer_origin_outcome_distribution') or {})} | "
+            f"{code_json(metric.get('analyzer_fallback_reason_distribution') or {})} | "
+            f"{code_json(metric.get('analyzer_fallback_task_ids') or [])} | "
+            f"{code_json(metric.get('analyzer_unknown_origin_task_ids') or [])} |"
         )
     lines.extend(
         [

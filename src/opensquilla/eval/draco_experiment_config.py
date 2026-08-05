@@ -16,6 +16,7 @@ FORMAL_DRACO_OPENROUTER_PROVIDER = "openrouter"
 FORMAL_DRACO_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 FORMAL_DRACO_OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 FROZEN_TASK_ANALYSIS_SCHEMA = "opensquilla.draco.frozen-task-analysis/v1"
+FROZEN_TASK_ANALYSIS_SCHEMA_V2 = "opensquilla.draco.frozen-task-analysis/v2"
 FROZEN_TASK_ANALYSIS_MODE = "frozen_replay"
 FORMAL_DRACO_WEB_SEARCH_API_KEY_ENVS = {
     "brave": "BRAVE_SEARCH_API_KEY",
@@ -165,6 +166,108 @@ class DracoFrozenTaskAnalysisExecutionConfig(_StrictConfig):
         return self
 
 
+class DracoFrozenTaskAnalyzerTraceV2Config(_StrictConfig):
+    """Replay provenance that preserves the authenticated live-source outcome."""
+
+    source: Literal["frozen_replay"]
+    schema_valid: bool
+    confidence: float = Field(ge=0.0, le=1.0)
+    analyzer_version: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    fallback_reason: str
+    usage: dict[str, Any]
+    normalization_warnings: list[str]
+
+    @model_validator(mode="after")
+    def _validate_zero_request_trace(self) -> DracoFrozenTaskAnalyzerTraceV2Config:
+        if self.usage:
+            raise ValueError("frozen task analyzer replay usage must be empty")
+        if any(not value.strip() for value in self.normalization_warnings):
+            raise ValueError("frozen task analyzer warnings must be non-empty strings")
+        if len(set(self.normalization_warnings)) != len(self.normalization_warnings):
+            raise ValueError("frozen task analyzer warnings must be unique")
+        return self
+
+
+class DracoFrozenTaskAnalysisEntryV2Config(_StrictConfig):
+    task_input_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_profile_pre_escalation: dict[str, Any]
+    task_profile_pre_escalation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    origin_outcome: Literal["live_success", "deterministic_router_fallback"]
+    task_analyzer: DracoFrozenTaskAnalyzerTraceV2Config
+
+    @model_validator(mode="after")
+    def _validate_profile_and_outcome(self) -> DracoFrozenTaskAnalysisEntryV2Config:
+        if not self.task_profile_pre_escalation:
+            raise ValueError("frozen pre-escalation task profile must be non-empty")
+        if (
+            _canonical_json_sha256(self.task_profile_pre_escalation)
+            != self.task_profile_pre_escalation_sha256
+        ):
+            raise ValueError(
+                "frozen task_profile_pre_escalation_sha256 does not match "
+                "task_profile_pre_escalation"
+            )
+        if self.origin_outcome == "live_success":
+            if self.task_analyzer.schema_valid is not True or self.task_analyzer.fallback_reason:
+                raise ValueError("live-success replay provenance is contradictory")
+        elif (
+            self.task_analyzer.schema_valid is not False
+            or not self.task_analyzer.fallback_reason.strip()
+        ):
+            raise ValueError("router-fallback replay provenance is contradictory")
+        return self
+
+
+class DracoFrozenTaskAnalysisExecutionV2Config(_StrictConfig):
+    """V2 replay bundle preserving deterministic router-fallback provenance."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        allow_inf_nan=False,
+        hide_input_in_errors=True,
+        serialize_by_alias=True,
+    )
+
+    schema_id: Literal["opensquilla.draco.frozen-task-analysis/v2"] = Field(
+        alias="schema"
+    )
+    mode: Literal["frozen_replay"]
+    source_experiment: str = Field(min_length=1)
+    source_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_results_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_task_analyzer_config: dict[str, Any]
+    source_task_analyzer_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    entries: dict[str, DracoFrozenTaskAnalysisEntryV2Config]
+    entries_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_bundle_hashes(self) -> DracoFrozenTaskAnalysisExecutionV2Config:
+        if len(self.entries) != 10 or any(
+            not task_id or task_id != task_id.strip() for task_id in self.entries
+        ):
+            raise ValueError("frozen task analysis must contain exactly 10 canonical task ids")
+        if not self.source_experiment.strip():
+            raise ValueError("source_experiment must be a non-empty canonical id")
+        if not self.source_task_analyzer_config:
+            raise ValueError("source_task_analyzer_config must be non-empty")
+        if (
+            _canonical_json_sha256(self.source_task_analyzer_config)
+            != self.source_task_analyzer_config_sha256
+        ):
+            raise ValueError("source_task_analyzer_config_sha256 does not match")
+        entries = {
+            task_id: entry.model_dump(mode="json")
+            for task_id, entry in self.entries.items()
+        }
+        if _canonical_json_sha256(entries) != self.entries_sha256:
+            raise ValueError("frozen task analysis entries_sha256 does not match entries")
+        return self
+
+
 class DracoG1RoutingConfig(_StrictConfig):
     """Versioned, fail-closed candidate contract for the formal G1 router."""
 
@@ -180,7 +283,11 @@ class DracoG1RoutingConfig(_StrictConfig):
     expected_candidate_count: int | None = Field(default=None, gt=0)
     expected_routes: dict[str, str] | None = None
     expected_routes_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    task_analysis_execution: DracoFrozenTaskAnalysisExecutionConfig | None = None
+    task_analysis_execution: (
+        DracoFrozenTaskAnalysisExecutionConfig
+        | DracoFrozenTaskAnalysisExecutionV2Config
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def _validate_expected_routes(self) -> DracoG1RoutingConfig:

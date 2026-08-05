@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
 import json
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+from opensquilla.provider.ranking_router import (
+    build_request_context,
+    fallback_task_profile,
+    ranking_config_resolution,
+)
 
 CONTROLLER_PATH = (
     Path(__file__).resolve().parents[2]
@@ -264,8 +272,525 @@ class ControllerTests(unittest.TestCase):
                 with self.assertRaises(controller.ControllerError):
                     controller.validate_plan(plan, allow_placeholders=True)
 
+    def test_replay_overlay_and_runtime_support_bind_declared_schema(self) -> None:
+        plan = controller.load_json(PLAN_TEMPLATE)
+        artifact = {
+            "replay_payload": {
+                "schema": controller.FROZEN_TASK_ANALYSIS_SCHEMA_V2,
+                "entries": {},
+            }
+        }
+        with self.assertRaises(controller.ControllerError):
+            controller.make_replay_overlay(plan, artifact)
+        artifact["replay_payload"]["schema"] = controller.FROZEN_TASK_ANALYSIS_SCHEMA_V1
+        overlay = controller.make_replay_overlay(plan, artifact)
+        self.assertEqual(
+            overlay["g1_routing"]["task_analysis_execution"]["schema"],
+            controller.FROZEN_TASK_ANALYSIS_SCHEMA_V1,
+        )
+        controller.validate_frozen_replay_runtime_support(
+            plan,
+            {"frozen_task_analysis_schemas": {controller.FROZEN_TASK_ANALYSIS_SCHEMA_V1}},
+        )
+        with self.assertRaises(controller.ControllerError):
+            controller.validate_frozen_replay_runtime_support(
+                plan,
+                {"frozen_task_analysis_schemas": {controller.FROZEN_TASK_ANALYSIS_SCHEMA_V2}},
+            )
+
+    def test_analyzer_fallback_and_preexisting_source_require_explicit_contracts(self) -> None:
+        template = controller.load_json(PLAN_TEMPLATE)
+        self.assertFalse(
+            controller.analyzer_source_policy(template)["allow_deterministic_router_fallback"]
+        )
+        self.assertIsNone(controller.preexisting_source_contract(template))
+
+        opted_in = copy.deepcopy(template)
+        opted_in["runtime_contract"]["analyzer_source"] = {
+            "schema": controller.ANALYZER_SOURCE_POLICY_SCHEMA,
+            "allow_deterministic_router_fallback": True,
+        }
+        with self.assertRaises(controller.ControllerError):
+            controller.validate_plan(opted_in, allow_placeholders=True)
+        opted_in["runtime_contract"]["frozen_replay"]["schema"] = (
+            controller.FROZEN_TASK_ANALYSIS_SCHEMA_V2
+        )
+        opted_in["runtime_contract"]["preexisting_source"] = {
+            "schema": controller.PREEXISTING_SOURCE_SCHEMA,
+            "enabled": True,
+            "source_plan_path": "TODO_SOURCE_PLAN_PATH",
+            "source_plan_raw_sha256": "TODO_SOURCE_PLAN_RAW_SHA256",
+            "source_plan_canonical_sha256": "TODO_SOURCE_PLAN_CANONICAL_SHA256",
+            "source_snapshot_path": "TODO_SOURCE_SNAPSHOT_PATH",
+            "source_snapshot_commit": "TODO_SOURCE_SNAPSHOT_COMMIT",
+            "source_snapshot_tree": "TODO_SOURCE_SNAPSHOT_TREE",
+            "source_output_dir": "TODO_SOURCE_OUTPUT_DIR",
+            "source_manifest_sha256": "TODO_SOURCE_MANIFEST_SHA256",
+            "source_results_sha256": "TODO_SOURCE_RESULTS_SHA256",
+            "source_trace_sha256": "TODO_SOURCE_TRACE_SHA256",
+        }
+        controller.validate_plan(opted_in, allow_placeholders=True)
+        self.assertTrue(
+            controller.analyzer_source_policy(opted_in)["allow_deterministic_router_fallback"]
+        )
+
+        malformed = copy.deepcopy(opted_in)
+        malformed["runtime_contract"]["preexisting_source"].pop("source_trace_sha256")
+        with self.assertRaises(controller.ControllerError):
+            controller.validate_plan(malformed, allow_placeholders=True)
+
+    def test_preexisting_source_publication_receipt_is_fail_closed(self) -> None:
+        plan = {
+            "benchmark": {"task_ids": [f"task-{index}" for index in range(10)]},
+            "execution": {"task_concurrency": 6},
+        }
+        expected = {"output_dir": "/bound/source"}
+        base_receipt = {"source_output_dir": "/bound/source"}
+        with (
+            mock.patch.object(
+                controller,
+                "preexisting_source_identity",
+                return_value=(expected, copy.deepcopy(base_receipt)),
+            ),
+            mock.patch.object(
+                controller,
+                "inspect_complete_arm",
+                return_value=(True, {"status": "complete"}),
+            ),
+        ):
+            receipt = controller.authenticate_preexisting_source(plan)
+        self.assertEqual(receipt["source_output_dir"], "/bound/source")
+        self.assertIn("publication_evidence_sha256", receipt)
+        self.assertIn("receipt_sha256", receipt)
+
+        with (
+            mock.patch.object(
+                controller,
+                "preexisting_source_identity",
+                return_value=(expected, copy.deepcopy(base_receipt)),
+            ),
+            mock.patch.object(
+                controller,
+                "inspect_complete_arm",
+                return_value=(False, {"reason": "hash_mismatch"}),
+            ),
+            self.assertRaises(controller.ControllerError),
+        ):
+            controller.authenticate_preexisting_source(plan)
+
+    def test_preexisting_source_is_frozen_once_and_reused_without_source_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "old-reports" / "common" / "source"
+            source.mkdir(parents=True)
+            snapshot = root / "old-snapshot"
+            module_dir = snapshot / "src" / "opensquilla" / "eval"
+            module_dir.mkdir(parents=True)
+            (snapshot / "src" / "opensquilla" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (module_dir / "__init__.py").write_text("", encoding="utf-8")
+            (module_dir / "draco_experiment_config.py").write_text(
+                "class Config:\n"
+                "    def model_dump(self, mode=None):\n"
+                "        return {'ensemble': {'candidate_order_seed': None, "
+                "'shuffle_candidates': False}}\n"
+                "class Loaded:\n"
+                "    config = Config()\n"
+                "def load_draco_experiment_config(*args, **kwargs):\n"
+                "    return Loaded()\n",
+                encoding="utf-8",
+            )
+            scripts = snapshot / "scripts"
+            scripts.mkdir()
+            for runner_name in (
+                "run_draco_routing_experiment.py",
+                "run_draco_routing_experiment_resume.py",
+            ):
+                (scripts / runner_name).write_text("# frozen runner\n", encoding="utf-8")
+            source_arm = controller.Arm(
+                arm_id=controller.ANALYZER_SOURCE_ARM_ID,
+                experiment_id="common-E0",
+                directory_name="common",
+                variant="E0",
+                replicate=1,
+                analyzer_mode="live",
+                override={},
+                dynamic=None,
+                wire_gate=None,
+                output_name="source",
+                control_arm_id=None,
+            )
+            source_plan_payload = {
+                "run_id": "old-run",
+                "paths": {
+                    "experiment_config_relative": "configs/draco.json",
+                    "reference_repo": str(root / "reference"),
+                    "report_root": str(root / "old-reports"),
+                },
+                "benchmark": {
+                    "input_sha256": "c" * 64,
+                    "task_ids": [f"task-{index}" for index in range(10)],
+                },
+                "execution": {
+                    "task_concurrency": 6,
+                    "judge_concurrency": 6,
+                    "generation_max_attempts": 3,
+                },
+            }
+            source_plan = root / "old-plan.json"
+            source_plan.write_text(
+                json.dumps(source_plan_payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            for name in (
+                "manifest.json",
+                "results.jsonl",
+                "trace.jsonl",
+                "audit.json",
+                "openrouter-non-byok-campaign-proof.json",
+            ):
+                (source / name).write_text(name + "\n", encoding="utf-8")
+            contract = {
+                "schema": controller.PREEXISTING_SOURCE_SCHEMA,
+                "enabled": True,
+                "source_plan_path": str(source_plan),
+                "source_plan_raw_sha256": controller.file_sha256(source_plan),
+                "source_plan_canonical_sha256": controller.canonical_sha256(
+                    source_plan_payload
+                ),
+                "source_snapshot_path": str(snapshot),
+                "source_snapshot_commit": "a" * 40,
+                "source_snapshot_tree": "b" * 40,
+                "source_output_dir": str(source),
+                "source_manifest_sha256": controller.file_sha256(source / "manifest.json"),
+                "source_results_sha256": controller.file_sha256(source / "results.jsonl"),
+                "source_trace_sha256": controller.file_sha256(source / "trace.jsonl"),
+            }
+            plan = {
+                "runtime_contract": {"preexisting_source": contract},
+                "paths": {
+                    "run_root": str(root / "run"),
+                    "report_root": str(root / "new-reports"),
+                },
+            }
+            (root / "run").mkdir()
+            git_state = {"commit": "a" * 40, "tree": "b" * 40, "status": ""}
+            expected_identity = controller.arm_completion_identity(
+                source_plan_payload,
+                source_arm,
+                snapshot=snapshot,
+                snapshot_identity=git_state,
+                override={},
+                isolated_config=True,
+            )
+            publication_evidence = {"reason": "complete"}
+            authenticated = {
+                **contract,
+                "expected_identity_sha256": controller.canonical_sha256(expected_identity),
+                "expected_publication_identity": expected_identity,
+                "publication_evidence": publication_evidence,
+                "publication_evidence_sha256": controller.canonical_sha256(publication_evidence),
+                "contract_sha256": controller.canonical_sha256(contract),
+            }
+            authenticated["receipt_sha256"] = controller.canonical_sha256(authenticated)
+            archive_bytes = io.BytesIO()
+            with tarfile.open(fileobj=archive_bytes, mode="w") as archive:
+                for path in sorted(snapshot.rglob("*")):
+                    if not path.is_file():
+                        continue
+                    payload = path.read_bytes()
+                    member = tarfile.TarInfo(path.relative_to(snapshot).as_posix())
+                    member.size = len(payload)
+                    member.mode = 0o644
+                    archive.addfile(member, io.BytesIO(payload))
+            completed = SimpleNamespace(returncode=0, stdout=archive_bytes.getvalue())
+            real_subprocess_run = subprocess.run
+
+            def run_with_frozen_archive(command, *args, **kwargs):
+                if list(command)[:2] == ["git", "archive"]:
+                    return completed
+                return real_subprocess_run(command, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    controller,
+                    "authenticate_preexisting_source",
+                    return_value=copy.deepcopy(authenticated),
+                ) as authenticate,
+                mock.patch.object(
+                    controller,
+                    "authenticate_published_arm_artifacts",
+                    return_value=({}, {}, {}, {}),
+                ),
+                mock.patch.object(controller, "git_identity", return_value=git_state),
+                mock.patch.object(
+                    controller.subprocess,
+                    "run",
+                    side_effect=run_with_frozen_archive,
+                ),
+                mock.patch.object(controller, "validate_plan", return_value=[source_arm]),
+            ):
+                first = controller.materialize_preexisting_source(plan)
+                (source / "results.jsonl").write_text("changed\n", encoding="utf-8")
+                second = controller.materialize_preexisting_source(plan)
+            self.assertEqual(first, second)
+            self.assertEqual(authenticate.call_count, 1)
+            package = Path(first["package_dir"])
+            self.assertNotEqual(
+                controller.file_sha256(source / "results.jsonl"),
+                controller.file_sha256(package / "results.jsonl"),
+            )
+
+    def test_preexisting_source_path_rejects_symlink_before_resolve(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = root / "target.json"
+            target.write_text("{}\n", encoding="utf-8")
+            alias = root / "alias.json"
+            alias.symlink_to(target)
+            with self.assertRaises(controller.ControllerError):
+                controller.absolute_path_without_symlinks(
+                    alias,
+                    label="source plan",
+                )
+
+    def test_effective_config_import_isolated_between_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            observed = []
+            for marker in ("old", "new"):
+                snapshot = root / marker
+                module_dir = snapshot / "src" / "opensquilla" / "eval"
+                module_dir.mkdir(parents=True)
+                (snapshot / "src" / "opensquilla" / "__init__.py").write_text("", encoding="utf-8")
+                (module_dir / "__init__.py").write_text("", encoding="utf-8")
+                (module_dir / "draco_experiment_config.py").write_text(
+                    "class _Config:\n"
+                    "    def model_dump(self, mode=None):\n"
+                    f"        return {{'marker': '{marker}', 'ensemble': {{}}}}\n"
+                    "class _Loaded:\n"
+                    "    config = _Config()\n"
+                    "def load_draco_experiment_config(*args, **kwargs):\n"
+                    "    return _Loaded()\n",
+                    encoding="utf-8",
+                )
+                base_config = snapshot / "config.json"
+                base_config.write_text("{}\n", encoding="utf-8")
+                observed.append(
+                    controller.load_effective_experiment_config_isolated(
+                        snapshot,
+                        base_config,
+                        {},
+                    )["marker"]
+                )
+            self.assertEqual(observed, ["old", "new"])
+
+    def test_preexisting_source_identity_binds_plan_snapshot_and_three_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source_dir = root / "reports" / "common" / "source-old"
+            source_dir.mkdir(parents=True)
+            for filename, content in (
+                ("manifest.json", "{}\n"),
+                ("results.jsonl", "{}\n"),
+                ("trace.jsonl", "{}\n"),
+            ):
+                (source_dir / filename).write_text(content, encoding="utf-8")
+            source_plan_path = root / "old-plan.json"
+            (root / "snapshot").mkdir()
+            benchmark = {
+                "task_count": 10,
+                "task_ids": [f"task-{index}" for index in range(10)],
+                "groups": ["G1"],
+            }
+            source_plan = {
+                "schema": controller.PLAN_SCHEMA,
+                "run_id": "old",
+                "benchmark": benchmark,
+                "runtime_contract": {},
+                "paths": {"report_root": str(root / "reports")},
+                "freeze": {"snapshot_commit": "a" * 40, "snapshot_tree": "b" * 40},
+            }
+            write_json(source_plan_path, source_plan)
+            source_arm = controller.Arm(
+                arm_id=controller.ANALYZER_SOURCE_ARM_ID,
+                experiment_id="common-E0",
+                directory_name="common",
+                variant="E0",
+                replicate=1,
+                analyzer_mode="live",
+                override={},
+                dynamic=None,
+                wire_gate=None,
+                output_name="source-old",
+                control_arm_id=None,
+            )
+            contract = {
+                "schema": controller.PREEXISTING_SOURCE_SCHEMA,
+                "enabled": True,
+                "source_plan_path": str(source_plan_path),
+                "source_plan_raw_sha256": controller.file_sha256(source_plan_path),
+                "source_plan_canonical_sha256": controller.canonical_sha256(source_plan),
+                "source_snapshot_path": str(root / "snapshot"),
+                "source_snapshot_commit": "a" * 40,
+                "source_snapshot_tree": "b" * 40,
+                "source_output_dir": str(source_dir),
+                "source_manifest_sha256": controller.file_sha256(source_dir / "manifest.json"),
+                "source_results_sha256": controller.file_sha256(source_dir / "results.jsonl"),
+                "source_trace_sha256": controller.file_sha256(source_dir / "trace.jsonl"),
+            }
+            plan = {
+                "benchmark": copy.deepcopy(benchmark),
+                "runtime_contract": {"preexisting_source": contract},
+            }
+            expected = {"output_dir": str(source_dir), "identity": "bound"}
+            with (
+                mock.patch.object(controller, "validate_plan", return_value=[source_arm]),
+                mock.patch.object(
+                    controller,
+                    "git_identity",
+                    return_value={
+                        "commit": "a" * 40,
+                        "tree": "b" * 40,
+                        "status": "",
+                    },
+                ),
+                mock.patch.object(
+                    controller,
+                    "arm_completion_identity",
+                    return_value=expected,
+                ) as completion_identity,
+            ):
+                observed = controller.preexisting_source_identity(plan)
+                self.assertEqual(observed[0], expected)
+                self.assertEqual(
+                    observed[1]["source_results_sha256"],
+                    contract["source_results_sha256"],
+                )
+                self.assertTrue(completion_identity.call_args.kwargs["isolated_config"])
+                (source_dir / "results.jsonl").write_text('{"changed":true}\n', encoding="utf-8")
+                with self.assertRaises(controller.ControllerError):
+                    controller.preexisting_source_identity(plan)
+
+    def test_analyzer_ledger_rejects_ambiguous_usage_and_cross_task_ids(self) -> None:
+        expected = {
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+        }
+        attempt = {
+            "attempt": 1,
+            "physical_attempt_id": "1" * 32,
+            "requested_provider": "openrouter",
+            "requested_model": "anthropic/claude-opus-4.8",
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.8",
+            "usage_unknown": False,
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "reasoning_tokens": 0,
+            "cached_tokens": 3,
+            "cache_write_tokens": 0,
+            "billed_cost": 0.01,
+            "provider_usage": {
+                "usage_unknown": False,
+                "physical_attempt_id": "1" * 32,
+            },
+        }
+        analyzer = {
+            **expected,
+            "normalization_warnings": [],
+            "usage": {
+                "attempt_count": 1,
+                "physical_request_count": 1,
+                "usage_unknown_count": 0,
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "reasoning_tokens": 0,
+                "cached_tokens": 3,
+                "cache_write_tokens": 0,
+                "billed_cost": 0.01,
+                "physical_attempts": [attempt],
+            },
+        }
+        usage, _, _ = controller._validated_analyzer_attempt_ledger(
+            task_id="task-a",
+            analyzer=analyzer,
+            expected_config=expected,
+            allow_zero_attempts=False,
+        )
+        owners: dict[str, str] = {}
+        controller.register_analyzer_attempt_owners(owners, task_id="task-a", usage=usage)
+        with self.assertRaises(controller.ControllerError):
+            controller.register_analyzer_attempt_owners(owners, task_id="task-b", usage=usage)
+
+        bool_aggregate = copy.deepcopy(analyzer)
+        bool_aggregate["usage"]["input_tokens"] = True
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-a",
+                analyzer=bool_aggregate,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
+        conflicting_id = copy.deepcopy(analyzer)
+        conflicting_id["usage"]["physical_attempts"][0]["reported_physical_attempt_ids"] = [
+            "2" * 32
+        ]
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-a",
+                analyzer=conflicting_id,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
+        contradictory_unknown = copy.deepcopy(analyzer)
+        unknown_attempt = contradictory_unknown["usage"]["physical_attempts"][0]
+        unknown_attempt.update(
+            {
+                "usage_unknown": True,
+                "unknown_reason": "TimeoutError",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "billed_cost": 0.0,
+                "provider_usage": {
+                    "usage_unknown": True,
+                    "unknown_reason": "TimeoutError",
+                    "physical_attempt_id": "1" * 32,
+                },
+            }
+        )
+        contradictory_unknown["usage"].update(
+            {
+                "usage_unknown_count": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+                "billed_cost": 0.0,
+            }
+        )
+        with self.assertRaises(controller.ControllerError):
+            controller._validated_analyzer_attempt_ledger(
+                task_id="task-a",
+                analyzer=contradictory_unknown,
+                expected_config=expected,
+                allow_zero_attempts=False,
+            )
+
     def test_authenticated_analyzer_extract_uses_terminal_physical_attempt(self) -> None:
         task_ids = [f"task-{index}" for index in range(10)]
+        ranking_config = ranking_config_resolution()["effective_config"]
+        request_context = build_request_context(
+            message="controller fallback replay fixture",
+            turn_metadata={},
+            attachments=[],
+            candidate_output_tokens=8192,
+            aggregator_output_tokens=8192,
+            ranking_config=ranking_config,
+        )
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             results_path = root / "results.jsonl"
@@ -277,7 +802,15 @@ class ControllerTests(unittest.TestCase):
             )
             trace_rows = []
             for index, (task_id, result) in enumerate(zip(task_ids, result_rows)):
-                profile = {"index": index, "constraints": {"risk": "medium"}}
+                profile = (
+                    fallback_task_profile(
+                        routed_tier="c1",
+                        request_context=request_context,
+                        ranking_config=ranking_config,
+                    )
+                    if index == 0
+                    else {"index": index, "constraints": {"risk": "medium"}}
+                )
                 attempts = [
                     {
                         "attempt": 1,
@@ -285,9 +818,11 @@ class ControllerTests(unittest.TestCase):
                         "requested_provider": "openrouter",
                         "requested_model": "anthropic/claude-opus-4.8",
                         "usage_unknown": True,
+                        "unknown_reason": "TimeoutError",
                         "output_tokens": 0,
                         "provider_usage": {
                             "usage_unknown": True,
+                            "unknown_reason": "TimeoutError",
                             "physical_attempt_id": f"{index + 1:032x}",
                         },
                     },
@@ -314,22 +849,51 @@ class ControllerTests(unittest.TestCase):
                     "model": "anthropic/claude-opus-4.8",
                     "fallback_reason": "",
                     "normalization_warnings": [f"warning-{index}"],
-                    # Deliberately not the terminal-attempt value.
                     "usage": {
                         "attempt_count": 2,
-                        "output_tokens": 9999,
+                        "output_tokens": 100 + index,
                         "physical_attempts": attempts,
                     },
                 }
+                if index == 0:
+                    for attempt in attempts:
+                        attempt.update(
+                            {
+                                "provider": "",
+                                "model": "",
+                                "usage_unknown": True,
+                                "unknown_reason": "TimeoutError",
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "reasoning_tokens": 0,
+                                "cached_tokens": 0,
+                                "cache_write_tokens": 0,
+                                "billed_cost": 0.0,
+                                "provider_usage": {
+                                    "usage_unknown": True,
+                                    "unknown_reason": "TimeoutError",
+                                    "physical_attempt_id": attempt["physical_attempt_id"],
+                                },
+                            }
+                        )
+                    analyzer.update(
+                        {
+                            "source": "router_fallback",
+                            "schema_valid": False,
+                            "fallback_reason": "TimeoutError",
+                            "usage": {
+                                "attempt_count": 2,
+                                "output_tokens": 0,
+                                "physical_attempts": attempts,
+                            },
+                        }
+                    )
                 selection = {
                     "task_profile_pre_escalation": profile,
                     "task_analyzer": analyzer,
-                    "ranking_parameters": {
-                        "task_analyzer": {
-                            "provider": "openrouter",
-                            "model": "anthropic/claude-opus-4.8",
-                        }
-                    },
+                    "ranking_parameters": copy.deepcopy(ranking_config),
+                    "request_context": copy.deepcopy(request_context),
+                    "routed_tier": "c1",
                 }
                 trace_rows.append(
                     {
@@ -388,28 +952,110 @@ class ControllerTests(unittest.TestCase):
                 output_name="source",
                 control_arm_id=None,
             )
+            extract_kwargs = {
+                "source_arm": source_arm,
+                "source_dir": root,
+                "destination": root / "artifact.json",
+                "expected_task_ids": set(task_ids),
+                "snapshot": Path(__file__).resolve().parents[2],
+                "snapshot_identity": {"commit": "c", "tree": "t"},
+                "plan_sha256": "p",
+                "replay_schema": controller.FROZEN_TASK_ANALYSIS_SCHEMA_V2,
+            }
+            with self.assertRaises(controller.ControllerError):
+                controller.extract_analyzer_artifact(
+                    **extract_kwargs,
+                    allow_deterministic_router_fallback=False,
+                )
+            v1_kwargs = {
+                **extract_kwargs,
+                "replay_schema": controller.FROZEN_TASK_ANALYSIS_SCHEMA_V1,
+            }
+            with self.assertRaises(controller.ControllerError):
+                controller.extract_analyzer_artifact(
+                    **v1_kwargs,
+                    allow_deterministic_router_fallback=True,
+                )
             artifact = controller.extract_analyzer_artifact(
-                source_arm=source_arm,
-                source_dir=root,
-                destination=root / "artifact.json",
-                expected_task_ids=set(task_ids),
-                snapshot_identity={"commit": "c", "tree": "t"},
-                plan_sha256="p",
+                **extract_kwargs,
+                allow_deterministic_router_fallback=True,
             )
             observed = sorted(
                 row["final_successful_physical_attempt_output_tokens"]
                 for row in artifact["profiles"].values()
+                if row["origin_outcome"] == "live_success"
             )
-            self.assertEqual(observed, list(range(100, 110)))
+            self.assertEqual(observed, list(range(101, 110)))
             replay = artifact["replay_payload"]["entries"]["task-0"]
             self.assertEqual(replay["task_analyzer"]["normalization_warnings"], ["warning-0"])
+            self.assertIs(replay["task_analyzer"]["schema_valid"], False)
+            self.assertEqual(replay["task_analyzer"]["fallback_reason"], "TimeoutError")
+            self.assertEqual(replay["origin_outcome"], "deterministic_router_fallback")
             self.assertIn("task_profile_pre_escalation", replay)
+
+            def isolated_validation(snapshot: Path, **kwargs: object) -> dict[str, object]:
+                return {
+                    "derived": copy.deepcopy(kwargs["profile"]),
+                    "normalized": copy.deepcopy(kwargs["profile"]),
+                    "schema_valid": True,
+                    "analyzer_version": "opus-4.8-json-v3",
+                    "module_path": str(snapshot / "ranking_router.py"),
+                    "module_sha256": "a" * 64,
+                }
+
+            imported_evidence = {
+                "source_snapshot_package_dir": str(root),
+                "source_snapshot_commit": "old-commit",
+                "source_snapshot_tree": "old-tree",
+                "source_output_dir": "/original/source",
+                "receipt_sha256": "r" * 64,
+            }
+            with mock.patch.object(
+                controller,
+                "validate_fallback_profile_isolated",
+                side_effect=isolated_validation,
+            ) as isolated:
+                controller.extract_analyzer_artifact(
+                    **{
+                        **extract_kwargs,
+                        "destination": root / "imported-artifact.json",
+                    },
+                    allow_deterministic_router_fallback=True,
+                    source_import_evidence=imported_evidence,
+                )
+            self.assertEqual(isolated.call_count, 2)
+            self.assertEqual(Path(isolated.call_args_list[0].args[0]), root)
+            self.assertEqual(
+                Path(isolated.call_args_list[1].args[0]),
+                extract_kwargs["snapshot"],
+            )
             receipt = controller.derive_analyzer_p99_receipt(
                 artifact,
                 destination=root / "p99.json",
                 plan_sha256="p",
             )
-            self.assertEqual(receipt["ordered_output_tokens"], list(range(100, 110)))
+            self.assertEqual(receipt["ordered_output_tokens"], list(range(101, 110)))
+            self.assertEqual(receipt["eligibility"]["eligible_denominator"], 9)
+            self.assertEqual(receipt["eligibility"]["excluded_denominator"], 1)
+            self.assertEqual(receipt["eligibility"]["excluded_task_ids"], ["task-0"])
+
+    def test_analyzer_p99_requires_eight_live_observations(self) -> None:
+        profiles = {
+            f"task-{index}": {
+                "origin_outcome": (
+                    "live_success" if index < 7 else "deterministic_router_fallback"
+                ),
+                "final_successful_physical_attempt_output_tokens": 100 + index,
+            }
+            for index in range(10)
+        }
+        artifact = {"artifact_sha256": "a" * 64, "profiles": profiles}
+        with tempfile.TemporaryDirectory() as raw, self.assertRaises(controller.ControllerError):
+            controller.derive_analyzer_p99_receipt(
+                artifact,
+                destination=Path(raw) / "p99.json",
+                plan_sha256="p",
+            )
 
     def test_result_and_document_hashes_fail_closed(self) -> None:
         row = sealed_result("task")
@@ -487,8 +1133,7 @@ class ControllerTests(unittest.TestCase):
                 "effective_candidate_order_seed": 0,
             },
             "candidates": [
-                {"index": index, "selected_for_aggregation": True}
-                for index in range(3)
+                {"index": index, "selected_for_aggregation": True} for index in range(3)
             ],
         }
         rows = [

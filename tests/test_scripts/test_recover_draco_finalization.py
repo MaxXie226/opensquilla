@@ -73,6 +73,13 @@ def _campaign_fixture(module, tmp_path: Path) -> tuple[Path, Path]:
         source_manifest,
         {
             "args": {"input": str(frozen_input)},
+            "command": {
+                "parsed_args": {
+                    "concurrency": 6,
+                    "judge_concurrency": 4,
+                    "generation_max_attempts": 3,
+                }
+            },
             "groups": ["B0"],
             "status": "result_incomplete",
         },
@@ -299,6 +306,69 @@ def test_status_reports_ready_without_writing_campaign(module, tmp_path: Path) -
     assert status["source_result_count"] == 1
     assert before == after
     assert not (campaign / "archive" / module.STATUS_NAME).exists()
+
+
+def test_recovery_binds_and_forwards_manifest_execution_contract(
+    module,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign, _ = _campaign_fixture(module, tmp_path)
+    plan = module.discover_plan(campaign)
+    assert plan.expected_task_concurrency == 6
+    assert plan.expected_judge_concurrency == 4
+    assert plan.max_generation_attempts == 3
+
+    captured: dict[str, object] = {}
+
+    class Parser:
+        def parse_args(self, argv):
+            captured["argv"] = list(argv)
+            return object()
+
+    class Finalizer:
+        @staticmethod
+        def build_parser():
+            return Parser()
+
+        @staticmethod
+        def run_finalization(_args):
+            return {"status": "complete"}
+
+    monkeypatch.setattr(module, "_scrub_secret_environment", lambda: None)
+    monkeypatch.setattr(module, "_install_offline_audit_guard", lambda: None)
+    monkeypatch.setattr(module, "_load_finalizer", lambda _path: Finalizer())
+
+    module._run_finalizer(
+        plan=plan,
+        finalizer_path=SCRIPT.with_name("finalize_draco_campaign.py"),
+        lock_fd=9,
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--expected-task-concurrency") + 1] == "6"
+    assert argv[argv.index("--expected-judge-concurrency") + 1] == "4"
+    assert argv[argv.index("--max-generation-attempts") + 1] == "3"
+
+
+@pytest.mark.parametrize("bad_value", [None, True, 0, "6"])
+def test_recovery_rejects_missing_or_invalid_manifest_execution_binding(
+    module,
+    tmp_path: Path,
+    bad_value: object,
+) -> None:
+    campaign, _ = _campaign_fixture(module, tmp_path)
+    manifest = next((campaign / "archive" / "waves" / "wave-1").glob("*.manifest.json"))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    parsed = payload["command"]["parsed_args"]
+    if bad_value is None:
+        parsed.pop("concurrency")
+    else:
+        parsed["concurrency"] = bad_value
+    _write_json(manifest, payload)
+
+    with pytest.raises(module.RecoveryError, match="positive integer"):
+        module.discover_plan(campaign)
 
 
 def test_status_blocks_offline_recovery_when_terminal_model_budget_is_exhausted(
@@ -540,11 +610,18 @@ def test_staging_bound_to_an_older_wave_set_is_blocked(module, tmp_path: Path) -
     )
     _write_json(
         second_wave / "draco_run_20260101-000100.manifest.json",
-        {
-            "args": {"input": str(original_plan.input_path)},
-            "groups": ["B0"],
-            "status": "metadata_incomplete",
-        },
+            {
+                "args": {"input": str(original_plan.input_path)},
+                "command": {
+                    "parsed_args": {
+                        "concurrency": original_plan.expected_task_concurrency,
+                        "judge_concurrency": original_plan.expected_judge_concurrency,
+                        "generation_max_attempts": original_plan.max_generation_attempts,
+                    }
+                },
+                "groups": ["B0"],
+                "status": "metadata_incomplete",
+            },
     )
 
     status = module.inspect_campaign(campaign)

@@ -67,6 +67,12 @@ RESOLUTION_SCHEMA = "opensquilla.draco.openrouter-non-byok-resolution/v1"
 GENERATION_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-generation-attempt/v1"
 JUDGE_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-judge-attempt/v1"
 ENSEMBLE_OUTPUT_BINDING_SCHEMA = "opensquilla.ensemble-output-binding/v1"
+GENERATION_POSTPROCESSING_TERMINAL_SCHEMA = (
+    "opensquilla.draco.generation-postprocessing-terminal/v1"
+)
+PROVIDER_NATIVE_PROPOSER_RECOVERY_TERMINAL_SCHEMA = (
+    "opensquilla.draco.provider-native-proposer-recovery-terminal/v1"
+)
 THINKING_PHYSICAL_EVIDENCE_SCHEMA = "opensquilla.router-dynamic-thinking-physical-evidence/v1"
 LEGACY_THINKING_RANKING_VERSION = "step2-ranking-v3"
 LEGACY_MANAGED_V3_SOURCE_IDENTITY = {
@@ -1689,7 +1695,19 @@ def load_manifest_contracts(
                     not isinstance(row.get("execution"), Mapping)
                     or row["execution"].get("generation_reused") is not True
                     or str(row["execution"].get("resume_action") or "")
-                    not in {"judge_only", "metadata_only", "audit_only"}
+                    not in {"regenerate", "judge_only", "metadata_only", "audit_only"}
+                    or (
+                        str(row["execution"].get("resume_action") or "") == "regenerate"
+                        and (
+                            row["execution"].get("generation_auto_retry_blocked")
+                            is not True
+                            or row["execution"].get("generation_model_started")
+                            is not False
+                            or not blocked_regenerate_terminal_evidence(
+                                row["execution"]
+                            )
+                        )
+                    )
                     or (
                         str(row["execution"].get("resume_action") or "") == "metadata_only"
                         and row["execution"].get("judge_reran") is True
@@ -2826,13 +2844,61 @@ def generation_identity(row: Mapping[str, Any]) -> str:
     )
 
 
+def blocked_regenerate_terminal_evidence(execution: Mapping[str, Any]) -> bool:
+    """Bind a no-model blocked regenerate row to producer terminal evidence."""
+
+    if execution.get("generation_model_started") is not False:
+        return False
+    raw_attempts = execution.get("generation_attempts")
+    if not isinstance(raw_attempts, list):
+        return False
+    generation_attempt_ids = {
+        attempt_id
+        for attempt in raw_attempts
+        if isinstance(attempt, Mapping)
+        and HEX32.fullmatch(
+            attempt_id := str(attempt.get("attempt_id") or "")
+        )
+        is not None
+    }
+    if not generation_attempt_ids:
+        return False
+
+    observed_terminal = False
+    for field_name, expected_schema in (
+        (
+            "generation_postprocessing_terminal",
+            GENERATION_POSTPROCESSING_TERMINAL_SCHEMA,
+        ),
+        (
+            "provider_native_proposer_recovery_terminal",
+            PROVIDER_NATIVE_PROPOSER_RECOVERY_TERMINAL_SCHEMA,
+        ),
+    ):
+        terminal = execution.get(field_name)
+        if terminal is None:
+            continue
+        observed_terminal = True
+        if not isinstance(terminal, Mapping):
+            return False
+        terminal_attempt_id = str(terminal.get("attempt_id") or "")
+        if (
+            terminal.get("schema") != expected_schema
+            or terminal.get("automatic_generation_retry_allowed") is not False
+            or HEX32.fullmatch(terminal_attempt_id) is None
+            or terminal_attempt_id not in generation_attempt_ids
+        ):
+            return False
+    return observed_terminal
+
+
 def repair_evidence(row: Mapping[str, Any], execution: Mapping[str, Any]) -> bool:
     """Return whether a no-new-generation row is explicitly a repair."""
 
     if execution.get("generation_reused") is not True:
         return False
     action = str(execution.get("resume_action") or "")
-    if action not in {"judge_only", "metadata_only", "audit_only"}:
+    if action not in {"regenerate", "judge_only", "metadata_only", "audit_only"}:
         return False
     completion = row.get("resume_completion")
     if isinstance(completion, Mapping):
@@ -2840,6 +2906,25 @@ def repair_evidence(row: Mapping[str, Any], execution: Mapping[str, Any]) -> boo
             return False
         completion_action = str(completion.get("action") or "")
         if completion_action and completion_action != action:
+            return False
+    if action == "regenerate":
+        incomplete_reasons = (
+            completion.get("incomplete_reasons")
+            if isinstance(completion, Mapping)
+            else None
+        )
+        if (
+            execution.get("generation_auto_retry_blocked") is not True
+            or execution.get("generation_model_started") is not False
+            or not blocked_regenerate_terminal_evidence(execution)
+            or not isinstance(completion, Mapping)
+            or completion.get("status") != "incomplete"
+            or completion.get("post_repair_action") != "regenerate"
+            or completion.get("judge_reran") is not False
+            or completion.get("metadata_repaired") is not False
+            or not isinstance(incomplete_reasons, list)
+            or "generation_auto_retry_blocked" not in incomplete_reasons
+        ):
             return False
     if action == "audit_only":
         summary = execution.get("audit_only_summary")
@@ -5303,6 +5388,22 @@ def proposer_recovery_execution_reasons(
     ):
         reasons.append("invalid_proposer_recovery_receipt")
         receipt_attempts = receipt_attempts if isinstance(receipt_attempts, list) else []
+    declared_recovery_slot_by_physical_id = {
+        physical_id: int(attempt["slot_index"])
+        for attempt in receipt_attempts
+        if isinstance(attempt, Mapping)
+        and attempt.get("request_started") is True
+        and isinstance(attempt.get("physical_request_count"), int)
+        and not isinstance(attempt.get("physical_request_count"), bool)
+        and attempt.get("physical_request_count") == 1
+        and isinstance(attempt.get("slot_index"), int)
+        and not isinstance(attempt.get("slot_index"), bool)
+        and 0 <= int(attempt["slot_index"]) < len(expanded_slot_identities)
+        and HEX32.fullmatch(
+            physical_id := str(attempt.get("physical_attempt_id") or "")
+        )
+        is not None
+    }
 
     cleanup_bypass = receipt.get("cleanup_quorum_bypass")
     cleanup_bypass_indexes: set[int] = set()
@@ -5365,6 +5466,7 @@ def proposer_recovery_execution_reasons(
     candidates = call.get("candidates")
     final_identity_by_slot: dict[int, str] = {}
     physical_identity_by_id: dict[str, str] = {}
+    candidate_slot_by_physical_id: dict[str, int] = {}
     all_candidate_ids: list[str] = []
     candidate_physical_attempts_by_slot: dict[
         int,
@@ -5438,6 +5540,16 @@ def proposer_recovery_execution_reasons(
                 else ""
             )
             stream_closed = physical.get("stream_closed") if isinstance(physical, Mapping) else None
+            physical_attempt_ordinal = (
+                physical.get("attempt") if isinstance(physical, Mapping) else None
+            )
+            receipt_bound_local_ordinal = bool(
+                isinstance(physical_attempt_ordinal, int)
+                and not isinstance(physical_attempt_ordinal, bool)
+                and physical_attempt_ordinal == 1
+                and declared_recovery_slot_by_physical_id.get(physical_id)
+                == slot_index
+            )
             quarantined_unclosed = bool(
                 isinstance(physical, Mapping)
                 and stream_closed is not True
@@ -5452,7 +5564,12 @@ def proposer_recovery_execution_reasons(
                 reasons.append("proposer_recovery_stream_not_closed")
             if (
                 not isinstance(physical, Mapping)
-                or physical.get("attempt") != ordinal
+                or not isinstance(physical_attempt_ordinal, int)
+                or isinstance(physical_attempt_ordinal, bool)
+                or (
+                    physical_attempt_ordinal != ordinal
+                    and not receipt_bound_local_ordinal
+                )
                 or physical.get("request_started") is not True
                 or stream_closed is not True
                 and not quarantined_unclosed
@@ -5467,6 +5584,7 @@ def proposer_recovery_execution_reasons(
             slot_identities.append(identity)
             all_candidate_ids.append(physical_id)
             physical_identity_by_id[physical_id] = identity
+            candidate_slot_by_physical_id[physical_id] = slot_index
             valid_slot_attempts.append(physical)
         candidate_physical_attempts_by_slot[slot_index] = valid_slot_attempts
         actual_identity = _canonical_proposer_recovery_identity(
@@ -5489,6 +5607,12 @@ def proposer_recovery_execution_reasons(
         all_candidate_ids
     ):
         reasons.append("duplicate_proposer_recovery_physical_attempt_id")
+    if any(
+        physical_id in candidate_slot_by_physical_id
+        and candidate_slot_by_physical_id[physical_id] != expected_slot
+        for physical_id, expected_slot in declared_recovery_slot_by_physical_id.items()
+    ):
+        reasons.append("proposer_recovery_candidate_slot_mismatch")
     if cleanup_bypass is not None and (
         observed_unclosed_indexes != cleanup_bypass_indexes
         or observed_unclosed_physical_ids != cleanup_bypass_physical_ids
@@ -5536,7 +5660,9 @@ def proposer_recovery_execution_reasons(
             if attempt.get("stream_closed") is not True:
                 reasons.append("proposer_recovery_stream_not_closed")
             if (
-                physical_count != 1
+                isinstance(physical_count, bool)
+                or not isinstance(physical_count, int)
+                or physical_count != 1
                 or HEX32.fullmatch(physical_id) is None
                 or outcome
                 not in {
@@ -5833,6 +5959,7 @@ def ensemble_physical_call_reasons(
     strict_physical_evidence = False
     recovered_identity_by_slot: dict[int, str] = {}
     recovery_physical_ids: set[str] = set()
+    receipt_bound_local_recovery_ids: set[str] = set()
     initial_identity_by_slot: tuple[str, ...] = ()
     if not isinstance(executed_plan, Mapping):
         reasons.append("missing_executed_selection_plan")
@@ -5868,6 +5995,10 @@ def ensemble_physical_call_reasons(
                 expected_policy=proposer_recovery_policy,
             )
             reasons.extend(proposer_recovery_reasons)
+            if not proposer_recovery_reasons:
+                # These IDs are the strict intersection of this call's
+                # candidate ledger and valid, slot-bound receipt entries.
+                receipt_bound_local_recovery_ids = set(recovery_physical_ids)
         elif call.get("proposer_recovery") is not None:
             reasons.append("unexpected_proposer_recovery_receipt")
     executed_aggregator, recovery_reasons = aggregator_recovery_execution_reasons(
@@ -6040,9 +6171,25 @@ def ensemble_physical_call_reasons(
                                         if isinstance(attempt, Mapping)
                                         else ""
                                     )
+                                    attempt_ordinal = (
+                                        attempt.get("attempt")
+                                        if isinstance(attempt, Mapping)
+                                        else None
+                                    )
+                                    receipt_bound_local_ordinal = bool(
+                                        isinstance(attempt_ordinal, int)
+                                        and not isinstance(attempt_ordinal, bool)
+                                        and attempt_ordinal == 1
+                                        and attempt_id in receipt_bound_local_recovery_ids
+                                    )
                                     if (
                                         not isinstance(attempt, Mapping)
-                                        or attempt.get("attempt") != ordinal
+                                        or not isinstance(attempt_ordinal, int)
+                                        or isinstance(attempt_ordinal, bool)
+                                        or (
+                                            attempt_ordinal != ordinal
+                                            and not receipt_bound_local_ordinal
+                                        )
                                         or attempt.get("request_started") is not True
                                         or HEX32.fullmatch(attempt_id) is None
                                     ):
@@ -7833,6 +7980,7 @@ def validate_g1_paid_attempt_plan_history(
     else:
         frozen_task_analysis_plan_reasons = None
     violations: list[dict[str, Any]] = []
+    campaign_analyzer_physical_ids: set[str] = set()
     selected_only_reasons = {
         "ambiguous_g1_selected_generation_attempt",
         "missing_g1_selected_attempt_selection_plan",
@@ -8070,6 +8218,15 @@ def validate_g1_paid_attempt_plan_history(
                     analyzer_reasons.append(
                         "invalid_g1_task_analyzer_physical_attempt_identity"
                     )
+                elif any(
+                    physical_id in campaign_analyzer_physical_ids
+                    for physical_id in physical_attempt_ids
+                ):
+                    analyzer_reasons.append(
+                        "duplicate_cross_task_g1_task_analyzer_physical_attempt_identity"
+                    )
+                else:
+                    campaign_analyzer_physical_ids.update(physical_attempt_ids)
                 requested_routes = {
                     (
                         str(analyzer.get("requested_provider") or "").strip().casefold(),

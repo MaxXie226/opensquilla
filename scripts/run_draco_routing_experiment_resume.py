@@ -18901,6 +18901,36 @@ def generation_postprocessing_terminal_evidence(
     }
 
 
+def provider_native_candidate_usable(candidate: Any) -> bool:
+    """Project the provider's proposer usability contract from trace evidence."""
+
+    if not isinstance(candidate, Mapping):
+        return False
+    content = candidate.get("content")
+    content_proven = bool(
+        candidate.get("request_started") is True
+        and isinstance(candidate.get("physical_request_count"), int)
+        and not isinstance(candidate.get("physical_request_count"), bool)
+        and candidate.get("physical_request_count") > 0
+        and isinstance(content, Mapping)
+        and coerce_metric_int(content.get("chars")) > 0
+        and str(content.get("text") or "").strip()
+    )
+    if not content_proven:
+        return False
+    if candidate.get("ok") is True and not str(candidate.get("error") or "").strip():
+        return candidate.get("usable_for_aggregation") is not False and candidate.get(
+            "completion_outcome"
+        ) not in {"failed", "partial_usable"}
+    return bool(
+        candidate.get("ok") is False
+        and candidate.get("usable_for_aggregation") is True
+        and candidate.get("completion_outcome") == "partial_usable"
+        and str(candidate.get("error") or "").strip()
+        and str(candidate.get("error_code") or "").strip()
+    )
+
+
 def provider_native_proposer_recovery_terminal_evidence(
     row: Mapping[str, Any],
 ) -> dict[str, Any] | None:
@@ -18937,9 +18967,12 @@ def provider_native_proposer_recovery_terminal_evidence(
     if len(generation_attempts) != 1 or len(native_attempts) != 1:
         reasons.append("provider_native_outer_generation_replayed")
     attempt = native_attempts[-1]
-    if (
-        attempt.get("will_retry") is not False
-        or str(attempt.get("retry_suppressed_reason") or "")
+    selected_generation_succeeded = row.get("selected_generation_succeeded") is True
+    retry_reason = str(attempt.get("retry_reason") or "").strip()
+    suppression_required = not (selected_generation_succeeded and not retry_reason)
+    if attempt.get("will_retry") is not False or (
+        suppression_required
+        and str(attempt.get("retry_suppressed_reason") or "")
         != "provider_native_proposer_recovery_terminal"
     ):
         reasons.append("provider_native_outer_retry_not_suppressed")
@@ -19096,12 +19129,25 @@ def provider_native_proposer_recovery_terminal_evidence(
         ):
             reasons.append("invalid_provider_native_recovery_budget")
 
+        new_receipt_slot_by_physical_id = {
+            str(item.get("physical_attempt_id") or ""): int(item["slot_index"])
+            for item in new_receipts
+            if item.get("request_started") is True
+            and isinstance(item.get("physical_request_count"), int)
+            and not isinstance(item.get("physical_request_count"), bool)
+            and item.get("physical_request_count") == 1
+            and isinstance(item.get("slot_index"), int)
+            and not isinstance(item.get("slot_index"), bool)
+            and len(str(item.get("physical_attempt_id") or "")) == 32
+            and all(
+                character in "0123456789abcdef"
+                for character in str(item.get("physical_attempt_id") or "")
+            )
+        }
+
         candidates = call.get("candidates")
         current_candidate_ids: list[str] = []
-        candidate_physical_attempts_by_slot: dict[
-            int,
-            list[Mapping[str, Any]],
-        ] = {}
+        current_candidate_slot_by_physical_id: dict[str, int] = {}
         if not isinstance(candidates, list):
             reasons.append("missing_provider_native_candidates")
         else:
@@ -19138,9 +19184,27 @@ def provider_native_proposer_recovery_terminal_evidence(
                         if isinstance(physical, Mapping)
                         else ""
                     )
+                    physical_attempt_ordinal = (
+                        physical.get("attempt")
+                        if isinstance(physical, Mapping)
+                        else None
+                    )
+                    receipt_bound_local_ordinal = bool(
+                        isinstance(physical, Mapping)
+                        and isinstance(physical_attempt_ordinal, int)
+                        and not isinstance(physical_attempt_ordinal, bool)
+                        and physical_attempt_ordinal == 1
+                        and new_receipt_slot_by_physical_id.get(physical_id)
+                        == slot_index
+                    )
                     if (
                         not isinstance(physical, Mapping)
-                        or physical.get("attempt") != ordinal
+                        or not isinstance(physical_attempt_ordinal, int)
+                        or isinstance(physical_attempt_ordinal, bool)
+                        or (
+                            physical_attempt_ordinal != ordinal
+                            and not receipt_bound_local_ordinal
+                        )
                         or physical.get("request_started") is not True
                         or len(physical_id) != 32
                         or any(
@@ -19154,15 +19218,9 @@ def provider_native_proposer_recovery_terminal_evidence(
                         continue
                     slot_ids.append(physical_id)
                     all_call_ids.append(physical_id)
-                if (
-                    physical_attempts
-                    and isinstance(physical_attempts[0], Mapping)
-                ):
-                    candidate_physical_attempts_by_slot[slot_index] = [
-                        physical
-                        for physical in physical_attempts
-                        if isinstance(physical, Mapping)
-                    ]
+                    current_candidate_slot_by_physical_id[physical_id] = (
+                        slot_index
+                    )
                 current_candidate_ids.extend(slot_ids)
             if len(all_call_ids) != len(set(all_call_ids)):
                 reasons.append(
@@ -19175,6 +19233,16 @@ def provider_native_proposer_recovery_terminal_evidence(
             if item.get("request_started") is True
         ]
         new_receipt_id_set = set(new_receipt_ids)
+        if any(
+            current_candidate_slot_by_physical_id.get(physical_id)
+            != expected_slot
+            for physical_id, expected_slot in (
+                new_receipt_slot_by_physical_id.items()
+            )
+        ):
+            reasons.append(
+                "provider_native_recovery_candidate_slot_mismatch"
+            )
         current_recovery_ids = [
             physical_id
             for physical_id in current_candidate_ids
@@ -19184,28 +19252,51 @@ def provider_native_proposer_recovery_terminal_evidence(
             reasons.append(
                 "provider_native_recovery_candidate_receipt_mismatch"
             )
-        primary_success_slots = {
+        usable_candidate_slots = {
             slot_index
-            for slot_index, physical_attempts in (
-                candidate_physical_attempts_by_slot.items()
-            )
-            if any(
-                str(physical.get("physical_attempt_id") or "")
-                not in new_receipt_id_set
-                and physical.get("outcome") == "succeeded"
-                for physical in physical_attempts
-            )
+            for slot_index, candidate in enumerate(candidates or [])
+            if provider_native_candidate_usable(candidate)
         }
-        successful_slots = set(primary_success_slots)
-        for item in new_receipts:
+        started_new_receipt_indexes_by_slot: dict[int, list[int]] = {}
+        semantic_success_receipt_indexes: set[int] = set()
+        for receipt_index, item in enumerate(new_receipts):
+            if item.get("request_started") is not True:
+                continue
+            slot_index = coerce_metric_int(item.get("slot_index"))
+            started_new_receipt_indexes_by_slot.setdefault(slot_index, []).append(
+                receipt_index
+            )
+            if (
+                slot_index in usable_candidate_slots
+                and item.get("outcome") == "succeeded"
+            ):
+                semantic_success_receipt_indexes.add(receipt_index)
+        # A provider can preserve a partial but aggregatable draft while its
+        # strict attempt outcome remains ``failed``.  Recovery stops at that
+        # point, so the last started receipt for that usable slot is the
+        # semantic transition when no strict-success receipt exists.
+        for slot_index in usable_candidate_slots:
+            receipt_indexes = started_new_receipt_indexes_by_slot.get(slot_index, [])
+            if receipt_indexes and not any(
+                receipt_index in semantic_success_receipt_indexes
+                for receipt_index in receipt_indexes
+            ):
+                semantic_success_receipt_indexes.add(receipt_indexes[-1])
+        # A transport-level physical success only proves that bytes arrived;
+        # it does not prove that the proposer produced an aggregatable draft.
+        # Remove newly recovered slots, then add them back in receipt order so
+        # continued-after-quorum remains a temporal check.
+        successful_slots = usable_candidate_slots - set(
+            started_new_receipt_indexes_by_slot
+        )
+        for receipt_index, item in enumerate(new_receipts):
             if item.get("request_started") is not True:
                 continue
             if len(successful_slots) >= 2:
                 reasons.append("provider_native_recovery_continued_after_quorum")
-            if item.get("outcome") == "succeeded":
-                successful_slots.add(
-                    coerce_metric_int(item.get("slot_index"))
-                )
+            slot_index = coerce_metric_int(item.get("slot_index"))
+            if receipt_index in semantic_success_receipt_indexes:
+                successful_slots.add(slot_index)
         if latest_quorum_reached != (len(successful_slots) >= 2):
             reasons.append("provider_native_recovery_quorum_mismatch")
 

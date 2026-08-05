@@ -28,6 +28,7 @@ import fcntl
 import hashlib
 import importlib.util
 import inspect
+import io
 import json
 import math
 import os
@@ -36,6 +37,7 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
 import textwrap
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -46,7 +48,15 @@ from urllib.parse import urlsplit
 
 PLAN_SCHEMA = "opensquilla.draco-p0-p05-campaign-plan/v1"
 STATUS_SCHEMA = "opensquilla.draco-p0-p05-controller-status/v1"
-ANALYZER_ARTIFACT_SCHEMA = "opensquilla.draco-frozen-task-analysis-source/v1"
+ANALYZER_ARTIFACT_SCHEMA = "opensquilla.draco-frozen-task-analysis-source/v2"
+FROZEN_TASK_ANALYSIS_SCHEMA_V1 = "opensquilla.draco.frozen-task-analysis/v1"
+FROZEN_TASK_ANALYSIS_SCHEMA_V2 = "opensquilla.draco.frozen-task-analysis/v2"
+FROZEN_TASK_ANALYSIS_SCHEMAS = frozenset(
+    {FROZEN_TASK_ANALYSIS_SCHEMA_V1, FROZEN_TASK_ANALYSIS_SCHEMA_V2}
+)
+ANALYZER_SOURCE_POLICY_SCHEMA = "opensquilla.draco-analyzer-source-policy/v1"
+PREEXISTING_SOURCE_SCHEMA = "opensquilla.draco-preexisting-analyzer-source/v1"
+PREEXISTING_SOURCE_PACKAGE_SCHEMA = "opensquilla.draco-preexisting-analyzer-source-package/v1"
 DERIVED_SCHEMA = "opensquilla.draco-p0-p05-derived-plan/v1"
 RECEIPT_SCHEMA = "opensquilla.draco-offline-effect-receipt/v1"
 AGGREGATOR_PROMPT_SCHEMA = "opensquilla.router-dynamic-aggregator-prompt/v1"
@@ -58,6 +68,7 @@ AGGREGATOR_PROMPT_VERSIONS = frozenset(
     }
 )
 EXPECTED_TASK_COUNT = 10
+MIN_ANALYZER_P99_LIVE_OBSERVATIONS = 8
 EXPECTED_OFFLINE_UNIQUE_REPLAY_OVERLAYS = 57
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLACEHOLDER_PREFIX = "TODO_"
@@ -264,6 +275,134 @@ def atomic_write_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
             temporary.unlink(missing_ok=True)
         finally:
             raise
+
+
+def atomic_write_bytes(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
+    """Publish immutable evidence bytes without following the destination leaf."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(temporary, flags, mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        finally:
+            raise
+
+
+def stable_regular_file_bytes(path: Path) -> bytes:
+    """Read one non-symlink file from a single descriptor and reject mutation."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ControllerError(f"cannot open frozen evidence file {path}: {exc}") from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ControllerError(f"frozen evidence is not a regular file: {path}")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        after = os.fstat(fd)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after:
+            raise ControllerError(f"frozen evidence changed while being read: {path}")
+        payload = b"".join(chunks)
+        if len(payload) != before.st_size:
+            raise ControllerError(f"frozen evidence size changed while being read: {path}")
+        return payload
+    finally:
+        os.close(fd)
+
+
+def regular_directory_tree_sha256(root: Path) -> str:
+    """Hash every regular file in a controller-owned extracted snapshot."""
+
+    rows: list[dict[str, Any]] = []
+    for directory, directory_names, filenames in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in [*directory_names, *filenames]:
+            path = directory_path / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise ControllerError(f"frozen snapshot package contains a symlink: {path}")
+        for filename in sorted(filenames):
+            path = directory_path / filename
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ControllerError(
+                    f"frozen snapshot package contains a non-regular file: {path}"
+                )
+            rows.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "size_bytes": info.st_size,
+                    "sha256": file_sha256(path),
+                }
+            )
+    return canonical_sha256(sorted(rows, key=lambda row: row["path"]))
+
+
+def extract_regular_git_archive(payload: bytes, destination: Path) -> None:
+    """Extract only ordinary files/directories from a git archive."""
+
+    destination.mkdir(mode=0o700)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+            members = archive.getmembers()
+            for member in members:
+                parts = Path(member.name).parts
+                if (
+                    not parts
+                    or Path(member.name).is_absolute()
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or not (member.isdir() or member.isreg())
+                ):
+                    raise ControllerError(
+                        f"source snapshot git archive has an unsafe member: {member.name}"
+                    )
+                target = destination.joinpath(*parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise ControllerError(f"source snapshot git archive cannot read: {member.name}")
+                mode = 0o700 if member.mode & 0o111 else 0o600
+                atomic_write_bytes(target, extracted.read(), mode=mode)
+    except (OSError, tarfile.TarError) as exc:
+        raise ControllerError(f"cannot extract source snapshot git archive: {exc}") from exc
 
 
 def run_text(command: Sequence[str], *, cwd: Path | None = None) -> str:
@@ -502,6 +641,84 @@ def all_strings(value: Any) -> Iterable[str]:
             yield from all_strings(item)
 
 
+def analyzer_source_policy(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the explicit Analyzer-source policy; absence stays strict."""
+
+    runtime = plan.get("runtime_contract")
+    raw = runtime.get("analyzer_source") if isinstance(runtime, Mapping) else None
+    if raw is None:
+        return {
+            "schema": ANALYZER_SOURCE_POLICY_SCHEMA,
+            "allow_deterministic_router_fallback": False,
+        }
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != {"schema", "allow_deterministic_router_fallback"}
+        or raw.get("schema") != ANALYZER_SOURCE_POLICY_SCHEMA
+        or type(raw.get("allow_deterministic_router_fallback")) is not bool
+    ):
+        raise ControllerError("runtime_contract.analyzer_source is invalid")
+    return copy.deepcopy(dict(raw))
+
+
+def frozen_replay_contract(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the exact replay projection promised by the frozen plan."""
+
+    runtime = plan.get("runtime_contract")
+    raw = runtime.get("frozen_replay") if isinstance(runtime, Mapping) else None
+    fields = {
+        "mode_path",
+        "mode_value",
+        "payload_path",
+        "artifact_projection_key",
+        "schema",
+        "expected_physical_analyzer_requests",
+    }
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != fields
+        or raw.get("mode_path") != ["g1_routing", "task_analysis_execution", "mode"]
+        or raw.get("mode_value") != "frozen_replay"
+        or raw.get("payload_path") != ["g1_routing", "task_analysis_execution"]
+        or raw.get("artifact_projection_key") != "replay_payload"
+        or raw.get("schema") not in FROZEN_TASK_ANALYSIS_SCHEMAS
+        or raw.get("expected_physical_analyzer_requests") != 0
+    ):
+        raise ControllerError("runtime_contract.frozen_replay is invalid")
+    return copy.deepcopy(dict(raw))
+
+
+def preexisting_source_contract(plan: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return an explicitly hash-bound source import, never an implicit path."""
+
+    runtime = plan.get("runtime_contract")
+    raw = runtime.get("preexisting_source") if isinstance(runtime, Mapping) else None
+    if raw is None:
+        return None
+    fields = {
+        "schema",
+        "enabled",
+        "source_plan_path",
+        "source_plan_raw_sha256",
+        "source_plan_canonical_sha256",
+        "source_snapshot_path",
+        "source_snapshot_commit",
+        "source_snapshot_tree",
+        "source_output_dir",
+        "source_manifest_sha256",
+        "source_results_sha256",
+        "source_trace_sha256",
+    }
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != fields
+        or raw.get("schema") != PREEXISTING_SOURCE_SCHEMA
+        or raw.get("enabled") is not True
+    ):
+        raise ControllerError("runtime_contract.preexisting_source is invalid")
+    return copy.deepcopy(dict(raw))
+
+
 def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[Arm]:
     if plan.get("schema") != PLAN_SCHEMA:
         raise ControllerError("campaign plan schema differs")
@@ -528,6 +745,41 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
         raise ControllerError("Judge concurrency must be exactly 6")
     if execution.get("generation_max_attempts") != 3:
         raise ControllerError("generation max attempts must be exactly 3")
+    source_policy = analyzer_source_policy(plan)
+    replay_contract = frozen_replay_contract(plan)
+    if (
+        source_policy["allow_deterministic_router_fallback"] is True
+        and replay_contract["schema"] != FROZEN_TASK_ANALYSIS_SCHEMA_V2
+    ):
+        raise ControllerError(
+            "deterministic Analyzer fallback replay requires frozen replay schema v2"
+        )
+    imported_source = preexisting_source_contract(plan)
+    if imported_source is not None:
+        for key in (
+            "source_plan_path",
+            "source_snapshot_path",
+            "source_output_dir",
+            "source_snapshot_commit",
+            "source_snapshot_tree",
+        ):
+            require_frozen_text(
+                imported_source.get(key),
+                label=f"runtime_contract.preexisting_source.{key}",
+                allow_placeholders=allow_placeholders,
+            )
+        for key in (
+            "source_plan_raw_sha256",
+            "source_plan_canonical_sha256",
+            "source_manifest_sha256",
+            "source_results_sha256",
+            "source_trace_sha256",
+        ):
+            require_frozen_sha256(
+                imported_source.get(key),
+                label=f"runtime_contract.preexisting_source.{key}",
+                allow_placeholders=allow_placeholders,
+            )
 
     freeze = plan.get("freeze")
     if not isinstance(freeze, Mapping):
@@ -784,6 +1036,9 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
 
 
 def output_dir(plan: Mapping[str, Any], arm: Arm) -> Path:
+    imported = preexisting_source_contract(plan)
+    if arm.arm_id == ANALYZER_SOURCE_ARM_ID and imported is not None:
+        return Path(str(imported["source_output_dir"]))
     return Path(str(plan["paths"]["report_root"])) / arm.directory_name / arm.output_name
 
 
@@ -911,6 +1166,33 @@ def _is_within(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def absolute_path_without_symlinks(value: Any, *, label: str) -> Path:
+    """Resolve an existing absolute path only after rejecting every symlink."""
+
+    raw = Path(str(value))
+    if not raw.is_absolute():
+        raise ControllerError(f"{label} must be an absolute path")
+    current = Path(raw.anchor)
+    for component in raw.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise ControllerError(f"{label} path component is unavailable: {current}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ControllerError(f"{label} must not traverse a symlink: {current}")
+    try:
+        return raw.resolve(strict=True)
+    except OSError as exc:
+        raise ControllerError(f"{label} cannot be resolved: {raw}") from exc
+
+
+def paths_overlap(left: Path, right: Path) -> bool:
+    """Return whether either resolved path contains the other."""
+
+    return _is_within(left, right) or _is_within(right, left)
 
 
 def verify_arm_publication_identity(
@@ -1106,8 +1388,7 @@ def candidate_order_seed_execution_evidence(
             aggregator_request_started = bool(
                 isinstance(aggregator_attempts, list)
                 and any(
-                    isinstance(attempt, Mapping)
-                    and attempt.get("request_started") is True
+                    isinstance(attempt, Mapping) and attempt.get("request_started") is True
                     for attempt in aggregator_attempts
                 )
             )
@@ -1189,11 +1470,7 @@ def candidate_order_seed_execution_evidence(
         "required": True,
         "pass": not failures,
         "status": (
-            "mismatched"
-            if failures
-            else "matched"
-            if aggregation_call_count
-            else "not_applicable"
+            "mismatched" if failures else "matched" if aggregation_call_count else "not_applicable"
         ),
         "configured_candidate_order_seed": expected_configured,
         "effective_candidate_order_seed": expected_effective,
@@ -1370,22 +1647,17 @@ def _analyzer_metadata_without_usage(analyzer: Mapping[str, Any]) -> dict[str, A
     return result
 
 
-def _validated_live_analyzer_evidence(
+def _validated_analyzer_attempt_ledger(
     *,
     task_id: str,
     analyzer: Mapping[str, Any],
     expected_config: Mapping[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], int]:
-    """Return detached usage, the final successful attempt, and its tokens."""
+    allow_zero_attempts: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    """Authenticate every known/unknown physical Analyzer attempt."""
 
     expected_provider = str(expected_config.get("provider") or "").strip().lower()
     expected_model = str(expected_config.get("model") or "").strip().lower()
-    if (
-        analyzer.get("source") != "llm_provider"
-        or analyzer.get("schema_valid") is not True
-        or str(analyzer.get("fallback_reason") or "")
-    ):
-        raise ControllerError(f"E0 task {task_id} Analyzer is not a valid live result")
     if (
         str(analyzer.get("provider") or "").strip().lower() != expected_provider
         or str(analyzer.get("model") or "").strip().lower() != expected_model
@@ -1402,16 +1674,47 @@ def _validated_live_analyzer_evidence(
     if not isinstance(usage, Mapping):
         raise ControllerError(f"E0 task {task_id} lacks Analyzer usage")
     usage_copy = copy.deepcopy(dict(usage))
-    attempts = usage_copy.get("physical_attempts")
-    if not isinstance(attempts, list) or not attempts:
+    raw_attempts = usage_copy.get("physical_attempts")
+    if not isinstance(raw_attempts, list) or (not raw_attempts and not allow_zero_attempts):
         raise ControllerError(f"E0 task {task_id} lacks physical Analyzer attempts")
-    normalized_attempts: list[dict[str, Any]] = []
+    declared_count = usage_copy.get("attempt_count")
+    if (
+        isinstance(declared_count, bool)
+        or not isinstance(declared_count, int)
+        or declared_count != len(raw_attempts)
+    ):
+        raise ControllerError(f"E0 task {task_id} Analyzer attempt count differs")
+    if "physical_request_count" in usage_copy:
+        physical_count = usage_copy.get("physical_request_count")
+        if (
+            isinstance(physical_count, bool)
+            or not isinstance(physical_count, int)
+            or physical_count != len(raw_attempts)
+        ):
+            raise ControllerError(f"E0 task {task_id} Analyzer physical request count differs")
+
+    attempts: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for ordinal, raw_attempt in enumerate(attempts, start=1):
+    unknown_count = 0
+    token_fields = (
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+    )
+    token_totals = {field: 0 for field in token_fields}
+    cost_total = 0.0
+    for ordinal, raw_attempt in enumerate(raw_attempts, start=1):
         if not isinstance(raw_attempt, Mapping):
             raise ControllerError(f"E0 task {task_id} has malformed Analyzer attempt")
         attempt = copy.deepcopy(dict(raw_attempt))
-        if attempt.get("attempt") != ordinal:
+        attempt_ordinal = attempt.get("attempt")
+        if (
+            isinstance(attempt_ordinal, bool)
+            or not isinstance(attempt_ordinal, int)
+            or attempt_ordinal != ordinal
+        ):
             raise ControllerError(f"E0 task {task_id} Analyzer attempt order is invalid")
         attempt_id = str(attempt.get("physical_attempt_id") or "").strip().lower()
         if PHYSICAL_ATTEMPT_ID_RE.fullmatch(attempt_id) is None or attempt_id in seen_ids:
@@ -1422,7 +1725,6 @@ def _validated_live_analyzer_evidence(
             or str(attempt.get("requested_model") or "").strip().lower() != expected_model
         ):
             raise ControllerError(f"E0 task {task_id} Analyzer physical request identity differs")
-        usage_unknown = attempt.get("usage_unknown") is True
         provider_usage = attempt.get("provider_usage")
         if not isinstance(provider_usage, Mapping):
             raise ControllerError(
@@ -1433,46 +1735,176 @@ def _validated_live_analyzer_evidence(
             raise ControllerError(
                 f"E0 task {task_id} Analyzer physical attempt identity mirror differs"
             )
-        output_tokens = attempt.get("output_tokens")
+        reported_ids = attempt.get("reported_physical_attempt_ids")
+        nested_reported_ids = provider_usage.get("reported_physical_attempt_ids")
+        for raw_reported in (reported_ids, nested_reported_ids):
+            if raw_reported in (None, []):
+                continue
+            if not isinstance(raw_reported, list) or raw_reported != [attempt_id]:
+                raise ControllerError(
+                    f"E0 task {task_id} Analyzer attempt reports conflicting identities"
+                )
+        for field in token_fields:
+            value = attempt.get(field, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ControllerError(f"E0 task {task_id} Analyzer attempt {field} is invalid")
+            token_totals[field] += value
+        raw_cost = attempt.get("billed_cost", 0.0)
         if (
-            isinstance(output_tokens, bool)
-            or not isinstance(output_tokens, int)
-            or output_tokens < 0
+            isinstance(raw_cost, bool)
+            or not isinstance(raw_cost, int | float)
+            or not math.isfinite(float(raw_cost))
+            or float(raw_cost) < 0.0
         ):
-            raise ControllerError(f"E0 task {task_id} Analyzer attempt output usage is invalid")
+            raise ControllerError(f"E0 task {task_id} Analyzer attempt cost is invalid")
+        cost_total += float(raw_cost)
+        usage_unknown = attempt.get("usage_unknown") is True
         if usage_unknown:
-            if output_tokens != 0 or provider_usage.get("usage_unknown") is not True:
+            unknown_count += 1
+            unknown_reason = str(attempt.get("unknown_reason") or "").strip()
+            nested_reason = str(provider_usage.get("unknown_reason") or "").strip()
+            if (
+                str(attempt.get("provider") or "").strip()
+                or str(attempt.get("model") or "").strip()
+                or str(provider_usage.get("provider") or "").strip()
+                or str(provider_usage.get("model") or "").strip()
+                or any(attempt.get(field, 0) != 0 for field in token_fields)
+                or any(
+                    provider_usage.get(field) not in (None, 0, 0.0)
+                    for field in (
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "input_tokens",
+                        "output_tokens",
+                        "reasoning_tokens",
+                        "cached_tokens",
+                        "cache_read_tokens",
+                        "cache_write_tokens",
+                        "cost",
+                        "billed_cost",
+                    )
+                )
+                or float(raw_cost) != 0.0
+                or str(attempt.get("cost_source") or "none").strip().lower()
+                not in {"none", "unavailable"}
+                or provider_usage.get("usage_unknown") is not True
+                or not unknown_reason
+                or nested_reason != unknown_reason
+            ):
                 raise ControllerError(
                     f"E0 task {task_id} Analyzer unknown attempt is contradictory"
                 )
         elif (
-            str(attempt.get("provider") or "").strip().lower() != expected_provider
+            provider_usage.get("usage_unknown") is True
+            or str(attempt.get("provider") or "").strip().lower() != expected_provider
             or str(attempt.get("model") or "").strip().lower() != expected_model
         ):
             raise ControllerError(f"E0 task {task_id} Analyzer physical response identity differs")
-        normalized_attempts.append(attempt)
-    if usage_copy.get("attempt_count") != len(normalized_attempts):
-        raise ControllerError(f"E0 task {task_id} Analyzer attempt count differs")
-    # A schema-valid live profile is produced by the terminal successful Done
-    # request. Earlier Done/error attempts may contribute to aggregate usage;
-    # p99 must use only this final physical attempt.
-    final_attempt = normalized_attempts[-1]
-    if final_attempt.get("usage_unknown") is True:
-        raise ControllerError(f"E0 task {task_id} final Analyzer attempt has unknown usage")
+        attempts.append(attempt)
+
+    if "usage_unknown_count" in usage_copy:
+        declared_unknown = usage_copy.get("usage_unknown_count")
+        if (
+            isinstance(declared_unknown, bool)
+            or not isinstance(declared_unknown, int)
+            or declared_unknown != unknown_count
+        ):
+            raise ControllerError(f"E0 task {task_id} Analyzer unknown count differs")
+    for field, total in token_totals.items():
+        if field in usage_copy:
+            aggregate_value = usage_copy.get(field)
+            if (
+                isinstance(aggregate_value, bool)
+                or not isinstance(aggregate_value, int)
+                or aggregate_value != total
+            ):
+                raise ControllerError(f"E0 task {task_id} Analyzer aggregate {field} differs")
+    if "billed_cost" in usage_copy:
+        aggregate_cost = usage_copy.get("billed_cost")
+        if (
+            isinstance(aggregate_cost, bool)
+            or not isinstance(aggregate_cost, int | float)
+            or not math.isfinite(float(aggregate_cost))
+            or not math.isclose(float(aggregate_cost), cost_total, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            raise ControllerError(f"E0 task {task_id} Analyzer aggregate cost differs")
+    return usage_copy, attempts, unknown_count
+
+
+def _validated_live_analyzer_evidence(
+    *,
+    task_id: str,
+    analyzer: Mapping[str, Any],
+    expected_config: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], int, int]:
+    """Return usage, terminal successful attempt, tokens, and unknown count."""
+
+    if (
+        analyzer.get("source") != "llm_provider"
+        or analyzer.get("schema_valid") is not True
+        or str(analyzer.get("fallback_reason") or "")
+    ):
+        raise ControllerError(f"E0 task {task_id} Analyzer is not a valid live result")
+    usage, attempts, unknown_count = _validated_analyzer_attempt_ledger(
+        task_id=task_id,
+        analyzer=analyzer,
+        expected_config=expected_config,
+        allow_zero_attempts=False,
+    )
+    final_attempt = attempts[-1]
     final_output_tokens = final_attempt.get("output_tokens")
     if (
-        isinstance(final_output_tokens, bool)
+        final_attempt.get("usage_unknown") is True
+        or isinstance(final_output_tokens, bool)
         or not isinstance(final_output_tokens, int)
         or final_output_tokens <= 0
     ):
         raise ControllerError(
-            f"E0 task {task_id} final Analyzer attempt has no positive output tokens"
+            f"E0 task {task_id} final Analyzer attempt has no known positive output tokens"
         )
-    # The enclosing schema-valid llm_provider result proves that the terminal
-    # known-usage Done attempt is the one whose JSON profile was accepted.
-    # Every preceding attempt remains authenticated above, but contributes no
-    # observation to the p99 derivation.
-    return usage_copy, final_attempt, final_output_tokens
+    return usage, final_attempt, final_output_tokens, unknown_count
+
+
+def _validated_router_fallback_evidence(
+    *,
+    task_id: str,
+    analyzer: Mapping[str, Any],
+    expected_config: Mapping[str, Any],
+) -> tuple[dict[str, Any], int]:
+    if (
+        analyzer.get("source") != "router_fallback"
+        or analyzer.get("schema_valid") is not False
+        or not str(analyzer.get("fallback_reason") or "").strip()
+    ):
+        raise ControllerError(f"E0 task {task_id} Analyzer fallback provenance is invalid")
+    usage, _, unknown_count = _validated_analyzer_attempt_ledger(
+        task_id=task_id,
+        analyzer=analyzer,
+        expected_config=expected_config,
+        allow_zero_attempts=True,
+    )
+    return usage, unknown_count
+
+
+def register_analyzer_attempt_owners(
+    owners: dict[str, str], *, task_id: str, usage: Mapping[str, Any]
+) -> None:
+    """Reject one physical Analyzer request being attributed to multiple tasks."""
+
+    attempts = usage.get("physical_attempts")
+    if not isinstance(attempts, list):
+        raise ControllerError(f"E0 task {task_id} lacks physical Analyzer attempts")
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            raise ControllerError(f"E0 task {task_id} has malformed Analyzer attempt")
+        attempt_id = str(attempt.get("physical_attempt_id") or "")
+        prior_owner = owners.get(attempt_id)
+        if prior_owner is not None and prior_owner != task_id:
+            raise ControllerError(
+                "Analyzer physical attempt identity is reused across tasks: "
+                f"{prior_owner}/{task_id}"
+            )
+        owners[attempt_id] = task_id
 
 
 def extract_analyzer_artifact(
@@ -1481,9 +1913,15 @@ def extract_analyzer_artifact(
     source_dir: Path,
     destination: Path,
     expected_task_ids: set[str],
+    snapshot: Path,
     snapshot_identity: Mapping[str, str],
     plan_sha256: str,
+    replay_schema: str,
+    allow_deterministic_router_fallback: bool,
+    source_import_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if replay_schema not in FROZEN_TASK_ANALYSIS_SCHEMAS:
+        raise ControllerError("unsupported frozen Analyzer replay schema")
     manifest, _, _, bound_paths = authenticate_published_arm_artifacts(source_dir)
     manifest_path = bound_paths["manifest.json"]
     trace_path = bound_paths["trace.jsonl"]
@@ -1508,6 +1946,12 @@ def extract_analyzer_artifact(
         raise ControllerError("source result evidence coverage differs")
     profiles: dict[str, Any] = {}
     source_task_analyzer_config: dict[str, Any] | None = None
+    physical_attempt_owners: dict[str, str] = {}
+    source_snapshot = (
+        Path(str(source_import_evidence["source_snapshot_package_dir"]))
+        if source_import_evidence is not None
+        else snapshot
+    )
     with trace_path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
@@ -1554,10 +1998,79 @@ def extract_analyzer_artifact(
                 source_task_analyzer_config = current_config_copy
             elif source_task_analyzer_config != current_config_copy:
                 raise ControllerError("E0 rows do not share one effective Analyzer config")
-            usage, final_attempt, output_tokens = _validated_live_analyzer_evidence(
+            origin_outcome: str
+            final_attempt: dict[str, Any] | None = None
+            output_tokens: int | None = None
+            fallback_validation: dict[str, Any] | None = None
+            if (
+                analyzer.get("source") == "llm_provider"
+                and analyzer.get("schema_valid") is True
+                and not str(analyzer.get("fallback_reason") or "")
+            ):
+                usage, final_attempt, output_tokens, unknown_count = (
+                    _validated_live_analyzer_evidence(
+                        task_id=task_id,
+                        analyzer=analyzer,
+                        expected_config=current_config_copy,
+                    )
+                )
+                origin_outcome = "live_success"
+            elif allow_deterministic_router_fallback:
+                usage, unknown_count = _validated_router_fallback_evidence(
+                    task_id=task_id,
+                    analyzer=analyzer,
+                    expected_config=current_config_copy,
+                )
+                request_context = selection.get("request_context")
+                routed_tier = str(selection.get("routed_tier") or "")
+                if not isinstance(request_context, Mapping) or not routed_tier:
+                    raise ControllerError(f"E0 task {task_id} lacks deterministic fallback inputs")
+                source_validation = validate_fallback_profile_isolated(
+                    source_snapshot,
+                    profile=profile_copy,
+                    routed_tier=routed_tier,
+                    request_context=request_context,
+                    ranking_config=ranking_parameters,
+                )
+                replay_validation = (
+                    copy.deepcopy(source_validation)
+                    if source_snapshot.resolve() == snapshot.resolve()
+                    else validate_fallback_profile_isolated(
+                        snapshot,
+                        profile=profile_copy,
+                        routed_tier=routed_tier,
+                        request_context=request_context,
+                        ranking_config=ranking_parameters,
+                    )
+                )
+                analyzer_version = str(analyzer.get("analyzer_version") or "")
+                if any(
+                    validation.get("schema_valid") is not True
+                    or validation.get("normalized") != profile_copy
+                    or validation.get("derived") != profile_copy
+                    or str(validation.get("analyzer_version") or "") != analyzer_version
+                    for validation in (source_validation, replay_validation)
+                ):
+                    raise ControllerError(
+                        f"E0 task {task_id} router fallback profile is not deterministic"
+                    )
+                fallback_validation = {
+                    "source_snapshot": {
+                        key: source_validation[key]
+                        for key in ("analyzer_version", "module_path", "module_sha256")
+                    },
+                    "replay_snapshot": {
+                        key: replay_validation[key]
+                        for key in ("analyzer_version", "module_path", "module_sha256")
+                    },
+                }
+                origin_outcome = "deterministic_router_fallback"
+            else:
+                raise ControllerError(f"E0 task {task_id} Analyzer is not a valid live result")
+            register_analyzer_attempt_owners(
+                physical_attempt_owners,
                 task_id=task_id,
-                analyzer=analyzer,
-                expected_config=current_config_copy,
+                usage=usage,
             )
             profile_sha256 = canonical_sha256(profile_copy)
             if (
@@ -1585,7 +2098,7 @@ def extract_analyzer_artifact(
                     or canonical_sha256(repeated_analyzer) != expected_analyzer_hash
                 ):
                     raise ControllerError(f"E0 task {task_id} Analyzer provenance drifted")
-            profiles[task_id] = {
+            profile_row: dict[str, Any] = {
                 "task_id": task_id,
                 "task_input_sha256": task_input_sha256,
                 "task_prompt_sha256": task_prompt_sha256,
@@ -1593,17 +2106,28 @@ def extract_analyzer_artifact(
                 "task_profile_pre_escalation_sha256": profile_sha256,
                 "original_analyzer": metadata,
                 "original_analyzer_sha256": canonical_sha256(metadata),
+                "origin_outcome": origin_outcome,
+                "original_analyzer_usage": usage,
                 "original_analyzer_usage_sha256": canonical_sha256(usage),
                 "original_analyzer_physical_attempt_count": len(usage["physical_attempts"]),
-                "final_successful_physical_attempt_sha256": canonical_sha256(final_attempt),
-                "final_successful_physical_attempt_id": final_attempt["physical_attempt_id"],
-                "final_successful_physical_attempt_output_tokens": output_tokens,
-                # Compatibility alias for the derivation reader; its meaning
-                # is explicitly the terminal successful physical attempt.
-                "original_analyzer_output_tokens": output_tokens,
+                "original_analyzer_usage_unknown_count": unknown_count,
                 "source_trace_row_sha256": canonical_sha256(row),
                 "source_result_evidence_sha256": result_evidence_sha256,
             }
+            if final_attempt is not None and output_tokens is not None:
+                profile_row.update(
+                    {
+                        "final_successful_physical_attempt_sha256": canonical_sha256(final_attempt),
+                        "final_successful_physical_attempt_id": final_attempt[
+                            "physical_attempt_id"
+                        ],
+                        "final_successful_physical_attempt_output_tokens": output_tokens,
+                        "original_analyzer_output_tokens": output_tokens,
+                    }
+                )
+            if fallback_validation is not None:
+                profile_row["fallback_validation"] = fallback_validation
+            profiles[task_id] = profile_row
     if set(profiles) != expected_task_ids:
         raise ControllerError(
             "E0 Analyzer profile coverage differs: "
@@ -1611,8 +2135,13 @@ def extract_analyzer_artifact(
             f"extra={sorted(set(profiles) - expected_task_ids)}"
         )
     assert source_task_analyzer_config is not None
-    replay_entries = {
-        task_id: {
+    if replay_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V1 and any(
+        row["origin_outcome"] != "live_success" for row in profiles.values()
+    ):
+        raise ControllerError("frozen replay schema v1 cannot encode fallback Analyzer origin")
+    replay_entries: dict[str, Any] = {}
+    for task_id, row in sorted(profiles.items()):
+        replay_entry = {
             "task_input_sha256": row["task_input_sha256"],
             "prompt_sha256": row["task_prompt_sha256"],
             "task_profile_pre_escalation": row["task_profile_pre_escalation"],
@@ -1631,10 +2160,11 @@ def extract_analyzer_artifact(
                 ),
             },
         }
-        for task_id, row in sorted(profiles.items())
-    }
+        if replay_schema == FROZEN_TASK_ANALYSIS_SCHEMA_V2:
+            replay_entry["origin_outcome"] = row["origin_outcome"]
+        replay_entries[task_id] = replay_entry
     replay_payload = {
-        "schema": "opensquilla.draco.frozen-task-analysis/v1",
+        "schema": replay_schema,
         "mode": "frozen_replay",
         "source_experiment": source_arm.arm_id,
         "source_manifest_sha256": file_sha256(manifest_path),
@@ -1650,11 +2180,31 @@ def extract_analyzer_artifact(
         "source": {
             "arm_id": source_arm.arm_id,
             "output_dir": str(source_dir),
+            "original_output_dir": (
+                source_import_evidence["source_output_dir"]
+                if source_import_evidence is not None
+                else str(source_dir)
+            ),
             "manifest_sha256": file_sha256(manifest_path),
             "trace_sha256": file_sha256(trace_path),
-            "snapshot_commit": snapshot_identity["commit"],
-            "snapshot_tree": snapshot_identity["tree"],
+            "snapshot_commit": (
+                source_import_evidence["source_snapshot_commit"]
+                if source_import_evidence is not None
+                else snapshot_identity["commit"]
+            ),
+            "snapshot_tree": (
+                source_import_evidence["source_snapshot_tree"]
+                if source_import_evidence is not None
+                else snapshot_identity["tree"]
+            ),
+            "replay_snapshot_commit": snapshot_identity["commit"],
+            "replay_snapshot_tree": snapshot_identity["tree"],
             "campaign_plan_sha256": plan_sha256,
+            "preexisting_source_import_receipt_sha256": (
+                source_import_evidence["receipt_sha256"]
+                if source_import_evidence is not None
+                else None
+            ),
         },
         "task_count": len(profiles),
         "task_ids": sorted(profiles),
@@ -1691,10 +2241,24 @@ def derive_analyzer_p99_receipt(
     destination: Path,
     plan_sha256: str,
 ) -> dict[str, Any]:
+    profiles = artifact.get("profiles")
+    if not isinstance(profiles, Mapping):
+        raise ControllerError("Analyzer artifact profiles are missing")
+    eligible_task_ids = sorted(
+        str(task_id)
+        for task_id, row in profiles.items()
+        if isinstance(row, Mapping) and row.get("origin_outcome") == "live_success"
+    )
+    excluded_task_ids = sorted(set(str(task_id) for task_id in profiles) - set(eligible_task_ids))
     values = [
-        int(row["final_successful_physical_attempt_output_tokens"])
-        for row in artifact["profiles"].values()
+        int(profiles[task_id]["final_successful_physical_attempt_output_tokens"])
+        for task_id in eligible_task_ids
     ]
+    if len(values) < MIN_ANALYZER_P99_LIVE_OBSERVATIONS:
+        raise ControllerError(
+            "Analyzer p99 has too few eligible live-success observations: "
+            f"need {MIN_ANALYZER_P99_LIVE_OBSERVATIONS}, got {len(values)}"
+        )
     p99 = linear_type7_quantile(values, 0.99)
     derived = {
         "P0.5-06-E1": math.floor(0.8 * p99),
@@ -1708,6 +2272,19 @@ def derive_analyzer_p99_receipt(
         "source_artifact_sha256": artifact["artifact_sha256"],
         "method": "Hyndman-Fan linear type 7; h=(n-1)*q; q=0.99",
         "observation_unit": "final successful physical Analyzer attempt per task",
+        "eligibility": {
+            "required_origin_outcome": "live_success",
+            "minimum_eligible_denominator": MIN_ANALYZER_P99_LIVE_OBSERVATIONS,
+            "source_task_count": len(profiles),
+            "eligible_denominator": len(eligible_task_ids),
+            "excluded_denominator": len(excluded_task_ids),
+            "eligible_task_ids": eligible_task_ids,
+            "excluded_task_ids": excluded_task_ids,
+            "excluded_reasons_by_task": {
+                task_id: str(profiles[task_id].get("origin_outcome") or "unknown")
+                for task_id in excluded_task_ids
+            },
+        },
         "ordered_output_tokens": sorted(values),
         "p99": p99,
         "formulae": {
@@ -1722,14 +2299,17 @@ def derive_analyzer_p99_receipt(
 
 
 def make_replay_overlay(plan: Mapping[str, Any], artifact: Mapping[str, Any]) -> dict[str, Any]:
-    contract = plan["runtime_contract"]["frozen_replay"]
+    contract = frozen_replay_contract(plan)
     mode_path = contract["mode_path"]
     payload_path = contract["payload_path"]
     payload_key = str(contract.get("artifact_projection_key", "replay_payload"))
     if payload_key not in artifact:
         raise ControllerError(f"frozen artifact lacks projection {payload_key!r}")
+    payload = artifact[payload_key]
+    if not isinstance(payload, Mapping) or payload.get("schema") != contract["schema"]:
+        raise ControllerError("frozen artifact replay schema differs from campaign plan")
     overlay: dict[str, Any] = {}
-    set_path(overlay, payload_path, artifact[payload_key])
+    set_path(overlay, payload_path, payload)
     set_path(overlay, mode_path, contract["mode_value"])
     return overlay
 
@@ -1866,6 +2446,143 @@ def load_effective_experiment_config(
         sys.path.pop(0)
 
 
+def _isolated_snapshot_json(
+    snapshot: Path,
+    *,
+    program: str,
+    payload: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    """Run snapshot-sensitive imports in a fresh interpreter."""
+
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    for name in list(environment):
+        if name.endswith("_API_KEY") or name.endswith("_TOKEN"):
+            environment.pop(name, None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", program, str(snapshot.resolve())],
+        cwd=snapshot,
+        env=environment,
+        input=json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout or "isolated helper failed").strip()
+        raise ControllerError(f"{label} failed in frozen snapshot: {detail[-1000:]}")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ControllerError(f"{label} returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ControllerError(f"{label} returned a non-object")
+    return value
+
+
+_ISOLATED_EFFECTIVE_CONFIG_PROGRAM = r"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+snapshot = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(snapshot / "src"))
+from opensquilla.eval import draco_experiment_config as module
+
+module_path = Path(module.__file__).resolve()
+module_path.relative_to((snapshot / "src").resolve())
+request = json.loads(sys.stdin.read())
+loaded = module.load_draco_experiment_config(
+    Path(request["base_config"]),
+    inline_overlay_json=json.dumps(
+        request["overlay"], separators=(",", ":"), sort_keys=True
+    ),
+).config
+print(json.dumps({
+    "config": loaded.model_dump(mode="json"),
+    "module_path": str(module_path),
+    "module_sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+}, sort_keys=True, separators=(",", ":"), allow_nan=False))
+"""
+
+
+def load_effective_experiment_config_isolated(
+    snapshot: Path,
+    base_config: Path,
+    overlay: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = _isolated_snapshot_json(
+        snapshot,
+        program=_ISOLATED_EFFECTIVE_CONFIG_PROGRAM,
+        payload={"base_config": str(base_config.resolve()), "overlay": dict(overlay)},
+        label="effective experiment config",
+    )
+    config = result.get("config")
+    if not isinstance(config, Mapping):
+        raise ControllerError("isolated effective experiment config is malformed")
+    return copy.deepcopy(dict(config))
+
+
+_ISOLATED_FALLBACK_VALIDATION_PROGRAM = r"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+snapshot = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(snapshot / "src"))
+from opensquilla.provider import ranking_router as module
+
+module_path = Path(module.__file__).resolve()
+module_path.relative_to((snapshot / "src").resolve())
+request = json.loads(sys.stdin.read())
+derived = module.fallback_task_profile(
+    routed_tier=request["routed_tier"],
+    request_context=request["request_context"],
+    ranking_config=request["ranking_config"],
+)
+normalized, schema_valid, warnings = module.normalize_task_profile(
+    request["profile"],
+    routed_tier=request["routed_tier"],
+    request_context=request["request_context"],
+    ranking_config=request["ranking_config"],
+)
+print(json.dumps({
+    "derived": derived,
+    "normalized": normalized,
+    "schema_valid": schema_valid,
+    "normalization_warnings": warnings,
+    "analyzer_version": module.TASK_ANALYZER_VERSION,
+    "module_path": str(module_path),
+    "module_sha256": hashlib.sha256(module_path.read_bytes()).hexdigest(),
+}, sort_keys=True, separators=(",", ":"), allow_nan=False))
+"""
+
+
+def validate_fallback_profile_isolated(
+    snapshot: Path,
+    *,
+    profile: Mapping[str, Any],
+    routed_tier: str,
+    request_context: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _isolated_snapshot_json(
+        snapshot,
+        program=_ISOLATED_FALLBACK_VALIDATION_PROGRAM,
+        payload={
+            "profile": dict(profile),
+            "routed_tier": routed_tier,
+            "request_context": dict(request_context),
+            "ranking_config": dict(ranking_config),
+        },
+        label="deterministic Analyzer fallback validation",
+    )
+
+
 _RUNTIME_HELPERS: dict[str, dict[str, Any]] = {}
 
 
@@ -1889,6 +2606,12 @@ def _runtime_helpers(snapshot: Path) -> dict[str, Any]:
         )
         from opensquilla.provider.model_catalog import shared_catalog  # type: ignore
         from opensquilla.provider.openai import _should_send_temperature  # type: ignore
+        from opensquilla.provider.ranking_router import (  # type: ignore
+            FROZEN_TASK_ANALYSIS_SCHEMAS,
+            TASK_ANALYZER_VERSION,
+            fallback_task_profile,
+            normalize_task_profile,
+        )
         from opensquilla.provider.registry import get_provider_spec  # type: ignore
         from opensquilla.provider.selector import ProviderConfig  # type: ignore
         from opensquilla.provider.types import ChatConfig  # type: ignore
@@ -1983,6 +2706,10 @@ def _runtime_helpers(snapshot: Path) -> dict[str, Any]:
         "should_send_temperature": _should_send_temperature,
         "compat_policy_for_kind": compat_policy_for_kind,
         "get_provider_spec": get_provider_spec,
+        "task_analyzer_version": TASK_ANALYZER_VERSION,
+        "frozen_task_analysis_schemas": FROZEN_TASK_ANALYSIS_SCHEMAS,
+        "fallback_task_profile": fallback_task_profile,
+        "normalize_task_profile": normalize_task_profile,
         "runner": runner,
         "draco_request_budget_rebinding_disabled": draco_binding_disabled,
         "ensemble_source_sha256": file_sha256(snapshot / "src/opensquilla/provider/ensemble.py"),
@@ -1990,6 +2717,9 @@ def _runtime_helpers(snapshot: Path) -> dict[str, Any]:
         "runner_source_sha256": file_sha256(snapshot / "scripts/run_draco_routing_experiment.py"),
         "aggregator_prompt_source_sha256": file_sha256(
             snapshot / "src/opensquilla/provider/aggregator_prompt.py"
+        ),
+        "ranking_router_source_sha256": file_sha256(
+            snapshot / "src/opensquilla/provider/ranking_router.py"
         ),
     }
     _RUNTIME_HELPERS[cache_key] = helpers
@@ -2922,6 +3652,15 @@ def validate_static_overlays(plan: Mapping[str, Any], arms: Sequence[Arm], snaps
         load_effective_experiment_config(snapshot, base, arm.override)
 
 
+def validate_frozen_replay_runtime_support(
+    plan: Mapping[str, Any], helpers: Mapping[str, Any]
+) -> None:
+    declared_schema = frozen_replay_contract(plan)["schema"]
+    supported = helpers.get("frozen_task_analysis_schemas")
+    if not isinstance(supported, Iterable) or declared_schema not in supported:
+        raise ControllerError(f"snapshot production runtime does not support {declared_schema}")
+
+
 def resolve_arm_override(
     plan: Mapping[str, Any],
     arm: Arm,
@@ -2944,6 +3683,99 @@ def resolve_arm_override(
     return override
 
 
+def preexisting_source_identity(
+    plan: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Authenticate a declared old source plan/snapshot and derive its arm identity."""
+
+    contract = preexisting_source_contract(plan)
+    if contract is None:
+        return None
+    source_plan_path = absolute_path_without_symlinks(
+        contract["source_plan_path"], label="preexisting source plan"
+    )
+    source_snapshot = absolute_path_without_symlinks(
+        contract["source_snapshot_path"], label="preexisting source snapshot"
+    )
+    source_dir = absolute_path_without_symlinks(
+        contract["source_output_dir"], label="preexisting source output"
+    )
+    if not source_snapshot.is_dir() or not source_dir.is_dir():
+        raise ControllerError("preexisting source snapshot/output must be directories")
+    current_run_root = Path(str(plan.get("paths", {}).get("run_root") or "")).resolve()
+    current_report_root = Path(str(plan.get("paths", {}).get("report_root") or "")).resolve()
+    if paths_overlap(source_dir, current_run_root) or paths_overlap(
+        source_dir, current_report_root
+    ):
+        raise ControllerError(
+            "preexisting source output overlaps the current writable run/report roots"
+        )
+    require_regular_file(source_plan_path)
+    if file_sha256(source_plan_path) != contract["source_plan_raw_sha256"]:
+        raise ControllerError("preexisting source plan/output raw identity differs")
+    source_plan = load_json(source_plan_path)
+    if (
+        canonical_sha256(source_plan) != contract["source_plan_canonical_sha256"]
+        or source_plan.get("schema") != PLAN_SCHEMA
+        or preexisting_source_contract(source_plan) is not None
+    ):
+        raise ControllerError("preexisting source plan identity or import depth differs")
+    source_arms = validate_plan(source_plan, allow_placeholders=False)
+    source_arm = next(
+        (arm for arm in source_arms if arm.arm_id == ANALYZER_SOURCE_ARM_ID),
+        None,
+    )
+    if source_arm is None or source_arm.override or source_arm.analyzer_mode != "live":
+        raise ControllerError("preexisting source plan lacks the canonical live source arm")
+    if source_plan.get("benchmark") != plan.get("benchmark"):
+        raise ControllerError("preexisting source benchmark contract differs")
+    source_snapshot_identity = git_identity(source_snapshot)
+    if (
+        source_snapshot_identity.get("commit") != contract["source_snapshot_commit"]
+        or source_snapshot_identity.get("tree") != contract["source_snapshot_tree"]
+        or source_snapshot_identity.get("status")
+        or source_plan.get("freeze", {}).get("snapshot_commit")
+        != contract["source_snapshot_commit"]
+        or source_plan.get("freeze", {}).get("snapshot_tree") != contract["source_snapshot_tree"]
+    ):
+        raise ControllerError("preexisting source snapshot identity differs")
+    if source_dir != output_dir(source_plan, source_arm).resolve():
+        raise ControllerError("preexisting source output does not belong to its source plan")
+    for field, filename in (
+        ("source_manifest_sha256", "manifest.json"),
+        ("source_results_sha256", "results.jsonl"),
+        ("source_trace_sha256", "trace.jsonl"),
+    ):
+        path = source_dir / filename
+        require_regular_file(path)
+        if file_sha256(path) != contract[field]:
+            raise ControllerError(f"preexisting source {filename} raw hash differs")
+    expected = arm_completion_identity(
+        source_plan,
+        source_arm,
+        snapshot=source_snapshot,
+        snapshot_identity=source_snapshot_identity,
+        override=source_arm.override,
+        isolated_config=True,
+    )
+    receipt = {
+        "schema": PREEXISTING_SOURCE_SCHEMA,
+        "source_plan_path": str(source_plan_path),
+        "source_plan_raw_sha256": contract["source_plan_raw_sha256"],
+        "source_plan_canonical_sha256": contract["source_plan_canonical_sha256"],
+        "source_snapshot_path": str(source_snapshot),
+        "source_snapshot_commit": source_snapshot_identity["commit"],
+        "source_snapshot_tree": source_snapshot_identity["tree"],
+        "source_output_dir": str(source_dir),
+        "source_manifest_sha256": contract["source_manifest_sha256"],
+        "source_results_sha256": contract["source_results_sha256"],
+        "source_trace_sha256": contract["source_trace_sha256"],
+        "expected_identity_sha256": canonical_sha256(expected),
+        "contract_sha256": canonical_sha256(contract),
+    }
+    return expected, receipt
+
+
 def arm_completion_identity(
     plan: Mapping[str, Any],
     arm: Arm,
@@ -2951,14 +3783,37 @@ def arm_completion_identity(
     snapshot: Path,
     snapshot_identity: Mapping[str, str],
     override: Mapping[str, Any],
+    isolated_config: bool = False,
 ) -> dict[str, Any]:
-    config = load_effective_experiment_config(
-        snapshot,
-        snapshot / str(plan["paths"]["experiment_config_relative"]),
-        override,
-    )
-    if not hasattr(config, "model_dump"):
-        raise ControllerError("effective experiment config cannot be authenticated")
+    if arm.arm_id == ANALYZER_SOURCE_ARM_ID:
+        imported = preexisting_source_identity(plan)
+        if imported is not None:
+            return imported[0]
+    base_config = snapshot / str(plan["paths"]["experiment_config_relative"])
+    if isolated_config:
+        config_payload = load_effective_experiment_config_isolated(
+            snapshot,
+            base_config,
+            override,
+        )
+        ensemble_payload = config_payload.get("ensemble")
+        if not isinstance(ensemble_payload, Mapping):
+            raise ControllerError("isolated effective config lacks ensemble settings")
+        configured_candidate_order_seed = ensemble_payload.get("candidate_order_seed")
+        effective_candidate_order_seed = (
+            configured_candidate_order_seed
+            if ensemble_payload.get("shuffle_candidates") is True
+            else None
+        )
+    else:
+        config = load_effective_experiment_config(snapshot, base_config, override)
+        if not hasattr(config, "model_dump"):
+            raise ControllerError("effective experiment config cannot be authenticated")
+        config_payload = config.model_dump(mode="json")
+        configured_candidate_order_seed = config.ensemble.candidate_order_seed
+        effective_candidate_order_seed = (
+            config.ensemble.candidate_order_seed if config.ensemble.shuffle_candidates else None
+        )
     reference_repo = Path(str(plan["paths"]["reference_repo"])).resolve()
     runner_path = snapshot / "scripts/run_draco_routing_experiment.py"
     resume_runner_path = snapshot / "scripts/run_draco_routing_experiment_resume.py"
@@ -2981,17 +3836,301 @@ def arm_completion_identity(
         "judge_concurrency": int(plan["execution"]["judge_concurrency"]),
         "generation_max_attempts": int(plan["execution"]["generation_max_attempts"]),
         "override_sha256": canonical_sha256(override),
-        "effective_config_sha256": canonical_sha256(config.model_dump(mode="json")),
+        "effective_config_sha256": canonical_sha256(config_payload),
         "candidate_order_seed_evidence": {
             "required": arm.experiment_id == "P0.5-36",
-            "configured_candidate_order_seed": config.ensemble.candidate_order_seed,
-            "effective_candidate_order_seed": (
-                config.ensemble.candidate_order_seed
-                if config.ensemble.shuffle_candidates
-                else None
-            ),
+            "configured_candidate_order_seed": configured_candidate_order_seed,
+            "effective_candidate_order_seed": effective_candidate_order_seed,
         },
     }
+
+
+def portable_arm_publication_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize only snapshot-local paths while retaining content identity."""
+
+    snapshot_value = str(identity.get("snapshot") or "")
+    snapshot = Path(snapshot_value)
+    runner_identities = identity.get("runner_identities")
+    if not snapshot.is_absolute() or not isinstance(runner_identities, Mapping):
+        raise ControllerError("arm publication identity has invalid snapshot paths")
+    snapshot = snapshot.resolve()
+    portable_runners: dict[str, str] = {}
+    for raw_path, raw_sha256 in runner_identities.items():
+        runner = Path(str(raw_path))
+        sha256 = str(raw_sha256 or "")
+        if not runner.is_absolute() or SHA256_RE.fullmatch(sha256) is None:
+            raise ControllerError("arm publication identity has invalid runner binding")
+        try:
+            relative = runner.resolve().relative_to(snapshot).as_posix()
+        except ValueError as exc:
+            raise ControllerError(
+                "arm publication runner is outside its frozen snapshot"
+            ) from exc
+        if not relative or relative in portable_runners:
+            raise ControllerError("arm publication runner binding is ambiguous")
+        portable_runners[relative] = sha256
+    portable = copy.deepcopy(dict(identity))
+    portable["snapshot"] = "$SNAPSHOT_ROOT"
+    portable["runner_identities"] = dict(sorted(portable_runners.items()))
+    return portable
+
+
+def authenticate_preexisting_source(plan: Mapping[str, Any]) -> dict[str, Any] | None:
+    imported = preexisting_source_identity(plan)
+    if imported is None:
+        return None
+    expected, receipt = imported
+    source_dir = Path(str(receipt["source_output_dir"]))
+    complete, evidence = inspect_complete_arm(
+        source_dir,
+        expected_task_ids=set(plan["benchmark"]["task_ids"]),
+        expected_task_concurrency=int(plan["execution"]["task_concurrency"]),
+        expected_identity=expected,
+    )
+    if not complete:
+        raise ControllerError(
+            "preexisting Analyzer source publication is not authenticated: "
+            + str(evidence.get("reason") or "unknown")
+        )
+    receipt["expected_publication_identity"] = copy.deepcopy(expected)
+    receipt["publication_evidence"] = copy.deepcopy(evidence)
+    receipt["publication_evidence_sha256"] = canonical_sha256(evidence)
+    receipt["receipt_sha256"] = canonical_sha256(receipt)
+    return receipt
+
+
+def _preexisting_source_package_dir(plan: Mapping[str, Any]) -> Path:
+    return Path(str(plan["paths"]["run_root"])) / "preexisting-source-package"
+
+
+def _verify_preexisting_source_package(
+    plan: Mapping[str, Any],
+    package_dir: Path,
+) -> dict[str, Any]:
+    if package_dir.is_symlink() or not package_dir.is_dir():
+        raise ControllerError("preexisting source package directory is unsafe")
+    receipt_path = package_dir / "import-receipt.json"
+    receipt = load_json(receipt_path)
+    if not isinstance(receipt, Mapping):
+        raise ControllerError("preexisting source package receipt is malformed")
+    receipt_copy = copy.deepcopy(dict(receipt))
+    verify_bare_document_self_hash(
+        receipt_copy,
+        field="receipt_sha256",
+        label="preexisting source package",
+    )
+    contract = preexisting_source_contract(plan)
+    if contract is None:
+        raise ControllerError("preexisting source package exists without an import contract")
+    if (
+        receipt_copy.get("schema") != PREEXISTING_SOURCE_PACKAGE_SCHEMA
+        or Path(str(receipt_copy.get("package_dir") or "")).resolve() != package_dir.resolve()
+        or receipt_copy.get("contract_sha256") != canonical_sha256(contract)
+    ):
+        raise ControllerError("preexisting source package contract differs")
+    source_authentication = copy.deepcopy(receipt_copy)
+    for field in (
+        "receipt_sha256",
+        "package_dir",
+        "package_artifacts",
+        "source_plan_package_sha256",
+        "source_snapshot_archive_sha256",
+        "source_snapshot_package_dir",
+        "source_snapshot_package_tree_sha256",
+        "source_authentication_receipt_sha256",
+    ):
+        source_authentication.pop(field, None)
+    source_authentication["schema"] = PREEXISTING_SOURCE_SCHEMA
+    if receipt_copy.get("source_authentication_receipt_sha256") != canonical_sha256(
+        source_authentication
+    ):
+        raise ControllerError("preexisting source authentication receipt differs")
+    artifact_records = receipt_copy.get("package_artifacts")
+    if not isinstance(artifact_records, Mapping):
+        raise ControllerError("preexisting source package artifact inventory is missing")
+    required_names = {
+        "manifest.json",
+        "results.jsonl",
+        "trace.jsonl",
+        "audit.json",
+        "openrouter-non-byok-campaign-proof.json",
+    }
+    if set(artifact_records) != required_names:
+        raise ControllerError("preexisting source package artifact inventory differs")
+    for name, record in artifact_records.items():
+        path = package_dir / name
+        require_regular_file(path)
+        if (
+            not isinstance(record, Mapping)
+            or record.get("size_bytes") != path.stat().st_size
+            or record.get("sha256") != file_sha256(path)
+        ):
+            raise ControllerError(f"preexisting source package {name} binding differs")
+    source_plan_copy = package_dir / "source-plan.json"
+    source_archive = package_dir / "source-snapshot.tar"
+    source_snapshot_copy = package_dir / "source-snapshot"
+    for path in (source_plan_copy, source_archive):
+        require_regular_file(path)
+    if source_snapshot_copy.is_symlink() or not source_snapshot_copy.is_dir():
+        raise ControllerError("preexisting source snapshot package is unsafe")
+    if (
+        receipt_copy.get("source_plan_package_sha256") != file_sha256(source_plan_copy)
+        or receipt_copy.get("source_plan_package_sha256")
+        != receipt_copy.get("source_plan_raw_sha256")
+        or receipt_copy.get("source_snapshot_archive_sha256") != file_sha256(source_archive)
+        or receipt_copy.get("source_snapshot_package_tree_sha256")
+        != regular_directory_tree_sha256(source_snapshot_copy)
+        or Path(str(receipt_copy.get("source_snapshot_package_dir") or "")).resolve()
+        != source_snapshot_copy.resolve()
+    ):
+        raise ControllerError("preexisting source plan/snapshot package binding differs")
+    authenticate_published_arm_artifacts(package_dir)
+    for field, filename in (
+        ("source_manifest_sha256", "manifest.json"),
+        ("source_results_sha256", "results.jsonl"),
+        ("source_trace_sha256", "trace.jsonl"),
+    ):
+        if receipt_copy.get(field) != file_sha256(package_dir / filename):
+            raise ControllerError(f"preexisting source package {filename} source hash differs")
+    expected_identity = receipt_copy.get("expected_publication_identity")
+    publication_evidence = receipt_copy.get("publication_evidence")
+    if (
+        not isinstance(expected_identity, Mapping)
+        or receipt_copy.get("expected_identity_sha256") != canonical_sha256(expected_identity)
+        or not isinstance(publication_evidence, Mapping)
+        or receipt_copy.get("publication_evidence_sha256") != canonical_sha256(publication_evidence)
+    ):
+        raise ControllerError("preexisting source package publication receipt differs")
+    return receipt_copy
+
+
+def materialize_preexisting_source(plan: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Freeze an authenticated old publication into the controller-owned run root."""
+
+    if preexisting_source_contract(plan) is None:
+        return None
+    package_dir = _preexisting_source_package_dir(plan)
+    if package_dir.exists() or package_dir.is_symlink():
+        return _verify_preexisting_source_package(plan, package_dir)
+    authenticated = authenticate_preexisting_source(plan)
+    assert authenticated is not None
+    source_dir = Path(str(authenticated["source_output_dir"]))
+    run_root = Path(str(plan["paths"]["run_root"])).resolve()
+    report_root = Path(str(plan["paths"]["report_root"])).resolve()
+    if paths_overlap(source_dir, run_root) or paths_overlap(source_dir, report_root):
+        raise ControllerError(
+            "preexisting source output overlaps the current writable run/report roots"
+        )
+    staging_dir = package_dir.with_name(
+        f".{package_dir.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
+    )
+    staging_dir.mkdir(mode=0o700)
+    required_names = (
+        "manifest.json",
+        "results.jsonl",
+        "trace.jsonl",
+        "audit.json",
+        "openrouter-non-byok-campaign-proof.json",
+    )
+    package_artifacts: dict[str, Any] = {}
+    for name in required_names:
+        payload = stable_regular_file_bytes(source_dir / name)
+        destination = staging_dir / name
+        atomic_write_bytes(destination, payload)
+        package_artifacts[name] = {
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    source_plan_payload = stable_regular_file_bytes(Path(str(authenticated["source_plan_path"])))
+    atomic_write_bytes(staging_dir / "source-plan.json", source_plan_payload)
+    source_snapshot = Path(str(authenticated["source_snapshot_path"]))
+    before_snapshot_identity = git_identity(source_snapshot)
+    archive_result = subprocess.run(
+        [
+            "git",
+            "archive",
+            "--format=tar",
+            str(authenticated["source_snapshot_commit"]),
+        ],
+        cwd=source_snapshot,
+        check=False,
+        capture_output=True,
+    )
+    after_snapshot_identity = git_identity(source_snapshot)
+    if (
+        archive_result.returncode
+        or before_snapshot_identity != after_snapshot_identity
+        or before_snapshot_identity.get("commit") != authenticated["source_snapshot_commit"]
+        or before_snapshot_identity.get("tree") != authenticated["source_snapshot_tree"]
+        or before_snapshot_identity.get("status")
+    ):
+        raise ControllerError("preexisting source snapshot changed while being frozen")
+    source_snapshot_archive = bytes(archive_result.stdout)
+    atomic_write_bytes(staging_dir / "source-snapshot.tar", source_snapshot_archive)
+    source_snapshot_package_staging = staging_dir / "source-snapshot"
+    extract_regular_git_archive(source_snapshot_archive, source_snapshot_package_staging)
+    packaged_source_plan = load_json(staging_dir / "source-plan.json")
+    if not isinstance(packaged_source_plan, Mapping):
+        raise ControllerError("packaged preexisting source plan is malformed")
+    packaged_source_arms = validate_plan(packaged_source_plan, allow_placeholders=False)
+    packaged_source_arm = next(
+        (arm for arm in packaged_source_arms if arm.arm_id == ANALYZER_SOURCE_ARM_ID),
+        None,
+    )
+    if packaged_source_arm is None:
+        raise ControllerError("packaged preexisting source plan lacks its source arm")
+    packaged_expected_identity = arm_completion_identity(
+        packaged_source_plan,
+        packaged_source_arm,
+        snapshot=source_snapshot_package_staging,
+        snapshot_identity={
+            "commit": str(authenticated["source_snapshot_commit"]),
+            "tree": str(authenticated["source_snapshot_tree"]),
+        },
+        override=packaged_source_arm.override,
+        isolated_config=True,
+    )
+    authenticated_identity = authenticated.get("expected_publication_identity")
+    if not isinstance(authenticated_identity, Mapping) or portable_arm_publication_identity(
+        packaged_expected_identity
+    ) != portable_arm_publication_identity(authenticated_identity):
+        raise ControllerError(
+            "packaged source plan/snapshot publication identity differs from authentication"
+        )
+    authenticate_published_arm_artifacts(staging_dir)
+    for field, filename in (
+        ("source_manifest_sha256", "manifest.json"),
+        ("source_results_sha256", "results.jsonl"),
+        ("source_trace_sha256", "trace.jsonl"),
+    ):
+        if authenticated[field] != package_artifacts[filename]["sha256"]:
+            raise ControllerError(f"preexisting source changed while freezing {filename}")
+    source_authentication_receipt_sha256 = authenticated["receipt_sha256"]
+    receipt = copy.deepcopy(dict(authenticated))
+    receipt.pop("receipt_sha256", None)
+    receipt.update(
+        {
+            "schema": PREEXISTING_SOURCE_PACKAGE_SCHEMA,
+            "package_dir": str(package_dir.resolve()),
+            "package_artifacts": package_artifacts,
+            "source_plan_package_sha256": hashlib.sha256(source_plan_payload).hexdigest(),
+            "source_snapshot_archive_sha256": hashlib.sha256(source_snapshot_archive).hexdigest(),
+            "source_snapshot_package_dir": str((package_dir / "source-snapshot").resolve()),
+            "source_snapshot_package_tree_sha256": regular_directory_tree_sha256(
+                source_snapshot_package_staging
+            ),
+            "source_authentication_receipt_sha256": (source_authentication_receipt_sha256),
+        }
+    )
+    receipt["receipt_sha256"] = canonical_sha256(receipt)
+    atomic_write_json(staging_dir / "import-receipt.json", receipt)
+    os.rename(staging_dir, package_dir)
+    directory_fd = os.open(package_dir.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return _verify_preexisting_source_package(plan, package_dir)
 
 
 def launch_arm(
@@ -3089,16 +4228,13 @@ def schedule_anchor_launch_gate(
 ) -> tuple[bool, dict[str, Any]]:
     """Fail closed unless this run already authenticated the frozen anchor."""
 
-    anchor_id = str(
-        plan["execution"]["schedule"]["anchor_by_arm_id"][arm.arm_id]
-    )
+    anchor_id = str(plan["execution"]["schedule"]["anchor_by_arm_id"][arm.arm_id])
     if anchor_id == arm.arm_id:
         return True, {}
     status_arms = status.get("arms")
     anchor_state = (
         status_arms.get(anchor_id)
-        if isinstance(status_arms, Mapping)
-        and isinstance(status_arms.get(anchor_id), Mapping)
+        if isinstance(status_arms, Mapping) and isinstance(status_arms.get(anchor_id), Mapping)
         else {}
     )
     recorded_state = str(anchor_state.get("state") or "unknown")
@@ -3140,13 +4276,28 @@ def prepare_derived(
 ) -> dict[str, Any]:
     run_root = Path(str(plan["paths"]["run_root"]))
     receipt_root = run_root / "receipts"
+    source_import = materialize_preexisting_source(plan)
+    if (
+        source_import is not None
+        and Path(str(source_import["source_output_dir"])).resolve() != source_dir.resolve()
+    ):
+        raise ControllerError("preexisting source import/output directory differs")
+    source_consumption_dir = (
+        Path(str(source_import["package_dir"])) if source_import is not None else source_dir
+    )
     artifact = extract_analyzer_artifact(
         source_arm=source_arm,
-        source_dir=source_dir,
+        source_dir=source_consumption_dir,
         destination=run_root / "frozen-analyzer-profiles.json",
         expected_task_ids=set(plan["benchmark"]["task_ids"]),
+        snapshot=snapshot,
         snapshot_identity=snapshot_identity,
         plan_sha256=plan_sha256,
+        replay_schema=str(frozen_replay_contract(plan)["schema"]),
+        allow_deterministic_router_fallback=bool(
+            analyzer_source_policy(plan)["allow_deterministic_router_fallback"]
+        ),
+        source_import_evidence=source_import,
     )
     p99 = derive_analyzer_p99_receipt(
         artifact,
@@ -3173,7 +4324,7 @@ def prepare_derived(
         label="baseline-frozen-replay",
     )
     live_plans = _source_selection_plans(
-        source_dir / "trace.jsonl",
+        source_consumption_dir / "trace.jsonl",
         expected_task_ids=expected_task_ids,
         require_dry_replay=False,
     )
@@ -3415,6 +4566,8 @@ def prepare_derived(
         "snapshot_tree": snapshot_identity["tree"],
         "source_arm_id": source_arm.arm_id,
         "source_output_dir": str(source_dir),
+        "source_consumption_dir": str(source_consumption_dir),
+        "preexisting_source_import": source_import,
         "frozen_analyzer_artifact": {
             "path": str(run_root / "frozen-analyzer-profiles.json"),
             "artifact_sha256": artifact["artifact_sha256"],
@@ -3465,46 +4618,79 @@ def load_derived(
         or derived.get("source_arm_id") != ANALYZER_SOURCE_ARM_ID
     ):
         raise ControllerError("derived plan source/snapshot identity differs")
+    expected_import = materialize_preexisting_source(plan)
+    if derived.get("preexisting_source_import") != expected_import:
+        raise ControllerError("derived preexisting source import receipt differs")
     if artifact.get("task_ids") != sorted(plan["benchmark"]["task_ids"]):
         raise ControllerError("frozen Analyzer artifact task identity differs")
     source = artifact.get("source")
     if not isinstance(source, Mapping):
         raise ControllerError("frozen Analyzer artifact source binding is missing")
+    expected_source_commit = (
+        expected_import["source_snapshot_commit"]
+        if expected_import is not None
+        else plan["freeze"]["snapshot_commit"]
+    )
+    expected_source_tree = (
+        expected_import["source_snapshot_tree"]
+        if expected_import is not None
+        else plan["freeze"]["snapshot_tree"]
+    )
+    if (
+        source.get("snapshot_commit") != expected_source_commit
+        or source.get("snapshot_tree") != expected_source_tree
+        or source.get("replay_snapshot_commit") != plan["freeze"]["snapshot_commit"]
+        or source.get("replay_snapshot_tree") != plan["freeze"]["snapshot_tree"]
+        or source.get("preexisting_source_import_receipt_sha256")
+        != (expected_import.get("receipt_sha256") if expected_import is not None else None)
+    ):
+        raise ControllerError("frozen Analyzer source/replay snapshot binding differs")
     source_dir = Path(str(derived.get("source_output_dir") or ""))
-    if source_dir.resolve() != Path(str(source.get("output_dir") or "")).resolve():
+    source_consumption_dir = Path(str(derived.get("source_consumption_dir") or ""))
+    if (
+        source_consumption_dir.resolve() != Path(str(source.get("output_dir") or "")).resolve()
+        or source_dir.resolve() != Path(str(source.get("original_output_dir") or "")).resolve()
+    ):
         raise ControllerError("derived/source Analyzer output directory differs")
-    source_arm = next(arm for arm in expand_arms(plan) if arm.arm_id == ANALYZER_SOURCE_ARM_ID)
-    snapshot = Path(str(plan["paths"]["snapshot"])).resolve()
-    source_identity = arm_completion_identity(
-        plan,
-        source_arm,
-        snapshot=snapshot,
-        snapshot_identity={
-            "commit": str(plan["freeze"]["snapshot_commit"]),
-            "tree": str(plan["freeze"]["snapshot_tree"]),
-        },
-        override=source_arm.override,
-    )
-    source_complete, source_evidence = inspect_complete_arm(
-        source_dir,
-        expected_task_ids=set(plan["benchmark"]["task_ids"]),
-        expected_task_concurrency=int(plan["execution"]["task_concurrency"]),
-        expected_identity=source_identity,
-    )
-    if not source_complete:
-        raise ControllerError(
-            "derived Analyzer source arm is no longer authenticated: "
-            + str(source_evidence.get("reason") or "unknown")
+    if expected_import is not None:
+        if source_consumption_dir.resolve() != Path(str(expected_import["package_dir"])).resolve():
+            raise ControllerError("derived Analyzer source package directory differs")
+    else:
+        source_arm = next(arm for arm in expand_arms(plan) if arm.arm_id == ANALYZER_SOURCE_ARM_ID)
+        snapshot = Path(str(plan["paths"]["snapshot"])).resolve()
+        source_identity = arm_completion_identity(
+            plan,
+            source_arm,
+            snapshot=snapshot,
+            snapshot_identity={
+                "commit": str(plan["freeze"]["snapshot_commit"]),
+                "tree": str(plan["freeze"]["snapshot_tree"]),
+            },
+            override=source_arm.override,
         )
+        source_complete, source_evidence = inspect_complete_arm(
+            source_dir,
+            expected_task_ids=set(plan["benchmark"]["task_ids"]),
+            expected_task_concurrency=int(plan["execution"]["task_concurrency"]),
+            expected_identity=source_identity,
+        )
+        if not source_complete:
+            raise ControllerError(
+                "derived Analyzer source arm is no longer authenticated: "
+                + str(source_evidence.get("reason") or "unknown")
+            )
     for field, filename in (
         ("manifest_sha256", "manifest.json"),
         ("trace_sha256", "trace.jsonl"),
     ):
-        if source.get(field) != file_sha256(source_dir / filename):
+        if source.get(field) != file_sha256(source_consumption_dir / filename):
             raise ControllerError(f"frozen Analyzer source {filename} binding differs")
     replay = artifact.get("replay_payload")
-    if not isinstance(replay, Mapping) or replay.get("source_results_sha256") != file_sha256(
-        source_dir / "results.jsonl"
+    if (
+        not isinstance(replay, Mapping)
+        or replay.get("schema") != frozen_replay_contract(plan)["schema"]
+        or replay.get("source_results_sha256")
+        != file_sha256(source_consumption_dir / "results.jsonl")
     ):
         raise ControllerError("frozen Analyzer source results binding differs")
 
@@ -3765,6 +4951,7 @@ def run_campaign(plan_path: Path) -> int:
         expected_snapshot_identity=snapshot_identity,
     )
     validate_static_overlays(plan, arms, snapshot)
+    validate_frozen_replay_runtime_support(plan, _runtime_helpers(snapshot))
     run_root = Path(str(plan["paths"]["run_root"]))
     run_root.mkdir(parents=True, exist_ok=True)
     lock_path = run_root / "controller.lock"
@@ -3784,6 +4971,7 @@ def run_campaign(plan_path: Path) -> int:
         status["phase"] = "running"
         status["started_at"] = status.get("started_at") or utc_now()
         status["completed_at"] = None
+        status["preexisting_source_import"] = materialize_preexisting_source(plan)
         update_status(status_file, status)
 
         expected_task_ids = set(plan["benchmark"]["task_ids"])
@@ -4099,6 +5287,8 @@ def validate_only(plan_path: Path) -> dict[str, Any]:
     )
     validate_static_overlays(plan, arms, snapshot)
     helpers = _runtime_helpers(snapshot)
+    validate_frozen_replay_runtime_support(plan, helpers)
+    imported_source = authenticate_preexisting_source(plan)
     return {
         "status": "valid",
         "candidate_live_arm_count": len(arms),
@@ -4118,6 +5308,14 @@ def validate_only(plan_path: Path) -> dict[str, Any]:
         "draco_request_budget_rebinding_disabled": helpers[
             "draco_request_budget_rebinding_disabled"
         ],
+        "preexisting_source_import": (
+            {
+                "status": "authenticated",
+                "receipt_sha256": imported_source["receipt_sha256"],
+            }
+            if imported_source is not None
+            else {"status": "not_declared"}
+        ),
     }
 
 

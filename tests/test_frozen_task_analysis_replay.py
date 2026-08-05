@@ -11,10 +11,13 @@ import pytest
 
 from opensquilla.eval.draco_experiment_config import (
     DracoFrozenTaskAnalysisExecutionConfig,
+    DracoFrozenTaskAnalysisExecutionV2Config,
 )
 from opensquilla.provider.ranking_router import (
     FROZEN_TASK_ANALYSIS_MODE,
+    FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK,
     FROZEN_TASK_ANALYSIS_SCHEMA,
+    FROZEN_TASK_ANALYSIS_SCHEMA_V2,
     TASK_ANALYZER_VERSION,
     DynamicRankingError,
     _assert_public_ranking_trace_payload,
@@ -135,6 +138,48 @@ def _fixture() -> tuple[
     )
 
 
+def _fallback_fixture() -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    str,
+    str,
+    str,
+]:
+    contract, _, request_context, task_id, input_sha, prompt_sha = _fixture()
+    fallback_contract = copy.deepcopy(contract)
+    fallback_contract["schema"] = FROZEN_TASK_ANALYSIS_SCHEMA_V2
+    for entry in fallback_contract["entries"].values():
+        entry["origin_outcome"] = FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK
+        entry["task_analyzer"]["schema_valid"] = False
+        entry["task_analyzer"]["fallback_reason"] = "TimeoutError"
+    fallback_contract["entries_sha256"] = canonical_json_sha256(
+        fallback_contract["entries"]
+    )
+    entry = fallback_contract["entries"][task_id]
+    result = frozen_task_analysis_result(
+        fallback_contract,
+        task_id=task_id,
+        task_input_sha256=input_sha,
+        prompt_sha256=prompt_sha,
+        routed_tier="c1",
+        request_context=request_context,
+        ranking_config=ranking_config_resolution()["effective_config"],
+    )
+    plan = {
+        "task_analyzer": result.trace(ranking_config_resolution()["effective_config"]),
+        "task_profile_pre_escalation": copy.deepcopy(
+            entry["task_profile_pre_escalation"]
+        ),
+        "ranking_parameters": {
+            "task_analyzer": copy.deepcopy(
+                fallback_contract["source_task_analyzer_config"]
+            ),
+        },
+    }
+    return fallback_contract, plan, request_context, task_id, input_sha, prompt_sha
+
+
 def test_replay_contract_materializes_bound_profile_with_zero_usage() -> None:
     contract, plan, _, task_id, task_input_sha256, prompt_sha256 = _fixture()
 
@@ -163,6 +208,64 @@ def test_replay_contract_materializes_bound_profile_with_zero_usage() -> None:
             "task_profile_pre_escalation_sha256"
         ]
     )
+
+
+def test_v2_replay_preserves_deterministic_router_fallback_outcome() -> None:
+    contract, plan, _, task_id, input_sha, prompt_sha = _fallback_fixture()
+
+    assert frozen_task_analysis_contract_reasons(contract) == []
+    validated = DracoFrozenTaskAnalysisExecutionV2Config.model_validate(contract)
+    assert validated.model_dump(mode="json")["schema"] == FROZEN_TASK_ANALYSIS_SCHEMA_V2
+    assert frozen_task_analysis_plan_reasons(
+        plan,
+        contract,
+        expected_task_id=task_id,
+        expected_task_input_sha256=input_sha,
+        expected_prompt_sha256=prompt_sha,
+    ) == []
+    analyzer = plan["task_analyzer"]
+    assert analyzer["source"] == "frozen_replay"
+    assert analyzer["schema_valid"] is False
+    assert analyzer["fallback_reason"] == "TimeoutError"
+    assert analyzer["usage"] == {}
+    assert analyzer["replay"]["physical_request_count"] == 0
+    assert (
+        analyzer["replay"]["origin_outcome"]
+        == FROZEN_TASK_ANALYSIS_ROUTER_FALLBACK
+    )
+
+
+def test_v2_replay_rejects_provenance_laundering_and_nondeterministic_profile() -> None:
+    contract, _, request_context, task_id, input_sha, prompt_sha = _fallback_fixture()
+    for field, value in (("schema_valid", True), ("fallback_reason", "")):
+        tampered = copy.deepcopy(contract)
+        tampered["entries"][task_id]["task_analyzer"][field] = value
+        tampered["entries_sha256"] = canonical_json_sha256(tampered["entries"])
+        assert "invalid_frozen_task_analyzer_trace" in (
+            frozen_task_analysis_contract_reasons(tampered)
+        )
+
+    nondeterministic = copy.deepcopy(contract)
+    profile = nondeterministic["entries"][task_id]["task_profile_pre_escalation"]
+    profile["constraints"]["risk"] = (
+        "high" if profile["constraints"]["risk"] != "high" else "low"
+    )
+    nondeterministic["entries"][task_id][
+        "task_profile_pre_escalation_sha256"
+    ] = canonical_json_sha256(profile)
+    nondeterministic["entries_sha256"] = canonical_json_sha256(
+        nondeterministic["entries"]
+    )
+    with pytest.raises(DynamicRankingError, match="not deterministic"):
+        frozen_task_analysis_result(
+            nondeterministic,
+            task_id=task_id,
+            task_input_sha256=input_sha,
+            prompt_sha256=prompt_sha,
+            routed_tier="c1",
+            request_context=request_context,
+            ranking_config=ranking_config_resolution()["effective_config"],
+        )
 
 
 def test_public_trace_secret_scan_allows_schema_but_rejects_real_key() -> None:
@@ -290,6 +393,50 @@ def test_finalizer_requires_zero_replay_analyzer_requests_but_keeps_live_gate(
     assert "unexpected_g1_task_analyzer_request_in_frozen_replay" in (
         module.g1_provider_lifecycle_analyzer_reasons(
             row,
+            replay_contract=contract,
+        )
+    )
+
+
+def test_finalizer_authenticates_v2_fallback_trace_without_laundering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_finalizer()
+    contract, plan, _, task_id, input_sha, prompt_sha = _fallback_fixture()
+    row = {
+        "group": "G1",
+        "task_id": task_id,
+        "task_input_sha256": input_sha,
+        "prompt_sha256": prompt_sha,
+        "execution": {
+            "generation_attempts": [
+                {
+                    "attempt_id": "attempt-1",
+                    "run": {
+                        "llm_request_count": 1,
+                        "routing_trace": {"selection_plan": plan},
+                    },
+                }
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        module,
+        "_canonical_task_analyzer_setup_units",
+        lambda *args, **kwargs: [],
+    )
+    assert module.g1_provider_lifecycle_analyzer_reasons(
+        row,
+        replay_contract=contract,
+    ) == []
+
+    laundered = copy.deepcopy(row)
+    laundered["execution"]["generation_attempts"][0]["run"]["routing_trace"][
+        "selection_plan"
+    ]["task_analyzer"]["schema_valid"] = True
+    assert "wrong_frozen_task_analyzer_provenance" in (
+        module.g1_provider_lifecycle_analyzer_reasons(
+            laundered,
             replay_contract=contract,
         )
     )

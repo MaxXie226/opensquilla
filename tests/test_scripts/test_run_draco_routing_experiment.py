@@ -11059,6 +11059,180 @@ def test_resume_provider_native_exhaustion_is_terminal_across_waves() -> None:
     )
 
 
+def _mark_provider_native_candidate_success(
+    candidate: dict[str, object],
+    *,
+    text: str,
+) -> None:
+    candidate.update(
+        {
+            "ok": True,
+            "error": "",
+            "usable_for_aggregation": True,
+            "completion_outcome": "complete",
+            "content": {"text": text, "chars": len(text)},
+        }
+    )
+
+
+def test_resume_provider_native_success_needs_no_failure_suppression_marker() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    trace = attempt["run"]["ensemble_trace"]
+    candidates = trace["candidates"]
+    _mark_provider_native_candidate_success(candidates[0], text="recovered draft")
+    _mark_provider_native_candidate_success(candidates[1], text="primary draft")
+    candidates[0]["execution"]["physical_attempts"][-1]["outcome"] = "succeeded"
+    trace["proposer_recovery"]["attempts"][-1]["outcome"] = "succeeded"
+    trace["proposer_recovery"]["quorum_reached"] = True
+    trace["successful_proposers"] = 2
+    row["selected_generation_succeeded"] = True
+    row["error"] = ""
+    attempt["retry_reason"] = ""
+    attempt["retry_suppressed_reason"] = ""
+    attempt["run"]["error"] = ""
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["status"] == "provider_scope_terminal"
+    assert evidence["receipt_valid"] is True
+    assert "provider_native_outer_retry_not_suppressed" not in evidence[
+        "receipt_reasons"
+    ]
+
+
+def test_resume_provider_native_failed_terminal_still_requires_marker() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    attempt["retry_suppressed_reason"] = ""
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["receipt_valid"] is False
+    assert "provider_native_outer_retry_not_suppressed" in evidence[
+        "receipt_reasons"
+    ]
+
+
+def test_resume_provider_native_transport_success_is_not_candidate_quorum() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    trace = attempt["run"]["ensemble_trace"]
+    candidates = trace["candidates"]
+    # Provider transport completed, but the payload produced no usable draft.
+    candidates[0]["execution"]["physical_attempts"][0]["outcome"] = "succeeded"
+    candidates[0].update(
+        {
+            "ok": False,
+            "error": "provider payload was unusable",
+            "error_code": "provider_payload_unusable",
+            "usable_for_aggregation": False,
+            "completion_outcome": "failed",
+            "content": {"text": "", "chars": 0},
+        }
+    )
+    _mark_provider_native_candidate_success(candidates[1], text="usable primary")
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["status"] == "budget_exhausted"
+    assert evidence["receipt_valid"] is True
+    assert "provider_native_recovery_continued_after_quorum" not in evidence[
+        "receipt_reasons"
+    ]
+
+
+def test_resume_provider_native_partial_candidate_reaches_quorum_at_last_receipt() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    trace = attempt["run"]["ensemble_trace"]
+    candidates = trace["candidates"]
+    partial_text = "partial but usable draft"
+    candidates[0].update(
+        {
+            "ok": False,
+            "error": "provider stream ended after usable text",
+            "error_code": "provider_stream_interrupted",
+            "usable_for_aggregation": True,
+            "completion_outcome": "partial_usable",
+            "content": {"text": partial_text, "chars": len(partial_text)},
+        }
+    )
+    _mark_provider_native_candidate_success(candidates[1], text="primary draft")
+    trace["proposer_recovery"]["quorum_reached"] = True
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["status"] == "provider_scope_terminal"
+    assert evidence["receipt_valid"] is True
+    assert "provider_native_recovery_continued_after_quorum" not in evidence[
+        "receipt_reasons"
+    ]
+
+
+def test_resume_provider_native_accepts_receipt_bound_local_attempt_ordinals() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    candidates = attempt["run"]["ensemble_trace"]["candidates"]
+    recovery_rows = candidates[0]["execution"]["physical_attempts"][1:]
+    assert [physical["physical_attempt_id"] for physical in recovery_rows] == [
+        "b" * 32,
+        "c" * 32,
+        "d" * 32,
+    ]
+    for physical in recovery_rows:
+        physical["attempt"] = 1
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["status"] == "budget_exhausted"
+    assert evidence["receipt_valid"] is True
+    assert evidence["receipt_reasons"] == []
+
+
+def test_resume_provider_native_local_ordinal_requires_matching_receipt_slot() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    trace = attempt["run"]["ensemble_trace"]
+    recovery_row = trace["candidates"][0]["execution"]["physical_attempts"][1]
+    recovery_row["attempt"] = 1
+    trace["proposer_recovery"]["attempts"][0]["slot_index"] = 1
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["status"] == "receipt_invalid"
+    assert evidence["receipt_valid"] is False
+    assert (
+        "provider_native_recovery_candidate_slot_mismatch"
+        in evidence["receipt_reasons"]
+    )
+
+
+def test_resume_provider_native_local_ordinal_rejects_boolean_attempt() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    recovery_row = attempt["run"]["ensemble_trace"]["candidates"][0][
+        "execution"
+    ]["physical_attempts"][1]
+    recovery_row["attempt"] = True
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+
+    assert evidence is not None
+    assert evidence["status"] == "receipt_invalid"
+    assert evidence["receipt_valid"] is False
+    assert (
+        "invalid_provider_native_candidate_physical_attempt"
+        in evidence["receipt_reasons"]
+    )
+
+
 def test_resume_provider_native_malformed_receipt_fails_closed() -> None:
     row = _provider_native_exhausted_resume_row()
     attempt = row["execution"]["generation_attempts"][0]

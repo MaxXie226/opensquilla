@@ -434,6 +434,105 @@ class CostTests(unittest.TestCase):
         self.assertEqual(report.selected_model_usage(row, self.prices), {})
 
 
+class AnalyzerOriginTests(unittest.TestCase):
+    def test_v2_replay_fallback_is_explicit_and_preserves_reason(self) -> None:
+        evidence = report.task_analyzer_origin_evidence(
+            {
+                "source": "frozen_replay",
+                "schema_valid": False,
+                "fallback_reason": "TimeoutError",
+                "replay": {
+                    "schema": "opensquilla.draco.frozen-task-analysis/v2",
+                    "origin_outcome": "deterministic_router_fallback",
+                },
+            }
+        )
+        self.assertEqual(evidence["origin_outcome"], "deterministic_router_fallback")
+        self.assertTrue(evidence["origin_outcome_explicit"])
+        self.assertTrue(evidence["is_explicit_router_fallback"])
+        self.assertEqual(evidence["fallback_reason"], "TimeoutError")
+
+    def test_v1_success_is_compatible_but_legacy_reason_does_not_invent_fallback(self) -> None:
+        v1 = report.task_analyzer_origin_evidence(
+            {
+                "source": "frozen_replay",
+                "schema_valid": True,
+                "fallback_reason": "",
+                "replay": {"schema": "opensquilla.draco.frozen-task-analysis/v1"},
+            }
+        )
+        self.assertEqual(v1["origin_outcome"], "live_success")
+        self.assertFalse(v1["origin_outcome_explicit"])
+        self.assertFalse(v1["is_explicit_router_fallback"])
+
+        ambiguous = report.task_analyzer_origin_evidence(
+            {
+                "source": "frozen_replay",
+                "schema_valid": False,
+                "fallback_reason": "TimeoutError",
+                "replay": {"schema": "opensquilla.draco.frozen-task-analysis/v1"},
+            }
+        )
+        self.assertEqual(ambiguous["origin_outcome"], "unknown")
+        self.assertFalse(ambiguous["is_explicit_router_fallback"])
+        self.assertEqual(ambiguous["fallback_reason"], "TimeoutError")
+
+    def test_summary_reports_distributions_and_only_explicit_fallback_task_ids(self) -> None:
+        def row(
+            task_id: str,
+            outcome: str,
+            *,
+            reason: str = "",
+            explicit_fallback: bool = False,
+        ) -> dict:
+            return {
+                "task_id": task_id,
+                "generation_cost": {
+                    "usd": 0.1,
+                    "complete": True,
+                    "request_count": 1,
+                    "actual_requests": 1,
+                },
+                "judge_cost": {
+                    "usd": 0.01,
+                    "complete": True,
+                    "request_count": 1,
+                    "actual_requests": 1,
+                },
+                "model_generation": {},
+                "analyzer_origin_outcome": outcome,
+                "analyzer_fallback_reason": reason,
+                "analyzer_origin_is_fallback": explicit_fallback,
+            }
+
+        summary = report.summarize_rows(
+            [
+                row("live", "live_success"),
+                row(
+                    "fallback",
+                    "deterministic_router_fallback",
+                    reason="TimeoutError",
+                    explicit_fallback=True,
+                ),
+                row("legacy-ambiguous", "unknown", reason="ConnectionError"),
+            ]
+        )
+        self.assertEqual(
+            summary["analyzer_origin_outcome_distribution"],
+            {
+                "deterministic_router_fallback": 1,
+                "live_success": 1,
+                "unknown": 1,
+            },
+        )
+        self.assertEqual(
+            summary["analyzer_fallback_reason_distribution"],
+            {"ConnectionError": 1, "TimeoutError": 1},
+        )
+        self.assertEqual(summary["analyzer_fallback_task_ids"], ["fallback"])
+        self.assertEqual(summary["analyzer_unknown_origin_task_ids"], ["legacy-ambiguous"])
+
+
 class PairingTests(unittest.TestCase):
     @staticmethod
     def arm(arm_id: str, offset: float) -> dict:
@@ -1460,6 +1559,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("失败/被替换 retry", markdown)
         self.assertIn("anchored-serial", markdown)
         self.assertIn("不是逐题 AB/BA", markdown)
+        self.assertIn("Analyzer origin / fallback 取证", markdown)
+        self.assertIn("Origin outcome distribution", markdown)
         self.assertTrue(result["schedule_evidence"]["valid"])
         self.assertFalse(result["schedule_evidence"]["strict_task_interleaving"])
         self.assertEqual(result["replay_control_drift"]["comparison_count"], 2)
