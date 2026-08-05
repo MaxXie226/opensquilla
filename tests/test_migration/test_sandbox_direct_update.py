@@ -141,6 +141,14 @@ def _mock_windows_acl(
     monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
 
 
+def test_windows_acl_script_does_not_require_powershell_module_autoload() -> None:
+    script = upgrade_migration._WINDOWS_PRIVATE_ACL_SCRIPT
+
+    assert "Get-Acl" not in script
+    assert "[System.IO.Directory]::GetAccessControl($target)" in script
+    assert "[System.IO.File]::GetAccessControl($target)" in script
+
+
 def test_frozen_windows_acl_process_restores_packaged_dll_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

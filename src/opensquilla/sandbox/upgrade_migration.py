@@ -64,10 +64,11 @@ foreach ($sidText in $allowed) {
 }
 if ($isDirectory) {
     [System.IO.Directory]::SetAccessControl($target, $acl)
+    $verified = [System.IO.Directory]::GetAccessControl($target)
 } else {
     [System.IO.File]::SetAccessControl($target, $acl)
+    $verified = [System.IO.File]::GetAccessControl($target)
 }
-$verified = Get-Acl -LiteralPath $target
 if (-not $verified.AreAccessRulesProtected) {
     throw "DACL inheritance remains enabled"
 }
