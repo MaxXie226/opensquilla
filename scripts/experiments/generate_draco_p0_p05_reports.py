@@ -40,6 +40,15 @@ STATUS_SCHEMA = "opensquilla.draco-p0-p05-controller-status/v1"
 DERIVED_SCHEMA = "opensquilla.draco-p0-p05-derived-plan/v1"
 REPORT_SCHEMA = "opensquilla.draco-p0-p05-comprehensive-report/v1"
 GROUP_REPORT_SCHEMA = "opensquilla.draco-p0-p05-experiment-report/v1"
+ACCOUNT_WINDOW_COHORT_SCHEMA = "opensquilla.draco.account-window-cohort/v1"
+CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA = (
+    "opensquilla.draco-confirmatory-report-input-index/v1"
+)
+CONFIRMATORY_COHORT_MANIFEST_SCHEMA = (
+    "opensquilla.draco-confirmatory-cohort-manifest/v1"
+)
+CONFIRMATORY_SCHEDULE_SCHEMA = "opensquilla.draco-p0-p05-confirmatory-schedule/v1"
+CONFIRMATORY_REPORT_INPUT_INDEX_NAME = "confirmatory-report-inputs.json"
 TERMINAL_STATUS_INPUT_SCHEMA = "opensquilla.draco-p0-p05-terminal-status-input/v1"
 BOOTSTRAP_SEED = 20260803
 BOOTSTRAP_SAMPLES = 20_000
@@ -257,6 +266,43 @@ def regular_file(path: Path) -> None:
         raise ReportError(f"missing artifact: {path}") from exc
     if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
         raise ReportError(f"artifact is not a regular non-symlink file: {path}")
+
+
+def regular_directory(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        raise ReportError(f"missing artifact directory: {path}") from exc
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise ReportError(f"artifact directory is not a non-symlink directory: {path}")
+
+
+def raw_sha256(value: Any) -> str | None:
+    text = str(value or "")
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        return None
+    return text
+
+
+def prefixed_sha256(value: Any) -> str | None:
+    text = str(value or "")
+    if not text.startswith("sha256:") or raw_sha256(text[7:]) is None:
+        return None
+    return text
+
+
+def absolute_receipt_path(value: Any, *, label: str) -> Path:
+    text = str(value or "")
+    path = Path(text)
+    if not text or not path.is_absolute():
+        raise ReportError(f"{label} must be an absolute path")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ReportError(f"{label} does not exist: {path}") from exc
+    if resolved != path:
+        raise ReportError(f"{label} is not a canonical non-symlink path: {path}")
+    return path
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -1759,7 +1805,155 @@ def status_dimension(values: Sequence[Any], *, warning_status: str = "warning") 
     return "unknown"
 
 
-def account_evidence(manifest: Mapping[str, Any], proof: Mapping[str, Any]) -> dict[str, Any]:
+def validate_account_window_cohort(
+    manifest: Mapping[str, Any],
+    audit: Mapping[str, Any],
+    proof: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Authenticate one role's projection of a shared two-arm account window."""
+
+    values = [
+        source.get("account_window_cohort")
+        for source in (manifest, audit, proof)
+    ]
+    present = [value for value in values if value is not None]
+    if not present:
+        return None, []
+    reasons: list[str] = []
+    if len(present) != len(values) or any(not isinstance(value, Mapping) for value in present):
+        return None, ["account-window cohort evidence is not bound by all formal artifacts"]
+    cohort = copy.deepcopy(dict(present[0]))
+    if any(dict(value) != cohort for value in present[1:] if isinstance(value, Mapping)):
+        reasons.append("account-window cohort evidence differs across formal artifacts")
+    expected_fields = {
+        "schema",
+        "cohort_id",
+        "members",
+        "account_evidence",
+        "role",
+        "companion_role",
+        "cohort_sha256",
+    }
+    if set(cohort) != expected_fields:
+        reasons.append("account-window cohort field set differs")
+        return cohort, reasons
+    cohort_id = str(cohort.get("cohort_id") or "")
+    safe_chars = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    )
+    if (
+        not 1 <= len(cohort_id) <= 128
+        or not cohort_id[0].isalnum()
+        or any(char not in safe_chars for char in cohort_id)
+    ):
+        reasons.append("account-window cohort id is invalid")
+    role = str(cohort.get("role") or "")
+    companion_role = str(cohort.get("companion_role") or "")
+    if {role, companion_role} != {"control", "candidate"}:
+        reasons.append("account-window cohort roles are invalid")
+    members = cohort.get("members")
+    if not isinstance(members, Mapping) or set(members) != {"control", "candidate"}:
+        reasons.append("account-window cohort members are incomplete")
+    else:
+        for member_role, member in members.items():
+            if not isinstance(member, Mapping) or set(member) != {
+                "results",
+                "manifests",
+                "selected_generation_attempt_bindings_sha256",
+            }:
+                reasons.append(f"account-window cohort {member_role} member is invalid")
+                continue
+            results = member.get("results")
+            manifests = member.get("manifests")
+            if (
+                not isinstance(results, list)
+                or not results
+                or not isinstance(manifests, list)
+                or len(results) != len(manifests)
+            ):
+                reasons.append(
+                    f"account-window cohort {member_role} source cardinality differs"
+                )
+            for kind, sources in (("result", results), ("manifest", manifests)):
+                if not isinstance(sources, list):
+                    continue
+                source_indexes: list[int] = []
+                for source in sources:
+                    source_index = (
+                        source.get("source_index")
+                        if isinstance(source, Mapping)
+                        else None
+                    )
+                    digest = (
+                        str(source.get("sha256") or "")
+                        if isinstance(source, Mapping)
+                        else ""
+                    )
+                    if (
+                        not isinstance(source, Mapping)
+                        or set(source) != {"source_index", "sha256"}
+                        or isinstance(source_index, bool)
+                        or not isinstance(source_index, int)
+                        or source_index < 0
+                        or len(digest) != 64
+                        or any(char not in "0123456789abcdef" for char in digest)
+                    ):
+                        reasons.append(
+                            f"account-window cohort {member_role} {kind} hash is invalid"
+                        )
+                    if isinstance(source_index, int) and not isinstance(source_index, bool):
+                        source_indexes.append(source_index)
+                if source_indexes != list(range(len(sources))):
+                    reasons.append(
+                        f"account-window cohort {member_role} {kind} order differs"
+                    )
+            binding_sha = str(
+                member.get("selected_generation_attempt_bindings_sha256") or ""
+            )
+            if (
+                len(binding_sha) != 71
+                or not binding_sha.startswith("sha256:")
+                or any(char not in "0123456789abcdef" for char in binding_sha[7:])
+            ):
+                reasons.append(
+                    f"account-window cohort {member_role} selection hash is invalid"
+                )
+    account_evidence = cohort.get("account_evidence")
+    expected_account_fields = {
+        "account_before_sha256",
+        "account_after_sha256",
+        "account_reconciliation_sha256",
+        "runtime_environment_sha256",
+    }
+    if not isinstance(account_evidence, Mapping) or set(account_evidence) != expected_account_fields:
+        reasons.append("account-window cohort account evidence is invalid")
+    elif any(
+        len(str(value or "")) != 64
+        or any(char not in "0123456789abcdef" for char in str(value or ""))
+        for value in account_evidence.values()
+    ):
+        reasons.append("account-window cohort account evidence hash is invalid")
+    stable_projection = {
+        "schema": cohort.get("schema"),
+        "cohort_id": cohort.get("cohort_id"),
+        "members": cohort.get("members"),
+        "account_evidence": cohort.get("account_evidence"),
+    }
+    if cohort.get("schema") != ACCOUNT_WINDOW_COHORT_SCHEMA:
+        reasons.append("account-window cohort schema differs")
+    if str(cohort.get("cohort_sha256") or "") != "sha256:" + canonical_sha256(
+        stable_projection
+    ):
+        reasons.append("account-window cohort hash differs")
+    return cohort, list(dict.fromkeys(reasons))
+
+
+def account_evidence(
+    manifest: Mapping[str, Any],
+    proof: Mapping[str, Any],
+    *,
+    cohort: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     attribution = (
         manifest.get("cost_attribution")
         if isinstance(manifest.get("cost_attribution"), Mapping)
@@ -1788,7 +1982,7 @@ def account_evidence(manifest: Mapping[str, Any], proof: Mapping[str, Any]) -> d
             >= integer(item.get("required_stable_poll_count"))
             for item in windows or []
         )
-    return {
+    result = {
         "account_delta_usd": account_delta,
         "byok_delta_usd": byok_delta,
         "reconciliation_status": str(
@@ -1798,6 +1992,12 @@ def account_evidence(manifest: Mapping[str, Any], proof: Mapping[str, Any]) -> d
         "account_window_count": len(attribution.get("account_windows") or []),
         "scope": "campaign account delta including Judge; separate from selected generation",
     }
+    if cohort is not None:
+        result["account_window_cohort"] = copy.deepcopy(dict(cohort))
+        result["cohort_id"] = cohort.get("cohort_id")
+        result["cohort_role"] = cohort.get("role")
+        result["cohort_sha256"] = cohort.get("cohort_sha256")
+    return result
 
 
 def summarize_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -2153,6 +2353,12 @@ def load_formal_arm(
     audit = load_json(root / "audit.json")
     proof = load_json(root / "openrouter-non-byok-campaign-proof.json")
     reasons: list[str] = list(initial_reasons)
+    account_window_cohort, cohort_reasons = validate_account_window_cohort(
+        manifest,
+        audit,
+        proof,
+    )
+    reasons.extend(cohort_reasons)
     if not validate_embedded_hash(manifest, "manifest_sha256"):
         reasons.append("manifest self-hash differs")
     if not validate_embedded_hash(audit, "audit_sha256"):
@@ -2273,6 +2479,11 @@ def load_formal_arm(
                 "audit_pass": manifest.get("audit_pass"),
                 "manifest_sha256": manifest.get("manifest_sha256"),
                 "warnings": manifest.get("warnings") or [],
+                **(
+                    {"account_window_cohort": account_window_cohort}
+                    if account_window_cohort is not None
+                    else {}
+                ),
             },
             "audit": {
                 "schema": audit.get("schema"),
@@ -2297,7 +2508,305 @@ def load_formal_arm(
                 "policy": policy_status,
                 "audit": audit_status,
             },
-            "account": account_evidence(manifest, proof),
+            "account": account_evidence(
+                manifest,
+                proof,
+                cohort=account_window_cohort,
+            ),
+            "candidate_order_seed_evidence": seed_evidence,
+        }
+    )
+    return result
+
+
+def load_confirmatory_formal_role(
+    *,
+    role: str,
+    receipt: Mapping[str, Any],
+    spec: ArmSpec,
+    root: Path,
+    prices: Mapping[str, Price],
+    plan: Mapping[str, Any],
+    cohort_id: str,
+    expected_cohort_sha256: str,
+) -> dict[str, Any]:
+    """Load one receipt-authenticated role without legacy controller assumptions."""
+
+    reasons: list[str] = []
+    result: dict[str, Any] = {
+        "spec": asdict(spec),
+        "state": "formal_evidence_invalid",
+        "declared_state": str(receipt.get("publication_status") or "unknown"),
+        "output_dir": str(root),
+        "completion_evidence": {
+            "source": CONFIRMATORY_REPORT_INPUT_INDEX_NAME,
+            "role": role,
+            "manifest_sha256": receipt.get("manifest_sha256"),
+        },
+        "controller_reinspection": {
+            "complete": False,
+            "evidence": {
+                "source": "confirmatory_receipt_and_cohort_manifest",
+                "cohort_id": cohort_id,
+                "role": role,
+            },
+            "terminal_evidence_matches": False,
+        },
+        "failure": None,
+        "formal": False,
+        "formal_evidence_valid": False,
+        "formal_evidence_reasons": reasons,
+        "rows": [],
+        "metrics": summarize_rows([]),
+        "manifest": {},
+        "audit": {},
+        "proof": {},
+        "statuses": {"execution": "unknown", "policy": "unknown", "audit": "unknown"},
+        "account": {},
+        "candidate_order_seed_evidence": None,
+        "confirmatory_role": role,
+        "confirmatory_cohort_id": cohort_id,
+    }
+    if receipt.get("publication_status") != "complete":
+        reasons.append(f"confirmatory {role} publication_status is not complete")
+        return result
+    expected_manifest_sha = raw_sha256(receipt.get("manifest_sha256"))
+    if expected_manifest_sha is None:
+        reasons.append(f"confirmatory {role} manifest hash is invalid")
+        return result
+    try:
+        regular_directory(root)
+    except ReportError as exc:
+        reasons.append(str(exc))
+        return result
+    required_names = (
+        "manifest.json",
+        "results.jsonl",
+        "trace.jsonl",
+        "audit.json",
+        "openrouter-non-byok-campaign-proof.json",
+    )
+    required = [root / name for name in required_names]
+    try:
+        for path in required:
+            regular_file(path)
+    except ReportError as exc:
+        reasons.append(str(exc))
+        return result
+    if file_sha256(root / "manifest.json") != expected_manifest_sha:
+        reasons.append(f"confirmatory {role} manifest file hash differs from receipt")
+        return result
+
+    manifest = load_json(root / "manifest.json")
+    audit = load_json(root / "audit.json")
+    proof = load_json(root / "openrouter-non-byok-campaign-proof.json")
+    account_window_cohort, cohort_reasons = validate_account_window_cohort(
+        manifest,
+        audit,
+        proof,
+    )
+    reasons.extend(cohort_reasons)
+    if account_window_cohort is None:
+        reasons.append("confirmatory formal artifacts lack account-window cohort evidence")
+    else:
+        if account_window_cohort.get("cohort_id") != cohort_id:
+            reasons.append("confirmatory formal cohort id differs from receipt")
+        if account_window_cohort.get("role") != role:
+            reasons.append("confirmatory formal cohort role differs from receipt")
+        if account_window_cohort.get("cohort_sha256") != expected_cohort_sha256:
+            reasons.append("confirmatory formal cohort hash differs from receipt")
+    if not validate_embedded_hash(manifest, "manifest_sha256"):
+        reasons.append("manifest self-hash differs")
+    if not validate_embedded_hash(audit, "audit_sha256"):
+        reasons.append("audit self-hash differs")
+    if not validate_embedded_hash(proof, "proof_sha256"):
+        reasons.append("non-BYOK proof self-hash differs")
+    for name in (
+        "results.jsonl",
+        "trace.jsonl",
+        "audit.json",
+        "openrouter-non-byok-campaign-proof.json",
+    ):
+        valid, detail = artifact_binding_valid(root, manifest, name)
+        if not valid:
+            reasons.append(detail)
+    try:
+        rows, row_reasons = read_compact_rows(root / "results.jsonl", prices)
+    except ReportError as exc:
+        rows, row_reasons = [], [str(exc)]
+    reasons.extend(row_reasons)
+    try:
+        trace_bindings, trace_candidate_calls, trace_reasons = read_trace_evidence(
+            root / "trace.jsonl"
+        )
+    except ReportError as exc:
+        trace_bindings, trace_candidate_calls, trace_reasons = {}, {}, [str(exc)]
+    reasons.extend(trace_reasons)
+    task_ids = [str(row.get("task_id") or "") for row in rows]
+    expected_task_ids = [
+        str(value) for value in plan.get("benchmark", {}).get("task_ids") or []
+    ]
+    if len(rows) != 10:
+        reasons.append(f"results row count is {len(rows)}, expected 10")
+    if len(task_ids) != len(set(task_ids)):
+        reasons.append("result task ids are not unique")
+    if expected_task_ids and set(task_ids) != set(expected_task_ids):
+        reasons.append("result task ids differ from frozen benchmark")
+    if {row.get("group") for row in rows} != {"G1"}:
+        reasons.append("results are not exactly G1")
+    invalid_selected_bindings = [
+        str(row.get("task_id") or "")
+        for row in rows
+        if row.get("selected_attempt_binding_valid") is not True
+    ]
+    if invalid_selected_bindings:
+        reasons.append(
+            "selected generation attempt usage binding invalid for tasks: "
+            + ",".join(sorted(invalid_selected_bindings))
+        )
+    selected_ids = [str(row.get("selected_attempt_id") or "") for row in rows]
+    if len(selected_ids) != len(set(selected_ids)):
+        reasons.append("selected generation attempt ids are not unique by task")
+    expected_selected_bindings = {
+        f"G1/{row.get('task_id')}": row.get("selected_attempt_id") for row in rows
+    }
+    if manifest.get("selected_generation_attempt_bindings") != expected_selected_bindings:
+        reasons.append("manifest/result selected generation attempt bindings differ")
+    result_bindings = {
+        str(row.get("task_id") or ""): str(row.get("result_evidence_sha256") or "")
+        for row in rows
+    }
+    if trace_bindings != result_bindings:
+        reasons.append("trace/result evidence bindings differ")
+    seed_evidence = p0_5_36_seed_evidence(
+        spec,
+        trace_candidate_calls,
+        expected_task_ids=expected_task_ids,
+    )
+    if manifest.get("schema") != "opensquilla.draco.campaign-final-manifest/v1":
+        reasons.append("manifest schema differs")
+    if manifest.get("status") != "complete":
+        reasons.append("manifest status is not complete")
+    if manifest.get("execution_pass") is not True:
+        reasons.append("manifest execution_pass is not true")
+    if manifest.get("result_count") != 10 or manifest.get("task_count") != 10:
+        reasons.append("manifest result/task counts differ from 10")
+    if manifest.get("groups") != ["G1"]:
+        reasons.append("manifest groups differ from [G1]")
+    source_manifests = manifest.get("source_manifests")
+    if not isinstance(source_manifests, list) or not source_manifests or any(
+        not isinstance(source, Mapping) for source in source_manifests
+    ):
+        reasons.append("confirmatory source manifest set is missing or malformed")
+    else:
+        archive_root = root / "archive"
+        seen_archived_sources: set[Path] = set()
+        for source_index, source in enumerate(source_manifests):
+            for path_field, hash_field, label in (
+                ("path", "sha256", "manifest"),
+                ("result_path", "result_sha256", "result"),
+            ):
+                try:
+                    source_path = absolute_receipt_path(
+                        source.get(path_field),
+                        label=f"confirmatory source {source_index} {label}",
+                    )
+                    source_path.relative_to(archive_root)
+                    regular_file(source_path)
+                except (ReportError, ValueError) as exc:
+                    reasons.append(str(exc))
+                    continue
+                expected_source_sha = raw_sha256(source.get(hash_field))
+                if (
+                    expected_source_sha is None
+                    or file_sha256(source_path) != expected_source_sha
+                    or source_path in seen_archived_sources
+                ):
+                    reasons.append(
+                        f"confirmatory source {source_index} {label} hash/path differs"
+                    )
+                seen_archived_sources.add(source_path)
+    audit_binding = str(manifest.get("audit_sha256") or "")
+    if audit_binding != audit.get("audit_sha256"):
+        reasons.append("manifest/audit hash binding differs")
+    proof_binding = str(manifest.get("openrouter_non_byok_campaign_proof_sha256") or "")
+    if proof_binding != proof.get("proof_sha256"):
+        reasons.append("manifest/non-BYOK proof hash binding differs")
+    execution_status = status_dimension(
+        [manifest.get("execution_pass"), audit.get("execution_pass"), proof.get("execution_pass")],
+        warning_status="fail",
+    )
+    policy_status = status_dimension(
+        [manifest.get("policy_pass"), audit.get("policy_pass"), proof.get("policy_pass")],
+        warning_status="warning",
+    )
+    audit_status = (
+        "pass"
+        if manifest.get("audit_pass") is True and audit.get("pass") is True
+        else "warning"
+        if execution_status == "pass"
+        else "fail"
+    )
+    result.update(
+        {
+            "state": "succeeded" if not reasons else "formal_evidence_invalid",
+            "controller_reinspection": {
+                "complete": not reasons,
+                "evidence": {
+                    "source": "confirmatory_receipt_and_cohort_manifest",
+                    "cohort_id": cohort_id,
+                    "role": role,
+                    "manifest_sha256": expected_manifest_sha,
+                },
+                "terminal_evidence_matches": not reasons,
+            },
+            "formal": True,
+            "formal_evidence_valid": not reasons,
+            "formal_evidence_reasons": list(dict.fromkeys(reasons)),
+            "rows": rows,
+            "metrics": summarize_rows(rows),
+            "manifest": {
+                "schema": manifest.get("schema"),
+                "status": manifest.get("status"),
+                "execution_pass": manifest.get("execution_pass"),
+                "policy_pass": manifest.get("policy_pass"),
+                "audit_pass": manifest.get("audit_pass"),
+                "manifest_sha256": manifest.get("manifest_sha256"),
+                "warnings": manifest.get("warnings") or [],
+                **(
+                    {"account_window_cohort": account_window_cohort}
+                    if account_window_cohort is not None
+                    else {}
+                ),
+            },
+            "audit": {
+                "schema": audit.get("schema"),
+                "status": audit.get("status"),
+                "pass": audit.get("pass"),
+                "execution_pass": audit.get("execution_pass"),
+                "policy_pass": audit.get("policy_pass"),
+                "audit_sha256": audit.get("audit_sha256"),
+                "warnings": audit.get("warnings") or [],
+            },
+            "proof": {
+                "schema": proof.get("schema"),
+                "status": proof.get("status"),
+                "pass": proof.get("pass"),
+                "execution_pass": proof.get("execution_pass"),
+                "policy_pass": proof.get("policy_pass"),
+                "proof_sha256": proof.get("proof_sha256"),
+                "warnings": proof.get("warnings") or [],
+            },
+            "statuses": {
+                "execution": execution_status,
+                "policy": policy_status,
+                "audit": audit_status,
+            },
+            "account": account_evidence(
+                manifest,
+                proof,
+                cohort=account_window_cohort,
+            ),
             "candidate_order_seed_evidence": seed_evidence,
         }
     )
@@ -4091,6 +4600,101 @@ def experiment_summary_line(experiment: Mapping[str, Any]) -> str:
     )
 
 
+def confirmatory_markdown_lines(report: Mapping[str, Any]) -> list[str]:
+    evidence = report.get("confirmatory_cohorts")
+    if not isinstance(evidence, Mapping):
+        return []
+    lines = [
+        "",
+        "## 确认性逐题 AB/BA paired cohorts",
+        "",
+        (
+            f"- receipt index=`{evidence.get('path')}`；status=`{evidence.get('status')}`；"
+            f"cohorts={integer(evidence.get('cohort_count'))}；complete="
+            f"{integer(evidence.get('complete_cohort_count'))}；partial="
+            f"{integer(evidence.get('partial_cohort_count'))}。"
+        ),
+        "- 这里只摄取 controller 固定路径发布且通过 self-hash、plan binding、schedule、cohort manifest 与正式 artifact 校验的收据；不会扫描目录猜测实验。",
+    ]
+    if evidence.get("status") == "absent":
+        lines.append("- 本次没有 confirmatory receipt index；保留原 screening 报告语义。")
+        return lines
+    cohorts = evidence.get("cohorts") if isinstance(evidence.get("cohorts"), Mapping) else {}
+    for cohort_id, cohort in cohorts.items():
+        if not isinstance(cohort, Mapping):
+            continue
+        lines.extend(
+            [
+                "",
+                f"### `{cohort_id}`",
+                "",
+                f"- state=`{cohort.get('state')}`；schedule=`{cohort.get('schedule_sha256')}`；account cohort=`{cohort.get('account_window_cohort_sha256')}`。",
+                f"- evidence reasons={code_json(cohort.get('reasons') or [])}。",
+            ]
+        )
+        roles = cohort.get("roles") if isinstance(cohort.get("roles"), Mapping) else {}
+        formal_roles = {
+            role: value
+            for role, value in roles.items()
+            if isinstance(value, Mapping) and isinstance(value.get("metrics"), Mapping)
+        }
+        if formal_roles:
+            lines.extend(["", METRIC_HEADER])
+            for role in ("control", "candidate"):
+                if role in formal_roles:
+                    lines.append(metric_table_row(formal_roles[role]))
+        else:
+            lines.append(
+                "- role publications="
+                + code_json(
+                    {
+                        role: value.get("publication_status")
+                        for role, value in roles.items()
+                        if isinstance(value, Mapping)
+                    }
+                )
+                + "。"
+            )
+        comparison = cohort.get("comparison")
+        if isinstance(comparison, Mapping):
+            low, high = comparison.get("bootstrap_ci95") or [None, None]
+            lines.extend(
+                [
+                    "",
+                    (
+                        f"- paired tasks={integer(comparison.get('pair_count'))}/10；"
+                        f"mean ΔQ={fmt(comparison.get('mean_delta_quality'), 4)}；"
+                        f"95% CI=[{fmt(low, 4)}, {fmt(high, 4)}]；W/T/L="
+                        f"{integer(comparison.get('wins'))}/{integer(comparison.get('ties'))}/"
+                        f"{integer(comparison.get('losses'))}。"
+                    ),
+                    "",
+                    "| Task | Order | Control Q | Candidate Q | ΔQ |",
+                    "|---|---|---:|---:|---:|",
+                ]
+            )
+            for row in comparison.get("task_rows") or []:
+                if not isinstance(row, Mapping):
+                    continue
+                lines.append(
+                    f"| {row.get('task_id')} | {row.get('execution_order')} | "
+                    f"{fmt(row.get('control_quality'), 4)} | "
+                    f"{fmt(row.get('variant_quality'), 4)} | "
+                    f"{fmt(row.get('delta_quality'), 4)} |"
+                )
+            order_balance = comparison.get("order_balance") or {}
+            lines.append(f"- AB/BA 分层 ΔQ={code_json(order_balance)}。")
+        costs = cohort.get("costs")
+        if isinstance(costs, Mapping) and cohort.get("state") == "complete":
+            lines.append(
+                "- cohort costs：selected generation="
+                f"${fmt(costs.get('selected_generation_counted_usd'), 6)}；Judge="
+                f"${fmt(costs.get('judge_counted_usd'), 6)}；shared account actual="
+                f"${fmt(costs.get('account_delta_usd'), 6)}（仅计一次）。"
+            )
+    return lines
+
+
 def build_root_markdown(report: Mapping[str, Any]) -> str:
     experiments = report["experiments"]
     arms = report["arms"]
@@ -4100,6 +4704,16 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
     drift = report.get("replay_control_drift") or {}
     controls = report.get("comparison_controls") or {}
     c3 = (report.get("promotion") or {}).get("P0-20-E3") or {}
+    paired_cohort_count = integer(costs.get("paired_cohort_count"))
+    account_window_design = (
+        f"确认性 control/candidate 使用 {paired_cohort_count} 个认证 paired cohort 共享账户窗口；"
+        "selected generation 与 Judge 仍逐臂统计，账户 delta 按 cohort_id 只计一次。"
+        if paired_cohort_count
+        else (
+            "每个正式臂保留独立的 10 行 finalizer 和串行账户窗口；"
+            "因此只能做 anchored-serial 时间控制。"
+        )
+    )
     lines = [
         "# P0 / P0.5 DRACO Mini 综合实验结果",
         "",
@@ -4109,16 +4723,17 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
         f"- 冻结提交/tree：`{report['freeze'].get('snapshot_commit')}` / `{report['freeze'].get('snapshot_tree')}`；DRACO mini 10 题，task concurrency=`{report['execution'].get('task_concurrency')}`。",
         f"- 计划候选 live arms={completion['planned_arm_count']}；formal succeeded={completion['formal_succeeded_arm_count']}；wire no-op={completion['wire_no_op_arm_count']}；failed/blocked={completion['failed_or_blocked_arm_count']}。",
         f"- Active experiment comparison evidence=`{completion['comparison_evidence_valid']}`；invalid={code_json(completion['comparison_evidence_invalid_experiment_ids'])}。",
+        f"- Confirmatory receipt evidence=`{completion.get('confirmatory_evidence_status')}`；complete cohorts={integer(completion.get('confirmatory_complete_cohort_count'))}；partial cohorts={integer(completion.get('confirmatory_partial_cohort_count'))}。",
         "- 31 个新 live experiment groups、P0.5-07 formal no-op，以及 P0-01/P0-02/P0.5-31/P0-15 既有证据均单独索引；任何缺失/失败均保持显式，不伪装完整。",
         "- 本任务集没有独立 SafetyGate。所有结果只是固定 10 题 mini 调参诊断，不能自动推广 winner 或直接改写默认配置。",
-        f"- 调度=`{schedule.get('design_label')}`、schedule evidence=`{schedule.get('valid')}`、strict task interleaving=`False`。这是三 replay E0 锚定的整臂串行近似，不是逐题 AB/BA。",
+        f"- Screening 调度=`{schedule.get('design_label')}`、schedule evidence=`{schedule.get('valid')}`、strict task interleaving=`False`。Screening 是三 replay E0 锚定的整臂串行近似；任何逐题 AB/BA 结果只在下方认证 confirmatory cohort 中报告。",
         f"- `P0-20-E3`=`{c3.get('status') or 'mini_diagnostic_only'}`，不得作为降本链 C3 晋级证据。它位于 R1 anchor 后的近邻串行 tranche（ordinal gap={c3.get('schedule_ordinal_gap', 'unknown')}）以减小时漂，但不满足源计划要求的逐题 E0/候选交错。",
         "- source control 使用 live Analyzer；三个 replay controls 与所有 frozen candidates 使用同一 frozen-replay Analyzer mode，跨 mode 不生成 paired 比较。",
         "",
         "## 调度、E0 漂移与时间局限",
         "",
         f"- Schedule SHA=`{schedule.get('schedule_sha256')}`；status SHA=`{schedule.get('status_schedule_sha256')}`；source=`{controls.get('source_arm_id')}`；replay controls={code_json(controls.get('replay_control_arm_ids') or [])}。",
-        "- 每个正式臂保留独立的 10 行 finalizer 和串行账户窗口；因此只能做 anchored-serial 时间控制。候选与 anchor 的 lag 如实列出，ΔQ 仍可能包含 provider/time drift。",
+        f"- {account_window_design} 候选与 anchor 的 lag 如实列出，ΔQ 仍可能包含 provider/time drift。",
         f"- Schedule validation reasons={code_json(schedule.get('reasons') or [])}。",
         "",
         "### Frozen-replay E0 漂移",
@@ -4156,6 +4771,7 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
             f"`{timing.get('started_at') or 'not-started'}` | `{timing.get('anchor_completed_at') or 'not-complete'}` | "
             f"{fmt(timing.get('anchor_lag_seconds'), 1)} |"
         )
+    lines.extend(confirmatory_markdown_lines(report))
     lines.extend(
         [
         "",
@@ -4193,7 +4809,14 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
             f"| Campaign account actual | {fmt(costs.get('account_delta_usd'), 6)} | `{costs.get('account_windows_complete')}` | — | — | includes Judge; never add to theoretical totals |",
             f"| Campaign BYOK delta | {fmt(costs.get('byok_delta_usd'), 6)} | — | — | — | policy/audit evidence, not execution status |",
             "",
-            "source 与三个 replay control 均只按唯一 arm 各计一次；它们虽被多个实验组引用，绝不按引用次数重复累计。",
+            (
+                "source 与三个 replay control 均只按唯一 arm 各计一次；它们虽被多个实验组引用，绝不按引用次数重复累计。"
+                + (
+                    " Paired cohort 的账户实际增量按 cohort_id 去重，control/candidate 不会双算。"
+                    if paired_cohort_count
+                    else ""
+                )
+            ),
             "",
             "## 重复实验配对",
             "",
@@ -4264,9 +4887,12 @@ def build_group_json(
 
 
 def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-    formal = [
-        arm for arm in arms.values() if arm.get("formal_evidence_valid") is True and arm.get("rows")
+    formal_items = [
+        (arm_id, arm)
+        for arm_id, arm in arms.items()
+        if arm.get("formal_evidence_valid") is True and arm.get("rows")
     ]
+    formal = [arm for _, arm in formal_items]
     generation_values = [
         number(arm.get("metrics", {}).get("selected_generation_cost_counted_usd"))
         for arm in formal
@@ -4277,17 +4903,73 @@ def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any
         for arm in formal
         if number(arm.get("metrics", {}).get("judge_cost_counted_usd")) is not None
     ]
+    account_groups: dict[str, dict[str, Any]] = {}
+    cohort_arm_count = 0
+    for arm_id, arm in formal_items:
+        account = arm.get("account") if isinstance(arm.get("account"), Mapping) else {}
+        cohort = (
+            account.get("account_window_cohort")
+            if isinstance(account.get("account_window_cohort"), Mapping)
+            else None
+        )
+        if cohort is None:
+            key = f"arm:{arm_id}"
+            cohort_id = None
+            cohort_sha = None
+            role = None
+        else:
+            cohort_arm_count += 1
+            cohort_id = str(cohort.get("cohort_id") or "")
+            cohort_sha = str(cohort.get("cohort_sha256") or "")
+            role = str(cohort.get("role") or "")
+            key = f"cohort:{cohort_id}"
+        delta = number(account.get("account_delta_usd"))
+        byok = number(account.get("byok_delta_usd"))
+        current = account_groups.get(key)
+        if current is None:
+            account_groups[key] = {
+                "cohort_id": cohort_id,
+                "cohort_sha256": cohort_sha,
+                "roles": {role} if role else set(),
+                "account_delta_usd": delta,
+                "byok_delta_usd": byok,
+                "stable": account.get("reconciliation_stable") is True,
+                "arm_ids": [arm_id],
+            }
+            continue
+        if (
+            current["cohort_sha256"] != cohort_sha
+            or delta != current["account_delta_usd"]
+            or byok != current["byok_delta_usd"]
+            or role in current["roles"]
+        ):
+            raise ReportError(
+                f"account-window cohort {cohort_id!r} has conflicting role/hash/delta evidence"
+            )
+        current["roles"].add(role)
+        current["stable"] = current["stable"] and account.get("reconciliation_stable") is True
+        current["arm_ids"].append(arm_id)
+
     account_values = [
-        number(arm.get("account", {}).get("account_delta_usd"))
-        for arm in formal
-        if number(arm.get("account", {}).get("account_delta_usd")) is not None
+        value["account_delta_usd"]
+        for value in account_groups.values()
+        if value["account_delta_usd"] is not None
     ]
     byok_values = [
-        number(arm.get("account", {}).get("byok_delta_usd"))
-        for arm in formal
-        if number(arm.get("account", {}).get("byok_delta_usd")) is not None
+        value["byok_delta_usd"]
+        for value in account_groups.values()
+        if value["byok_delta_usd"] is not None
     ]
-    return {
+    account_complete = bool(formal) and all(
+        value["account_delta_usd"] is not None
+        and value["stable"] is True
+        and (
+            value["cohort_id"] is None
+            or value["roles"] == {"control", "candidate"}
+        )
+        for value in account_groups.values()
+    )
+    result = {
         "unique_formal_arm_count": len(formal),
         "selected_generation_counted_usd": sum(
             value for value in generation_values if value is not None
@@ -4326,11 +5008,501 @@ def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any
         "byok_delta_usd": sum(value for value in byok_values if value is not None)
         if byok_values
         else None,
-        "account_windows_complete": bool(formal)
-        and len(account_values) == len(formal)
-        and all(arm.get("account", {}).get("reconciliation_stable") is True for arm in formal),
+        "account_windows_complete": account_complete,
         "note": "unique arms only; shared common E0 is counted once; account actual includes Judge and is never added to theoretical cost",
     }
+    if cohort_arm_count:
+        result.update(
+            {
+                "unique_account_window_count": len(account_groups),
+                "paired_cohort_count": sum(
+                    value["cohort_id"] is not None for value in account_groups.values()
+                ),
+                "paired_cohort_arm_count": cohort_arm_count,
+                "account_window_groups": [
+                    {
+                        "cohort_id": value["cohort_id"],
+                        "cohort_sha256": value["cohort_sha256"],
+                        "roles": sorted(value["roles"]),
+                        "arm_ids": sorted(value["arm_ids"]),
+                        "account_delta_usd": value["account_delta_usd"],
+                        "byok_delta_usd": value["byok_delta_usd"],
+                        "stable": value["stable"],
+                    }
+                    for value in sorted(
+                        account_groups.values(),
+                        key=lambda item: (str(item["cohort_id"] or ""), item["arm_ids"]),
+                    )
+                ],
+                "note": (
+                    "selected generation and Judge remain per-arm; shared account-window "
+                    "deltas are counted once per authenticated cohort_id"
+                ),
+            }
+        )
+    return result
+
+
+def _confirmatory_task_order_evidence(
+    comparison: Mapping[str, Any],
+    schedule: Mapping[str, Any],
+) -> dict[str, Any]:
+    task_schedule = schedule.get("task_schedule")
+    order_by_task = {
+        str(item.get("task_id") or ""): str(item.get("order") or "")
+        for item in task_schedule or []
+        if isinstance(item, Mapping)
+    }
+    task_rows = []
+    by_order: dict[str, list[float]] = {"AB": [], "BA": []}
+    for raw in comparison.get("task_rows") or []:
+        row = dict(raw)
+        order = order_by_task.get(str(row.get("task_id") or ""), "unknown")
+        row["execution_order"] = order
+        task_rows.append(row)
+        delta = number(row.get("delta_quality"))
+        if order in by_order and delta is not None:
+            by_order[order].append(delta)
+    result = copy.deepcopy(dict(comparison))
+    result["task_rows"] = task_rows
+    result["order_balance"] = {
+        order: {
+            "pair_count": len(values),
+            "mean_delta_quality": mean(values),
+        }
+        for order, values in by_order.items()
+    }
+    return result
+
+
+def _partial_confirmatory_entry(
+    entry: Mapping[str, Any],
+    *,
+    reasons: Sequence[str],
+) -> dict[str, Any]:
+    roles = entry.get("roles") if isinstance(entry.get("roles"), Mapping) else {}
+    role_receipts = {
+        role: {
+            "arm_id": value.get("arm_id"),
+            "experiment_id": value.get("experiment_id"),
+            "root": value.get("root"),
+            "manifest_sha256": value.get("manifest_sha256"),
+            "publication_status": value.get("publication_status"),
+            "formal_evidence_valid": False,
+            "formal_evidence_reasons": ["confirmatory cohort is partial; role not loaded"],
+        }
+        for role, value in roles.items()
+        if role in {"control", "candidate"} and isinstance(value, Mapping)
+    }
+    return {
+        "cohort_id": entry.get("cohort_id"),
+        "state": "partial",
+        "formal_evidence_valid": False,
+        "reasons": list(dict.fromkeys(str(reason) for reason in reasons if str(reason))),
+        "status": entry.get("status"),
+        "schedule_sha256": entry.get("schedule_sha256"),
+        "schedule_path": entry.get("schedule_path"),
+        "schedule_file_sha256": entry.get("schedule_file_sha256"),
+        "cohort_root": entry.get("cohort_root"),
+        "cohort_manifest_path": entry.get("cohort_manifest_path"),
+        "cohort_manifest_sha256": entry.get("cohort_manifest_sha256"),
+        "account_window_cohort_sha256": entry.get("account_window_cohort_sha256"),
+        "entry_sha256": entry.get("entry_sha256"),
+        "failure": copy.deepcopy(entry.get("failure")),
+        "roles": role_receipts,
+        "comparison": None,
+        "costs": compute_unique_costs({}),
+    }
+
+
+def load_confirmatory_report_input_entry(
+    entry: Mapping[str, Any],
+    *,
+    specs_by_id: Mapping[str, ArmSpec],
+    prices: Mapping[str, Price],
+    plan: Mapping[str, Any],
+    plan_sha256: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Authenticate and load exactly one receipt-declared confirmatory cohort."""
+
+    reasons: list[str] = []
+    cohort_id = str(entry.get("cohort_id") or "")
+    safe_chars = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    )
+    if (
+        not 1 <= len(cohort_id) <= 128
+        or not cohort_id[0].isalnum()
+        or any(char not in safe_chars for char in cohort_id)
+    ):
+        reasons.append("confirmatory cohort id is invalid")
+    if not validate_embedded_hash(entry, "entry_sha256", prefixed=False):
+        reasons.append("confirmatory report-input entry self-hash differs")
+    if entry.get("campaign_plan_sha256") != plan_sha256:
+        reasons.append("confirmatory report-input entry is bound to another campaign plan")
+    roles = entry.get("roles")
+    if not isinstance(roles, Mapping) or set(roles) != {"control", "candidate"}:
+        reasons.append("confirmatory report-input entry roles are incomplete")
+        roles = {}
+    else:
+        for role in ("control", "candidate"):
+            if not isinstance(roles.get(role), Mapping):
+                reasons.append(f"confirmatory {role} receipt is malformed")
+    status = str(entry.get("status") or "")
+    if status not in {"complete", "partial"}:
+        reasons.append("confirmatory report-input entry status is invalid")
+    if status == "partial":
+        failure = entry.get("failure")
+        if isinstance(failure, Mapping) and failure.get("reason"):
+            reasons.append(f"launcher failure: {failure.get('reason')}")
+        for role in ("control", "candidate"):
+            receipt = roles.get(role) if isinstance(roles.get(role), Mapping) else {}
+            publication_status = str(receipt.get("publication_status") or "missing")
+            if publication_status != "complete":
+                reasons.append(f"{role} publication_status={publication_status}")
+        if not reasons:
+            reasons.append("controller declared a partial confirmatory cohort")
+        return _partial_confirmatory_entry(entry, reasons=reasons), {}
+    if reasons:
+        return _partial_confirmatory_entry(entry, reasons=reasons), {}
+
+    schedule_sha = raw_sha256(entry.get("schedule_sha256"))
+    schedule_file_sha = raw_sha256(entry.get("schedule_file_sha256"))
+    cohort_manifest_sha = raw_sha256(entry.get("cohort_manifest_sha256"))
+    account_cohort_sha = prefixed_sha256(entry.get("account_window_cohort_sha256"))
+    if schedule_sha is None:
+        reasons.append("confirmatory schedule semantic hash is invalid")
+    if schedule_file_sha is None:
+        reasons.append("confirmatory schedule file hash is invalid")
+    if cohort_manifest_sha is None:
+        reasons.append("confirmatory cohort manifest file hash is invalid")
+    if account_cohort_sha is None:
+        reasons.append("confirmatory account-window cohort hash is invalid")
+    try:
+        cohort_root = absolute_receipt_path(entry.get("cohort_root"), label="cohort root")
+        regular_directory(cohort_root)
+        schedule_path = absolute_receipt_path(
+            entry.get("schedule_path"), label="confirmatory schedule"
+        )
+        cohort_manifest_path = absolute_receipt_path(
+            entry.get("cohort_manifest_path"), label="confirmatory cohort manifest"
+        )
+    except ReportError as exc:
+        reasons.append(str(exc))
+        return _partial_confirmatory_entry(entry, reasons=reasons), {}
+    if schedule_path != cohort_root / "archive" / "confirmatory-schedule.json":
+        reasons.append("confirmatory schedule path is outside its fixed cohort location")
+    if cohort_manifest_path != cohort_root / "cohort-manifest.json":
+        reasons.append("confirmatory cohort manifest path is outside its fixed cohort location")
+    try:
+        regular_file(schedule_path)
+        regular_file(cohort_manifest_path)
+    except ReportError as exc:
+        reasons.append(str(exc))
+    if schedule_file_sha is not None and file_sha256(schedule_path) != schedule_file_sha:
+        reasons.append("confirmatory schedule file hash differs from receipt")
+    if cohort_manifest_sha is not None and file_sha256(cohort_manifest_path) != cohort_manifest_sha:
+        reasons.append("confirmatory cohort manifest file hash differs from receipt")
+    if reasons:
+        return _partial_confirmatory_entry(entry, reasons=reasons), {}
+
+    schedule = load_json(schedule_path)
+    if schedule.get("schema") != CONFIRMATORY_SCHEDULE_SCHEMA:
+        reasons.append("confirmatory schedule schema differs")
+    if not validate_embedded_hash(schedule, "schedule_sha256", prefixed=False):
+        reasons.append("confirmatory schedule self-hash differs")
+    if schedule.get("schedule_sha256") != schedule_sha:
+        reasons.append("confirmatory schedule hash differs from receipt")
+    if schedule.get("campaign_plan_sha256") != plan_sha256:
+        reasons.append("confirmatory schedule is bound to another campaign plan")
+    if schedule.get("cohort_id") != cohort_id or schedule.get("output_name") != cohort_id:
+        reasons.append("confirmatory schedule cohort identity differs")
+    benchmark_task_ids = [
+        str(value) for value in plan.get("benchmark", {}).get("task_ids") or []
+    ]
+    schedule_task_ids = [
+        str(item.get("task_id") or "")
+        for item in schedule.get("task_schedule") or []
+        if isinstance(item, Mapping)
+    ]
+    if (
+        len(schedule_task_ids) != 10
+        or schedule_task_ids != benchmark_task_ids
+        or len(set(schedule_task_ids)) != 10
+    ):
+        reasons.append("confirmatory schedule task order differs from the frozen benchmark")
+    schedule_orders = [
+        str(item.get("order") or "")
+        for item in schedule.get("task_schedule") or []
+        if isinstance(item, Mapping)
+    ]
+    if Counter(schedule_orders) != Counter({"AB": 5, "BA": 5}):
+        reasons.append("confirmatory schedule is not balanced 5 AB / 5 BA")
+
+    cohort_manifest = load_json(cohort_manifest_path)
+    if cohort_manifest.get("schema") != CONFIRMATORY_COHORT_MANIFEST_SCHEMA:
+        reasons.append("confirmatory cohort manifest schema differs")
+    if not validate_embedded_hash(cohort_manifest, "manifest_sha256", prefixed=False):
+        reasons.append("confirmatory cohort manifest self-hash differs")
+    if cohort_manifest.get("status") != "complete":
+        reasons.append("confirmatory cohort manifest is not complete")
+    if cohort_manifest.get("cohort_id") != cohort_id:
+        reasons.append("confirmatory cohort manifest id differs")
+    if cohort_manifest.get("schedule_sha256") != schedule_sha:
+        reasons.append("confirmatory cohort manifest schedule hash differs")
+    if cohort_manifest.get("account_delta_report_scope") != "paired_cohort_once":
+        reasons.append("confirmatory cohort account-delta scope differs")
+    if cohort_manifest.get("screening_is_diagnostic_only") is not True:
+        reasons.append("confirmatory cohort diagnostic-only declaration differs")
+    manifest_roles = cohort_manifest.get("roles")
+    if not isinstance(manifest_roles, Mapping) or set(manifest_roles) != {
+        "control",
+        "candidate",
+    }:
+        reasons.append("confirmatory cohort manifest roles are incomplete")
+        manifest_roles = {}
+
+    schedule_roles = schedule.get("roles")
+    if not isinstance(schedule_roles, Mapping) or set(schedule_roles) != {
+        "control",
+        "candidate",
+    }:
+        reasons.append("confirmatory schedule roles are incomplete")
+        schedule_roles = {}
+    role_context: dict[str, tuple[ArmSpec, Mapping[str, Any], Path]] = {}
+    for role in ("control", "candidate"):
+        receipt = roles.get(role) if isinstance(roles.get(role), Mapping) else {}
+        if receipt.get("publication_status") != "complete":
+            reasons.append(f"confirmatory {role} publication is not complete")
+            continue
+        arm_id = str(receipt.get("arm_id") or "")
+        experiment_id = str(receipt.get("experiment_id") or "")
+        spec = specs_by_id.get(arm_id)
+        if spec is None:
+            reasons.append(f"confirmatory {role} arm is absent from the frozen plan")
+            continue
+        if spec.experiment_id != experiment_id:
+            reasons.append(f"confirmatory {role} experiment identity differs from the plan")
+        schedule_role = (
+            schedule_roles.get(role) if isinstance(schedule_roles.get(role), Mapping) else {}
+        )
+        if (
+            schedule_role.get("arm_id") != arm_id
+            or schedule_role.get("experiment_id") != experiment_id
+            or schedule_role.get("analyzer_mode") != spec.analyzer_mode
+        ):
+            reasons.append(f"confirmatory {role} schedule identity differs from receipt")
+        manifest_sha = raw_sha256(receipt.get("manifest_sha256"))
+        if manifest_sha is None:
+            reasons.append(f"confirmatory {role} manifest hash is invalid")
+            continue
+        try:
+            root = absolute_receipt_path(receipt.get("root"), label=f"{role} root")
+            regular_directory(root)
+        except ReportError as exc:
+            reasons.append(str(exc))
+            continue
+        if root != cohort_root / role:
+            reasons.append(f"confirmatory {role} root is outside its fixed cohort location")
+        formal_manifest_path = root / "manifest.json"
+        try:
+            regular_file(formal_manifest_path)
+        except ReportError as exc:
+            reasons.append(str(exc))
+            continue
+        if file_sha256(formal_manifest_path) != manifest_sha:
+            reasons.append(f"confirmatory {role} manifest hash differs from receipt")
+        manifest_role = (
+            manifest_roles.get(role)
+            if isinstance(manifest_roles.get(role), Mapping)
+            else {}
+        )
+        relative_path = Path(str(manifest_role.get("path") or ""))
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or cohort_root / relative_path != formal_manifest_path
+            or manifest_role.get("sha256") != manifest_sha
+        ):
+            reasons.append(f"confirmatory {role} cohort-manifest binding differs")
+        role_context[role] = (spec, receipt, root)
+    if set(role_context) == {"control", "candidate"}:
+        control_spec = role_context["control"][0]
+        candidate_spec = role_context["candidate"][0]
+        if (
+            candidate_spec.control_arm_id != control_spec.arm_id
+            or candidate_spec.analyzer_mode != control_spec.analyzer_mode
+        ):
+            reasons.append("confirmatory control/candidate plan binding differs")
+    if reasons:
+        return _partial_confirmatory_entry(entry, reasons=reasons), {}
+
+    internal_roles: dict[str, dict[str, Any]] = {}
+    for role, (spec, receipt, root) in role_context.items():
+        internal_roles[role] = load_confirmatory_formal_role(
+            role=role,
+            receipt=receipt,
+            spec=spec,
+            root=root,
+            prices=prices,
+            plan=plan,
+            cohort_id=cohort_id,
+            expected_cohort_sha256=str(account_cohort_sha),
+        )
+        reasons.extend(internal_roles[role].get("formal_evidence_reasons") or [])
+    if all(role in internal_roles for role in ("control", "candidate")):
+        descriptors = {
+            role: internal_roles[role].get("account", {}).get(
+                "account_window_cohort"
+            )
+            for role in ("control", "candidate")
+        }
+        if any(not isinstance(value, Mapping) for value in descriptors.values()):
+            reasons.append("confirmatory role account-window cohort evidence is missing")
+        else:
+            control_descriptor = descriptors["control"]
+            candidate_descriptor = descriptors["candidate"]
+            if (
+                control_descriptor.get("members") != candidate_descriptor.get("members")
+                or control_descriptor.get("account_evidence")
+                != candidate_descriptor.get("account_evidence")
+                or control_descriptor.get("cohort_sha256")
+                != candidate_descriptor.get("cohort_sha256")
+            ):
+                reasons.append("confirmatory role cohort descriptors differ")
+    comparison: dict[str, Any] | None = None
+    costs = compute_unique_costs({})
+    if not reasons:
+        try:
+            comparison = _confirmatory_task_order_evidence(
+                paired(internal_roles["control"], internal_roles["candidate"]),
+                schedule,
+            )
+            if comparison.get("pair_count") != 10:
+                reasons.append("confirmatory paired comparison does not cover all ten tasks")
+            costs = compute_unique_costs(internal_roles)
+            if costs.get("account_windows_complete") is not True:
+                reasons.append("confirmatory cohort account window is incomplete")
+        except ReportError as exc:
+            reasons.append(str(exc))
+    if reasons:
+        partial = _partial_confirmatory_entry(entry, reasons=reasons)
+        partial["roles"] = {
+            role: compact_arm_for_json(value) for role, value in internal_roles.items()
+        }
+        partial["comparison"] = comparison
+        partial["costs"] = costs
+        return partial, {}
+    public = {
+        "cohort_id": cohort_id,
+        "state": "complete",
+        "formal_evidence_valid": True,
+        "reasons": [],
+        "status": status,
+        "schedule_sha256": schedule_sha,
+        "schedule_path": str(schedule_path),
+        "schedule_file_sha256": schedule_file_sha,
+        "schedule": {
+            "seed": schedule.get("seed"),
+            "task_schedule": copy.deepcopy(schedule.get("task_schedule") or []),
+            "order_balance": copy.deepcopy(schedule.get("order_balance") or {}),
+            "execution_contract": copy.deepcopy(schedule.get("execution_contract") or {}),
+        },
+        "cohort_root": str(cohort_root),
+        "cohort_manifest_path": str(cohort_manifest_path),
+        "cohort_manifest_sha256": cohort_manifest_sha,
+        "account_window_cohort_sha256": account_cohort_sha,
+        "entry_sha256": entry.get("entry_sha256"),
+        "failure": None,
+        "roles": {
+            role: compact_arm_for_json(value) for role, value in internal_roles.items()
+        },
+        "comparison": comparison,
+        "costs": costs,
+    }
+    cost_arms = {
+        f"confirmatory:{cohort_id}:{role}": value
+        for role, value in internal_roles.items()
+    }
+    return public, cost_arms
+
+
+def load_confirmatory_report_inputs(
+    *,
+    run_root: Path,
+    plan: Mapping[str, Any],
+    plan_sha256: str,
+    specs: Sequence[ArmSpec],
+    prices: Mapping[str, Price],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Load only the controller-published fixed receipt; never scan directories."""
+
+    index_path = run_root / CONFIRMATORY_REPORT_INPUT_INDEX_NAME
+    try:
+        mode = index_path.lstat().st_mode
+    except FileNotFoundError:
+        return {
+            "status": "absent",
+            "available": False,
+            "valid": True,
+            "path": str(index_path),
+            "cohort_count": 0,
+            "complete_cohort_count": 0,
+            "partial_cohort_count": 0,
+            "cohorts": {},
+        }, {}
+    except OSError as exc:
+        raise ReportError(f"cannot inspect confirmatory report-input index: {exc}") from exc
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise ReportError("confirmatory report-input index is not a regular non-symlink file")
+    index = load_json(index_path)
+    if index.get("schema") != CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA:
+        raise ReportError("confirmatory report-input index schema differs")
+    if index.get("campaign_plan_sha256") != plan_sha256:
+        raise ReportError("confirmatory report-input index is bound to another campaign plan")
+    if not validate_embedded_hash(index, "index_sha256", prefixed=False):
+        raise ReportError("confirmatory report-input index self-hash differs")
+    entries = index.get("entries")
+    if not isinstance(entries, list):
+        raise ReportError("confirmatory report-input index entries are malformed")
+    if any(not isinstance(entry, Mapping) for entry in entries):
+        raise ReportError("confirmatory report-input index entry is not an object")
+    cohort_ids = [str(entry.get("cohort_id") or "") for entry in entries]
+    if cohort_ids != sorted(cohort_ids) or len(cohort_ids) != len(set(cohort_ids)):
+        raise ReportError("confirmatory report-input entries are not uniquely cohort-sorted")
+    specs_by_id = {spec.arm_id: spec for spec in specs}
+    cohorts: dict[str, Any] = {}
+    cost_arms: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        cohort, entry_cost_arms = load_confirmatory_report_input_entry(
+            entry,
+            specs_by_id=specs_by_id,
+            prices=prices,
+            plan=plan,
+            plan_sha256=plan_sha256,
+        )
+        key = str(cohort.get("cohort_id") or f"invalid-{len(cohorts) + 1}")
+        cohorts[key] = cohort
+        cost_arms.update(entry_cost_arms)
+    complete_count = sum(
+        cohort.get("state") == "complete" for cohort in cohorts.values()
+    )
+    partial_count = len(cohorts) - complete_count
+    status = "complete" if entries and not partial_count else "partial"
+    return {
+        "schema": CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA,
+        "status": status,
+        "available": True,
+        "valid": status == "complete",
+        "path": str(index_path),
+        "file_sha256": file_sha256(index_path),
+        "index_sha256": index.get("index_sha256"),
+        "campaign_plan_sha256": index.get("campaign_plan_sha256"),
+        "cohort_count": len(cohorts),
+        "complete_cohort_count": complete_count,
+        "partial_cohort_count": partial_count,
+        "cohorts": cohorts,
+    }, cost_arms
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -4425,6 +5597,13 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         arms[spec.arm_id]["schedule"] = copy.deepcopy(
             schedule_evidence.get("arm_timing", {}).get(spec.arm_id, {})
         )
+    confirmatory_cohorts, confirmatory_cost_arms = load_confirmatory_report_inputs(
+        run_root=run_root,
+        plan=plan,
+        plan_sha256=plan_sha,
+        specs=specs,
+        prices=prices,
+    )
     c3_evidence = p0_20_e3_promotion_evidence(schedule_evidence)
     if "P0-20-E3" in arms:
         arms["P0-20-E3"]["c3_promotion_evidence"] = c3_evidence
@@ -4466,6 +5645,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         and derived.get("valid") is True
         and schedule_evidence.get("valid") is True
         and comparison_evidence_valid
+        and confirmatory_cohorts.get("valid") is True
         else "partial_or_failed"
         if phase in TERMINAL_PHASES
         else "nonterminal_snapshot"
@@ -4483,6 +5663,15 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "comparison_evidence_valid": comparison_evidence_valid,
         "comparison_evidence_invalid_experiment_ids": (
             comparison_evidence_invalid_experiment_ids
+        ),
+        "confirmatory_evidence_status": confirmatory_cohorts.get("status"),
+        "confirmatory_evidence_valid": confirmatory_cohorts.get("valid") is True,
+        "confirmatory_cohort_count": confirmatory_cohorts.get("cohort_count"),
+        "confirmatory_complete_cohort_count": confirmatory_cohorts.get(
+            "complete_cohort_count"
+        ),
+        "confirmatory_partial_cohort_count": confirmatory_cohorts.get(
+            "partial_cohort_count"
         ),
         "planned_arm_count": len(arms),
         "formal_succeeded_arm_count": len(succeeded),
@@ -4519,6 +5708,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "terminal_status_input": str(status_path),
             "mutable_status": str(run_root / "status.json"),
             "derived_plan": derived.get("path"),
+            "confirmatory_report_inputs": confirmatory_cohorts.get("path"),
             "output_root": str(output_root),
         },
         "price_registry": price_metadata,
@@ -4543,9 +5733,15 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "completion": completion,
         "derived": derived,
         "legacy_evidence": legacy,
+        "confirmatory_cohorts": confirmatory_cohorts,
         "arms": {arm_id: compact_arm_for_json(arm) for arm_id, arm in arms.items()},
         "experiments": experiments,
-        "unique_arm_costs": compute_unique_costs(arms),
+        "unique_arm_costs": compute_unique_costs(
+            {
+                **arms,
+                **confirmatory_cost_arms,
+            }
+        ),
     }
     # Group Markdown is written first so the root report can link only to
     # artifacts produced by this exact in-memory evidence snapshot.

@@ -434,6 +434,125 @@ class CostTests(unittest.TestCase):
         self.assertEqual(report.selected_model_usage(row, self.prices), {})
 
 
+class AccountWindowCohortTests(unittest.TestCase):
+    @staticmethod
+    def _descriptor(role: str) -> dict:
+        stable = {
+            "schema": report.ACCOUNT_WINDOW_COHORT_SCHEMA,
+            "cohort_id": "confirmatory-pair-1",
+            "members": {
+                member_role: {
+                    "results": [
+                        {"source_index": 0, "sha256": "a" * 64}
+                    ],
+                    "manifests": [
+                        {"source_index": 0, "sha256": "b" * 64}
+                    ],
+                    "selected_generation_attempt_bindings_sha256": "sha256:" + "c" * 64,
+                }
+                for member_role in ("control", "candidate")
+            },
+            "account_evidence": {
+                "account_before_sha256": "d" * 64,
+                "account_after_sha256": "e" * 64,
+                "account_reconciliation_sha256": "f" * 64,
+                "runtime_environment_sha256": "0" * 64,
+            },
+        }
+        companion = "candidate" if role == "control" else "control"
+        return {
+            **stable,
+            "role": role,
+            "companion_role": companion,
+            "cohort_sha256": "sha256:" + report.canonical_sha256(stable),
+        }
+
+    @classmethod
+    def _arm(cls, role: str, generation: float, judge: float) -> dict:
+        return {
+            "formal_evidence_valid": True,
+            "rows": [{}],
+            "metrics": {
+                "selected_generation_cost_counted_usd": generation,
+                "selected_generation_cost_complete": True,
+                "selected_generation_cost_estimated_request_count": 0,
+                "selected_generation_cost_ignored_request_count": 0,
+                "judge_cost_counted_usd": judge,
+                "judge_cost_complete": True,
+                "judge_cost_estimated_request_count": 0,
+                "judge_cost_ignored_request_count": 0,
+            },
+            "account": {
+                "account_delta_usd": 5.0,
+                "byok_delta_usd": 0.0,
+                "reconciliation_stable": True,
+                "account_window_cohort": cls._descriptor(role),
+            },
+        }
+
+    def test_shared_account_delta_is_counted_once_but_arm_costs_are_not(self) -> None:
+        costs = report.compute_unique_costs(
+            {
+                "E0": self._arm("control", 1.0, 0.1),
+                "E1": self._arm("candidate", 2.0, 0.2),
+            }
+        )
+        self.assertEqual(costs["selected_generation_counted_usd"], 3.0)
+        self.assertAlmostEqual(costs["judge_counted_usd"], 0.3)
+        self.assertEqual(costs["account_delta_usd"], 5.0)
+        self.assertEqual(costs["byok_delta_usd"], 0.0)
+        self.assertTrue(costs["account_windows_complete"])
+        self.assertEqual(costs["unique_account_window_count"], 1)
+        self.assertEqual(costs["paired_cohort_count"], 1)
+        self.assertEqual(costs["paired_cohort_arm_count"], 2)
+        self.assertEqual(costs["account_window_groups"][0]["roles"], ["candidate", "control"])
+
+    def test_shared_account_delta_requires_two_distinct_consistent_roles(self) -> None:
+        duplicate = self._arm("control", 2.0, 0.2)
+        with self.assertRaisesRegex(report.ReportError, "conflicting role/hash/delta"):
+            report.compute_unique_costs(
+                {"E0": self._arm("control", 1.0, 0.1), "E1": duplicate}
+            )
+
+        conflicting = self._arm("candidate", 2.0, 0.2)
+        conflicting["account"]["account_delta_usd"] = 5.1
+        with self.assertRaisesRegex(report.ReportError, "conflicting role/hash/delta"):
+            report.compute_unique_costs(
+                {"E0": self._arm("control", 1.0, 0.1), "E1": conflicting}
+            )
+
+    def test_formal_artifacts_must_bind_the_same_cohort_descriptor(self) -> None:
+        descriptor = self._descriptor("control")
+        manifest = {"account_window_cohort": descriptor}
+        audit = {"account_window_cohort": json.loads(json.dumps(descriptor))}
+        proof = {"account_window_cohort": json.loads(json.dumps(descriptor))}
+        cohort, reasons = report.validate_account_window_cohort(manifest, audit, proof)
+        self.assertEqual(reasons, [])
+        self.assertEqual(cohort, descriptor)
+
+        proof["account_window_cohort"]["role"] = "candidate"
+        _, reasons = report.validate_account_window_cohort(manifest, audit, proof)
+        self.assertIn("account-window cohort evidence differs across formal artifacts", reasons)
+
+        self.assertEqual(report.validate_account_window_cohort({}, {}, {}), (None, []))
+
+    def test_legacy_arms_keep_independent_account_windows_and_shape(self) -> None:
+        arms = {}
+        for arm_id, delta in (("E0", 3.0), ("E1", 4.0)):
+            arm = self._arm("control", 1.0, 0.1)
+            arm["account"].pop("account_window_cohort")
+            arm["account"]["account_delta_usd"] = delta
+            arms[arm_id] = arm
+        costs = report.compute_unique_costs(arms)
+        self.assertEqual(costs["account_delta_usd"], 7.0)
+        self.assertNotIn("unique_account_window_count", costs)
+        self.assertNotIn("account_window_groups", costs)
+        self.assertEqual(
+            costs["note"],
+            "unique arms only; shared common E0 is counted once; account actual includes Judge and is never added to theoretical cost",
+        )
+
+
 class AnalyzerOriginTests(unittest.TestCase):
     def test_v2_replay_fallback_is_explicit_and_preserves_reason(self) -> None:
         evidence = report.task_analyzer_origin_evidence(
@@ -1494,6 +1613,203 @@ class EndToEndTests(unittest.TestCase):
             "artifact_sha256": {key: report.file_sha256(path) for key, path in files.items()},
         }
 
+    def _bind_confirmatory_cohort(
+        self,
+        root: Path,
+        *,
+        role: str,
+        descriptor: dict,
+    ) -> None:
+        audit_path = root / "audit.json"
+        proof_path = root / "openrouter-non-byok-campaign-proof.json"
+        manifest_path = root / "manifest.json"
+        audit = json.loads(audit_path.read_text())
+        audit.pop("audit_sha256")
+        audit["account_window_cohort"] = descriptor
+        seal(audit, "audit_sha256")
+        write_json(audit_path, audit)
+        proof = json.loads(proof_path.read_text())
+        proof.pop("proof_sha256")
+        proof["account_window_cohort"] = descriptor
+        seal(proof, "proof_sha256")
+        write_json(proof_path, proof)
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("manifest_sha256")
+        manifest["account_window_cohort"] = descriptor
+        manifest["audit_sha256"] = audit["audit_sha256"]
+        manifest["openrouter_non_byok_campaign_proof_sha256"] = proof["proof_sha256"]
+        source_manifests = []
+        for shard in (1, 2, 3, 4):
+            shard_root = root / "archive" / f"shard-{shard}"
+            shard_root.mkdir(parents=True)
+            source_result = shard_root / "results.jsonl"
+            source_manifest = shard_root / "manifest.json"
+            source_result.write_text("{}\n", encoding="utf-8")
+            write_json(
+                source_manifest,
+                {"artifacts": {"results_jsonl": str(source_result)}},
+            )
+            source_manifests.append(
+                {
+                    "path": str(source_manifest.resolve()),
+                    "sha256": report.file_sha256(source_manifest),
+                    "result_path": str(source_result.resolve()),
+                    "result_sha256": report.file_sha256(source_result),
+                    "runner_kind": "main",
+                    "role": role,
+                    "shard": shard,
+                    "execution_scheduling": {"task_concurrency": 3},
+                }
+            )
+        manifest["source_manifests"] = source_manifests
+        for name, path in (
+            ("audit.json", audit_path),
+            ("openrouter-non-byok-campaign-proof.json", proof_path),
+        ):
+            manifest["artifacts"][name] = {
+                "path": name,
+                "size_bytes": path.stat().st_size,
+                "sha256": report.file_sha256(path),
+            }
+        seal(manifest, "manifest_sha256")
+        write_json(manifest_path, manifest)
+
+    def _write_confirmatory_index(
+        self,
+        *,
+        partial: bool = False,
+        omit_candidate: bool = False,
+    ) -> tuple[Path, dict]:
+        cohort_id = "P0-12-E1-confirmatory-synthetic"
+        cohort_root = self.report_root / "confirmatory" / cohort_id
+        cohort_root.mkdir(parents=True)
+        descriptor_by_role = {
+            role: AccountWindowCohortTests._descriptor(role)
+            for role in ("control", "candidate")
+        }
+        for descriptor in descriptor_by_role.values():
+            descriptor["cohort_id"] = cohort_id
+            stable = {
+                "schema": descriptor["schema"],
+                "cohort_id": descriptor["cohort_id"],
+                "members": descriptor["members"],
+                "account_evidence": descriptor["account_evidence"],
+            }
+            descriptor["cohort_sha256"] = "sha256:" + report.canonical_sha256(stable)
+        role_specs = {
+            "control": ("common-E0-R1", "common-E0", 50.0),
+            "candidate": ("P0-12-E1", "P0-12", 52.0),
+        }
+        role_receipts = {}
+        for role, (arm_id, experiment_id, quality) in role_specs.items():
+            root = cohort_root / role
+            self._formal_arm(root, quality, arm_id)
+            self._bind_confirmatory_cohort(
+                root,
+                role=role,
+                descriptor=descriptor_by_role[role],
+            )
+            role_receipts[role] = {
+                "arm_id": arm_id,
+                "experiment_id": experiment_id,
+                "root": str(root.resolve()),
+                "manifest_sha256": report.file_sha256(root / "manifest.json"),
+                "publication_status": "complete",
+            }
+        schedule = {
+            "schema": report.CONFIRMATORY_SCHEDULE_SCHEMA,
+            "campaign_plan_sha256": report.canonical_sha256(self.plan),
+            "campaign_run_id": self.plan["run_id"],
+            "cohort_id": cohort_id,
+            "output_name": cohort_id,
+            "seed": "synthetic-confirmatory",
+            "benchmark": {"task_ids": self.task_ids, "task_count": 10, "group": "G1"},
+            "roles": {
+                "control": {
+                    "arm_id": "common-E0-R1",
+                    "experiment_id": "common-E0",
+                    "analyzer_mode": "frozen_replay",
+                },
+                "candidate": {
+                    "arm_id": "P0-12-E1",
+                    "experiment_id": "P0-12",
+                    "analyzer_mode": "frozen_replay",
+                },
+            },
+            "task_schedule": [
+                {
+                    "task_id": task_id,
+                    "input_ordinal": index + 1,
+                    "order": "AB" if index < 5 else "BA",
+                    "first_role": "control" if index < 5 else "candidate",
+                    "second_role": "candidate" if index < 5 else "control",
+                    "assignment_sha256": hashlib.sha256(task_id.encode()).hexdigest(),
+                }
+                for index, task_id in enumerate(self.task_ids)
+            ],
+            "order_balance": {"AB": 5, "BA": 5},
+            "execution_contract": {"global_task_concurrency": 6},
+        }
+        schedule["schedule_sha256"] = report.canonical_sha256(schedule)
+        schedule_path = cohort_root / "archive" / "confirmatory-schedule.json"
+        write_json(schedule_path, schedule)
+        cohort_manifest = {
+            "schema": report.CONFIRMATORY_COHORT_MANIFEST_SCHEMA,
+            "status": "complete",
+            "cohort_id": cohort_id,
+            "schedule_sha256": schedule["schedule_sha256"],
+            "roles": {
+                role: {
+                    "path": f"{role}/manifest.json",
+                    "sha256": receipt["manifest_sha256"],
+                }
+                for role, receipt in role_receipts.items()
+            },
+            "account_delta_report_scope": "paired_cohort_once",
+            "screening_is_diagnostic_only": True,
+        }
+        cohort_manifest["manifest_sha256"] = report.canonical_sha256(cohort_manifest)
+        cohort_manifest_path = cohort_root / "cohort-manifest.json"
+        write_json(cohort_manifest_path, cohort_manifest)
+        if partial:
+            role_receipts["control"]["publication_status"] = "present_unverified"
+            role_receipts["candidate"]["publication_status"] = "missing"
+            role_receipts["candidate"]["manifest_sha256"] = None
+            if omit_candidate:
+                role_receipts.pop("candidate")
+        entry = {
+            "campaign_plan_sha256": report.canonical_sha256(self.plan),
+            "cohort_id": cohort_id,
+            "schedule_sha256": schedule["schedule_sha256"],
+            "schedule_path": str(schedule_path.resolve()) if not partial else None,
+            "schedule_file_sha256": report.file_sha256(schedule_path) if not partial else None,
+            "cohort_root": str(cohort_root.resolve()),
+            "cohort_manifest_path": str(cohort_manifest_path.resolve()) if not partial else None,
+            "cohort_manifest_sha256": (
+                report.file_sha256(cohort_manifest_path) if not partial else None
+            ),
+            "roles": role_receipts,
+            "account_window_cohort_sha256": (
+                descriptor_by_role["control"]["cohort_sha256"] if not partial else None
+            ),
+            "status": "partial" if partial else "complete",
+            "failure": (
+                {"reason": "candidate_launcher_failed", "launcher_returncode": 1}
+                if partial
+                else None
+            ),
+        }
+        entry["entry_sha256"] = report.canonical_sha256(entry)
+        index = {
+            "schema": report.CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA,
+            "campaign_plan_sha256": report.canonical_sha256(self.plan),
+            "entries": [entry],
+        }
+        index["index_sha256"] = report.canonical_sha256(index)
+        index_path = self.run_root / report.CONFIRMATORY_REPORT_INPUT_INDEX_NAME
+        write_json(index_path, index)
+        return index_path, entry
+
     def _controller_evidence(
         self,
         verifier: report.FrozenControllerVerifier,
@@ -1573,6 +1889,148 @@ class EndToEndTests(unittest.TestCase):
             report.METRIC_HEADER.splitlines()[0],
             "| Arm | Rows | Done | AvgQ | AvgPass | JudgeErr | Avg Gen$ | Total Gen$ | Gen exact | Avg Input | Avg Output | Avg Reason | Avg Cache | Avg Visible | Avg Tokens | Avg Tools | Tool% | Avg Steps | Avg LLMReq | p50 ms | p95 ms |",
         )
+
+    def test_confirmatory_receipt_is_ingested_and_shared_account_is_counted_once(self) -> None:
+        self._write_confirmatory_index()
+        output = self.root / "confirmatory-output"
+        result, exit_code = report.generate(
+            argparse.Namespace(
+                plan=self.plan_path,
+                status=self.status_path,
+                derived_plan=self.derived_path,
+                price_registry=self.snapshot / report.PRICE_REGISTRY_RELATIVE,
+                output_root=output,
+                allow_nonterminal=False,
+                strict=True,
+            )
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["completion"]["status"], "complete")
+        confirmatory = result["confirmatory_cohorts"]
+        self.assertEqual(confirmatory["status"], "complete")
+        self.assertTrue(confirmatory["valid"])
+        self.assertEqual(confirmatory["complete_cohort_count"], 1)
+        cohort = next(iter(confirmatory["cohorts"].values()))
+        self.assertEqual(cohort["state"], "complete")
+        self.assertTrue(cohort["formal_evidence_valid"])
+        self.assertEqual(cohort["comparison"]["pair_count"], 10)
+        self.assertEqual(
+            {row["execution_order"] for row in cohort["comparison"]["task_rows"]},
+            {"AB", "BA"},
+        )
+        self.assertEqual(cohort["comparison"]["order_balance"]["AB"]["pair_count"], 5)
+        self.assertEqual(cohort["comparison"]["order_balance"]["BA"]["pair_count"], 5)
+        self.assertEqual(cohort["costs"]["selected_generation_counted_usd"], 4.0)
+        self.assertEqual(cohort["costs"]["account_delta_usd"], 3.0)
+        costs = result["unique_arm_costs"]
+        self.assertEqual(costs["unique_formal_arm_count"], 7)
+        self.assertEqual(costs["selected_generation_counted_usd"], 14.0)
+        # Five screening account windows ($15) plus one shared confirmatory
+        # cohort window ($3), not two confirmatory role windows ($6).
+        self.assertEqual(costs["account_delta_usd"], 18.0)
+        self.assertEqual(costs["paired_cohort_count"], 1)
+        markdown = (output / "EXPERIMENT_RESULTS.md").read_text()
+        self.assertIn("确认性逐题 AB/BA paired cohorts", markdown)
+        self.assertIn("paired tasks=10/10", markdown)
+        self.assertIn("shared account actual=$3.000000", markdown)
+
+    def test_partial_confirmatory_receipt_is_explicit_and_strict_exit_two(self) -> None:
+        self._write_confirmatory_index(partial=True, omit_candidate=True)
+        result, exit_code = report.generate(
+            argparse.Namespace(
+                plan=self.plan_path,
+                status=self.status_path,
+                derived_plan=self.derived_path,
+                price_registry=self.snapshot / report.PRICE_REGISTRY_RELATIVE,
+                output_root=self.root / "partial-confirmatory-output",
+                allow_nonterminal=False,
+                strict=True,
+            )
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["completion"]["status"], "partial_or_failed")
+        self.assertFalse(result["completion"]["confirmatory_evidence_valid"])
+        confirmatory = result["confirmatory_cohorts"]
+        self.assertEqual(confirmatory["status"], "partial")
+        self.assertEqual(confirmatory["partial_cohort_count"], 1)
+        cohort = next(iter(confirmatory["cohorts"].values()))
+        self.assertEqual(cohort["state"], "partial")
+        self.assertFalse(cohort["formal_evidence_valid"])
+        self.assertIn("launcher failure: candidate_launcher_failed", cohort["reasons"])
+        self.assertTrue(
+            any("roles are incomplete" in reason for reason in cohort["reasons"])
+        )
+        # No partial role is laundered into formal cost totals.
+        self.assertEqual(result["unique_arm_costs"]["unique_formal_arm_count"], 5)
+        self.assertEqual(result["unique_arm_costs"]["account_delta_usd"], 15.0)
+
+    def test_confirmatory_manifest_hash_mismatch_becomes_partial(self) -> None:
+        _, entry = self._write_confirmatory_index()
+        candidate_manifest = Path(entry["roles"]["candidate"]["root"]) / "manifest.json"
+        candidate_manifest.write_text(
+            candidate_manifest.read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        result, exit_code = report.generate(
+            argparse.Namespace(
+                plan=self.plan_path,
+                status=self.status_path,
+                derived_plan=self.derived_path,
+                price_registry=self.snapshot / report.PRICE_REGISTRY_RELATIVE,
+                output_root=self.root / "tampered-confirmatory-output",
+                allow_nonterminal=False,
+                strict=True,
+            )
+        )
+        self.assertEqual(exit_code, 2)
+        cohort = next(iter(result["confirmatory_cohorts"]["cohorts"].values()))
+        self.assertEqual(cohort["state"], "partial")
+        self.assertTrue(
+            any("candidate manifest hash differs" in reason for reason in cohort["reasons"])
+        )
+
+    def test_confirmatory_archived_source_tamper_becomes_partial(self) -> None:
+        _, entry = self._write_confirmatory_index()
+        control_manifest = json.loads(
+            (Path(entry["roles"]["control"]["root"]) / "manifest.json").read_text()
+        )
+        source_result = Path(control_manifest["source_manifests"][0]["result_path"])
+        source_result.write_text("{\"tampered\": true}\n", encoding="utf-8")
+        result, exit_code = report.generate(
+            argparse.Namespace(
+                plan=self.plan_path,
+                status=self.status_path,
+                derived_plan=self.derived_path,
+                price_registry=self.snapshot / report.PRICE_REGISTRY_RELATIVE,
+                output_root=self.root / "tampered-confirmatory-source-output",
+                allow_nonterminal=False,
+                strict=True,
+            )
+        )
+        self.assertEqual(exit_code, 2)
+        cohort = next(iter(result["confirmatory_cohorts"]["cohorts"].values()))
+        self.assertEqual(cohort["state"], "partial")
+        self.assertTrue(
+            any("source 0 result hash/path differs" in reason for reason in cohort["reasons"])
+        )
+
+    def test_confirmatory_index_self_hash_mismatch_fails_closed(self) -> None:
+        index_path, _ = self._write_confirmatory_index(partial=True)
+        index = json.loads(index_path.read_text())
+        index["index_sha256"] = "0" * 64
+        write_json(index_path, index)
+        with self.assertRaisesRegex(report.ReportError, "index self-hash differs"):
+            report.generate(
+                argparse.Namespace(
+                    plan=self.plan_path,
+                    status=self.status_path,
+                    derived_plan=self.derived_path,
+                    price_registry=self.snapshot / report.PRICE_REGISTRY_RELATIVE,
+                    output_root=self.root / "bad-index-output",
+                    allow_nonterminal=False,
+                    strict=True,
+                )
+            )
 
     def test_controller_manifest_hash_binding_fails_closed(self) -> None:
         status = json.loads(self.status_path.read_text())

@@ -63,6 +63,7 @@ PROOF_SCHEMA = "opensquilla.draco.openrouter-non-byok-campaign-proof/v1"
 LEDGER_SCHEMA = "opensquilla.draco.actual-spend-ledger/v1"
 AUDIT_SCHEMA = "opensquilla.draco.campaign-final-audit/v1"
 MANIFEST_SCHEMA = "opensquilla.draco.campaign-final-manifest/v1"
+ACCOUNT_WINDOW_COHORT_SCHEMA = "opensquilla.draco.account-window-cohort/v1"
 RESOLUTION_SCHEMA = "opensquilla.draco.openrouter-non-byok-resolution/v1"
 GENERATION_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-generation-attempt/v1"
 JUDGE_ATTEMPT_EVIDENCE_SCHEMA = "opensquilla.draco-judge-attempt/v1"
@@ -83,6 +84,8 @@ JUDGE_ATTEMPT_BUDGET_SCOPE = "criterion_repeat_campaign"
 JUDGE_ATTEMPT_BUDGET_LIMIT = 3
 JUDGE_ATTEMPT_BUDGET_EXHAUSTED_ERROR = "judge_attempt_budget_exhausted"
 FINALIZER_VERSION = 9
+ACCOUNT_WINDOW_COHORT_ROLES = frozenset({"control", "candidate"})
+ACCOUNT_WINDOW_COHORT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 FROZEN_DRACO_MINI_TASK_COUNT = 10
 FROZEN_DRACO_MINI_SHA256 = "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
 FORMAL_REQUIRED_STABLE_POLL_COUNT = 6
@@ -1523,6 +1526,179 @@ def read_source_rows(paths: Sequence[Path]) -> tuple[list[SourceRecord], dict[st
     if not records:
         raise FinalizationError("result sources contain no sealed rows")
     return records, snapshots
+
+
+def account_window_cohort_request(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Normalize the optional two-arm shared-account-window contract."""
+
+    cohort_id = str(getattr(args, "cohort_id", "") or "").strip()
+    role = str(getattr(args, "cohort_role", "") or "").strip()
+    companion_results = list(getattr(args, "cohort_companion_result", ()) or ())
+    companion_manifests = list(getattr(args, "cohort_companion_manifest", ()) or ())
+    supplied = bool(cohort_id or role or companion_results or companion_manifests)
+    if not supplied:
+        return None
+    if not ACCOUNT_WINDOW_COHORT_ID.fullmatch(cohort_id):
+        raise FinalizationError(
+            "--cohort-id must be one safe 1-128 character identifier"
+        )
+    if role not in ACCOUNT_WINDOW_COHORT_ROLES:
+        raise FinalizationError("--cohort-role must be control or candidate")
+    if not companion_results or len(companion_results) != len(companion_manifests):
+        raise FinalizationError(
+            "paired cohort requires one companion manifest for every companion result"
+        )
+    active_results = [require_regular_file(Path(path), owner_only=True) for path in args.result]
+    active_manifests = [
+        require_regular_file(Path(path), owner_only=True) for path in args.manifest
+    ]
+    normalized_results = [
+        require_regular_file(Path(path), owner_only=True) for path in companion_results
+    ]
+    normalized_manifests = [
+        require_regular_file(Path(path), owner_only=True) for path in companion_manifests
+    ]
+    all_paths = [
+        *active_results,
+        *active_manifests,
+        *normalized_results,
+        *normalized_manifests,
+    ]
+    if len({str(path) for path in all_paths}) != len(all_paths):
+        raise FinalizationError("cohort active and companion sources must be disjoint")
+    companion_role = next(iter(ACCOUNT_WINDOW_COHORT_ROLES - {role}))
+    return {
+        "cohort_id": cohort_id,
+        "role": role,
+        "companion_role": companion_role,
+        "active_results": active_results,
+        "active_manifests": active_manifests,
+        "companion_results": normalized_results,
+        "companion_manifests": normalized_manifests,
+    }
+
+
+def reindex_source_records(
+    records: Sequence[SourceRecord],
+    *,
+    source_index_offset: int,
+) -> list[SourceRecord]:
+    """Shift an independently authenticated arm into one cohort source index space."""
+
+    return [
+        SourceRecord(
+            path=record.path,
+            source_index=record.source_index + source_index_offset,
+            line=record.line,
+            row=record.row,
+        )
+        for record in records
+    ]
+
+
+def _cohort_member_sources(
+    *,
+    result_paths: Sequence[Path],
+    manifest_paths: Sequence[Path],
+) -> dict[str, Any]:
+    def stable_manifest_sha256(path: Path) -> str:
+        # Confirmatory role archives are self-contained copies. Their manifest
+        # artifact paths are rebased to the copy root, so raw bytes differ by
+        # role even though the authenticated run contract is identical. Bind
+        # the canonical manifest with artifact locations reduced to basenames;
+        # result bytes and selected-attempt bindings remain independently exact.
+        payload = load_json(path, owner_only=True)
+        artifacts = payload.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            raise FinalizationError("cohort source manifest lacks artifact bindings")
+        normalized = copy.deepcopy(payload)
+        normalized["artifacts"] = {
+            key: Path(value).name if isinstance(value, str) and value else value
+            for key, value in artifacts.items()
+        }
+        return canonical_sha256(normalized)
+
+    return {
+        "results": [
+            {"source_index": index, "sha256": file_sha256(path)}
+            for index, path in enumerate(result_paths)
+        ],
+        "manifests": [
+            {"source_index": index, "sha256": stable_manifest_sha256(path)}
+            for index, path in enumerate(manifest_paths)
+        ],
+    }
+
+
+def build_account_window_cohort(
+    request: Mapping[str, Any],
+    *,
+    account_before: Path,
+    account_after: Path,
+    account_reconciliation: Path,
+    runtime_environment: Path,
+    selected_bindings_by_role: Mapping[str, Mapping[str, str]],
+) -> dict[str, Any]:
+    """Build a role-independent cohort identity plus the current arm's role."""
+
+    role = str(request["role"])
+    companion_role = str(request["companion_role"])
+    members = {
+        role: {
+            **_cohort_member_sources(
+                result_paths=request["active_results"],
+                manifest_paths=request["active_manifests"],
+            ),
+            "selected_generation_attempt_bindings_sha256": canonical_sha256(
+                dict(sorted(selected_bindings_by_role[role].items())),
+                prefix=True,
+            ),
+        },
+        companion_role: {
+            **_cohort_member_sources(
+                result_paths=request["companion_results"],
+                manifest_paths=request["companion_manifests"],
+            ),
+            "selected_generation_attempt_bindings_sha256": canonical_sha256(
+                dict(sorted(selected_bindings_by_role[companion_role].items())),
+                prefix=True,
+            ),
+        },
+    }
+    stable_projection = {
+        "schema": ACCOUNT_WINDOW_COHORT_SCHEMA,
+        "cohort_id": str(request["cohort_id"]),
+        "members": dict(sorted(members.items())),
+        "account_evidence": {
+            "account_before_sha256": file_sha256(account_before),
+            "account_after_sha256": file_sha256(account_after),
+            "account_reconciliation_sha256": file_sha256(account_reconciliation),
+            "runtime_environment_sha256": file_sha256(runtime_environment),
+        },
+    }
+    return {
+        **stable_projection,
+        "role": role,
+        "companion_role": companion_role,
+        "cohort_sha256": canonical_sha256(stable_projection, prefix=True),
+    }
+
+
+def bind_account_window_cohort(
+    payload: Mapping[str, Any],
+    cohort: Mapping[str, Any] | None,
+    *,
+    hash_field: str,
+) -> dict[str, Any]:
+    """Conditionally bind cohort evidence and reseal an already-built proof."""
+
+    bound = copy.deepcopy(dict(payload))
+    if cohort is None:
+        return bound
+    bound.pop(hash_field, None)
+    bound["account_window_cohort"] = copy.deepcopy(dict(cohort))
+    bound[hash_field] = canonical_sha256(bound, prefix=True)
+    return bound
 
 
 def verify_source_snapshots(snapshots: Mapping[str, str]) -> None:
@@ -10182,14 +10358,31 @@ def build_actual_spend_ledger(
     *,
     selected: Sequence[SourceRecord] = (),
     selected_attempt_bindings: Mapping[str, str] | None = None,
+    source_namespaces: Mapping[int, str] | None = None,
+    companion_selected_attempt_bindings: Mapping[str, str] | None = None,
+    companion_namespace: str = "",
     judge_model: str = JUDGE_MODEL,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Rebuild physical spend from every wave; never trust a row-level total."""
 
     entries: dict[str, LedgerEntry] = {}
     response_id_bindings: dict[str, dict[str, Any]] = {}
-    seen_generation_attempts: set[str] = set()
-    generation_attempt_versions: dict[str, list[tuple[SourceRecord, Mapping[str, Any], int]]] = (
+    namespaces = dict(source_namespaces or {})
+    if namespaces:
+        record_indexes = {record.source_index for record in records}
+        if set(namespaces) != record_indexes or any(
+            namespace not in ACCOUNT_WINDOW_COHORT_ROLES
+            for namespace in namespaces.values()
+        ):
+            raise FinalizationError("cohort ledger source namespace coverage is invalid")
+
+    def record_namespace(record: SourceRecord) -> str:
+        return namespaces.get(record.source_index, "")
+
+    seen_generation_attempts: set[tuple[str, str]] = set()
+    generation_attempt_versions: dict[
+        tuple[str, str], list[tuple[SourceRecord, Mapping[str, Any], int]]
+    ] = (
         defaultdict(list)
     )
     bindings = (
@@ -10204,7 +10397,22 @@ def build_actual_spend_ledger(
             "selected generation attempt binding does not cover every selected pair"
         )
     selected_attempt_ids = set(bindings.values())
-    judge_run_versions: dict[str, list[tuple[SourceRecord, str, Mapping[str, Any], str]]] = (
+    selected_attempt_keys = {
+        (
+            record_namespace(record),
+            bindings[f"{record.key[0]}/{record.key[1]}"],
+        )
+        for record in selected
+    }
+    companion_bindings = dict(companion_selected_attempt_bindings or {})
+    if companion_bindings and companion_namespace not in ACCOUNT_WINDOW_COHORT_ROLES:
+        raise FinalizationError("cohort companion selection namespace is invalid")
+    companion_selected_attempt_keys = {
+        (companion_namespace, attempt_id) for attempt_id in companion_bindings.values()
+    }
+    judge_run_versions: dict[
+        tuple[str, str], list[tuple[SourceRecord, str, Mapping[str, Any], str]]
+    ] = (
         defaultdict(list)
     )
 
@@ -10221,8 +10429,11 @@ def build_actual_spend_ledger(
             if not isinstance(attempt, Mapping):
                 continue
             attempt_id = str(attempt.get("attempt_id") or "")
-            seen_generation_attempts.add(attempt_id)
-            generation_attempt_versions[attempt_id].append((record, attempt, fallback_index))
+            attempt_key = (record_namespace(record), attempt_id)
+            seen_generation_attempts.add(attempt_key)
+            generation_attempt_versions[attempt_key].append(
+                (record, attempt, fallback_index)
+            )
 
         for judge_scope, judge in (
             ("judge", row.get("judge")),
@@ -10233,12 +10444,16 @@ def build_actual_spend_ledger(
         ):
             for path, run in iter_judge_runs(judge):
                 identity = f"judge:{record.key[0]}:{record.key[1]}:{judge_scope}:{path}"
-                judge_run_versions[identity].append((record, judge_scope, run, path))
+                judge_run_versions[(record_namespace(record), identity)].append(
+                    (record, judge_scope, run, path)
+                )
 
     # A copied repair can add receipt/provider/cost metadata to the same
     # immutable attempt.  Retain exactly one physical request set, but choose
     # the most enriched monotonic copy instead of freezing the first wave.
-    for attempt_id, versions in generation_attempt_versions.items():
+    for (namespace, attempt_id), versions in generation_attempt_versions.items():
+        identity_prefix = f"cohort:{namespace}:" if namespace else ""
+        base_identity = f"{identity_prefix}generation-attempt:{attempt_id}"
         physical_record = min(
             (version[0] for version in versions),
             key=lambda candidate: (candidate.source_index, candidate.line),
@@ -10250,7 +10465,7 @@ def build_actual_spend_ledger(
                 if isinstance(attempt.get("run"), Mapping)
             ],
             label=f"generation attempt {attempt_id}",
-            identity_seed=f"generation-attempt:{attempt_id}",
+            identity_seed=base_identity,
         )
         matching_versions = [version for version in versions if version[0] is record]
         if not matching_versions:
@@ -10264,7 +10479,7 @@ def build_actual_spend_ledger(
             response_id_bindings,
             run=run,
             scope="generation",
-            base_identity=f"generation-attempt:{attempt_id}",
+            base_identity=base_identity,
             reference=record.reference
             | {
                 "group": record.key[0],
@@ -10274,7 +10489,10 @@ def build_actual_spend_ledger(
                 "attempt_id": attempt_id,
                 "attempt_kind": attempt.get("attempt_kind"),
                 "attempt_outcome": ("failed" if str(run.get("error") or "") else "successful"),
-                "selected_generation": attempt_id in selected_attempt_ids,
+                "selected_generation": (namespace, attempt_id) in selected_attempt_keys,
+                "cohort_companion_selected_generation": (
+                    (namespace, attempt_id) in companion_selected_attempt_keys
+                ),
                 "receipt_version_count": len(versions),
                 "receipt_version_selected": True,
                 "physical_source_index": physical_record.source_index,
@@ -10283,14 +10501,17 @@ def build_actual_spend_ledger(
                 "receipt_source_index": record.source_index,
                 "receipt_source_path": str(record.path),
                 "receipt_source_line": record.line,
-            },
+            }
+            | ({"account_window_cohort_role": namespace} if namespace else {}),
             occurrence_counter=Counter(),
         )
 
     # Judge repair rows copy earlier logical attempt paths.  Select the most
     # enriched monotonic copy for each path; newly appended retry paths remain
     # independent physical calls.
-    for identity, versions in judge_run_versions.items():
+    for (namespace, identity), versions in judge_run_versions.items():
+        identity_prefix = f"cohort:{namespace}:" if namespace else ""
+        base_identity = f"{identity_prefix}{identity}"
         physical_record = min(
             (version[0] for version in versions),
             key=lambda candidate: (candidate.source_index, candidate.line),
@@ -10302,7 +10523,7 @@ def build_actual_spend_ledger(
         record, run = validate_and_select_monotonic_run_version(
             [(version[0], version[2]) for version in versions],
             label=identity,
-            identity_seed=f"judge-attempt:{attempt_id}",
+            identity_seed=f"{identity_prefix}judge-attempt:{attempt_id}",
             requested_provider="openrouter",
             requested_model=judge_model,
             role="unknown_request",
@@ -10316,7 +10537,7 @@ def build_actual_spend_ledger(
             response_id_bindings,
             run=run,
             scope=judge_scope,
-            base_identity=identity,
+            base_identity=base_identity,
             reference=record.reference
             | {
                 "group": record.key[0],
@@ -10331,7 +10552,8 @@ def build_actual_spend_ledger(
                 "receipt_source_index": record.source_index,
                 "receipt_source_path": str(record.path),
                 "receipt_source_line": record.line,
-            },
+            }
+            | ({"account_window_cohort_role": namespace} if namespace else {}),
             occurrence_counter=Counter(),
         )
 
@@ -10407,6 +10629,11 @@ def build_actual_spend_ledger(
             "run-occurrence identity. Failed and replaced generation attempts remain."
         ),
     }
+    if namespaces:
+        summary["account_window_cohort_roles"] = sorted(set(namespaces.values()))
+        summary["cohort_companion_selected_generation_pair_count"] = len(
+            companion_bindings
+        )
     return ledger_rows, summary
 
 
@@ -10629,10 +10856,12 @@ def build_external_tool_cost_summary(
     records: Sequence[SourceRecord],
     *,
     manifest_sources: Sequence[Mapping[str, Any]] = (),
+    source_namespaces: Mapping[int, str] | None = None,
 ) -> dict[str, Any]:
     """Aggregate Web/Brave spend separately, deduplicated by attempt ID."""
 
-    seen_attempts: set[str] = set()
+    namespaces = dict(source_namespaces or {})
+    seen_attempts: set[tuple[str, str]] = set()
     scopes: list[dict[str, Any]] = []
     providers: set[str] = set()
     for record in sorted(records, key=lambda item: (item.source_index, item.line)):
@@ -10648,9 +10877,10 @@ def build_external_tool_cost_summary(
             if not isinstance(attempt, Mapping):
                 continue
             attempt_id = str(attempt.get("attempt_id") or "")
-            if attempt_id in seen_attempts:
+            attempt_key = (namespaces.get(record.source_index, ""), attempt_id)
+            if attempt_key in seen_attempts:
                 continue
-            seen_attempts.add(attempt_id)
+            seen_attempts.add(attempt_key)
             new_attempts.append(attempt)
         if not new_attempts:
             continue
@@ -11069,6 +11299,11 @@ def ledger_entry_payload(entry: LedgerEntry) -> dict[str, Any]:
     generation_disposition: str | None = None
     if any(reference.get("selected_generation") is True for reference in generation_references):
         generation_disposition = "selected"
+    elif any(
+        reference.get("cohort_companion_selected_generation") is True
+        for reference in generation_references
+    ):
+        generation_disposition = "cohort_companion_selected"
     elif any(reference.get("attempt_outcome") == "failed" for reference in generation_references):
         generation_disposition = "failed"
     elif generation_references:
@@ -11357,6 +11592,7 @@ def manifest_source_window_coverage(
     *,
     source_records: Sequence[SourceRecord],
     campaign_windows: Sequence[Mapping[str, Any]],
+    source_namespaces: Mapping[int, str] | None = None,
 ) -> tuple[datetime, datetime, list[dict[str, Any]]]:
     """Bind each live shard to exactly one settled campaign account window."""
 
@@ -11369,7 +11605,10 @@ def manifest_source_window_coverage(
     starts: list[datetime] = []
     completions: list[datetime] = []
     coverage: list[dict[str, Any]] = []
-    seen_generation_attempt_ids: set[str] = set()
+    namespaces = dict(source_namespaces or {})
+    if namespaces and set(namespaces) != source_indexes:
+        raise FinalizationError("cohort source-window namespace coverage is incomplete")
+    seen_generation_attempt_ids: set[tuple[str, str]] = set()
     for source_index, manifest in enumerate(manifest_sources):
         raw_started = manifest.get("started_at")
         raw_finished = manifest.get("finished_at")
@@ -11412,7 +11651,8 @@ def manifest_source_window_coverage(
                 if not isinstance(attempt, Mapping):
                     continue
                 attempt_id = str(attempt.get("attempt_id") or "")
-                if attempt_id in seen_generation_attempt_ids:
+                attempt_key = (namespaces.get(source_index, ""), attempt_id)
+                if attempt_key in seen_generation_attempt_ids:
                     continue
                 raw_attempt_started = attempt.get("started_at")
                 raw_attempt_completed = attempt.get("completed_at")
@@ -11434,7 +11674,7 @@ def manifest_source_window_coverage(
                     raise FinalizationError(
                         "physical-first generation attempt is outside its source manifest"
                     )
-                seen_generation_attempt_ids.add(attempt_id)
+                seen_generation_attempt_ids.add(attempt_key)
                 new_generation_attempt_count += 1
         matches = [
             window
@@ -11470,6 +11710,11 @@ def manifest_source_window_coverage(
                 "account_window_path": matches[0].get("path"),
                 "account_window_kind": matches[0].get("kind"),
             }
+            | (
+                {"account_window_cohort_role": namespaces[source_index]}
+                if namespaces
+                else {}
+            )
         )
     return min(starts), max(completions), coverage
 
@@ -11752,6 +11997,7 @@ def validate_account_proof(
     ledger_summary: Mapping[str, Any],
     prior_account_window_dirs: Sequence[Path] = (),
     prior_campaign_account_window_dirs: Sequence[Path] = (),
+    source_namespaces: Mapping[int, str] | None = None,
 ) -> dict[str, Any]:
     before_path = require_regular_file(before_path, owner_only=True)
     after_path = require_regular_file(after_path, owner_only=True)
@@ -12041,6 +12287,7 @@ def validate_account_proof(
         manifest_sources,
         source_records=source_records,
         campaign_windows=campaign_windows,
+        source_namespaces=source_namespaces,
     )
     ledger_window_reconciliation = reconcile_ledger_campaign_windows(
         ledger_rows,
@@ -14047,6 +14294,37 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Terminal source manifest; all manifests must bind the same contracts.",
     )
+    parser.add_argument(
+        "--cohort-id",
+        default="",
+        help=(
+            "Stable identifier for a control/candidate pair that shared this exact "
+            "account window. Omit all cohort options for legacy one-arm finalization."
+        ),
+    )
+    parser.add_argument(
+        "--cohort-role",
+        choices=sorted(ACCOUNT_WINDOW_COHORT_ROLES),
+        default=None,
+        help="Role of the active --result/--manifest arm in the paired cohort.",
+    )
+    parser.add_argument(
+        "--cohort-companion-result",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Companion arm sealed result JSONL; repeat in chronological wave order. "
+            "Used only for the shared account ledger/window, never active result selection."
+        ),
+    )
+    parser.add_argument(
+        "--cohort-companion-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="Manifest matching each --cohort-companion-result in order.",
+    )
     parser.add_argument("--account-before", type=Path, required=True)
     parser.add_argument("--account-after", type=Path, required=True)
     parser.add_argument("--account-reconciliation", type=Path, required=True)
@@ -14128,22 +14406,55 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     tasks = read_tasks(input_path)
     frozen_input_sha256 = validate_frozen_draco_input(input_path, tasks)
     source_records, source_snapshots = read_source_rows(args.result)
+    cohort_request = account_window_cohort_request(args)
+    raw_companion_records: list[SourceRecord] = []
+    companion_records: list[SourceRecord] = []
+    companion_source_snapshots: dict[str, str] = {}
+    source_namespaces: dict[int, str] = {}
+    if cohort_request is not None:
+        raw_companion_records, companion_source_snapshots = read_source_rows(
+            cohort_request["companion_results"]
+        )
+        companion_records = reindex_source_records(
+            raw_companion_records,
+            source_index_offset=len(args.result),
+        )
+        source_namespaces = {
+            **{index: cohort_request["role"] for index in range(len(args.result))},
+            **{
+                len(args.result) + index: cohort_request["companion_role"]
+                for index in range(len(cohort_request["companion_results"]))
+            },
+        }
+    account_source_records = [*source_records, *companion_records]
     unexpected_source_groups = sorted(
-        {record.key[0] for record in source_records if record.key[0] not in set(groups)}
+        {
+            record.key[0]
+            for record in account_source_records
+            if record.key[0] not in set(groups)
+        }
     )
     if unexpected_source_groups:
         raise FinalizationError(
             "result sources contain groups outside the active finalization scope: "
             f"{unexpected_source_groups}"
         )
-    source_policy_findings = validate_source_policy_history(source_records)
+    source_policy_findings = validate_source_policy_history(account_source_records)
     finalization_warnings: list[Any] = [
         {"kind": "source_policy_finding", **finding} for finding in source_policy_findings
     ]
-    critical_source_snapshots = dict(source_snapshots)
+    critical_source_snapshots = {
+        **source_snapshots,
+        **companion_source_snapshots,
+    }
     for raw_path in (
         input_path,
         *args.manifest,
+        *(
+            cohort_request["companion_manifests"]
+            if cohort_request is not None
+            else ()
+        ),
         args.account_before,
         args.account_after,
         args.account_reconciliation,
@@ -14171,13 +14482,32 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         expected_task_concurrency=expected_task_concurrency,
         expected_judge_concurrency=expected_judge_concurrency,
     )
+    companion_fingerprints: dict[str, str] = {}
+    companion_contracts: dict[str, dict[str, Any]] = {}
+    companion_manifest_sources: list[dict[str, Any]] = []
+    if cohort_request is not None:
+        (
+            companion_fingerprints,
+            companion_contracts,
+            companion_runtime_key,
+            companion_manifest_sources,
+        ) = load_manifest_contracts(
+            cohort_request["companion_manifests"],
+            result_paths=cohort_request["companion_results"],
+            groups=groups,
+            expected_task_concurrency=expected_task_concurrency,
+            expected_judge_concurrency=expected_judge_concurrency,
+        )
+        if not hmac.compare_digest(runtime_key, companion_runtime_key):
+            raise FinalizationError("cohort arms use different OpenRouter runtime keys")
+    account_manifest_sources = [*manifest_sources, *companion_manifest_sources]
     finalization_warnings.extend(
         {
             "kind": "source_manifest_audit_warning",
             "path": source.get("path"),
             "warning": warning,
         }
-        for source in manifest_sources
+        for source in account_manifest_sources
         for warning in source.get("audit_warnings") or []
     )
     experiment_policy = validate_formal_campaign_contracts(
@@ -14192,11 +14522,46 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         source_records,
         max_attempts=max_generation_attempts,
     )
+    companion_policy: FinalizerExperimentPolicy | None = None
+    companion_attempt_evidence_audit: dict[str, Any] | None = None
+    companion_max_generation_attempts: int | None = None
+    if cohort_request is not None:
+        companion_policy = validate_formal_campaign_contracts(
+            companion_contracts,
+            groups=groups,
+        )
+        companion_max_generation_attempts = authenticated_generation_attempt_limit(
+            getattr(args, "max_generation_attempts", None),
+            companion_policy,
+        )
+        active_judge_contract = (
+            experiment_policy.judge_model,
+            experiment_policy.judge_repeats,
+            experiment_policy.judge_max_attempts,
+            experiment_policy.judge_provider_pin,
+        )
+        companion_judge_contract = (
+            companion_policy.judge_model,
+            companion_policy.judge_repeats,
+            companion_policy.judge_max_attempts,
+            companion_policy.judge_provider_pin,
+        )
+        if companion_judge_contract != active_judge_contract:
+            raise FinalizationError("cohort arms use different Judge contracts")
+        companion_attempt_evidence_audit = validate_generation_attempt_evidence(
+            raw_companion_records,
+            max_attempts=companion_max_generation_attempts,
+        )
     if "G1" in groups:
         validate_g1_paid_attempt_plan_history(
             source_records,
             contracts=contracts,
         )
+        if cohort_request is not None:
+            validate_g1_paid_attempt_plan_history(
+                raw_companion_records,
+                contracts=companion_contracts,
+            )
     finalization_warnings.extend(
         {
             "kind": "physical_generation_audit_warning",
@@ -14207,6 +14572,17 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
             contracts=contracts,
         )
     )
+    if cohort_request is not None:
+        finalization_warnings.extend(
+            {
+                "kind": "cohort_companion_physical_generation_audit_warning",
+                **warning,
+            }
+            for warning in validate_physical_generation_routes(
+                raw_companion_records,
+                contracts=companion_contracts,
+            )
+        )
     try:
         judge_attempt_evidence_audit = validate_judge_attempt_evidence(
             source_records,
@@ -14223,6 +14599,30 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
             "warning": str(exc),
         }
         finalization_warnings.append({"kind": "judge_attempt_audit_conflict", "warning": str(exc)})
+    companion_judge_attempt_evidence_audit: dict[str, Any] | None = None
+    if cohort_request is not None:
+        assert companion_policy is not None
+        try:
+            companion_judge_attempt_evidence_audit = validate_judge_attempt_evidence(
+                raw_companion_records,
+                judge_model=companion_policy.judge_model,
+                judge_max_attempts=companion_policy.judge_max_attempts,
+                judge_provider_pin=companion_policy.judge_provider_pin,
+            )
+        except FinalizationError as exc:
+            if not judge_evidence_error_is_audit_only(exc):
+                raise
+            companion_judge_attempt_evidence_audit = {
+                "status": "audit_conflict",
+                "pass": False,
+                "warning": str(exc),
+            }
+            finalization_warnings.append(
+                {
+                    "kind": "cohort_companion_judge_attempt_audit_conflict",
+                    "warning": str(exc),
+                }
+            )
     selected, pair_audit = select_results(
         source_records,
         tasks=tasks,
@@ -14239,17 +14639,64 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     )
     for pair, attempt_id in selected_attempt_bindings.items():
         pair_audit[pair]["selected_generation_attempt_id"] = attempt_id
+    companion_selected: list[SourceRecord] = []
+    companion_pair_audit: dict[str, Any] = {}
+    companion_selected_attempt_bindings: dict[str, str] = {}
+    if cohort_request is not None:
+        assert companion_policy is not None
+        assert companion_max_generation_attempts is not None
+        companion_selected, companion_pair_audit = select_results(
+            raw_companion_records,
+            tasks=tasks,
+            groups=groups,
+            fingerprints=companion_fingerprints,
+            contracts=companion_contracts,
+            max_attempts=companion_max_generation_attempts,
+            experiment_policy=companion_policy,
+            manifest_sources=companion_manifest_sources,
+        )
+        companion_selected_attempt_bindings = bind_selected_generation_attempts(
+            raw_companion_records,
+            companion_selected,
+        )
+    account_window_cohort = (
+        build_account_window_cohort(
+            cohort_request,
+            account_before=require_regular_file(args.account_before, owner_only=True),
+            account_after=require_regular_file(args.account_after, owner_only=True),
+            account_reconciliation=require_regular_file(
+                args.account_reconciliation,
+                owner_only=True,
+            ),
+            runtime_environment=require_regular_file(
+                args.runtime_environment,
+                owner_only=True,
+            ),
+            selected_bindings_by_role={
+                cohort_request["role"]: selected_attempt_bindings,
+                cohort_request["companion_role"]: companion_selected_attempt_bindings,
+            },
+        )
+        if cohort_request is not None
+        else None
+    )
     ledger_rows, ledger_summary = build_actual_spend_ledger(
-        source_records,
+        account_source_records,
         selected=selected,
         selected_attempt_bindings=selected_attempt_bindings,
+        source_namespaces=source_namespaces,
+        companion_selected_attempt_bindings=companion_selected_attempt_bindings,
+        companion_namespace=(
+            cohort_request["companion_role"] if cohort_request is not None else ""
+        ),
         judge_model=experiment_policy.judge_model,
     )
     attach_retrospective_recovery_spend(pair_audit, ledger_rows)
     model_metrics = ledger_model_metrics(ledger_rows)
     external_tool_cost = build_external_tool_cost_summary(
-        source_records,
-        manifest_sources=manifest_sources,
+        account_source_records,
+        manifest_sources=account_manifest_sources,
+        source_namespaces=source_namespaces,
     )
     try:
         proof = validate_account_proof(
@@ -14260,12 +14707,13 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
             lock_file=args.lock_file,
             lock_fd=args.lock_fd,
             runtime_key_fingerprint=runtime_key,
-            source_records=source_records,
-            manifest_sources=manifest_sources,
+            source_records=account_source_records,
+            manifest_sources=account_manifest_sources,
             ledger_rows=ledger_rows,
             ledger_summary=ledger_summary,
             prior_account_window_dirs=prior_account_window_dirs,
             prior_campaign_account_window_dirs=prior_campaign_account_window_dirs,
+            source_namespaces=source_namespaces,
         )
     except FinalizationError as exc:
         if not account_proof_error_is_audit_only(exc):
@@ -14285,7 +14733,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         ),
         *(
             f"source manifest policy finding: {warning}"
-            for source in manifest_sources
+            for source in account_manifest_sources
             for warning in source.get("audit_warnings") or []
             if "byok" in str(warning).casefold()
             or "non_byok_policy_violation" in str(warning).casefold()
@@ -14308,7 +14756,7 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
         proof["proof_sha256"] = canonical_sha256(proof, prefix=True)
     inherited_reconciliation_warnings = [
         f"source manifest reconciliation finding: {warning}"
-        for source in manifest_sources
+        for source in account_manifest_sources
         for warning in source.get("audit_warnings") or []
         if "cost" in str(warning).casefold()
     ]
@@ -14331,6 +14779,12 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
         proof["proof_sha256"] = canonical_sha256(proof, prefix=True)
+    if account_window_cohort is not None:
+        proof = bind_account_window_cohort(
+            proof,
+            account_window_cohort,
+            hash_field="proof_sha256",
+        )
     final_rows = finalize_rows(
         selected,
         tasks=tasks,
@@ -14374,6 +14828,18 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
     audit["generation_attempt_evidence_schema"] = GENERATION_ATTEMPT_EVIDENCE_SCHEMA
     audit["generation_attempt_evidence"] = attempt_evidence_audit
     audit["judge_attempt_evidence_schema"] = JUDGE_ATTEMPT_EVIDENCE_SCHEMA
+    if account_window_cohort is not None:
+        audit["account_window_cohort"] = copy.deepcopy(account_window_cohort)
+        audit["cohort_companion_validation"] = {
+            "role": cohort_request["companion_role"],
+            "selected_result_count": len(companion_selected),
+            "selected_generation_attempt_bindings": dict(
+                sorted(companion_selected_attempt_bindings.items())
+            ),
+            "generation_attempt_evidence": companion_attempt_evidence_audit,
+            "judge_attempt_evidence": companion_judge_attempt_evidence_audit,
+            "pair_selection_count": len(companion_pair_audit),
+        }
     audit["frozen_draco_mini_input"] = {
         "sha256": frozen_input_sha256,
         "task_count": len(tasks),
@@ -14470,6 +14936,8 @@ def run_finalization(args: argparse.Namespace) -> dict[str, Any]:
             "account_delta_allocated_to_tasks": False,
         },
     }
+    if account_window_cohort is not None:
+        manifest_base["account_window_cohort"] = copy.deepcopy(account_window_cohort)
     return publish_atomically(
         output_dir=args.output_dir,
         final_rows=final_rows,

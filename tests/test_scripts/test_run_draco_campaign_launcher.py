@@ -69,9 +69,47 @@ def test_launcher_is_valid_bash_without_executing_it() -> None:
 
 def test_embedded_python_blocks_compile_without_executing_them() -> None:
     blocks = _embedded_python_blocks()
-    assert len(blocks) == 4
+    assert len(blocks) == 7
     for index, block in enumerate(blocks, start=1):
         compile(block, f"{LAUNCHER.name}:embedded-python-{index}", "exec")
+
+
+def test_confirmatory_mode_freezes_pair_order_and_global_concurrency() -> None:
+    script = _script()
+    assert "--confirmatory-schedule" in script
+    assert "confirmatory schedule must freeze five AB and five BA tasks" in script
+    assert "confirmatory schedule must use 6+4 tranches" in script
+    assert "Confirmatory phase exceeds global task concurrency" in script
+    assert "${#control_tasks[@]} + ${#candidate_tasks[@]} > TASK_CONCURRENCY" in script
+    assert "phase_barrier_between_legs" in script
+    assert "confirmatory schedule changed after preflight validation" in script
+    assert "CONFIRMATORY_VALIDATED_SCHEDULE_SHA256" in script
+    schedule_symlink_check = script.index('-L "$CONFIRMATORY_SCHEDULE"')
+    schedule_realpath = script.index('realpath "$CONFIRMATORY_SCHEDULE"')
+    assert schedule_symlink_check < schedule_realpath
+
+
+def test_confirmatory_mode_never_performs_unpaired_generation_resume() -> None:
+    script = _script()
+    paired_start = script.index("run_confirmatory_pair()")
+    paired_end = script.index('if [[ -n "$CONFIRMATORY_SCHEDULE" ]]', paired_start)
+    paired = script[paired_start:paired_end]
+    assert "cohort_incomplete_no_unpaired_retry" in script
+    assert "Confirmatory generation leg is incomplete; unpaired retry is forbidden" in paired
+    assert '"$RESUME_RUNNER"' not in paired
+    assert "--only-group-task-keys" not in paired
+
+
+def test_confirmatory_finalization_uses_companion_ledger_and_cohort_roles() -> None:
+    script = _script()
+    assert '--cohort-id "$cohort_id"' in script
+    assert '--cohort-role "$cohort_role"' in script
+    assert '--cohort-companion-result "$path"' in script
+    assert '--cohort-companion-manifest "$path"' in script
+    assert re.search(r"finalize_confirmatory_role \\\s+control", script)
+    assert re.search(r"finalize_confirmatory_role \\\s+candidate", script)
+    assert "rebase_copied_manifest_artifacts" in script
+    assert "confirmatory copied manifest artifact path is malformed" in script
 
 
 def test_lock_validation_runs_before_paid_window_and_fails_closed(
@@ -337,11 +375,11 @@ def test_campaign_shape_and_runtime_policy_are_frozen() -> None:
         assert fragment in script
     # Static compatibility, wave 1, and resume waves must fingerprint the
     # same strict non-BYOK policy.
-    assert script.count("--require-openrouter-non-byok") == 3
+    assert script.count("--require-openrouter-non-byok") == 5
     # The only campaign-owned dotted override is the explicit legacy
     # concurrency environment variable. Defaults and inline JSON must never be
     # silently overwritten by fixed launcher values.
-    assert script.count("--experiment-config-set") == 1
+    assert script.count("--experiment-config-set") == 3
     forbidden_fixed_args = (
         '--concurrency "$TASK_CONCURRENCY"',
         "--experiment-config-set timeouts.task_seconds=10800",
@@ -669,7 +707,7 @@ def test_snapshot_is_parameterized_and_must_be_clean() -> None:
     assert "DRACO_CAMPAIGN_OUTPUT_NAME" in script
     assert 'git -C "$SNAPSHOT_REPO" status --porcelain=v1 --untracked-files=all' in script
     assert "Formal campaign requires a completely clean source snapshot" in script
-    assert script.count("--require-clean-source") == 3
+    assert script.count("--require-clean-source") == 5
 
 
 def test_campaign_python_can_reuse_an_external_executable() -> None:
@@ -717,13 +755,13 @@ def test_direct_openrouter_and_local_web_fetch_policy_fail_closed() -> None:
 
 def test_fd9_covers_account_window_waves_settlement_and_finalizer() -> None:
     script = _script()
-    lock_open = script.index('exec 9<>"$LOCK_FILE"')
+    lock_open = script.rindex('exec 9<>"$LOCK_FILE"')
     lock_validation = script.index("validate_lock_file", lock_open)
-    account_before = script.index('capture_account_snapshot "$ACCOUNT_BEFORE"')
+    account_before = script.index('capture_account_snapshot "$ACCOUNT_BEFORE"', lock_open)
     wave_one = script.index('"$PYTHON" "$MAIN_RUNNER"', account_before)
     stable_after = script.index("capture_stable_after", wave_one)
     finalizer = script.index('"$PYTHON" "$FINALIZER" "${FINALIZER_ARGS[@]}"')
-    unlock = script.index("flock -u 9")
+    unlock = script.index("flock -u 9", finalizer)
     assert (
         lock_open < lock_validation < account_before < wave_one < stable_after < finalizer < unlock
     )

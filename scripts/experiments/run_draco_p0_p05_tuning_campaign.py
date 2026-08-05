@@ -58,6 +58,13 @@ ANALYZER_SOURCE_POLICY_SCHEMA = "opensquilla.draco-analyzer-source-policy/v1"
 PREEXISTING_SOURCE_SCHEMA = "opensquilla.draco-preexisting-analyzer-source/v1"
 PREEXISTING_SOURCE_PACKAGE_SCHEMA = "opensquilla.draco-preexisting-analyzer-source-package/v1"
 DERIVED_SCHEMA = "opensquilla.draco-p0-p05-derived-plan/v1"
+CONFIRMATORY_SCHEDULE_SCHEMA = "opensquilla.draco-p0-p05-confirmatory-schedule/v1"
+CONFIRMATORY_COHORT_MANIFEST_SCHEMA = (
+    "opensquilla.draco-confirmatory-cohort-manifest/v1"
+)
+CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA = (
+    "opensquilla.draco-confirmatory-report-input-index/v1"
+)
 RECEIPT_SCHEMA = "opensquilla.draco-offline-effect-receipt/v1"
 AGGREGATOR_PROMPT_SCHEMA = "opensquilla.router-dynamic-aggregator-prompt/v1"
 AGGREGATOR_PROMPT_VERSIONS = frozenset(
@@ -68,6 +75,9 @@ AGGREGATOR_PROMPT_VERSIONS = frozenset(
     }
 )
 EXPECTED_TASK_COUNT = 10
+CONFIRMATORY_TASK_CONCURRENCY = 6
+CONFIRMATORY_ORDER_COUNT_PER_ROLE = EXPECTED_TASK_COUNT // 2
+CONFIRMATORY_TRANCHE_SIZES = (6, 4)
 MIN_ANALYZER_P99_LIVE_OBSERVATIONS = 8
 EXPECTED_OFFLINE_UNIQUE_REPLAY_OVERLAYS = 57
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -3685,6 +3695,935 @@ def resolve_arm_override(
     return override
 
 
+def _confirmatory_order_key(*, seed: str, candidate_arm_id: str, task_id: str) -> str:
+    payload = f"{seed}\0{candidate_arm_id}\0{task_id}".encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _confirmatory_replay_payload(override: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    g1 = override.get("g1_routing")
+    execution = g1.get("task_analysis_execution") if isinstance(g1, Mapping) else None
+    return execution if isinstance(execution, Mapping) else None
+
+
+def build_confirmatory_schedule_payload(
+    plan: Mapping[str, Any],
+    *,
+    control_arm: Arm,
+    candidate_arm: Arm,
+    control_override: Mapping[str, Any],
+    candidate_override: Mapping[str, Any],
+    analyzer_artifact: Mapping[str, Any] | None,
+    seed: str,
+) -> dict[str, Any]:
+    """Freeze one strict task-paired AB/BA confirmatory cohort.
+
+    The production runner already supports exact task-id shards.  This schedule
+    freezes the causal ordering above that runner: exactly five tasks execute
+    control then candidate (AB), exactly five execute candidate then control
+    (BA), and no tranche can admit more than six tasks at once.
+    """
+
+    task_ids = plan.get("benchmark", {}).get("task_ids")
+    if (
+        not isinstance(task_ids, list)
+        or len(task_ids) != EXPECTED_TASK_COUNT
+        or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)
+        or len(set(task_ids)) != EXPECTED_TASK_COUNT
+    ):
+        raise ControllerError("confirmatory schedule requires the exact ten frozen task IDs")
+    if int(plan.get("execution", {}).get("task_concurrency", 0)) != CONFIRMATORY_TASK_CONCURRENCY:
+        raise ControllerError("confirmatory schedule requires task_concurrency=6")
+    if candidate_arm.experiment_id == "common-E0":
+        raise ControllerError("confirmatory candidate must not be a common E0 arm")
+    if candidate_arm.control_arm_id != control_arm.arm_id:
+        raise ControllerError("confirmatory candidate/control binding differs from the plan")
+    if candidate_arm.analyzer_mode != control_arm.analyzer_mode:
+        raise ControllerError("confirmatory pair must use the same Analyzer execution mode")
+    if not seed:
+        raise ControllerError("confirmatory schedule seed must be non-empty")
+
+    ranked = sorted(
+        task_ids,
+        key=lambda task_id: (
+            _confirmatory_order_key(
+                seed=seed,
+                candidate_arm_id=candidate_arm.arm_id,
+                task_id=task_id,
+            ),
+            task_id,
+        ),
+    )
+    control_first = set(ranked[:CONFIRMATORY_ORDER_COUNT_PER_ROLE])
+    task_schedule: list[dict[str, Any]] = []
+    for input_ordinal, task_id in enumerate(task_ids, start=1):
+        order = "AB" if task_id in control_first else "BA"
+        task_schedule.append(
+            {
+                "task_id": task_id,
+                "input_ordinal": input_ordinal,
+                "order": order,
+                "first_role": "control" if order == "AB" else "candidate",
+                "second_role": "candidate" if order == "AB" else "control",
+                "assignment_sha256": _confirmatory_order_key(
+                    seed=seed,
+                    candidate_arm_id=candidate_arm.arm_id,
+                    task_id=task_id,
+                ),
+            }
+        )
+
+    tranches: list[dict[str, Any]] = []
+    offset = 0
+    for tranche_index, tranche_size in enumerate(CONFIRMATORY_TRANCHE_SIZES, start=1):
+        tranche_tasks = task_schedule[offset : offset + tranche_size]
+        offset += tranche_size
+        phases: list[dict[str, Any]] = []
+        for leg, role_field in ((1, "first_role"), (2, "second_role")):
+            control_tasks = [
+                item["task_id"] for item in tranche_tasks if item[role_field] == "control"
+            ]
+            candidate_tasks = [
+                item["task_id"] for item in tranche_tasks if item[role_field] == "candidate"
+            ]
+            phases.append(
+                {
+                    "leg": leg,
+                    "control_task_ids": control_tasks,
+                    "candidate_task_ids": candidate_tasks,
+                    "max_inflight_tasks": len(control_tasks) + len(candidate_tasks),
+                }
+            )
+        tranches.append(
+            {
+                "tranche": tranche_index,
+                "task_ids": [item["task_id"] for item in tranche_tasks],
+                "phases": phases,
+            }
+        )
+    if offset != EXPECTED_TASK_COUNT:
+        raise ControllerError("confirmatory tranche sizes do not cover the frozen mini set")
+
+    frozen_analyzer: dict[str, Any] | None = None
+    if candidate_arm.analyzer_mode == "frozen_replay":
+        if not isinstance(analyzer_artifact, Mapping):
+            raise ControllerError("frozen confirmatory pair requires the Analyzer artifact")
+        replay_payload = analyzer_artifact.get("replay_payload")
+        entries = replay_payload.get("entries") if isinstance(replay_payload, Mapping) else None
+        if not isinstance(entries, Mapping) or set(entries) != set(task_ids):
+            raise ControllerError("frozen Analyzer replay must retain all ten entries")
+        control_replay = _confirmatory_replay_payload(control_override)
+        candidate_replay = _confirmatory_replay_payload(candidate_override)
+        if (
+            control_replay != replay_payload
+            or candidate_replay != replay_payload
+            or control_replay.get("mode") != "frozen_replay"
+        ):
+            raise ControllerError("both confirmatory arms must use the identical replay payload")
+        frozen_analyzer = {
+            "artifact_sha256": analyzer_artifact.get("artifact_sha256"),
+            "replay_payload_sha256": canonical_sha256(replay_payload),
+            "entry_count": len(entries),
+            "task_ids": sorted(entries),
+            "physical_analyzer_requests_per_task": 0,
+        }
+    elif analyzer_artifact is not None:
+        raise ControllerError("live Analyzer confirmatory pairs must not embed replay evidence")
+
+    core: dict[str, Any] = {
+        "schema": CONFIRMATORY_SCHEDULE_SCHEMA,
+        "campaign_plan_sha256": canonical_sha256(plan),
+        "campaign_run_id": str(plan.get("run_id") or ""),
+        "snapshot_commit": str(plan.get("freeze", {}).get("snapshot_commit") or ""),
+        "snapshot_tree": str(plan.get("freeze", {}).get("snapshot_tree") or ""),
+        "benchmark": {
+            "name": "DRACO mini",
+            "group": "G1",
+            "task_count": EXPECTED_TASK_COUNT,
+            "task_ids": list(task_ids),
+            "input_sha256": plan.get("benchmark", {}).get("input_sha256"),
+        },
+        "seed": seed,
+        "roles": {
+            "control": {
+                "arm_id": control_arm.arm_id,
+                "experiment_id": control_arm.experiment_id,
+                "variant": control_arm.variant,
+                "replicate": control_arm.replicate,
+                "analyzer_mode": control_arm.analyzer_mode,
+                "override": copy.deepcopy(dict(control_override)),
+            },
+            "candidate": {
+                "arm_id": candidate_arm.arm_id,
+                "experiment_id": candidate_arm.experiment_id,
+                "variant": candidate_arm.variant,
+                "replicate": candidate_arm.replicate,
+                "control_arm_id": candidate_arm.control_arm_id,
+                "analyzer_mode": candidate_arm.analyzer_mode,
+                "override": copy.deepcopy(dict(candidate_override)),
+            },
+        },
+        "task_schedule": task_schedule,
+        "order_balance": {"AB": 5, "BA": 5},
+        "tranches": tranches,
+        "execution_contract": {
+            "global_task_concurrency": CONFIRMATORY_TASK_CONCURRENCY,
+            "phase_barrier_between_legs": True,
+            "generation_max_attempts": int(
+                plan.get("execution", {}).get("generation_max_attempts", 0)
+            ),
+            "generation_leg_failure_policy": "cohort_incomplete_no_unpaired_retry",
+            "allowed_post_pair_repairs": ["judge_only", "metadata_only", "audit_only"],
+        },
+        "frozen_analyzer": frozen_analyzer,
+        "account_window_contract": {
+            "scope": "paired_cohort_shared",
+            "single_exclusive_lock": True,
+            "single_account_before_after": True,
+            "companion_ledger_required": True,
+            "report_account_delta_once": True,
+        },
+        "screening_contract": {
+            "source_screening_is_diagnostic_only": True,
+            "confirmatory_mini_is_diagnostic_only": True,
+            "automatic_winner_promotion": False,
+        },
+    }
+    identity_sha256 = canonical_sha256(core)
+    cohort_id = (
+        f"{candidate_arm.experiment_id}-{candidate_arm.variant}-confirmatory-"
+        f"{identity_sha256[:16]}"
+    )
+    if SAFE_COMPONENT_RE.fullmatch(cohort_id) is None:
+        raise ControllerError("derived confirmatory cohort ID is unsafe")
+    payload = {
+        **core,
+        "identity_sha256": identity_sha256,
+        "cohort_id": cohort_id,
+        "output_name": cohort_id,
+    }
+    payload["schedule_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def validate_confirmatory_schedule(
+    plan: Mapping[str, Any], schedule: Mapping[str, Any]
+) -> None:
+    if schedule.get("schema") != CONFIRMATORY_SCHEDULE_SCHEMA:
+        raise ControllerError("confirmatory schedule schema differs")
+    without_schedule_hash = dict(schedule)
+    schedule_sha256 = without_schedule_hash.pop("schedule_sha256", None)
+    if schedule_sha256 != canonical_sha256(without_schedule_hash):
+        raise ControllerError("confirmatory schedule self-hash differs")
+    identity_payload = dict(without_schedule_hash)
+    identity_sha256 = identity_payload.pop("identity_sha256", None)
+    cohort_id = identity_payload.pop("cohort_id", None)
+    output_name = identity_payload.pop("output_name", None)
+    if identity_sha256 != canonical_sha256(identity_payload):
+        raise ControllerError("confirmatory schedule identity hash differs")
+    roles = schedule.get("roles")
+    if not isinstance(roles, Mapping) or set(roles) != {"control", "candidate"}:
+        raise ControllerError("confirmatory roles differ")
+    control = roles["control"]
+    candidate = roles["candidate"]
+    if not isinstance(control, Mapping) or not isinstance(candidate, Mapping):
+        raise ControllerError("confirmatory role descriptors are malformed")
+    plan_arms = {arm.arm_id: arm for arm in expand_arms(plan)}
+    control_arm = plan_arms.get(str(control.get("arm_id") or ""))
+    candidate_arm = plan_arms.get(str(candidate.get("arm_id") or ""))
+    if control_arm is None or candidate_arm is None:
+        raise ControllerError("confirmatory role is not a frozen plan arm")
+    if candidate_arm.control_arm_id != control_arm.arm_id:
+        raise ControllerError("confirmatory candidate/control binding differs")
+    expected_role_fields = {
+        "control": {
+            "experiment_id": control_arm.experiment_id,
+            "variant": control_arm.variant,
+            "replicate": control_arm.replicate,
+            "analyzer_mode": control_arm.analyzer_mode,
+        },
+        "candidate": {
+            "experiment_id": candidate_arm.experiment_id,
+            "variant": candidate_arm.variant,
+            "replicate": candidate_arm.replicate,
+            "control_arm_id": candidate_arm.control_arm_id,
+            "analyzer_mode": candidate_arm.analyzer_mode,
+        },
+    }
+    for role, expected_fields in expected_role_fields.items():
+        actual = roles[role]
+        if any(actual.get(field) != value for field, value in expected_fields.items()):
+            raise ControllerError(f"confirmatory {role} descriptor differs from the plan")
+        if not isinstance(actual.get("override"), Mapping):
+            raise ControllerError(f"confirmatory {role} override is malformed")
+    expected_cohort_id = (
+        f"{candidate_arm.experiment_id}-{candidate_arm.variant}-confirmatory-"
+        f"{str(identity_sha256)[:16]}"
+    )
+    if (
+        cohort_id != expected_cohort_id
+        or not isinstance(cohort_id, str)
+        or SAFE_COMPONENT_RE.fullmatch(cohort_id) is None
+        or output_name != cohort_id
+    ):
+        raise ControllerError("confirmatory cohort identity differs")
+    if schedule.get("campaign_plan_sha256") != canonical_sha256(plan):
+        raise ControllerError("confirmatory schedule is bound to another campaign plan")
+    if (
+        schedule.get("snapshot_commit") != plan.get("freeze", {}).get("snapshot_commit")
+        or schedule.get("snapshot_tree") != plan.get("freeze", {}).get("snapshot_tree")
+    ):
+        raise ControllerError("confirmatory schedule snapshot identity differs")
+    benchmark = schedule.get("benchmark")
+    task_ids = benchmark.get("task_ids") if isinstance(benchmark, Mapping) else None
+    if (
+        task_ids != plan.get("benchmark", {}).get("task_ids")
+        or benchmark.get("name") != "DRACO mini"
+        or benchmark.get("task_count") != EXPECTED_TASK_COUNT
+        or benchmark.get("group") != "G1"
+        or benchmark.get("input_sha256") != plan.get("benchmark", {}).get("input_sha256")
+    ):
+        raise ControllerError("confirmatory benchmark identity differs")
+    seed = schedule.get("seed")
+    if not isinstance(seed, str) or not seed:
+        raise ControllerError("confirmatory schedule seed is invalid")
+    task_schedule = schedule.get("task_schedule")
+    if not isinstance(task_schedule, list) or len(task_schedule) != EXPECTED_TASK_COUNT:
+        raise ControllerError("confirmatory task schedule is incomplete")
+    if [item.get("task_id") for item in task_schedule] != task_ids:
+        raise ControllerError("confirmatory task schedule order differs")
+    orders = [item.get("order") for item in task_schedule]
+    if orders.count("AB") != 5 or orders.count("BA") != 5:
+        raise ControllerError("confirmatory schedule is not balanced 5 AB / 5 BA")
+    ranked = sorted(
+        task_ids,
+        key=lambda task_id: (
+            _confirmatory_order_key(
+                seed=seed,
+                candidate_arm_id=candidate_arm.arm_id,
+                task_id=task_id,
+            ),
+            task_id,
+        ),
+    )
+    expected_control_first = set(ranked[:CONFIRMATORY_ORDER_COUNT_PER_ROLE])
+    for ordinal, item in enumerate(task_schedule, start=1):
+        task_id = item.get("task_id")
+        expected_order = "AB" if task_id in expected_control_first else "BA"
+        expected_first = "control" if expected_order == "AB" else "candidate"
+        expected_second = "candidate" if expected_order == "AB" else "control"
+        if (
+            item.get("input_ordinal") != ordinal
+            or item.get("order") != expected_order
+            or item.get("first_role") != expected_first
+            or item.get("second_role") != expected_second
+            or item.get("assignment_sha256")
+            != _confirmatory_order_key(
+                seed=seed,
+                candidate_arm_id=candidate_arm.arm_id,
+                task_id=task_id,
+            )
+        ):
+            raise ControllerError("confirmatory deterministic task assignment differs")
+    if schedule.get("order_balance") != {"AB": 5, "BA": 5}:
+        raise ControllerError("confirmatory order-balance receipt differs")
+    tranches = schedule.get("tranches")
+    if not isinstance(tranches, list) or [len(item.get("task_ids", [])) for item in tranches] != [
+        *CONFIRMATORY_TRANCHE_SIZES
+    ]:
+        raise ControllerError("confirmatory tranche partition differs")
+    flattened: list[str] = []
+    by_task = {item["task_id"]: item for item in task_schedule}
+    offset = 0
+    for tranche_index, tranche in enumerate(tranches, start=1):
+        tranche_task_ids = tranche.get("task_ids")
+        phases = tranche.get("phases")
+        if (
+            not isinstance(tranche_task_ids, list)
+            or not isinstance(phases, list)
+            or len(phases) != 2
+        ):
+            raise ControllerError("confirmatory tranche phases are malformed")
+        expected_tranche_tasks = task_ids[
+            offset : offset + CONFIRMATORY_TRANCHE_SIZES[tranche_index - 1]
+        ]
+        offset += len(expected_tranche_tasks)
+        if (
+            tranche.get("tranche") != tranche_index
+            or tranche_task_ids != expected_tranche_tasks
+        ):
+            raise ControllerError("confirmatory tranche identity or order differs")
+        flattened.extend(tranche_task_ids)
+        for phase_index, phase in enumerate(phases, start=1):
+            control_ids = phase.get("control_task_ids")
+            candidate_ids = phase.get("candidate_task_ids")
+            if not isinstance(control_ids, list) or not isinstance(candidate_ids, list):
+                raise ControllerError("confirmatory phase task sets are malformed")
+            if phase.get("leg") != phase_index:
+                raise ControllerError("confirmatory phase leg identity differs")
+            if set(control_ids) & set(candidate_ids) or set(control_ids + candidate_ids) != set(
+                tranche_task_ids
+            ):
+                raise ControllerError("confirmatory phase does not cover its tranche exactly")
+            expected_control = {
+                task_id
+                for task_id in tranche_task_ids
+                if by_task[task_id]["first_role" if phase_index == 1 else "second_role"]
+                == "control"
+            }
+            if set(control_ids) != expected_control:
+                raise ControllerError("confirmatory phase role assignment differs")
+            inflight = len(control_ids) + len(candidate_ids)
+            if (
+                phase.get("max_inflight_tasks") != inflight
+                or inflight > CONFIRMATORY_TASK_CONCURRENCY
+            ):
+                raise ControllerError("confirmatory global task concurrency exceeds six")
+    if flattened != task_ids:
+        raise ControllerError("confirmatory tranches do not preserve the frozen input order")
+    execution = schedule.get("execution_contract")
+    if (
+        not isinstance(execution, Mapping)
+        or execution.get("global_task_concurrency") != CONFIRMATORY_TASK_CONCURRENCY
+        or execution.get("phase_barrier_between_legs") is not True
+        or execution.get("generation_max_attempts")
+        != plan.get("execution", {}).get("generation_max_attempts")
+        or execution.get("generation_leg_failure_policy")
+        != "cohort_incomplete_no_unpaired_retry"
+        or execution.get("allowed_post_pair_repairs")
+        != ["judge_only", "metadata_only", "audit_only"]
+    ):
+        raise ControllerError("confirmatory execution contract differs")
+    account = schedule.get("account_window_contract")
+    if (
+        not isinstance(account, Mapping)
+        or account.get("scope") != "paired_cohort_shared"
+        or account.get("single_exclusive_lock") is not True
+        or account.get("single_account_before_after") is not True
+        or account.get("companion_ledger_required") is not True
+        or account.get("report_account_delta_once") is not True
+    ):
+        raise ControllerError("confirmatory shared account-window contract differs")
+    screening = schedule.get("screening_contract")
+    if (
+        not isinstance(screening, Mapping)
+        or screening.get("source_screening_is_diagnostic_only") is not True
+        or screening.get("confirmatory_mini_is_diagnostic_only") is not True
+        or screening.get("automatic_winner_promotion") is not False
+    ):
+        raise ControllerError("confirmatory diagnostic-only contract differs")
+    analyzer_modes = {value.get("analyzer_mode") for value in roles.values()}
+    if len(analyzer_modes) != 1:
+        raise ControllerError("confirmatory Analyzer modes differ")
+    if analyzer_modes == {"frozen_replay"}:
+        frozen = schedule.get("frozen_analyzer")
+        if (
+            not isinstance(frozen, Mapping)
+            or frozen.get("entry_count") != EXPECTED_TASK_COUNT
+            or frozen.get("task_ids") != sorted(task_ids)
+            or frozen.get("physical_analyzer_requests_per_task") != 0
+        ):
+            raise ControllerError("confirmatory frozen Analyzer evidence differs")
+        replay_values = [
+            _confirmatory_replay_payload(value.get("override", {}))
+            for value in roles.values()
+        ]
+        replay = replay_values[0]
+        entries = replay.get("entries") if isinstance(replay, Mapping) else None
+        if (
+            replay_values[0] != replay_values[1]
+            or not isinstance(replay, Mapping)
+            or replay.get("mode") != "frozen_replay"
+            or replay.get("schema") not in FROZEN_TASK_ANALYSIS_SCHEMAS
+            or not isinstance(entries, Mapping)
+            or set(entries) != set(task_ids)
+            or frozen.get("replay_payload_sha256") != canonical_sha256(replay)
+        ):
+            raise ControllerError("confirmatory roles do not share the replay payload")
+    elif schedule.get("frozen_analyzer") is not None:
+        raise ControllerError("live Analyzer confirmatory pair embeds frozen replay evidence")
+
+
+def prepare_confirmatory_schedule(
+    plan_path: Path,
+    *,
+    candidate_arm_id: str,
+    output_path: Path,
+    seed: str,
+) -> dict[str, Any]:
+    plan = load_json(plan_path)
+    arms = validate_plan(plan, allow_placeholders=False)
+    by_id = {arm.arm_id: arm for arm in arms}
+    candidate = by_id.get(candidate_arm_id)
+    if candidate is None or candidate.control_arm_id is None:
+        raise ControllerError("unknown or uncontrolled confirmatory candidate arm")
+    control = by_id.get(candidate.control_arm_id)
+    if control is None:
+        raise ControllerError("confirmatory control arm is missing")
+    plan_sha256 = canonical_sha256(plan)
+    derived, artifact = load_derived(plan, plan_sha256)
+    if candidate.analyzer_mode == "frozen_replay":
+        offline = derived.get("offline_effect", {}).get(candidate.arm_id)
+        if not isinstance(offline, Mapping) or offline.get("decision") == "deleted_no_live_run":
+            raise ControllerError("offline no-op arm cannot enter confirmatory execution")
+    p99_receipt = derived.get("p0_5_06")
+    control_override = resolve_arm_override(
+        plan,
+        control,
+        artifact=artifact,
+        p99_receipt=p99_receipt,
+    )
+    candidate_override = resolve_arm_override(
+        plan,
+        candidate,
+        artifact=artifact,
+        p99_receipt=p99_receipt,
+    )
+    schedule = build_confirmatory_schedule_payload(
+        plan,
+        control_arm=control,
+        candidate_arm=candidate,
+        control_override=control_override,
+        candidate_override=candidate_override,
+        analyzer_artifact=(artifact if candidate.analyzer_mode == "frozen_replay" else None),
+        seed=seed,
+    )
+    validate_confirmatory_schedule(plan, schedule)
+    if output_path.exists() or output_path.is_symlink():
+        raise ControllerError("refusing to overwrite a confirmatory schedule")
+    atomic_write_json(output_path, schedule)
+    return schedule
+
+
+def _validate_confirmatory_role_publication(
+    *,
+    cohort_root: Path,
+    role: str,
+    schedule: Mapping[str, Any],
+    pair_role: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    expected_relative = f"{role}/manifest.json"
+    if set(pair_role) != {"path", "sha256"} or pair_role.get("path") != expected_relative:
+        raise ControllerError(f"confirmatory {role} pair-manifest binding differs")
+    role_root = absolute_path_without_symlinks(
+        cohort_root / role,
+        label=f"confirmatory {role} publication root",
+    )
+    if not role_root.is_dir():
+        raise ControllerError(f"confirmatory {role} publication root is not a directory")
+    required_names = (
+        "manifest.json",
+        "results.jsonl",
+        "trace.jsonl",
+        "audit.json",
+        "openrouter-non-byok-campaign-proof.json",
+    )
+    required = {
+        name: absolute_path_without_symlinks(
+            role_root / name,
+            label=f"confirmatory {role} {name}",
+        )
+        for name in required_names
+    }
+    if any(not path.is_file() for path in required.values()):
+        raise ControllerError(f"confirmatory {role} formal artifacts are incomplete")
+    manifest_path = required["manifest.json"]
+    if pair_role.get("sha256") != file_sha256(manifest_path):
+        raise ControllerError(f"confirmatory {role} manifest raw hash differs")
+    manifest = load_json(manifest_path)
+    if not isinstance(manifest, Mapping):
+        raise ControllerError(f"confirmatory {role} manifest is malformed")
+    manifest_without_hash = dict(manifest)
+    recorded_manifest_hash = manifest_without_hash.pop("manifest_sha256", None)
+    if recorded_manifest_hash != "sha256:" + canonical_sha256(manifest_without_hash):
+        raise ControllerError(f"confirmatory {role} manifest self-hash differs")
+    if (
+        manifest.get("status") != "complete"
+        or manifest.get("execution_pass") is not True
+        or manifest.get("groups") != ["G1"]
+        or manifest.get("task_count") != EXPECTED_TASK_COUNT
+        or manifest.get("result_count") != EXPECTED_TASK_COUNT
+        or manifest.get("task_ids") != schedule.get("benchmark", {}).get("task_ids")
+    ):
+        raise ControllerError(f"confirmatory {role} publication is not formally complete")
+    cohort = manifest.get("account_window_cohort")
+    companion_role = "candidate" if role == "control" else "control"
+    if (
+        not isinstance(cohort, Mapping)
+        or cohort.get("cohort_id") != schedule.get("cohort_id")
+        or cohort.get("role") != role
+        or cohort.get("companion_role") != companion_role
+        or not isinstance(cohort.get("cohort_sha256"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", cohort["cohort_sha256"]) is None
+    ):
+        raise ControllerError(f"confirmatory {role} shared account-window binding differs")
+    schedule_role = schedule.get("roles", {}).get(role)
+    if not isinstance(schedule_role, Mapping):
+        raise ControllerError(f"confirmatory {role} schedule descriptor is missing")
+    return (
+        {
+            "arm_id": schedule_role.get("arm_id"),
+            "experiment_id": schedule_role.get("experiment_id"),
+            "root": str(role_root),
+            "manifest_sha256": file_sha256(manifest_path),
+            "publication_status": "complete",
+        },
+        str(cohort["cohort_sha256"]),
+    )
+
+
+def build_confirmatory_report_input_entry(
+    plan: Mapping[str, Any],
+    schedule: Mapping[str, Any],
+    cohort_root: Path,
+) -> dict[str, Any]:
+    resolved_root = absolute_path_without_symlinks(
+        cohort_root,
+        label="confirmatory cohort root",
+    )
+    if not resolved_root.is_dir():
+        raise ControllerError("confirmatory cohort root is not a directory")
+    cohort_manifest_path = absolute_path_without_symlinks(
+        resolved_root / "cohort-manifest.json",
+        label="confirmatory cohort manifest",
+    )
+    if not cohort_manifest_path.is_file():
+        raise ControllerError("confirmatory cohort manifest is missing")
+    schedule_copy_path = absolute_path_without_symlinks(
+        resolved_root / "archive" / "confirmatory-schedule.json",
+        label="confirmatory frozen schedule copy",
+    )
+    if not schedule_copy_path.is_file() or load_json(schedule_copy_path) != dict(schedule):
+        raise ControllerError("confirmatory frozen schedule copy differs")
+    cohort_manifest = load_json(cohort_manifest_path)
+    if not isinstance(cohort_manifest, Mapping):
+        raise ControllerError("confirmatory cohort manifest is malformed")
+    manifest_without_hash = dict(cohort_manifest)
+    recorded_hash = manifest_without_hash.pop("manifest_sha256", None)
+    if recorded_hash != canonical_sha256(manifest_without_hash):
+        raise ControllerError("confirmatory cohort manifest self-hash differs")
+    if (
+        cohort_manifest.get("schema") != CONFIRMATORY_COHORT_MANIFEST_SCHEMA
+        or cohort_manifest.get("status") != "complete"
+        or cohort_manifest.get("cohort_id") != schedule.get("cohort_id")
+        or cohort_manifest.get("schedule_sha256") != schedule.get("schedule_sha256")
+        or cohort_manifest.get("account_delta_report_scope") != "paired_cohort_once"
+        or cohort_manifest.get("screening_is_diagnostic_only") is not True
+    ):
+        raise ControllerError("confirmatory cohort manifest contract differs")
+    pair_roles = cohort_manifest.get("roles")
+    if not isinstance(pair_roles, Mapping) or set(pair_roles) != {"control", "candidate"}:
+        raise ControllerError("confirmatory cohort manifest role coverage differs")
+    role_entries: dict[str, Any] = {}
+    cohort_hashes: set[str] = set()
+    for role in ("control", "candidate"):
+        pair_role = pair_roles[role]
+        if not isinstance(pair_role, Mapping):
+            raise ControllerError(f"confirmatory {role} pair binding is malformed")
+        role_entry, cohort_hash = _validate_confirmatory_role_publication(
+            cohort_root=resolved_root,
+            role=role,
+            schedule=schedule,
+            pair_role=pair_role,
+        )
+        role_entries[role] = role_entry
+        cohort_hashes.add(cohort_hash)
+    if len(cohort_hashes) != 1:
+        raise ControllerError("confirmatory role publications disagree on account cohort")
+    entry: dict[str, Any] = {
+        "status": "complete",
+        "campaign_plan_sha256": canonical_sha256(plan),
+        "cohort_id": schedule["cohort_id"],
+        "schedule_sha256": schedule["schedule_sha256"],
+        "cohort_root": str(resolved_root),
+        "schedule_path": str(schedule_copy_path),
+        "schedule_file_sha256": file_sha256(schedule_copy_path),
+        "cohort_manifest_path": str(cohort_manifest_path),
+        "cohort_manifest_sha256": file_sha256(cohort_manifest_path),
+        "roles": role_entries,
+        "account_window_cohort_sha256": next(iter(cohort_hashes)),
+    }
+    entry["entry_sha256"] = canonical_sha256(entry)
+    return entry
+
+
+def _validate_confirmatory_report_input_index(
+    plan: Mapping[str, Any],
+    index: Mapping[str, Any],
+) -> None:
+    if index.get("schema") != CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA:
+        raise ControllerError("confirmatory report-input index schema differs")
+    without_hash = dict(index)
+    recorded_hash = without_hash.pop("index_sha256", None)
+    if recorded_hash != canonical_sha256(without_hash):
+        raise ControllerError("confirmatory report-input index self-hash differs")
+    if index.get("campaign_plan_sha256") != canonical_sha256(plan):
+        raise ControllerError("confirmatory report-input index belongs to another plan")
+    entries = index.get("entries")
+    if not isinstance(entries, list):
+        raise ControllerError("confirmatory report-input index entries are malformed")
+    cohort_ids: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise ControllerError("confirmatory report-input index entry is malformed")
+        entry_without_hash = dict(entry)
+        recorded_entry_hash = entry_without_hash.pop("entry_sha256", None)
+        if recorded_entry_hash != canonical_sha256(entry_without_hash):
+            raise ControllerError("confirmatory report-input entry self-hash differs")
+        if (
+            entry.get("campaign_plan_sha256") != canonical_sha256(plan)
+            or entry.get("status") not in {"complete", "partial"}
+            or not isinstance(entry.get("roles"), Mapping)
+            or set(entry["roles"]) != {"control", "candidate"}
+        ):
+            raise ControllerError("confirmatory report-input entry contract differs")
+        cohort_id = str(entry.get("cohort_id") or "")
+        if SAFE_COMPONENT_RE.fullmatch(cohort_id) is None:
+            raise ControllerError("confirmatory report-input cohort ID is unsafe")
+        cohort_ids.append(cohort_id)
+    if cohort_ids != sorted(set(cohort_ids)):
+        raise ControllerError("confirmatory report-input entries are not uniquely sorted")
+
+
+def _register_confirmatory_report_input_entry(
+    plan: Mapping[str, Any],
+    entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    entry = dict(entry)
+    entry_without_hash = dict(entry)
+    recorded_entry_hash = entry_without_hash.pop("entry_sha256", None)
+    if recorded_entry_hash != canonical_sha256(entry_without_hash):
+        raise ControllerError("refusing an unsealed confirmatory report-input entry")
+    run_root = Path(str(plan["paths"]["run_root"]))
+    index_path = run_root / "confirmatory-report-inputs.json"
+    if index_path.exists() or index_path.is_symlink():
+        index = load_json(index_path)
+        if not isinstance(index, Mapping):
+            raise ControllerError("confirmatory report-input index is malformed")
+        _validate_confirmatory_report_input_index(plan, index)
+        entries = [dict(value) for value in index["entries"]]
+    else:
+        entries = []
+    by_cohort = {str(value["cohort_id"]): value for value in entries}
+    existing = by_cohort.get(str(entry["cohort_id"]))
+    if existing is not None and existing != entry:
+        raise ControllerError("confirmatory cohort is already registered with other evidence")
+    by_cohort[str(entry["cohort_id"])] = entry
+    payload: dict[str, Any] = {
+        "schema": CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA,
+        "campaign_plan_sha256": canonical_sha256(plan),
+        "entries": [by_cohort[key] for key in sorted(by_cohort)],
+    }
+    payload["index_sha256"] = canonical_sha256(payload)
+    if not index_path.exists() or load_json(index_path) != payload:
+        atomic_write_json(index_path, payload)
+    return {**entry, "index_path": str(index_path), "index_sha256": payload["index_sha256"]}
+
+
+def registered_confirmatory_report_input(
+    plan: Mapping[str, Any],
+    cohort_id: str,
+) -> dict[str, Any] | None:
+    index_path = Path(str(plan["paths"]["run_root"])) / "confirmatory-report-inputs.json"
+    if not index_path.exists() and not index_path.is_symlink():
+        return None
+    index = load_json(index_path)
+    if not isinstance(index, Mapping):
+        raise ControllerError("confirmatory report-input index is malformed")
+    _validate_confirmatory_report_input_index(plan, index)
+    return next(
+        (
+            dict(entry)
+            for entry in index["entries"]
+            if isinstance(entry, Mapping) and entry.get("cohort_id") == cohort_id
+        ),
+        None,
+    )
+
+
+def register_confirmatory_report_input(
+    plan: Mapping[str, Any],
+    schedule: Mapping[str, Any],
+    cohort_root: Path,
+) -> dict[str, Any]:
+    return _register_confirmatory_report_input_entry(
+        plan,
+        build_confirmatory_report_input_entry(plan, schedule, cohort_root),
+    )
+
+
+def register_partial_confirmatory_report_input(
+    plan: Mapping[str, Any],
+    schedule: Mapping[str, Any],
+    cohort_root: Path,
+    *,
+    reason: str,
+    launcher_returncode: int,
+) -> dict[str, Any]:
+    resolved_root = cohort_root.resolve()
+    if cohort_root.is_symlink() or (cohort_root.exists() and not cohort_root.is_dir()):
+        raise ControllerError("partial confirmatory cohort root is unsafe")
+    role_entries: dict[str, Any] = {}
+    for role in ("control", "candidate"):
+        role_root = resolved_root / role
+        if role_root.is_symlink():
+            raise ControllerError(f"partial confirmatory {role} root is unsafe")
+        manifest_path = role_root / "manifest.json"
+        manifest_hash: str | None = None
+        publication_status = "missing"
+        if manifest_path.exists() or manifest_path.is_symlink():
+            require_regular_file(manifest_path)
+            manifest_hash = file_sha256(manifest_path)
+            publication_status = "present_unverified"
+        schedule_role = schedule.get("roles", {}).get(role)
+        if not isinstance(schedule_role, Mapping):
+            raise ControllerError(f"confirmatory {role} schedule descriptor is missing")
+        role_entries[role] = {
+            "arm_id": schedule_role.get("arm_id"),
+            "experiment_id": schedule_role.get("experiment_id"),
+            "root": str(role_root),
+            "manifest_sha256": manifest_hash,
+            "publication_status": publication_status,
+        }
+    cohort_manifest_path = resolved_root / "cohort-manifest.json"
+    cohort_manifest_hash: str | None = None
+    recorded_cohort_manifest_path: str | None = None
+    if cohort_manifest_path.exists() or cohort_manifest_path.is_symlink():
+        require_regular_file(cohort_manifest_path)
+        recorded_cohort_manifest_path = str(cohort_manifest_path)
+        cohort_manifest_hash = file_sha256(cohort_manifest_path)
+    schedule_copy_path = resolved_root / "archive" / "confirmatory-schedule.json"
+    schedule_path: str | None = None
+    schedule_file_hash: str | None = None
+    if schedule_copy_path.exists() or schedule_copy_path.is_symlink():
+        require_regular_file(schedule_copy_path)
+        schedule_path = str(schedule_copy_path)
+        schedule_file_hash = file_sha256(schedule_copy_path)
+    entry: dict[str, Any] = {
+        "status": "partial",
+        "campaign_plan_sha256": canonical_sha256(plan),
+        "cohort_id": schedule["cohort_id"],
+        "schedule_sha256": schedule["schedule_sha256"],
+        "cohort_root": str(resolved_root),
+        "schedule_path": schedule_path,
+        "schedule_file_sha256": schedule_file_hash,
+        "cohort_manifest_path": recorded_cohort_manifest_path,
+        "cohort_manifest_sha256": cohort_manifest_hash,
+        "roles": role_entries,
+        "account_window_cohort_sha256": None,
+        "failure": {
+            "reason": reason,
+            "launcher_returncode": launcher_returncode,
+        },
+    }
+    entry["entry_sha256"] = canonical_sha256(entry)
+    return _register_confirmatory_report_input_entry(plan, entry)
+
+
+def launch_confirmatory_schedule(plan_path: Path, schedule_path: Path) -> int:
+    plan = load_json(plan_path)
+    validate_plan(plan, allow_placeholders=False)
+    snapshot, snapshot_identity = validate_snapshot(plan)
+    validate_runtime_freeze(
+        plan,
+        snapshot=snapshot,
+        expected_snapshot_identity=snapshot_identity,
+    )
+    schedule = load_json(schedule_path)
+    validate_confirmatory_schedule(plan, schedule)
+    report_root = Path(str(plan["paths"]["report_root"])) / "confirmatory"
+    report_root.mkdir(parents=True, exist_ok=True)
+    cohort_root = report_root / str(schedule["output_name"])
+    run_root = Path(str(plan["paths"]["run_root"]))
+    run_root.mkdir(parents=True, exist_ok=True)
+    lock_path = run_root / "controller.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_fd, "r+") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ControllerError("another campaign controller is active") from exc
+        registered = registered_confirmatory_report_input(
+            plan,
+            str(schedule["cohort_id"]),
+        )
+        if registered is not None:
+            if registered.get("status") == "partial":
+                return 2
+            current = build_confirmatory_report_input_entry(plan, schedule, cohort_root)
+            if current != registered:
+                raise ControllerError(
+                    "registered confirmatory publication no longer matches its evidence"
+                )
+            return 0
+        if cohort_root.exists() or cohort_root.is_symlink():
+            if (cohort_root / "cohort-manifest.json").is_file():
+                try:
+                    register_confirmatory_report_input(plan, schedule, cohort_root)
+                except ControllerError:
+                    register_partial_confirmatory_report_input(
+                        plan,
+                        schedule,
+                        cohort_root,
+                        reason="existing_cohort_publication_invalid",
+                        launcher_returncode=2,
+                    )
+                    return 2
+                else:
+                    return 0
+            register_partial_confirmatory_report_input(
+                plan,
+                schedule,
+                cohort_root,
+                reason="existing_incomplete_cohort_no_unpaired_retry",
+                launcher_returncode=2,
+            )
+            return 2
+        launcher = snapshot / str(plan["paths"]["launcher_relative"])
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "DRACO_CAMPAIGN_REPORT_ROOT": str(report_root),
+                "DRACO_CAMPAIGN_REFERENCE_REPO": str(plan["paths"]["reference_repo"]),
+                "DRACO_CAMPAIGN_PYTHON": str(plan["paths"]["python"]),
+                "DRACO_CAMPAIGN_TASK_CONCURRENCY": str(CONFIRMATORY_TASK_CONCURRENCY),
+            }
+        )
+        command = [
+            str(launcher),
+            "--snapshot-repo",
+            str(snapshot),
+            "--output-name",
+            str(schedule["output_name"]),
+            "--groups",
+            "G1",
+            "--confirmatory-schedule",
+            str(schedule_path.resolve()),
+        ]
+        completed = subprocess.run(command, env=environment, check=False)
+        if completed.returncode == 0:
+            try:
+                register_confirmatory_report_input(plan, schedule, cohort_root)
+            except ControllerError:
+                register_partial_confirmatory_report_input(
+                    plan,
+                    schedule,
+                    cohort_root,
+                    reason="confirmatory_publication_validation_failed",
+                    launcher_returncode=2,
+                )
+                return 2
+        else:
+            register_partial_confirmatory_report_input(
+                plan,
+                schedule,
+                cohort_root,
+                reason="confirmatory_launcher_failed",
+                launcher_returncode=int(completed.returncode),
+            )
+        return int(completed.returncode)
+
+
 def preexisting_source_identity(
     plan: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -5380,6 +6319,17 @@ def main() -> int:
     expand_parser.add_argument("--allow-placeholders", action="store_true")
     validate_only_parser = subparsers.add_parser("validate-only")
     validate_only_parser.add_argument("plan", type=Path)
+    prepare_confirmatory_parser = subparsers.add_parser("prepare-confirmatory")
+    prepare_confirmatory_parser.add_argument("plan", type=Path)
+    prepare_confirmatory_parser.add_argument("--candidate-arm-id", required=True)
+    prepare_confirmatory_parser.add_argument("--output", required=True, type=Path)
+    prepare_confirmatory_parser.add_argument("--seed", default="draco-confirmatory-v1")
+    validate_confirmatory_parser = subparsers.add_parser("validate-confirmatory")
+    validate_confirmatory_parser.add_argument("plan", type=Path)
+    validate_confirmatory_parser.add_argument("schedule", type=Path)
+    run_confirmatory_parser = subparsers.add_parser("run-confirmatory")
+    run_confirmatory_parser.add_argument("plan", type=Path)
+    run_confirmatory_parser.add_argument("schedule", type=Path)
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("plan", type=Path)
     args = parser.parse_args()
@@ -5409,6 +6359,34 @@ def main() -> int:
     if args.command == "validate-only":
         print(json.dumps(validate_only(args.plan), ensure_ascii=False, sort_keys=True))
         return 0
+    if args.command == "prepare-confirmatory":
+        schedule = prepare_confirmatory_schedule(
+            args.plan,
+            candidate_arm_id=args.candidate_arm_id,
+            output_path=args.output,
+            seed=args.seed,
+        )
+        print(json.dumps(schedule, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.command == "validate-confirmatory":
+        plan = load_json(args.plan)
+        validate_plan(plan, allow_placeholders=False)
+        schedule = load_json(args.schedule)
+        validate_confirmatory_schedule(plan, schedule)
+        print(
+            json.dumps(
+                {
+                    "status": "valid",
+                    "cohort_id": schedule["cohort_id"],
+                    "schedule_sha256": schedule["schedule_sha256"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command == "run-confirmatory":
+        return launch_confirmatory_schedule(args.plan, args.schedule)
     return run_campaign(args.plan)
 
 

@@ -20,6 +20,7 @@ Usage:
     [--prior-account-window-dir ABORTED_CAMPAIGN_ACCOUNT_DIR]
     [--groups CANONICAL_GROUP_SUBSET]
     [--experiment-config-override-json JSON_OBJECT]
+    [--confirmatory-schedule IMMUTABLE_PAIRED_COHORT_JSON]
 
 By default, output is a new direct child of:
   SNAPSHOT_REPO/reports/draco
@@ -93,6 +94,7 @@ DRACO_GROUPS="$DEFAULT_DRACO_GROUPS"
 OUTPUT_NAME="${DRACO_CAMPAIGN_OUTPUT_NAME:-}"
 EXPERIMENT_CONFIG_OVERRIDE_JSON=""
 EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT=0
+CONFIRMATORY_SCHEDULE=""
 PRIOR_ACCOUNT_WINDOW_SOURCES=()
 if [[ -n "${DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR:-}" ]]; then
   PRIOR_ACCOUNT_WINDOW_SOURCES+=("$DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR")
@@ -126,6 +128,11 @@ while [[ "$#" -gt 0 ]]; do
       EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT=1
       shift 2
       ;;
+    --confirmatory-schedule)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      CONFIRMATORY_SCHEDULE="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -139,6 +146,25 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 validate_draco_groups "$DRACO_GROUPS" || exit 2
+if [[ -n "$CONFIRMATORY_SCHEDULE" ]]; then
+  if [[ "$DRACO_GROUPS" != "G1" ]]; then
+    echo "Confirmatory paired cohorts require --groups G1" >&2
+    exit 2
+  fi
+  if [[ "$EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT" == "1" ]]; then
+    echo "--confirmatory-schedule cannot be combined with a single-arm override" >&2
+    exit 2
+  fi
+  if [[ "${#PRIOR_ACCOUNT_WINDOW_SOURCES[@]}" -ne 0 ]]; then
+    echo "Confirmatory paired cohorts require one new shared account window" >&2
+    exit 2
+  fi
+  if [[ ! -f "$CONFIRMATORY_SCHEDULE" || -L "$CONFIRMATORY_SCHEDULE" ]]; then
+    echo "Confirmatory schedule must be a regular non-symlink file" >&2
+    exit 2
+  fi
+  CONFIRMATORY_SCHEDULE="$(realpath "$CONFIRMATORY_SCHEDULE")"
+fi
 readonly DRACO_GROUPS
 DRACO_GROUP_SLUG="${DRACO_GROUPS,,}"
 DRACO_GROUP_SLUG="${DRACO_GROUP_SLUG//,/-}"
@@ -197,12 +223,131 @@ if [[ -n "$(git -C "$SNAPSHOT_REPO" status --porcelain=v1 --untracked-files=all)
   exit 2
 fi
 
-# Resolve the same sparse overlay before creating output paths. This keeps the
-# campaign label, finalizer contract, and runner concurrency aligned with the
-# effective experiment config. The legacy environment variable remains an
-# explicit high-priority input, but an unset variable never masks inline JSON.
-if ! EFFECTIVE_CONFIG_RUNTIME_VALUES="$(
-  "$PYTHON" -c '
+# Resolve the same sparse overlay before creating output paths. Paired mode
+# validates both role configs and the immutable 5 AB / 5 BA schedule before
+# loading credentials or opening an account window.
+CONFIRMATORY_VALIDATED_SCHEDULE_SHA256=""
+if [[ -n "$CONFIRMATORY_SCHEDULE" ]]; then
+  if ! EFFECTIVE_CONFIG_RUNTIME_VALUES="$(
+    "$PYTHON" -c '
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
+
+schedule = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+if schedule.get("schema") != "opensquilla.draco-p0-p05-confirmatory-schedule/v1":
+    raise SystemExit("confirmatory schedule schema differs")
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+without_hash = dict(schedule)
+recorded = without_hash.pop("schedule_sha256", None)
+if recorded != hashlib.sha256(canonical(without_hash)).hexdigest():
+    raise SystemExit("confirmatory schedule self-hash differs")
+tasks = schedule.get("task_schedule")
+if not isinstance(tasks, list) or len(tasks) != 10:
+    raise SystemExit("confirmatory schedule must contain ten tasks")
+orders = [row.get("order") for row in tasks if isinstance(row, dict)]
+if orders.count("AB") != 5 or orders.count("BA") != 5:
+    raise SystemExit("confirmatory schedule must freeze five AB and five BA tasks")
+if schedule.get("order_balance") != {"AB": 5, "BA": 5}:
+    raise SystemExit("confirmatory order receipt differs")
+input_task_ids = []
+for line in Path(sys.argv[4]).read_text(encoding="utf-8").splitlines():
+    row = json.loads(line)
+    input_task_ids.append(str(row.get("task_id") or row.get("id") or ""))
+schedule_task_ids = [str(row.get("task_id") or "") for row in tasks]
+benchmark = schedule.get("benchmark")
+if (
+    len(set(input_task_ids)) != 10
+    or schedule_task_ids != input_task_ids
+    or not isinstance(benchmark, dict)
+    or benchmark.get("task_ids") != input_task_ids
+    or benchmark.get("task_count") != 10
+    or benchmark.get("group") != "G1"
+):
+    raise SystemExit("confirmatory task identities differ from frozen DRACO mini")
+tranches = schedule.get("tranches")
+if not isinstance(tranches, list) or [len(row.get("task_ids", [])) for row in tranches] != [6, 4]:
+    raise SystemExit("confirmatory schedule must use 6+4 tranches")
+for tranche in tranches:
+    for phase in tranche.get("phases", []):
+        control = phase.get("control_task_ids")
+        candidate = phase.get("candidate_task_ids")
+        if not isinstance(control, list) or not isinstance(candidate, list):
+            raise SystemExit("confirmatory phase task lists are malformed")
+        if len(control) + len(candidate) > 6 or phase.get("max_inflight_tasks") != len(control) + len(candidate):
+            raise SystemExit("confirmatory phase exceeds global concurrency six")
+execution = schedule.get("execution_contract")
+if (
+    not isinstance(execution, dict)
+    or execution.get("global_task_concurrency") != 6
+    or execution.get("phase_barrier_between_legs") is not True
+    or execution.get("generation_leg_failure_policy") != "cohort_incomplete_no_unpaired_retry"
+):
+    raise SystemExit("confirmatory execution contract differs")
+account = schedule.get("account_window_contract")
+if (
+    not isinstance(account, dict)
+    or account.get("scope") != "paired_cohort_shared"
+    or account.get("companion_ledger_required") is not True
+    or account.get("report_account_delta_once") is not True
+):
+    raise SystemExit("confirmatory account-window contract differs")
+screening = schedule.get("screening_contract")
+if (
+    not isinstance(screening, dict)
+    or screening.get("source_screening_is_diagnostic_only") is not True
+    or screening.get("confirmatory_mini_is_diagnostic_only") is not True
+    or screening.get("automatic_winner_promotion") is not False
+):
+    raise SystemExit("confirmatory screening contract differs")
+roles = schedule.get("roles")
+if not isinstance(roles, dict) or set(roles) != {"control", "candidate"}:
+    raise SystemExit("confirmatory roles differ")
+runtime_values = []
+replays = []
+for role in ("control", "candidate"):
+    row = roles[role]
+    override = row.get("override")
+    if not isinstance(override, dict):
+        raise SystemExit("confirmatory role override is malformed")
+    bundle = load_draco_experiment_config(
+        Path(sys.argv[2]),
+        inline_overlay_json=json.dumps(override, sort_keys=True, separators=(",", ":")),
+    )
+    config = bundle.config
+    runtime_values.append(
+        (config.runner.concurrency, config.judge.concurrency, config.generation.max_attempts)
+    )
+    replay = override.get("g1_routing", {}).get("task_analysis_execution")
+    replays.append(replay)
+if len(set(runtime_values)) != 1 or runtime_values[0][0] != 6:
+    raise SystemExit("confirmatory role runtime concurrency/contracts differ")
+if roles["control"].get("analyzer_mode") == "frozen_replay":
+    if replays[0] != replays[1] or not isinstance(replays[0], dict):
+        raise SystemExit("confirmatory roles do not share frozen Analyzer replay")
+    entries = replays[0].get("entries")
+    if (
+        replays[0].get("mode") != "frozen_replay"
+        or not isinstance(entries, dict)
+        or set(entries) != set(input_task_ids)
+    ):
+        raise SystemExit("confirmatory frozen Analyzer replay must retain ten entries")
+print("\t".join(str(value) for value in (*runtime_values[0], schedule["schedule_sha256"])))
+' "$SNAPSHOT_REPO/src" "$EXPERIMENT_CONFIG" "$CONFIRMATORY_SCHEDULE" "$INPUT"
+  )"; then
+    echo "Unable to validate the confirmatory schedule/effective configs" >&2
+    exit 2
+  fi
+else
+  if ! EFFECTIVE_CONFIG_RUNTIME_VALUES="$(
+    "$PYTHON" -c '
 import sys
 from pathlib import Path
 
@@ -220,13 +365,15 @@ print(
     f"{config.generation.max_attempts}"
 )
 ' "$SNAPSHOT_REPO/src" "$EXPERIMENT_CONFIG" \
-  "$EXPERIMENT_CONFIG_OVERRIDE_JSON" "$EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT"
-)"; then
-  echo "Unable to resolve the effective DRACO experiment config" >&2
-  exit 2
+    "$EXPERIMENT_CONFIG_OVERRIDE_JSON" "$EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT"
+  )"; then
+    echo "Unable to resolve the effective DRACO experiment config" >&2
+    exit 2
+  fi
 fi
 IFS=$'\t' read -r CONFIG_TASK_CONCURRENCY JUDGE_CONCURRENCY \
-  GENERATION_MAX_ATTEMPTS <<<"$EFFECTIVE_CONFIG_RUNTIME_VALUES"
+  GENERATION_MAX_ATTEMPTS CONFIRMATORY_VALIDATED_SCHEDULE_SHA256 \
+  <<<"$EFFECTIVE_CONFIG_RUNTIME_VALUES"
 if [[
   ! "$CONFIG_TASK_CONCURRENCY" =~ ^[1-9][0-9]*$
   || ! "$JUDGE_CONCURRENCY" =~ ^[1-9][0-9]*$
@@ -696,7 +843,10 @@ capture_after_on_failure() {
 trap capture_after_on_failure EXIT
 
 publish_final_artifacts() {
-  "$PYTHON" - "$FINAL_OUTPUT_DIR" "$OUTPUT_DIR" "$ARCHIVE_DIR" <<'PY'
+  local formal_dir="${1:-$FINAL_OUTPUT_DIR}"
+  local output_dir="${2:-$OUTPUT_DIR}"
+  local archive_dir="${3:-$ARCHIVE_DIR}"
+  "$PYTHON" - "$formal_dir" "$output_dir" "$archive_dir" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -1238,6 +1388,459 @@ os.chmod(temporary_summary, 0o600)
 os.replace(temporary_summary, summary_path)
 PY
 }
+
+run_confirmatory_pair() {
+  local schedule_copy="$ARCHIVE_DIR/confirmatory-schedule.json"
+  local control_override="$ARCHIVE_DIR/control-override.json"
+  local candidate_override="$ARCHIVE_DIR/candidate-override.json"
+  local shard_root="$ARCHIVE_DIR/confirmatory-shards"
+  local control_output="$OUTPUT_DIR/control"
+  local candidate_output="$OUTPUT_DIR/candidate"
+  local control_archive="$control_output/archive"
+  local candidate_archive="$candidate_output/archive"
+  local cohort_id
+  local schedule_sha256
+  local role
+  local tranche_index
+  local leg
+  local phase_failed=0
+  local control_pid=""
+  local candidate_pid=""
+  local control_rc=0
+  local candidate_rc=0
+  local control_shard=""
+  local candidate_shard=""
+  local -a control_results=()
+  local -a control_manifests=()
+  local -a candidate_results=()
+  local -a candidate_manifests=()
+
+  install -m 600 "$CONFIRMATORY_SCHEDULE" "$schedule_copy"
+  "$PYTHON" - "$schedule_copy" "$control_override" "$candidate_override" \
+    "$CONFIRMATORY_VALIDATED_SCHEDULE_SHA256" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+schedule = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+without_hash = dict(schedule)
+recorded_hash = without_hash.pop("schedule_sha256", None)
+canonical = json.dumps(
+    without_hash,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode()
+if (
+    recorded_hash != sys.argv[4]
+    or recorded_hash != hashlib.sha256(canonical).hexdigest()
+):
+    raise SystemExit("confirmatory schedule changed after preflight validation")
+for role, destination in zip(("control", "candidate"), sys.argv[2:4], strict=True):
+    path = Path(destination)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(schedule["roles"][role]["override"], ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+PY
+  cohort_id="$(jq -er '.cohort_id | select(type == "string" and length > 0)' "$schedule_copy")"
+  schedule_sha256="$(jq -er '.schedule_sha256 | select(type == "string" and test("^[0-9a-f]{64}$"))' "$schedule_copy")"
+  mkdir "$shard_root"
+
+  cd "$SNAPSHOT_REPO"
+  if [[ -L "$LOCK_FILE" ]]; then
+    echo "Campaign lock path must not be a symlink" >&2
+    return 2
+  fi
+  exec 9<>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "Another benchmark owns the exclusive OpenRouter attribution window" >&2
+    return 2
+  fi
+  LOCK_HELD=1
+  validate_lock_file
+
+  "$PYTHON" "$CAPTURE_RUNTIME" capture "$RUNTIME_ENV" --repo "$SNAPSHOT_REPO"
+  for role in control candidate; do
+    local role_override
+    local role_preflight
+    local role_override_json
+    if [[ "$role" == "control" ]]; then
+      role_override="$control_override"
+    else
+      role_override="$candidate_override"
+    fi
+    role_preflight="$ARCHIVE_DIR/preflight/openrouter-route-$role.json"
+    role_override_json="$(jq -c . "$role_override")"
+    "$PYTHON" "$ROUTE_PREFLIGHT" \
+      "$role_preflight" \
+      --scope formal \
+      --groups G1 \
+      --experiment-config "$EXPERIMENT_CONFIG" \
+      --experiment-config-override-json "$role_override_json" >/dev/null
+
+    local static_dir="$ARCHIVE_DIR/preflight/static-$role"
+    mkdir "$static_dir"
+    "$PYTHON" "$MAIN_RUNNER" \
+      --input "$INPUT" \
+      --config "$CONFIG" \
+      --experiment-config "$EXPERIMENT_CONFIG" \
+      --experiment-config-override "$role_override" \
+      --experiment-config-set "runner.concurrency=$TASK_CONCURRENCY" \
+      --groups G1 \
+      --max-tasks 10 \
+      --output-dir "$static_dir" \
+      --dry-run \
+      --require-openrouter-non-byok \
+      --require-clean-source >"$static_dir/run.log" 2>&1
+  done
+
+  capture_account_snapshot "$ACCOUNT_BEFORE"
+  if ! jq -e '
+    .benchmark_environment_key_verified == true
+    and .is_free_tier == false
+    and (.api_key_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$ACCOUNT_BEFORE" >/dev/null; then
+    echo "OpenRouter account-before snapshot is not a verified paid-key boundary" >&2
+    return 2
+  fi
+  ACCOUNT_WINDOW_OPEN=1
+
+  record_confirmatory_shard() {
+    local shard_role="$1"
+    local shard_dir="$2"
+    local runner_status="$3"
+    local -a results=()
+    local -a manifests=()
+    mapfile -t results < <(
+      find "$shard_dir" -maxdepth 1 -type f -name 'draco_ensemble_*.jsonl' | sort
+    )
+    mapfile -t manifests < <(
+      find "$shard_dir" -maxdepth 1 -type f -name 'draco_run_*.manifest.json' | sort
+    )
+    if [[ "${#results[@]}" -ne 1 || "${#manifests[@]}" -ne 1 ]]; then
+      echo "Confirmatory shard did not produce one result and manifest" >&2
+      return 2
+    fi
+    accept_or_reject_wave_status "$runner_status" "${manifests[0]}"
+    if [[ "$runner_status" != "0" ]] || [[ "$(jq -r '.status' "${manifests[0]}")" != "complete" ]]; then
+      echo "Confirmatory generation leg is incomplete; unpaired retry is forbidden" >&2
+      return 2
+    fi
+    if [[ "$shard_role" == "control" ]]; then
+      control_results+=("${results[0]}")
+      control_manifests+=("${manifests[0]}")
+    else
+      candidate_results+=("${results[0]}")
+      candidate_manifests+=("${manifests[0]}")
+    fi
+  }
+
+  launch_confirmatory_shard() {
+    local shard_role="$1"
+    local override_path="$2"
+    local shard_dir="$3"
+    shift 3
+    local -a task_ids=("$@")
+    local -a command=(
+      "$PYTHON" "$MAIN_RUNNER"
+      --input "$INPUT"
+      --config "$CONFIG"
+      --experiment-config "$EXPERIMENT_CONFIG"
+      --experiment-config-override "$override_path"
+      --experiment-config-set "runner.concurrency=$TASK_CONCURRENCY"
+      --groups G1
+      --max-tasks 10
+      --output-dir "$shard_dir"
+      --require-clean-source
+      --require-openrouter-non-byok
+    )
+    local task_id
+    for task_id in "${task_ids[@]}"; do
+      command+=(--task-ids "$task_id")
+    done
+    mkdir "$shard_dir"
+    "${command[@]}" >"$shard_dir/run.log" 2>&1
+  }
+
+  for tranche_index in 0 1; do
+    for leg in 0 1; do
+      local -a control_tasks=()
+      local -a candidate_tasks=()
+      mapfile -t control_tasks < <(
+        jq -er ".tranches[$tranche_index].phases[$leg].control_task_ids[]" "$schedule_copy"
+      )
+      mapfile -t candidate_tasks < <(
+        jq -er ".tranches[$tranche_index].phases[$leg].candidate_task_ids[]" "$schedule_copy"
+      )
+      if (( ${#control_tasks[@]} + ${#candidate_tasks[@]} > TASK_CONCURRENCY )); then
+        echo "Confirmatory phase exceeds global task concurrency" >&2
+        return 2
+      fi
+      control_pid=""
+      candidate_pid=""
+      control_rc=0
+      candidate_rc=0
+      if (( ${#control_tasks[@]} > 0 )); then
+        control_shard="$shard_root/control-t$((tranche_index + 1))-l$((leg + 1))"
+        launch_confirmatory_shard \
+          control "$control_override" "$control_shard" "${control_tasks[@]}" &
+        control_pid=$!
+      fi
+      if (( ${#candidate_tasks[@]} > 0 )); then
+        candidate_shard="$shard_root/candidate-t$((tranche_index + 1))-l$((leg + 1))"
+        launch_confirmatory_shard \
+          candidate "$candidate_override" "$candidate_shard" "${candidate_tasks[@]}" &
+        candidate_pid=$!
+      fi
+      if [[ -n "$control_pid" ]]; then
+        if wait "$control_pid"; then
+          control_rc=0
+        else
+          control_rc=$?
+        fi
+      fi
+      if [[ -n "$candidate_pid" ]]; then
+        if wait "$candidate_pid"; then
+          candidate_rc=0
+        else
+          candidate_rc=$?
+        fi
+      fi
+      phase_failed=0
+      if [[ -n "$control_pid" ]]; then
+        if ! record_confirmatory_shard control "$control_shard" "$control_rc"; then
+          phase_failed=1
+        fi
+      fi
+      if [[ -n "$candidate_pid" ]]; then
+        if ! record_confirmatory_shard candidate "$candidate_shard" "$candidate_rc"; then
+          phase_failed=1
+        fi
+      fi
+      if [[ "$phase_failed" == "1" ]]; then
+        "$PYTHON" -c '
+import json, os, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+tmp.write_text(json.dumps({
+    "schema": "opensquilla.draco-confirmatory-terminal/v1",
+    "status": "incomplete",
+    "reason": "generation_leg_incomplete_no_unpaired_retry",
+    "cohort_id": sys.argv[2],
+    "schedule_sha256": sys.argv[3],
+}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+' "$ARCHIVE_DIR/confirmatory-terminal.json" "$cohort_id" "$schedule_sha256"
+        return 2
+      fi
+    done
+  done
+
+  capture_stable_after
+  ACCOUNT_WINDOW_OPEN=0
+
+  mkdir "$control_output" "$candidate_output"
+  cp -a "$ARCHIVE_DIR" "$control_archive"
+  cp -a "$ARCHIVE_DIR" "$candidate_archive"
+
+  map_copied_paths() {
+    local source_archive="$1"
+    local destination_archive="$2"
+    local source_name="$3"
+    local destination_name="$4"
+    local -n source_values="$source_name"
+    local -n destination_values="$destination_name"
+    local path relative
+    destination_values=()
+    for path in "${source_values[@]}"; do
+      relative="${path#"$source_archive"/}"
+      destination_values+=("$destination_archive/$relative")
+    done
+  }
+
+  local -a control_role_results=()
+  local -a control_role_manifests=()
+  local -a control_companion_results=()
+  local -a control_companion_manifests=()
+  local -a candidate_role_results=()
+  local -a candidate_role_manifests=()
+  local -a candidate_companion_results=()
+  local -a candidate_companion_manifests=()
+  map_copied_paths "$ARCHIVE_DIR" "$control_archive" control_results control_role_results
+  map_copied_paths "$ARCHIVE_DIR" "$control_archive" control_manifests control_role_manifests
+  map_copied_paths "$ARCHIVE_DIR" "$control_archive" candidate_results control_companion_results
+  map_copied_paths "$ARCHIVE_DIR" "$control_archive" candidate_manifests control_companion_manifests
+  map_copied_paths "$ARCHIVE_DIR" "$candidate_archive" candidate_results candidate_role_results
+  map_copied_paths "$ARCHIVE_DIR" "$candidate_archive" candidate_manifests candidate_role_manifests
+  map_copied_paths "$ARCHIVE_DIR" "$candidate_archive" control_results candidate_companion_results
+  map_copied_paths "$ARCHIVE_DIR" "$candidate_archive" control_manifests candidate_companion_manifests
+
+  rebase_copied_manifest_artifacts() {
+    local destination_archive="$1"
+    shift
+    "$PYTHON" - "$ARCHIVE_DIR" "$destination_archive" "$@" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+source_archive = Path(sys.argv[1]).resolve(strict=True)
+destination_archive = Path(sys.argv[2]).resolve(strict=True)
+for raw_manifest in sys.argv[3:]:
+    manifest_path = Path(raw_manifest).resolve(strict=True)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise SystemExit("confirmatory copied manifest lacks artifact paths")
+    rebased = {}
+    for name, raw_path in artifacts.items():
+        if not isinstance(raw_path, str) or not raw_path:
+            raise SystemExit("confirmatory copied manifest artifact path is malformed")
+        try:
+            relative = Path(raw_path).resolve(strict=True).relative_to(source_archive)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(
+                "confirmatory source artifact is outside the shared archive"
+            ) from exc
+        copied_path = destination_archive / relative
+        if not copied_path.is_file() or copied_path.is_symlink():
+            raise SystemExit("confirmatory copied artifact is missing or unsafe")
+        rebased[name] = str(copied_path)
+    payload["artifacts"] = rebased
+    temporary = manifest_path.with_name(f".{manifest_path.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, manifest_path)
+PY
+  }
+  rebase_copied_manifest_artifacts \
+    "$control_archive" \
+    "${control_role_manifests[@]}" \
+    "${control_companion_manifests[@]}"
+  rebase_copied_manifest_artifacts \
+    "$candidate_archive" \
+    "${candidate_role_manifests[@]}" \
+    "${candidate_companion_manifests[@]}"
+
+  finalize_confirmatory_role() {
+    local cohort_role="$1"
+    local role_output="$2"
+    local role_archive="$3"
+    local active_results_name="$4"
+    local active_manifests_name="$5"
+    local companion_results_name="$6"
+    local companion_manifests_name="$7"
+    local -n active_results="$active_results_name"
+    local -n active_manifests="$active_manifests_name"
+    local -n companion_results="$companion_results_name"
+    local -n companion_manifests="$companion_manifests_name"
+    local formal_dir="$role_output/.formal-results"
+    local -a finalizer_args=(
+      --input "$INPUT"
+      --account-before "$role_archive/account/openrouter-account-before.json"
+      --account-after "$role_archive/account/openrouter-account-after.json"
+      --account-reconciliation "$role_archive/account/openrouter-account-reconciliation.json"
+      --runtime-environment "$role_archive/runtime-environment.json"
+      --lock-file "$LOCK_FILE"
+      --lock-fd 9
+      --output-dir "$formal_dir"
+      --groups G1
+      --max-generation-attempts "$GENERATION_MAX_ATTEMPTS"
+      --expected-task-concurrency "$TASK_CONCURRENCY"
+      --expected-judge-concurrency "$JUDGE_CONCURRENCY"
+      --cohort-id "$cohort_id"
+      --cohort-role "$cohort_role"
+    )
+    local path
+    for path in "${active_results[@]}"; do
+      finalizer_args+=(--result "$path")
+    done
+    for path in "${active_manifests[@]}"; do
+      finalizer_args+=(--manifest "$path")
+    done
+    for path in "${companion_results[@]}"; do
+      finalizer_args+=(--cohort-companion-result "$path")
+    done
+    for path in "${companion_manifests[@]}"; do
+      finalizer_args+=(--cohort-companion-manifest "$path")
+    done
+    "$PYTHON" "$FINALIZER" "${finalizer_args[@]}" >"$role_archive/finalizer.log" 2>&1
+    publish_final_artifacts "$formal_dir" "$role_output" "$role_archive"
+  }
+
+  finalize_confirmatory_role \
+    control "$control_output" "$control_archive" \
+    control_role_results control_role_manifests \
+    control_companion_results control_companion_manifests
+  finalize_confirmatory_role \
+    candidate "$candidate_output" "$candidate_archive" \
+    candidate_role_results candidate_role_manifests \
+    candidate_companion_results candidate_companion_manifests
+
+  "$PYTHON" - "$schedule_copy" "$control_output/manifest.json" \
+    "$candidate_output/manifest.json" "$OUTPUT_DIR/cohort-manifest.json" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+schedule_path, control_path, candidate_path, output_path = map(Path, sys.argv[1:])
+schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+payload = {
+    "schema": "opensquilla.draco-confirmatory-cohort-manifest/v1",
+    "status": "complete",
+    "cohort_id": schedule["cohort_id"],
+    "schedule_sha256": schedule["schedule_sha256"],
+    "roles": {
+        "control": {"path": "control/manifest.json", "sha256": digest(control_path)},
+        "candidate": {"path": "candidate/manifest.json", "sha256": digest(candidate_path)},
+    },
+    "account_delta_report_scope": "paired_cohort_once",
+    "screening_is_diagnostic_only": True,
+}
+payload["manifest_sha256"] = hashlib.sha256(
+    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+temporary = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
+temporary.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, output_path)
+PY
+
+  flock -u 9
+  exec 9>&-
+  LOCK_HELD=0
+  trap - EXIT
+  echo "DRACO confirmatory paired cohort completed: $OUTPUT_DIR"
+}
+
+if [[ -n "$CONFIRMATORY_SCHEDULE" ]]; then
+  run_confirmatory_pair
+  exit $?
+fi
 
 cd "$SNAPSHOT_REPO"
 

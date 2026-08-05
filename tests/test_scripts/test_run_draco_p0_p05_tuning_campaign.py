@@ -63,6 +63,263 @@ def sealed_result(task_id: str) -> dict[str, object]:
 
 
 class ControllerTests(unittest.TestCase):
+    def _confirmatory_fixture(
+        self,
+        *,
+        run_root: Path | None = None,
+    ) -> tuple[dict[str, object], object, object, dict[str, object]]:
+        plan = controller.load_json(PLAN_TEMPLATE)
+        if run_root is not None:
+            plan["paths"]["run_root"] = str(run_root)
+        arms = controller.validate_plan(plan, allow_placeholders=True)
+        by_id = {arm.arm_id: arm for arm in arms}
+        control = by_id["common-E0-R1"]
+        candidate = by_id["P0-12-E1"]
+        task_ids = plan["benchmark"]["task_ids"]
+        replay = {
+            "schema": "opensquilla.draco.frozen-task-analysis/v2",
+            "mode": "frozen_replay",
+            "entries": {task_id: {"task_id": task_id} for task_id in task_ids},
+        }
+        artifact = {
+            "artifact_sha256": "a" * 64,
+            "replay_payload": replay,
+        }
+        replay_overlay = {"g1_routing": {"task_analysis_execution": replay}}
+        control_override = controller.deep_merge(control.override, replay_overlay)
+        candidate_override = controller.deep_merge(candidate.override, replay_overlay)
+        schedule = controller.build_confirmatory_schedule_payload(
+            plan,
+            control_arm=control,
+            candidate_arm=candidate,
+            control_override=control_override,
+            candidate_override=candidate_override,
+            analyzer_artifact=artifact,
+            seed="fixture-seed",
+        )
+        return plan, control, candidate, schedule
+
+    def _write_confirmatory_publication(
+        self,
+        root: Path,
+        schedule: dict[str, object],
+    ) -> None:
+        (root / "archive").mkdir(parents=True)
+        controller.atomic_write_json(
+            root / "archive" / "confirmatory-schedule.json",
+            schedule,
+        )
+        role_manifest_hashes = {}
+        cohort_sha = "sha256:" + "c" * 64
+        for role in ("control", "candidate"):
+            role_root = root / role
+            role_root.mkdir(parents=True)
+            for name in (
+                "results.jsonl",
+                "trace.jsonl",
+                "audit.json",
+                "openrouter-non-byok-campaign-proof.json",
+            ):
+                (role_root / name).write_text("{}\n", encoding="utf-8")
+            companion = "candidate" if role == "control" else "control"
+            manifest = {
+                "status": "complete",
+                "execution_pass": True,
+                "groups": ["G1"],
+                "task_count": 10,
+                "result_count": 10,
+                "task_ids": schedule["benchmark"]["task_ids"],
+                "account_window_cohort": {
+                    "cohort_id": schedule["cohort_id"],
+                    "role": role,
+                    "companion_role": companion,
+                    "cohort_sha256": cohort_sha,
+                },
+            }
+            manifest["manifest_sha256"] = "sha256:" + controller.canonical_sha256(
+                manifest
+            )
+            controller.atomic_write_json(role_root / "manifest.json", manifest)
+            role_manifest_hashes[role] = controller.file_sha256(
+                role_root / "manifest.json"
+            )
+        pair_manifest = {
+            "schema": controller.CONFIRMATORY_COHORT_MANIFEST_SCHEMA,
+            "status": "complete",
+            "cohort_id": schedule["cohort_id"],
+            "schedule_sha256": schedule["schedule_sha256"],
+            "roles": {
+                role: {
+                    "path": f"{role}/manifest.json",
+                    "sha256": role_manifest_hashes[role],
+                }
+                for role in ("control", "candidate")
+            },
+            "account_delta_report_scope": "paired_cohort_once",
+            "screening_is_diagnostic_only": True,
+        }
+        pair_manifest["manifest_sha256"] = controller.canonical_sha256(pair_manifest)
+        controller.atomic_write_json(root / "cohort-manifest.json", pair_manifest)
+
+    def test_confirmatory_schedule_is_deterministic_balanced_and_globally_bounded(self) -> None:
+        plan, _, _, schedule = self._confirmatory_fixture()
+        controller.validate_confirmatory_schedule(plan, schedule)
+        self.assertEqual(schedule["order_balance"], {"AB": 5, "BA": 5})
+        self.assertEqual(
+            [len(tranche["task_ids"]) for tranche in schedule["tranches"]],
+            [6, 4],
+        )
+        self.assertTrue(
+            all(
+                phase["max_inflight_tasks"] <= 6
+                for tranche in schedule["tranches"]
+                for phase in tranche["phases"]
+            )
+        )
+        self.assertEqual(schedule["frozen_analyzer"]["entry_count"], 10)
+        self.assertEqual(
+            schedule["roles"]["control"]["override"]["g1_routing"][
+                "task_analysis_execution"
+            ],
+            schedule["roles"]["candidate"]["override"]["g1_routing"][
+                "task_analysis_execution"
+            ],
+        )
+        _, _, _, repeated = self._confirmatory_fixture()
+        self.assertEqual(schedule, repeated)
+
+    def test_confirmatory_schedule_rejects_unbalanced_or_unpaired_repair_drift(self) -> None:
+        plan, _, _, schedule = self._confirmatory_fixture()
+        mutations = []
+        unbalanced = copy.deepcopy(schedule)
+        unbalanced["task_schedule"][0]["order"] = "BA"
+        unbalanced["order_balance"] = {"AB": 4, "BA": 6}
+        mutations.append(unbalanced)
+        concurrency = copy.deepcopy(schedule)
+        concurrency["tranches"][0]["phases"][0]["max_inflight_tasks"] = 7
+        mutations.append(concurrency)
+        retry = copy.deepcopy(schedule)
+        retry["execution_contract"]["generation_leg_failure_policy"] = "retry_unpaired"
+        mutations.append(retry)
+        replay = copy.deepcopy(schedule)
+        replay["roles"]["candidate"]["override"]["g1_routing"][
+            "task_analysis_execution"
+        ] = {"mode": "frozen_replay", "entries": {}}
+        mutations.append(replay)
+        role_binding = copy.deepcopy(schedule)
+        role_binding["roles"]["candidate"]["control_arm_id"] = "common-E0-R2"
+        mutations.append(role_binding)
+        deterministic_assignment = copy.deepcopy(schedule)
+        current_first_role = deterministic_assignment["task_schedule"][0]["first_role"]
+        deterministic_assignment["task_schedule"][0]["first_role"] = (
+            "candidate" if current_first_role == "control" else "control"
+        )
+        mutations.append(deterministic_assignment)
+        account_window = copy.deepcopy(schedule)
+        account_window["account_window_contract"]["single_account_before_after"] = False
+        mutations.append(account_window)
+        for mutation in mutations:
+            mutation.pop("schedule_sha256")
+            mutation["schedule_sha256"] = controller.canonical_sha256(mutation)
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(controller.ControllerError):
+                    controller.validate_confirmatory_schedule(plan, mutation)
+
+    def test_live_analyzer_confirmatory_schedule_does_not_embed_replay(self) -> None:
+        plan = controller.load_json(PLAN_TEMPLATE)
+        by_id = {
+            arm.arm_id: arm
+            for arm in controller.validate_plan(plan, allow_placeholders=True)
+        }
+        candidate = by_id["P0-03-E1"]
+        control = by_id[candidate.control_arm_id]
+        schedule = controller.build_confirmatory_schedule_payload(
+            plan,
+            control_arm=control,
+            candidate_arm=candidate,
+            control_override=control.override,
+            candidate_override=candidate.override,
+            analyzer_artifact=None,
+            seed="live-analyzer-seed",
+        )
+        controller.validate_confirmatory_schedule(plan, schedule)
+        self.assertIsNone(schedule["frozen_analyzer"])
+
+    def test_confirmatory_publication_registration_is_receipt_driven_and_idempotent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = Path(raw)
+            plan, _, _, schedule = self._confirmatory_fixture(
+                run_root=temporary / "run",
+            )
+            cohort_root = temporary / "cohort"
+            self._write_confirmatory_publication(cohort_root, schedule)
+            first = controller.register_confirmatory_report_input(
+                plan,
+                schedule,
+                cohort_root,
+            )
+            index_path = Path(first["index_path"])
+            first_raw = index_path.read_bytes()
+            second = controller.register_confirmatory_report_input(
+                plan,
+                schedule,
+                cohort_root,
+            )
+            self.assertEqual(first, second)
+            self.assertEqual(first_raw, index_path.read_bytes())
+            index = controller.load_json(index_path)
+            controller._validate_confirmatory_report_input_index(plan, index)
+            self.assertEqual(len(index["entries"]), 1)
+            self.assertEqual(
+                index["entries"][0]["account_window_cohort_sha256"],
+                "sha256:" + "c" * 64,
+            )
+
+    def test_confirmatory_publication_missing_one_role_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = Path(raw)
+            plan, _, _, schedule = self._confirmatory_fixture(
+                run_root=temporary / "run",
+            )
+            cohort_root = temporary / "cohort"
+            self._write_confirmatory_publication(cohort_root, schedule)
+            (cohort_root / "candidate" / "manifest.json").unlink()
+            with self.assertRaises(controller.ControllerError):
+                controller.register_confirmatory_report_input(
+                    plan,
+                    schedule,
+                    cohort_root,
+                )
+            partial = controller.register_partial_confirmatory_report_input(
+                plan,
+                schedule,
+                cohort_root,
+                reason="candidate_missing",
+                launcher_returncode=2,
+            )
+            self.assertEqual(partial["status"], "partial")
+            self.assertEqual(
+                partial["roles"]["candidate"]["publication_status"],
+                "missing",
+            )
+            self.assertEqual(
+                partial["roles"]["control"]["publication_status"],
+                "present_unverified",
+            )
+            self.assertEqual(
+                controller.registered_confirmatory_report_input(
+                    plan,
+                    schedule["cohort_id"],
+                ),
+                {
+                    key: value
+                    for key, value in partial.items()
+                    if key not in {"index_path", "index_sha256"}
+                },
+            )
+
     def test_isolated_snapshot_helper_does_not_write_bytecode(self) -> None:
         program = """
 import json

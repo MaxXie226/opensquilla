@@ -6810,6 +6810,64 @@ def _g1_only_campaign(
     return args, [row for row in rows if row["group"] == "G1"], lock_fd
 
 
+def _paired_g1_companion_sources(
+    module,
+    args: argparse.Namespace,
+    tmp_path: Path,
+) -> tuple[list[Path], list[Path]]:
+    """Create a distinct, contract-compatible companion arm for cohort tests."""
+
+    companion_dir = tmp_path / "candidate-arm"
+    companion_dir.mkdir(parents=True)
+    task = json.loads(args.input.read_text().splitlines()[0])
+    first_manifest = json.loads(args.manifest[0].read_text())
+    fingerprint = first_manifest["run_compatibility"]["fingerprints"]["G1"]
+    base = _row(
+        module,
+        group="G1",
+        task=task,
+        fingerprint=fingerprint,
+        response_prefix="candidate-g1",
+    )
+    result_paths: list[Path] = []
+    manifest_paths: list[Path] = []
+    for source_index, active_manifest_path in enumerate(args.manifest):
+        row = deepcopy(base)
+        if source_index:
+            row["completed_at"] = 1_020.0
+            execution = row["execution"]
+            execution["prior_generation_attempts_used"] = 1
+            execution["resume_action"] = "metadata_only"
+            execution["generation_reused"] = True
+            execution["metadata_repaired"] = True
+            execution["judge_reran"] = False
+            row["resume_completion"] = {
+                "action": "metadata_only",
+                "generation_reused": True,
+                "metadata_repaired": True,
+                "judge_reran": False,
+                "post_repair_action": "complete",
+                "status": "complete",
+                "incomplete_reasons": [],
+            }
+            for judgment in row["judge"]["criterion_judgments"]:
+                judgment["prior_judge_attempts_used"] = 1
+                judgment["judge_new_attempt_count"] = 0
+            row["judge"]["judge_new_attempt_count"] = 0
+        row = module.seal_result_row(row)
+        result_path = companion_dir / f"wave{source_index + 1}.jsonl"
+        result_path.write_text(json.dumps(row) + "\n")
+        result_path.chmod(0o600)
+        result_paths.append(result_path)
+
+        manifest = json.loads(active_manifest_path.read_text())
+        manifest["artifacts"]["results_jsonl"] = str(result_path.resolve())
+        manifest_path = companion_dir / f"wave{source_index + 1}.manifest.json"
+        _owner_json(manifest_path, manifest)
+        manifest_paths.append(manifest_path)
+    return result_paths, manifest_paths
+
+
 def _prior_account_window(
     module,
     args: argparse.Namespace,
@@ -7328,6 +7386,179 @@ def test_g1_only_finalization_scopes_all_formal_outputs(
     assert "| G1 | selection_mode | frozen-registry `router_dynamic` |" in report
     assert "| B0 | single |" not in report
     assert "本次活动组不包含 B0/B1 基线，无法进行同题配对比较" in report
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"cohort_id": "paired-1"}, "--cohort-role"),
+        (
+            {"cohort_id": "paired-1", "cohort_role": "control"},
+            "one companion manifest",
+        ),
+        (
+            {
+                "cohort_id": "unsafe cohort",
+                "cohort_role": "control",
+                "cohort_companion_result": [Path("missing-result")],
+                "cohort_companion_manifest": [Path("missing-manifest")],
+            },
+            "safe 1-128 character identifier",
+        ),
+    ],
+)
+def test_account_window_cohort_cli_is_all_or_none(
+    module,
+    tmp_path: Path,
+    fields: dict[str, object],
+    message: str,
+) -> None:
+    args, _, lock_fd = _g1_only_campaign(module, tmp_path)
+    for key, value in fields.items():
+        setattr(args, key, value)
+    try:
+        with pytest.raises(module.FinalizationError, match=message):
+            module.account_window_cohort_request(args)
+    finally:
+        os.close(lock_fd)
+
+
+def test_paired_cohort_finalizes_active_arm_against_full_account_window(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _g1_only_campaign(module, tmp_path)
+    companion_results, companion_manifests = _paired_g1_companion_sources(
+        module,
+        args,
+        tmp_path,
+    )
+    after = json.loads(args.account_after.read_text())
+    after["usage"] = "12.2"
+    _owner_json(args.account_after, after)
+    reconciliation = json.loads(args.account_reconciliation.read_text())
+    reconciliation["usage_after_usd"] = "12.2"
+    reconciliation["usage_delta_usd"] = "2.2"
+    for observation in reconciliation["stable_observations"]:
+        observation["usage"] = "12.2"
+    _owner_json(args.account_reconciliation, reconciliation)
+    args.cohort_id = "confirmatory-pair-1"
+    args.cohort_role = "control"
+    args.cohort_companion_result = companion_results
+    args.cohort_companion_manifest = companion_manifests
+
+    try:
+        manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+    output = args.output_dir
+    rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
+    ledger = [
+        json.loads(line)
+        for line in (output / "actual-spend-ledger.jsonl").read_text().splitlines()
+    ]
+    audit = json.loads((output / "audit.json").read_text())
+    proof = json.loads((output / "openrouter-non-byok-campaign-proof.json").read_text())
+    cohort = manifest["account_window_cohort"]
+
+    assert manifest["status"] == "complete"
+    assert manifest["result_count"] == 1
+    assert len(rows) == 1
+    assert rows[0]["task_id"] == "task-1"
+    assert len(ledger) == 22
+    generation_rows = [row for row in ledger if "generation" in row["scopes"]]
+    assert {row["generation_disposition"] for row in generation_rows} == {
+        "selected",
+        "cohort_companion_selected",
+    }
+    assert {
+        reference["account_window_cohort_role"]
+        for row in ledger
+        for reference in row["source_references"]
+    } == {"control", "candidate"}
+    assert manifest["ledger_summary"]["physical_request_count"] == 22
+    assert manifest["ledger_summary"][
+        "cohort_companion_selected_generation_pair_count"
+    ] == 1
+    assert proof["account"]["campaign_usage_delta_usd"] == "2.2"
+    assert proof["cost_scope"]["campaign_attributable_cost_usd"] == "2.2"
+    assert [
+        item["account_window_cohort_role"]
+        for item in proof["window"]["source_window_coverage"]
+    ] == ["control", "control", "candidate", "candidate"]
+    assert cohort == audit["account_window_cohort"] == proof["account_window_cohort"]
+    assert cohort["schema"] == module.ACCOUNT_WINDOW_COHORT_SCHEMA
+    assert cohort["cohort_id"] == "confirmatory-pair-1"
+    assert cohort["role"] == "control"
+    assert cohort["companion_role"] == "candidate"
+    assert set(cohort["members"]) == {"control", "candidate"}
+    assert manifest["group_metrics"][0]["selected_generation_cost_usd"] == "0.500000000"
+
+
+def test_paired_cohort_hash_is_independent_of_finalized_role(
+    module,
+    tmp_path: Path,
+) -> None:
+    paths = {}
+    for finalized_role in ("control", "candidate"):
+        paths[finalized_role] = {}
+        for member_role in ("control", "candidate"):
+            member = tmp_path / f"{finalized_role}-archive" / member_role
+            member.mkdir(parents=True)
+            result = member / "wave.jsonl"
+            manifest = member / "manifest.json"
+            result.write_text(f"{{\"role\": \"{member_role}\"}}\n")
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "role": member_role,
+                        "artifacts": {
+                            "results_jsonl": str(result),
+                            "manifest_json": str(manifest),
+                        },
+                    }
+                )
+                + "\n"
+            )
+            result.chmod(0o600)
+            manifest.chmod(0o600)
+            paths[finalized_role][member_role] = (result, manifest)
+    evidence = {}
+    for name in ("before", "after", "reconciliation", "runtime"):
+        path = tmp_path / f"{name}.json"
+        path.write_text("{}\n")
+        path.chmod(0o600)
+        evidence[name] = path
+
+    def descriptor(role: str) -> dict[str, object]:
+        companion = "candidate" if role == "control" else "control"
+        return module.build_account_window_cohort(
+            {
+                "cohort_id": "pair-stable",
+                "role": role,
+                "companion_role": companion,
+                "active_results": [paths[role][role][0]],
+                "active_manifests": [paths[role][role][1]],
+                "companion_results": [paths[role][companion][0]],
+                "companion_manifests": [paths[role][companion][1]],
+            },
+            account_before=evidence["before"],
+            account_after=evidence["after"],
+            account_reconciliation=evidence["reconciliation"],
+            runtime_environment=evidence["runtime"],
+            selected_bindings_by_role={
+                "control": {"G1/task-1": "a" * 32},
+                "candidate": {"G1/task-1": "b" * 32},
+            },
+        )
+
+    control = descriptor("control")
+    candidate = descriptor("candidate")
+    assert control["cohort_sha256"] == candidate["cohort_sha256"]
+    assert control["members"] == candidate["members"]
+    assert control["role"] == candidate["companion_role"]
+    assert candidate["role"] == control["companion_role"]
 
 
 @pytest.mark.parametrize("tamper", ["manifest_groups", "contract_scope"])
