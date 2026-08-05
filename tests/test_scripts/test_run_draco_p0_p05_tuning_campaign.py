@@ -63,6 +63,36 @@ def sealed_result(task_id: str) -> dict[str, object]:
 
 
 class ControllerTests(unittest.TestCase):
+    def test_isolated_snapshot_helper_does_not_write_bytecode(self) -> None:
+        program = """
+import json
+import sys
+from pathlib import Path
+
+snapshot = Path(sys.argv[1])
+sys.path.insert(0, str(snapshot))
+import snapshot_probe
+
+print(json.dumps({"value": snapshot_probe.VALUE}))
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp)
+            (snapshot / "snapshot_probe.py").write_text(
+                "VALUE = 'snapshot-imported'\n",
+                encoding="utf-8",
+            )
+
+            result = controller._isolated_snapshot_json(
+                snapshot,
+                program=program,
+                payload={},
+                label="bytecode isolation probe",
+            )
+
+            self.assertEqual(result, {"value": "snapshot-imported"})
+            self.assertEqual(list(snapshot.rglob("__pycache__")), [])
+            self.assertEqual(list(snapshot.rglob("*.pyc")), [])
+
     def test_matrix_freezes_66_arms_controls_modes_and_schedule(self) -> None:
         plan = controller.load_json(PLAN_TEMPLATE)
         arms = controller.validate_plan(plan, allow_placeholders=True)

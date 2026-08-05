@@ -2462,7 +2462,7 @@ def _isolated_snapshot_json(
             environment.pop(name, None)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", program, str(snapshot.resolve())],
+        [sys.executable, "-I", "-B", "-c", program, str(snapshot.resolve())],
         cwd=snapshot,
         env=environment,
         input=json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
