@@ -3784,10 +3784,18 @@ async def start_gateway_server(
         session_manager=svc.session_manager,
         usage_event_sink=usage_event_sink,
     )
-    turn_runner.set_prompt_cache_keepalive_recorder(
-        prompt_cache_keepalive_service.record_candidate,
-        armed=prompt_cache_keepalive_service.is_enabled,
+    set_keepalive_recorder = getattr(
+        turn_runner,
+        "set_prompt_cache_keepalive_recorder",
+        None,
     )
+    if callable(set_keepalive_recorder):
+        set_keepalive_recorder(
+            prompt_cache_keepalive_service.record_candidate,
+            armed=prompt_cache_keepalive_service.is_enabled,
+        )
+    else:
+        log.warning("gateway.prompt_cache_keepalive_recorder_unavailable")
     svc.prompt_cache_keepalive_service = prompt_cache_keepalive_service
     # Wire the runtime into SessionManager so kill_session can cascade-cancel.
     attach_runtime = getattr(svc.session_manager, "attach_task_runtime", None)
