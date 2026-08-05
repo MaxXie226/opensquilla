@@ -11,11 +11,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-class BackupTooLarge(RuntimeError):  # noqa: N818 - public domain name
+class BackupUnavailable(RuntimeError):  # noqa: N818 - public domain name
+    """Backup could not be created even after old entries were removed."""
+
+    def __init__(self, *, reason: str) -> None:
+        self.reason = str(reason)
+        super().__init__(f"backup_unavailable: {self.reason}")
+
+
+class BackupTooLarge(BackupUnavailable):  # noqa: N818 - public domain name
     def __init__(self, *, size_bytes: int, quota_bytes: int) -> None:
         self.size_bytes = int(size_bytes)
         self.quota_bytes = int(quota_bytes)
-        super().__init__(
+        self.reason = "quota_exceeded"
+        RuntimeError.__init__(
+            self,
             f"recursive_backup_too_large: {self.size_bytes} > {self.quota_bytes}"
         )
 
@@ -63,6 +73,10 @@ class StagedBackup:
         self.created_at = int(created_at)
 
     def publish(self, *, quota_bytes: int) -> BackupReceipt:
+        self._vault.evict_for_capacity(
+            required_bytes=self.size_bytes,
+            quota_bytes=int(quota_bytes),
+        )
         if self.size_bytes > int(quota_bytes):
             self.discard()
             raise BackupTooLarge(
@@ -142,8 +156,52 @@ class BackupVault:
         *,
         quota_bytes: int,
     ) -> BackupReceipt:
-        staged = self.stage(target)
-        return staged.publish(quota_bytes=quota_bytes)
+        return self.backup_many((target,), quota_bytes=quota_bytes)[0]
+
+    def backup_many(
+        self,
+        targets: tuple[str | Path, ...] | list[str | Path],
+        *,
+        quota_bytes: int,
+    ) -> tuple[BackupReceipt, ...]:
+        """Back up all targets, clearing old entries and retrying I/O once."""
+
+        normalized = tuple(targets)
+        if not normalized:
+            return ()
+        last_error: OSError | None = None
+        for attempt in range(2):
+            staged: list[StagedBackup] = []
+            try:
+                staged = [self.stage(target) for target in normalized]
+                total_size = sum(item.size_bytes for item in staged)
+                self.evict_for_capacity(
+                    required_bytes=total_size,
+                    quota_bytes=int(quota_bytes),
+                )
+                if total_size > int(quota_bytes):
+                    raise BackupTooLarge(
+                        size_bytes=total_size,
+                        quota_bytes=int(quota_bytes),
+                    )
+                return tuple(
+                    item.publish(quota_bytes=int(quota_bytes)) for item in staged
+                )
+            except BackupTooLarge:
+                for item in staged:
+                    item.discard()
+                raise
+            except OSError as exc:
+                last_error = exc
+                for item in staged:
+                    item.discard()
+                try:
+                    self.clear_committed_backups()
+                except OSError as cleanup_error:
+                    raise BackupUnavailable(reason="cleanup_failed") from cleanup_error
+                if attempt == 0:
+                    continue
+        raise BackupUnavailable(reason="io_error") from last_error
 
     def commit_bytes(
         self,
@@ -202,10 +260,33 @@ class BackupVault:
             shutil.rmtree(receipt.entry_path)
             total -= receipt.size_bytes
 
+    def evict_for_capacity(self, *, required_bytes: int, quota_bytes: int) -> None:
+        """Delete oldest committed backups until a new backup could fit."""
+
+        required = max(0, int(required_bytes))
+        quota = max(0, int(quota_bytes))
+        receipts = list(self.list_receipts())
+        total = sum(receipt.size_bytes for receipt in receipts)
+        for receipt in receipts:
+            if total + required <= quota:
+                break
+            shutil.rmtree(receipt.entry_path)
+            total -= receipt.size_bytes
+
+    def clear_committed_backups(self) -> None:
+        """Remove committed backup content to recover space for one retry."""
+
+        for entry in tuple(self.entries_root.iterdir()):
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink(missing_ok=True)
+
 
 __all__ = [
     "BackupReceipt",
     "BackupTooLarge",
+    "BackupUnavailable",
     "BackupVault",
     "StagedBackup",
 ]
