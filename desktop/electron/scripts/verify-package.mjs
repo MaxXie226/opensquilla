@@ -8,6 +8,7 @@ import {
   assertRuntimeSetReady,
   currentRuntimeTarget,
   loadRuntimeManifest,
+  packagedRuntimeTarget,
 } from './fetch-bundled-runtimes.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -404,8 +405,8 @@ async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
     const manifest = await loadRuntimeManifest(
       join(resourcesDir, 'runtime', 'runtime-manifest.json'),
     )
-    const target = Object.keys(manifest.assets).find((candidate) => candidate.startsWith(`${platform === 'win32' ? 'windows' : platform}-`))
-    if (!target) {
+    const target = packagedRuntimeTarget(resourcesDir, platform)
+    if (!(target in manifest.assets)) {
       fail(`${label} runtime manifest has no target for ${platform}`)
     } else {
       await assertRuntimeSetReady({

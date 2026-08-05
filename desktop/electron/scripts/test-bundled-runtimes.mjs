@@ -11,12 +11,21 @@ import {
   defaultRuntimeRoot,
   downloadVerifiedAsset,
   loadRuntimeManifest,
+  packagedRuntimeTarget,
   validateRuntimeManifest,
 } from './fetch-bundled-runtimes.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'opensquilla-runtime-test-'))
 
 try {
+  assert.equal(
+    packagedRuntimeTarget(
+      '/tmp/dist/desktop-electron/mac-arm64/OpenSquilla.app/Contents/Resources',
+      'darwin',
+      'x64',
+    ),
+    'darwin-arm64',
+  )
   assert.equal(
     defaultRuntimeCacheRoot.startsWith(defaultRuntimeRoot),
     false,

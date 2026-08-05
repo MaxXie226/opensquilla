@@ -122,6 +122,19 @@ export function currentRuntimeTarget(platform = process.platform, arch = process
   return `${platformNames[platform] ?? platform}-${archNames[arch] ?? arch}`
 }
 
+export function packagedRuntimeTarget(
+  bundlePath,
+  platform = process.platform,
+  fallbackArch = process.arch,
+) {
+  const segments = String(bundlePath).replaceAll('\\', '/').split('/').reverse()
+  for (const segment of segments) {
+    const match = segment.match(/(?:^|-)(arm64|aarch64|x64|amd64)(?:-|$)/i)
+    if (match) return currentRuntimeTarget(platform, match[1].toLowerCase())
+  }
+  return currentRuntimeTarget(platform, fallbackArch)
+}
+
 async function sha256File(path) {
   return createHash('sha256').update(await readFile(path)).digest('hex')
 }
