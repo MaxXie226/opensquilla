@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -12,8 +12,10 @@ import {
   downloadVerifiedAsset,
   loadRuntimeManifest,
   packagedRuntimeTarget,
+  stripExtractedComponents,
   tarExtractArgs,
   validateRuntimeManifest,
+  windowsZipExtractSpec,
 } from './fetch-bundled-runtimes.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'opensquilla-runtime-test-'))
@@ -54,6 +56,33 @@ try {
     ['-xf', '/tmp/python.tar.gz', '-C', '/tmp/python.staging'],
     'non-Windows tar arguments must stay portable',
   )
+  assert.deepEqual(
+    windowsZipExtractSpec(
+      String.raw`Z:\fixture\.runtime-cache\node.zip`,
+      String.raw`Z:\fixture\runtime\node.staging`,
+    ),
+    {
+      command: 'powershell.exe',
+      args: [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        'Expand-Archive -LiteralPath $env:OPENSQUILLA_RUNTIME_ARCHIVE '
+          + '-DestinationPath $env:OPENSQUILLA_RUNTIME_DESTINATION -Force',
+      ],
+      environment: {
+        OPENSQUILLA_RUNTIME_ARCHIVE: String.raw`Z:\fixture\.runtime-cache\node.zip`,
+        OPENSQUILLA_RUNTIME_DESTINATION: String.raw`Z:\fixture\runtime\node.staging`,
+      },
+    },
+    'Windows zip extraction must use the system archive command with literal paths',
+  )
+  const extracted = join(root, 'extracted')
+  await mkdir(join(extracted, 'node-wrapper', 'bin'), { recursive: true })
+  await writeFile(join(extracted, 'node-wrapper', 'bin', 'node.exe'), 'node fixture')
+  await stripExtractedComponents(extracted, 1)
+  assert.equal(await readFile(join(extracted, 'bin', 'node.exe'), 'utf8'), 'node fixture')
   const releaseManifest = await loadRuntimeManifest(defaultManifestPath)
   const requiredTargets = [
     'darwin-arm64',
