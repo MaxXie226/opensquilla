@@ -76,6 +76,17 @@ def _screening_schedule(
     }
 
 
+def _excluded_rows(controller: Any) -> list[dict[str, str]]:
+    return [
+        {
+            "id": group,
+            "kind": controller.EXCLUDED_GROUP_CONTRACTS[group]["kind"],
+            "reason": controller.EXCLUDED_GROUP_CONTRACTS[group]["reason"],
+        }
+        for group in sorted(controller.EXCLUDED_GROUP_CONTRACTS)
+    ]
+
+
 def _preexisting_source_contract(
     args: argparse.Namespace, *, controller: Any, common: Any
 ) -> dict[str, Any]:
@@ -233,6 +244,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     }
     plan: dict[str, Any] = {
         "schema": controller.PLAN_SCHEMA,
+        "semantic_contract": controller.SEMANTIC_CONTRACT,
         "run_id": args.run_id,
         "created_at": controller.utc_now(),
         "source_plan": {
@@ -314,24 +326,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             ],
         ],
         "experiments": experiments,
-        "excluded": [
-            {
-                "id": group,
-                "kind": "missing_feature",
-                "reason": "required runtime feature/schedule/schema is absent",
-            }
-            for group in sorted(controller.MISSING_FEATURE_GROUPS)
-        ]
-        + [
-            {
-                "id": group,
-                "kind": "deterministic_no_hit",
-                "reason": "the frozen ten-task DRACO mini source cannot reach this path",
-            }
-            for group in sorted(controller.DETERMINISTIC_NO_HIT_GROUPS)
-        ],
+        "excluded": _excluded_rows(controller),
         "progression": {
-            "schema": "opensquilla.draco-p1-progression/v1",
+            "schema": controller.PROGRESSION_SCHEMA,
             "first_arm_id": "P1-35-E1",
             "conditional_arm_ids": ["P1-15-E1", "P1-15-E2"],
             "control_arm_id": "common-E0-R1",

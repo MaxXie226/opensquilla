@@ -108,6 +108,7 @@ def _plan() -> dict:
     }
     return {
         "schema": module.PLAN_SCHEMA,
+        "semantic_contract": module.SEMANTIC_CONTRACT,
         "run_id": "p1-test-20260805",
         "source_plan": {
             "commit": "1" * 40,
@@ -182,23 +183,11 @@ def _plan() -> dict:
         ],
         "experiments": experiments,
         "excluded": [
-            {
-                "id": group,
-                "kind": "missing_feature",
-                "reason": "feature unavailable",
-            }
-            for group in sorted(module.MISSING_FEATURE_GROUPS)
-        ]
-        + [
-            {
-                "id": group,
-                "kind": "deterministic_no_hit",
-                "reason": "frozen mini has no hit",
-            }
-            for group in sorted(module.DETERMINISTIC_NO_HIT_GROUPS)
+            {"id": group, **module.EXCLUDED_GROUP_CONTRACTS[group]}
+            for group in sorted(module.EXCLUDED_GROUP_CONTRACTS)
         ],
         "progression": {
-            "schema": "opensquilla.draco-p1-progression/v1",
+            "schema": module.PROGRESSION_SCHEMA,
             "first_arm_id": "P1-35-E1",
             "conditional_arm_ids": ["P1-15-E1", "P1-15-E2"],
             "control_arm_id": "common-E0-R1",
@@ -263,6 +252,19 @@ def test_missing_or_tampered_matrix_is_rejected() -> None:
     plan["execution"]["schedule"]["strict_task_interleaving"] = True
     with pytest.raises(module.ControllerError, match="anchored serial screening design"):
         module.validate_plan(plan, allow_placeholders=False)
+
+    plan = _plan()
+    plan["excluded"][0]["reason"] += " tampered"
+    with pytest.raises(module.ControllerError, match="exact per-group reason contracts"):
+        module.validate_plan(plan, allow_placeholders=False)
+
+
+def test_p1_04_uses_timeout_only_gate_while_p1_05_keeps_retry_gate() -> None:
+    contracts = module.expected_variant_contracts()
+    assert contracts["P1-04-E1"]["hit_gate"]["metric"] == "analyzer_timeout_observed"
+    assert contracts["P1-04-E2"]["hit_gate"]["metric"] == "analyzer_timeout_observed"
+    assert contracts["P1-05-E1"]["hit_gate"]["metric"] == "analyzer_retry_or_fallback"
+    assert contracts["P1-05-E2"]["hit_gate"]["metric"] == "analyzer_retry_or_fallback"
 
 
 def test_relative_secret_path_is_rejected() -> None:
@@ -470,6 +472,7 @@ def _row(task_id: str) -> dict:
 def test_source_metrics_cover_conditional_slices() -> None:
     metrics = module.derive_source_task_metrics([_row("task-1")])["task-1"]
     assert metrics["analyzer_retry_or_fallback"] is True
+    assert metrics["analyzer_timeout_observed"] is False
     assert metrics["max_proposer_elapsed_ms"] == 350_000
     assert metrics["estimated_aggregator_elapsed_ms"] == 650_000
     assert metrics["generation_retry_count"] == 1
@@ -480,6 +483,36 @@ def test_source_metrics_cover_conditional_slices() -> None:
     assert metrics["max_consecutive_retrieval_iterations"] == 3
     assert metrics["soft_deadline_finalizer_with_thinking"] is True
     assert metrics["constrained_at_two_proposers"] is True
+
+
+@pytest.mark.parametrize(
+    ("analyzer_patch", "attempt_patch"),
+    [
+        ({"fallback_reason": "TimeoutError"}, {}),
+        ({}, {"timed_out": True}),
+        ({}, {"error_code": "deadline_exceeded"}),
+    ],
+)
+def test_analyzer_timeout_gate_requires_explicit_timeout_evidence(
+    analyzer_patch: dict, attempt_patch: dict
+) -> None:
+    row = _row("task-1")
+    analyzer = row["routing_trace"]["selection_plan"]["task_analyzer"]
+    analyzer.update(analyzer_patch)
+    analyzer["usage"]["physical_attempts"][0].update(attempt_patch)
+    metrics = module.derive_source_task_metrics([row])["task-1"]
+    assert metrics["analyzer_timeout_observed"] is True
+
+
+def test_analyzer_timeout_gate_rejects_retry_usage_unknown_and_http_error() -> None:
+    row = _row("task-1")
+    attempts = row["routing_trace"]["selection_plan"]["task_analyzer"]["usage"][
+        "physical_attempts"
+    ]
+    attempts[0]["error_code"] = "http_503"
+    metrics = module.derive_source_task_metrics([row])["task-1"]
+    assert metrics["analyzer_retry_or_fallback"] is True
+    assert metrics["analyzer_timeout_observed"] is False
 
 
 def test_normal_final_answer_does_not_unlock_p1_36() -> None:
@@ -552,12 +585,19 @@ def test_prepare_derived_consumes_controller_owned_source_package(
         @staticmethod
         def extract_analyzer_artifact(**kwargs: object) -> dict:
             observed.update(kwargs)
-            artifact = {"schema": "artifact", "artifact_sha256": "f" * 64}
+            artifact = {"schema": "artifact"}
+            artifact["artifact_sha256"] = module.canonical_sha256(artifact)
             module.atomic_write_json(Path(str(kwargs["destination"])), artifact)
             return artifact
 
     monkeypatch.setattr(module, "common_controller", lambda _snapshot=None: Common())
-    monkeypatch.setattr(module, "_result_rows", lambda _source, _snapshot: [_row("task-1")])
+    monkeypatch.setattr(
+        module,
+        "_result_rows",
+        lambda _source, _snapshot: [
+            _row(f"task-{index}") for index in range(10)
+        ],
+    )
     derived, _ = module.prepare_derived(
         plan,
         arms,
@@ -568,7 +608,12 @@ def test_prepare_derived_consumes_controller_owned_source_package(
     assert observed["replay_schema"] == "opensquilla.draco.frozen-task-analysis/v2"
     assert observed["source_import_evidence"] == source_import
     assert derived["preexisting_source_import_receipt_sha256"] == "e" * 64
+    assert derived["semantic_contract"] == module.SEMANTIC_CONTRACT
     assert derived["screening_design"] == module.screening_design_contract(plan)
+    assert module.load_derived(plan)[0] == derived
+    Path(derived["hit_receipt_path"]).unlink()
+    with pytest.raises(module.ControllerError, match="not a regular JSON file"):
+        module.load_derived(plan)
 
     status = module.initialize_status(
         plan,
@@ -614,22 +659,45 @@ def test_p1_15_progression_skips_only_with_complete_sufficient_evidence(
     monkeypatch.setattr(
         module, "_progression_cost_runtime", lambda _plan, _snapshot: (None, {})
     )
+    p1_35 = next(
+        arm
+        for arm in module.validate_plan(plan, allow_placeholders=False)
+        if arm.arm_id == "P1-35-E1"
+    )
+    hit_decision = {
+        "decision": "eligible",
+        "gate": module.asdict(p1_35.hit_gate),
+        "matched_task_ids": plan["benchmark"]["task_ids"],
+        "matched_task_count": 10,
+    }
     receipt = module.p1_15_progression_decision(
         plan,
         snapshot=Path("/tmp/snapshot"),
         control_dir=control_path,
         p1_35_dir=variant_path,
+        hit_decision=hit_decision,
+        hit_receipt_sha256="f" * 64,
     )
     assert receipt["decision"] == "skip_p1_15_sufficient"
     assert receipt["cost_reduction_fraction"] == pytest.approx(0.2)
     receipt_path = tmp_path / "progression.json"
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
-    assert module.load_progression_receipt(plan, receipt_path) == receipt
+    assert module.load_progression_receipt(
+        plan,
+        receipt_path,
+        hit_decision=hit_decision,
+        hit_receipt_sha256="f" * 64,
+    ) == receipt
     tampered = dict(receipt)
     tampered["cost_reduction_fraction"] = 0.9
     receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
     with pytest.raises(module.ControllerError, match="identity differs"):
-        module.load_progression_receipt(plan, receipt_path)
+        module.load_progression_receipt(
+            plan,
+            receipt_path,
+            hit_decision=hit_decision,
+            hit_receipt_sha256="f" * 64,
+        )
 
     def missing_cost(path: Path, _snapshot: Path) -> list[dict]:
         result = rows(path, _snapshot)
@@ -642,6 +710,8 @@ def test_p1_15_progression_skips_only_with_complete_sufficient_evidence(
         snapshot=Path("/tmp/snapshot"),
         control_dir=control_path,
         p1_35_dir=variant_path,
+        hit_decision=hit_decision,
+        hit_receipt_sha256="f" * 64,
     )
     assert receipt["decision"] == "run_p1_15_insufficient_or_uncertain"
 
@@ -676,10 +746,79 @@ def test_progression_cost_uses_cache_aware_complete_estimate_fallback() -> None:
     ) is None
 
 
+def test_p1_15_progression_does_not_skip_on_full_task_average(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan()
+    control_path = Path("/tmp/control")
+    variant_path = Path("/tmp/variant")
+
+    def rows(path: Path, _snapshot: Path) -> list[dict]:
+        result = []
+        for index, task_id in enumerate(plan["benchmark"]["task_ids"]):
+            control_quality = 50.0
+            delta = -10.0 if index == 0 else 10.0
+            result.append(
+                {
+                    "task_id": task_id,
+                    "quality_total": (
+                        control_quality if path == control_path else control_quality + delta
+                    ),
+                    "selected_attempt_billed_cost_usd": (
+                        10.0 if path == control_path else 1.0
+                    ),
+                }
+            )
+        return result
+
+    monkeypatch.setattr(module, "_result_rows", rows)
+    monkeypatch.setattr(
+        module, "_progression_cost_runtime", lambda _plan, _snapshot: (None, {})
+    )
+    p1_35 = next(
+        arm
+        for arm in module.validate_plan(plan, allow_placeholders=False)
+        if arm.arm_id == "P1-35-E1"
+    )
+    hit_decision = {
+        "decision": "eligible",
+        "gate": module.asdict(p1_35.hit_gate),
+        "matched_task_ids": [plan["benchmark"]["task_ids"][0]],
+        "matched_task_count": 1,
+    }
+    receipt = module.p1_15_progression_decision(
+        plan,
+        snapshot=Path("/tmp/snapshot"),
+        control_dir=control_path,
+        p1_35_dir=variant_path,
+        hit_decision=hit_decision,
+        hit_receipt_sha256="f" * 64,
+    )
+    assert receipt["mean_delta_quality"] == pytest.approx(-10.0)
+    assert receipt["cost_reduction_fraction"] == pytest.approx(0.9)
+    assert receipt["secondary_all_tasks"]["mean_delta_quality"] == pytest.approx(8.0)
+    assert receipt["secondary_all_tasks"]["cost_reduction_fraction"] == pytest.approx(0.9)
+    assert receipt["decision"] == "run_p1_15_insufficient_or_uncertain"
+
+
 def test_p1_35_no_hit_keeps_p1_15_eligible_as_uncertain() -> None:
     plan = _plan()
+    p1_35 = next(
+        arm
+        for arm in module.validate_plan(plan, allow_placeholders=False)
+        if arm.arm_id == "P1-35-E1"
+    )
+    hit_decision = {
+        "decision": "no_hit",
+        "gate": module.asdict(p1_35.hit_gate),
+        "matched_task_ids": [],
+        "matched_task_count": 0,
+    }
     receipt = module.p1_15_uncertain_progression_decision(
-        plan, reason="p1_35_source_slice_no_hit"
+        plan,
+        reason="p1_35_source_slice_no_hit",
+        hit_decision=hit_decision,
+        hit_receipt_sha256="f" * 64,
     )
     assert receipt["decision"] == "run_p1_15_insufficient_or_uncertain"
     assert receipt["selected_generation_cost_evidence_complete"] is False
