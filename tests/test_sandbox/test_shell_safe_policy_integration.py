@@ -384,6 +384,25 @@ def test_quoted_static_windows_executable_path_is_not_a_dynamic_delete(
     assert shell._delete_target(command, str(tmp_path), windows=True) is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        'sh -lc \'printf "HTTP_PROXY=%s\\n" "$HTTP_PROXY"\'',
+        (
+            "python - <<'PY'\n"
+            "import urllib.request\n"
+            "urllib.request.urlopen('https://example.com')\n"
+            "PY"
+        ),
+    ),
+)
+def test_windows_quoted_data_is_not_treated_as_a_dynamic_delete(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path), windows=True) is None
+
+
 def test_echo_of_fragmented_windows_variable_is_not_treated_as_execution(
     tmp_path: Path,
 ) -> None:
@@ -424,16 +443,27 @@ def test_compound_inert_commands_without_delete_are_ignored(tmp_path: Path) -> N
     assert shell._delete_target("echo ok; printf done", str(tmp_path)) is None
 
 
-def test_heredoc_body_delete_words_are_data_not_commands(tmp_path: Path) -> None:
+@pytest.mark.parametrize("windows", (False, True))
+def test_heredoc_body_delete_words_are_data_not_commands(
+    tmp_path: Path,
+    windows: bool,
+) -> None:
     command = "cat <<'EOF'\nrm important.txt\n<?php echo 'debug';\nEOF\n"
 
-    assert shell._delete_target(command, str(tmp_path)) is None
+    assert shell._delete_target(command, str(tmp_path), windows=windows) is None
 
 
-def test_delete_after_heredoc_terminator_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("windows", (False, True))
+def test_delete_after_heredoc_terminator_fails_closed(
+    tmp_path: Path,
+    windows: bool,
+) -> None:
     command = "cat <<'EOF'\nrm body-only.txt\nEOF\nrm important.txt"
 
-    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+    assert shell._delete_target(command, str(tmp_path), windows=windows) == (
+        None,
+        False,
+    )
 
 
 def test_heredoc_marker_inside_comment_cannot_hide_later_delete(tmp_path: Path) -> None:

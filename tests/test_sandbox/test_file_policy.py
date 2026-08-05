@@ -125,6 +125,10 @@ def test_safe_profile_compiles_write_baseline_and_read_only_carveouts(
     assert profile.resolve(authority / "sessions.db") is FileSystemAccess.DENY
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX alias canonicalization requires native POSIX path semantics",
+)
 def test_safe_profile_freezes_posix_alias_and_canonical_protected_paths(
     tmp_path: Path,
 ) -> None:

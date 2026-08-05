@@ -299,7 +299,7 @@ _RECURSIVE_DELETE_RISK_RE = re.compile(
 _DYNAMIC_DELETE_PATH_RE = re.compile(r"[*?\[\]{}$`]|%\w+%")
 _WINDOWS_DYNAMIC_VARIABLE_RE = re.compile(r'''%[^%"'\r\n]+%|![^!"'\r\n]+!''')
 _WINDOWS_DYNAMIC_EXECUTABLE_RE = re.compile(
-    rf'''{_WINDOWS_DYNAMIC_VARIABLE_RE.pattern}|\^|["']'''
+    rf'''{_WINDOWS_DYNAMIC_VARIABLE_RE.pattern}|\^'''
 )
 
 
@@ -326,9 +326,7 @@ def _delete_target(
     """Parse one standalone literal shell deletion and its recursive scope."""
 
     native_windows = os.name == "nt" if windows is None else windows
-    analysis_command = (
-        command if native_windows else strip_shell_heredoc_bodies(command)
-    )
+    analysis_command = strip_shell_heredoc_bodies(command)
     folded_delete = False
     folded_dynamic = False
     if native_windows:
@@ -362,7 +360,7 @@ def _delete_target(
         return None
     try:
         segments = parse_shell_segments(
-            command,
+            analysis_command if native_windows else command,
             platform="windows" if native_windows else None,
         )
     except ValueError:
@@ -421,6 +419,8 @@ def _delete_target(
     if executable in {"bash", "fish", "sh", "zsh"}:
         if len(tokens) >= 3 and tokens[1] in {"-c", "-lc"}:
             script = tokens[2].strip()
+            if len(script) >= 2 and script[0] == script[-1] and script[0] in {"'", '"'}:
+                script = script[1:-1]
             return _delete_target(script, cwd, windows=native_windows)
         return (None, recursive_hint)
     if executable in {"powershell", "pwsh"}:
@@ -608,7 +608,7 @@ def _delete_target(
     }:
         try:
             segments = parse_shell_segments(
-                command,
+                analysis_command if native_windows else command,
                 platform="windows" if native_windows else None,
             )
         except ValueError:
