@@ -629,7 +629,10 @@ def gate_elevated_action(
 
 
 __all__ = [
+    "ApprovalDisplay",
+    "ApprovalDisplayKind",
     "ApprovalReviewerName",
+    "BackupState",
     "ElevationAction",
     "ElevationGateResult",
     "SandboxPermissionIntent",

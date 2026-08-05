@@ -47,6 +47,7 @@ from opensquilla.sandbox.backend import Backend, NoopBackend, UnavailableBackend
 from opensquilla.sandbox.capability_profile import capability_profile_for_command
 from opensquilla.sandbox.config import EffectiveMode, SandboxSettings
 from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
     ApprovalReviewerName,
     ElevationAction,
     ElevationGateResult,
@@ -2073,6 +2074,10 @@ async def escalate_backend_denial(
         sandbox_permissions="require_escalated",
         justification="command failed; retry without sandbox?",
         risk_markers=tuple(result.backend_notes),
+        display=ApprovalDisplay(
+            kind="run_command",
+            target=" ".join(request.argv),
+        ),
     )
     return gate_elevated_action(
         action,

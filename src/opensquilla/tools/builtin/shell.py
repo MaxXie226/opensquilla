@@ -54,10 +54,14 @@ from opensquilla.sandbox.backend.seatbelt import (
     seatbelt_env_for_policy,
 )
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
-from opensquilla.sandbox.backup_vault import BackupTooLarge, BackupVault
+from opensquilla.sandbox.backup_vault import BackupTooLarge, BackupUnavailable, BackupVault
 from opensquilla.sandbox.command_policy import CommandAction, decide_shell_command
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.escalation import (
     build_path_approval_params,
     current_tool_mounts,
@@ -67,6 +71,7 @@ from opensquilla.sandbox.escalation import (
 from opensquilla.sandbox.file_mutation_broker import (
     OVERSIZE_BACKUP_WARNING,
     RECURSIVE_DELETE_WARNING,
+    UNAVAILABLE_BACKUP_WARNING,
     FileMutationBroker,
     MutationDenied,
     MutationPlan,
@@ -293,6 +298,7 @@ def _recursive_delete_action(
     plan: MutationPlan,
     *,
     without_backup: bool = False,
+    backup_enabled: bool = True,
 ) -> ElevationAction:
     warning = (
         plan.warning
@@ -320,6 +326,19 @@ def _recursive_delete_action(
             if without_backup
             else ("recursive-delete",)
         ),
+        display=ApprovalDisplay(
+            kind="delete",
+            target=str(plan.target),
+            destructive=True,
+            irreversible=without_backup or not backup_enabled,
+            backup_state=(
+                "unavailable_requires_confirmation"
+                if without_backup
+                else "enabled"
+                if backup_enabled
+                else "disabled"
+            ),
+        ),
     )
 
 
@@ -327,15 +346,17 @@ def _recursive_delete_approval_envelope(
     gate: Any,
     *,
     warning: str,
-    target: Path,
+    action: ElevationAction,
 ) -> str:
+    display = action.display or ApprovalDisplay(kind="sensitive_operation")
     payload = gate.to_envelope()
     payload.update(
         {
             "warning": warning,
-            "target": str(target),
+            "target": display.target,
             "recursive": True,
-            "irreversible": True,
+            "irreversible": display.irreversible,
+            "backup_state": display.backup_state,
         }
     )
     return json.dumps(payload, ensure_ascii=False)
@@ -395,8 +416,9 @@ async def _gate_recursive_delete(
                 },
                 ensure_ascii=False,
             )
+        policy = active_sandbox_policy()
         broker = FileMutationBroker(
-            policy=active_sandbox_policy(),
+            policy=policy,
             vault=BackupVault(Path(state_dir) / "backup-vault"),
             authority_roots=authority_roots_for_state(state_dir),
         )
@@ -429,7 +451,12 @@ async def _gate_recursive_delete(
         pending = _PendingRecursiveDelete(
             broker=broker,
             plan=plan,
-            action=_recursive_delete_action(command, effective_cwd, plan),
+            action=_recursive_delete_action(
+                command,
+                effective_cwd,
+                plan,
+                backup_enabled=policy.files.recursive_delete_backup_enabled,
+            ),
         )
     context = current_tool_context.get()
     gate = gate_elevated_action(
@@ -454,7 +481,7 @@ async def _gate_recursive_delete(
         return _recursive_delete_approval_envelope(
             gate,
             warning=pending.plan.warning or RECURSIVE_DELETE_WARNING,
-            target=pending.plan.target,
+            action=pending.action,
         )
     if approval_id:
         _PENDING_RECURSIVE_DELETES.pop(approval_id, None)
@@ -463,7 +490,7 @@ async def _gate_recursive_delete(
         plan = pending.broker.approve(plan)
     try:
         result = await asyncio.to_thread(pending.broker.execute, plan)
-    except BackupTooLarge as exc:
+    except BackupUnavailable as exc:
         override = pending.broker.approve_without_backup(pending.plan, exc)
         override_pending = _PendingRecursiveDelete(
             broker=pending.broker,
@@ -489,11 +516,15 @@ async def _gate_recursive_delete(
         return _recursive_delete_approval_envelope(
             second_gate,
             warning=override.warning
-            or OVERSIZE_BACKUP_WARNING.format(
-                size_bytes=exc.size_bytes,
-                quota_bytes=exc.quota_bytes,
+            or (
+                OVERSIZE_BACKUP_WARNING.format(
+                    size_bytes=exc.size_bytes,
+                    quota_bytes=exc.quota_bytes,
+                )
+                if isinstance(exc, BackupTooLarge)
+                else UNAVAILABLE_BACKUP_WARNING
             ),
-            target=override.target,
+            action=override_pending.action,
         )
     except ObjectIdentityChanged as exc:
         return json.dumps(
@@ -551,6 +582,7 @@ def _gate_safe_command_approval(
         justification=reason,
         content_digest=hashlib.sha256(command.encode("utf-8")).hexdigest(),
         risk_markers=("safe-command-approval",),
+        display=ApprovalDisplay(kind="run_command", target=command),
     )
     context = current_tool_context.get()
     gate = gate_elevated_action(
@@ -5196,6 +5228,7 @@ def _shell_elevation_action(
         network_targets=tuple(profile.requested_domains),
         content_digest=content_digest,
         prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(kind="run_command", target=command),
     )
 
 

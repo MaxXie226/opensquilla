@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from opensquilla.sandbox.backup_vault import BackupTooLarge, BackupVault
+from opensquilla.sandbox.backup_vault import (
+    BackupTooLarge,
+    BackupUnavailable,
+    BackupVault,
+)
 from opensquilla.sandbox.file_mutation_broker import (
     RECURSIVE_DELETE_WARNING,
     ApprovalRequired,
@@ -118,3 +122,30 @@ def test_oversize_backup_requires_second_exact_confirmation(tmp_path: Path) -> N
     assert not target.exists()
     with pytest.raises(ApprovalRequired):
         broker.execute(second)
+
+
+def test_persistent_backup_failure_can_only_continue_with_second_exact_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    (target / "payload.bin").write_bytes(b"important")
+    vault = BackupVault(tmp_path / "vault")
+    broker = FileMutationBroker(policy=_policy(), vault=vault)
+    approved = broker.approve(broker.plan_delete(target, recursive=True))
+
+    def _fail_backup_many(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise BackupUnavailable(reason="io_error")
+
+    monkeypatch.setattr(vault, "backup_many", _fail_backup_many)
+
+    with pytest.raises(BackupUnavailable) as raised:
+        broker.execute(approved)
+
+    assert target.exists()
+    second = broker.approve_without_backup(approved, raised.value)
+    assert "不会创建备份" in str(second.warning)
+    assert broker.execute(second).deleted is True
+    assert not target.exists()

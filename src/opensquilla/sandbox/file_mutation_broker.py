@@ -12,16 +12,26 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from opensquilla.sandbox.backup_vault import BackupReceipt, BackupTooLarge, BackupVault
+from opensquilla.sandbox.backup_vault import (
+    BackupReceipt,
+    BackupTooLarge,
+    BackupUnavailable,
+    BackupVault,
+)
 from opensquilla.sandbox.file_policy import FileDecision, decide_file_access
 from opensquilla.sandbox.policy_models import SandboxPolicy
 
 RECURSIVE_DELETE_WARNING = (
     "递归删除会永久删除该目录及其中的全部文件和子目录，无法撤回。"
-    "如果已开启递归删除备份，OpenSquilla 会在删除前创建备份；备份失败时删除不会继续。"
+    "如果已开启文件安全备份，OpenSquilla 会在删除前创建可恢复副本，"
+    "并可能自动清理最旧的备份以腾出空间；如果仍无法备份，会再次明确询问是否无备份继续。"
 )
 OVERSIZE_BACKUP_WARNING = (
     "该目录的备份大小为 {size_bytes} 字节，超过备份空间上限 {quota_bytes} 字节。"
+    "继续将递归删除全部内容且不会创建备份，此操作不可撤回。"
+)
+UNAVAILABLE_BACKUP_WARNING = (
+    "OpenSquilla 已自动清理旧备份，但仍无法为该目录创建新备份。"
     "继续将递归删除全部内容且不会创建备份，此操作不可撤回。"
 )
 
@@ -145,7 +155,7 @@ class FileMutationBroker:
         self._vault = vault
         self._authority_roots = authority_roots
         self._approvals: dict[str, str] = {}
-        self._backup_overrides: dict[str, tuple[str, int, int]] = {}
+        self._backup_overrides: dict[str, tuple[str, str]] = {}
 
     def plan_delete(
         self,
@@ -188,12 +198,12 @@ class FileMutationBroker:
     def approve_without_backup(
         self,
         plan: MutationPlan,
-        error: BackupTooLarge,
+        error: BackupUnavailable,
     ) -> MutationPlan:
-        """Issue exact one-use approvals for an oversize, unbacked recursive delete."""
+        """Issue exact one-use approval for an unbacked recursive delete."""
         if not plan.recursive:
             raise ValueError("backup override is only valid for recursive deletes")
-        if error.size_bytes <= error.quota_bytes:
+        if isinstance(error, BackupTooLarge) and error.size_bytes <= error.quota_bytes:
             raise ValueError("backup override requires an oversize backup")
         approval_token = secrets.token_urlsafe(24)
         override_token = secrets.token_urlsafe(24)
@@ -201,19 +211,25 @@ class FileMutationBroker:
             plan,
             approval_token=approval_token,
             backup_override_token=override_token,
-            warning=OVERSIZE_BACKUP_WARNING.format(
-                size_bytes=error.size_bytes,
-                quota_bytes=error.quota_bytes,
+            warning=(
+                OVERSIZE_BACKUP_WARNING.format(
+                    size_bytes=error.size_bytes,
+                    quota_bytes=error.quota_bytes,
+                )
+                if isinstance(error, BackupTooLarge)
+                else UNAVAILABLE_BACKUP_WARNING
             ),
         )
         fingerprint = approved.fingerprint()
         self._approvals[approval_token] = fingerprint
-        self._backup_overrides[override_token] = (
-            fingerprint,
-            error.size_bytes,
-            error.quota_bytes,
-        )
+        self._backup_overrides[override_token] = (fingerprint, self._backup_error_key(error))
         return approved
+
+    @staticmethod
+    def _backup_error_key(error: BackupUnavailable) -> str:
+        if isinstance(error, BackupTooLarge):
+            return f"quota:{error.size_bytes}:{error.quota_bytes}"
+        return f"reason:{error.reason}"
 
     def _consume_approval(self, plan: MutationPlan) -> None:
         if not plan.approval_required:
@@ -226,17 +242,16 @@ class FileMutationBroker:
     def _consume_backup_override(
         self,
         plan: MutationPlan,
-        error: BackupTooLarge,
+        error: BackupUnavailable,
     ) -> bool:
         token = plan.backup_override_token
         expected = self._backup_overrides.pop(str(token), None) if token else None
         if expected is None:
             return False
-        fingerprint, size_bytes, quota_bytes = expected
+        fingerprint, error_key = expected
         return (
             secrets.compare_digest(fingerprint, plan.fingerprint())
-            and size_bytes == error.size_bytes
-            and quota_bytes == error.quota_bytes
+            and secrets.compare_digest(error_key, self._backup_error_key(error))
         )
 
     @staticmethod
@@ -259,11 +274,11 @@ class FileMutationBroker:
         backup: BackupReceipt | None = None
         if plan.recursive and self._policy.files.recursive_delete_backup_enabled:
             try:
-                backup = self._vault.backup(
-                    plan.target,
+                backup = self._vault.backup_many(
+                    (plan.target,),
                     quota_bytes=self._policy.files.backup_quota_bytes,
-                )
-            except BackupTooLarge as exc:
+                )[0]
+            except BackupUnavailable as exc:
                 if not self._consume_backup_override(plan, exc):
                     raise
             self._verify_identity(plan)
@@ -286,4 +301,5 @@ __all__ = [
     "ObjectIdentityChanged",
     "OVERSIZE_BACKUP_WARNING",
     "RECURSIVE_DELETE_WARNING",
+    "UNAVAILABLE_BACKUP_WARNING",
 ]

@@ -21,8 +21,13 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.escalation import (
     build_path_approval_params,
     current_tool_mounts,
@@ -1319,7 +1324,7 @@ async def _gate_out_of_workspace_write(
         )
 
     if _sandbox_path_access_enabled():
-        safe_policy_gate = _gate_safe_policy_file_mutation(
+        safe_policy_gate = await _gate_safe_policy_file_mutation(
             tool_name,
             resolved,
             original_path,
@@ -1389,8 +1394,25 @@ async def _gate_out_of_workspace_write(
                 target_paths=((str(resolved), "write"),),
                 content_digest=content_digest,
                 prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+                display=ApprovalDisplay(
+                    kind="modify" if resolved.exists() or resolved.is_symlink() else "create",
+                    target=str(resolved),
+                ),
             )
             ctx = current_tool_context.get()
+            if resolved.exists() or resolved.is_symlink():
+                config = getattr(ctx, "sandbox_gateway_config", None) if ctx else None
+                destructive = await DestructiveBackupGate().evaluate(
+                    action,
+                    approval_id=approval_id,
+                    targets=(resolved,),
+                    policy=active_sandbox_policy(),
+                    state_dir=str(getattr(config, "state_dir", "") or ""),
+                    session_key=ctx.session_key if ctx is not None else None,
+                )
+                if not destructive.allowed:
+                    return destructive.envelope, False
+                return None, True
             gate = gate_elevated_action(
                 action,
                 approval_id=approval_id,
@@ -1411,7 +1433,7 @@ async def _gate_out_of_workspace_write(
     return _outside_workspace_write_block(tool_name, resolved, original_path), False
 
 
-def _gate_safe_policy_file_mutation(
+async def _gate_safe_policy_file_mutation(
     tool_name: str,
     resolved: Path,
     original_path: str,
@@ -1487,7 +1509,39 @@ def _gate_safe_policy_file_mutation(
         content_digest=content_digest,
         risk_markers=("safe_policy_protected_path",),
         prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(
+            kind="modify" if resolved.exists() or resolved.is_symlink() else "create",
+            target=str(resolved),
+        ),
     )
+    if resolved.exists() or resolved.is_symlink():
+        destructive = await DestructiveBackupGate().evaluate(
+            action,
+            approval_id=approval_id,
+            targets=(resolved,),
+            policy=active_sandbox_policy(),
+            state_dir=state_dir,
+            session_key=ctx.session_key if ctx is not None else None,
+        )
+        if not destructive.allowed:
+            envelope = destructive.envelope or {
+                "status": "blocked",
+                "reason": "destructive_backup_gate_failed",
+            }
+            envelope.update(
+                {
+                    "reason": decision.code
+                    or "sensitive_file_mutation_requires_approval",
+                    "path": str(resolved),
+                    "matched_path": (
+                        str(decision.matched_path)
+                        if decision.matched_path is not None
+                        else None
+                    ),
+                }
+            )
+            return envelope, False
+        return None, True
     gate = gate_elevated_action(
         action,
         approval_id=approval_id,

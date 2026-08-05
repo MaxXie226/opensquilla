@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.identity.workspace import BOOTSTRAP_FILENAMES
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.integration import active_file_system_profile
 from opensquilla.sandbox.operation_runtime import (
     FilesystemOperationRequest,
@@ -420,7 +425,7 @@ def _workspace_write_note_summary(
     return summarize_workspace_write_notes(paths)
 
 
-def _gate_patch_ops(
+async def _gate_patch_ops(
     ops: list[PatchOp],
     root: Path,
     approval_id: str | None,
@@ -564,8 +569,42 @@ def _gate_patch_ops(
         target_paths=tuple(target_paths),
         content_digest=patch_digest,
         prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(
+            kind=(
+                "delete"
+                if any(isinstance(op, DeleteFile) for op in ops)
+                else "modify"
+                if any(
+                    _resolve_path(op.path, root).exists()
+                    or _resolve_path(op.path, root).is_symlink()
+                    for op in ops
+                )
+                else "create"
+            ),
+            target="\n".join(str(path) for path, _access in target_paths),
+        ),
     )
     ctx = current_tool_context.get()
+    existing_targets = tuple(
+        dict.fromkeys(
+            resolved
+            for resolved, _op, _reason in boundary_targets
+            if resolved.exists() or resolved.is_symlink()
+        )
+    )
+    if existing_targets:
+        config = getattr(ctx, "sandbox_gateway_config", None) if ctx else None
+        destructive = await DestructiveBackupGate().evaluate(
+            action,
+            approval_id=approval_id,
+            targets=existing_targets,
+            policy=filesystem.active_sandbox_policy(),
+            state_dir=str(getattr(config, "state_dir", "") or ""),
+            session_key=ctx.session_key if ctx is not None else None,
+        )
+        if not destructive.allowed:
+            return destructive.envelope, False
+        return None, True
     gate = gate_elevated_action(
         action,
         approval_id=approval_id,
@@ -1034,7 +1073,7 @@ async def apply_patch(
             "directory and pass its `path`."
         )
     ops = _parse_patch(patch)
-    blocked, elevated = _gate_patch_ops(
+    blocked, elevated = await _gate_patch_ops(
         ops,
         root,
         approval_id,

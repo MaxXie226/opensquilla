@@ -17,7 +17,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.integration import (
     SandboxRuntime,
     consume_backend_denial_retry,
@@ -696,6 +700,7 @@ def _code_elevation_action(
         content_length=len(code),
         risk_markers=risk_markers,
         prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(kind="run_code", target=str(workdir)),
     )
 
 

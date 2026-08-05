@@ -447,7 +447,13 @@ async def test_recursive_delete_requires_warning_before_mutation(
         sandbox_policy=SandboxPolicy(),
         sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
     )
-    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: _PendingGate())
+    reviewed_actions = []
+
+    def _capture_action(action, **_kwargs):
+        reviewed_actions.append(action)
+        return _PendingGate()
+
+    monkeypatch.setattr(shell, "gate_elevated_action", _capture_action)
     token = current_tool_context.set(context)
     try:
         result = await shell._gate_recursive_delete(
@@ -461,8 +467,12 @@ async def test_recursive_delete_requires_warning_before_mutation(
     payload = json.loads(result or "{}")
     assert payload["status"] == "approval_required"
     assert payload["recursive"] is True
-    assert payload["irreversible"] is True
+    assert payload["irreversible"] is False
+    assert payload["backup_state"] == "enabled"
     assert "无法撤回" in payload["warning"]
+    assert reviewed_actions[0].display.kind == "delete"
+    assert reviewed_actions[0].display.target == str(target)
+    assert reviewed_actions[0].display.backup_state == "enabled"
     assert target.exists()
 
 
