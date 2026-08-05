@@ -184,6 +184,63 @@ function runChecked(command, args, options = {}) {
   }
 }
 
+export function tarExtractArgs(
+  archive,
+  destination,
+  stripComponents,
+  platform = process.platform,
+) {
+  const args = platform === 'win32' ? ['--force-local'] : []
+  const archivePath = platform === 'win32' ? archive.replaceAll('\\', '/') : archive
+  const destinationPath = platform === 'win32' ? destination.replaceAll('\\', '/') : destination
+  args.push('-xf', archivePath, '-C', destinationPath)
+  if (stripComponents > 0) args.push(`--strip-components=${stripComponents}`)
+  return args
+}
+
+export function windowsZipExtractSpec(archive, destination) {
+  return {
+    command: 'powershell.exe',
+    args: [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      'Expand-Archive -LiteralPath $env:OPENSQUILLA_RUNTIME_ARCHIVE '
+        + '-DestinationPath $env:OPENSQUILLA_RUNTIME_DESTINATION -Force',
+    ],
+    environment: {
+      OPENSQUILLA_RUNTIME_ARCHIVE: archive,
+      OPENSQUILLA_RUNTIME_DESTINATION: destination,
+    },
+  }
+}
+
+export async function stripExtractedComponents(destination, count) {
+  if (count === 0) return
+  let source = destination
+  for (let index = 0; index < count; index += 1) {
+    const entries = await readdir(source, { withFileTypes: true })
+    if (entries.length !== 1 || !entries[0].isDirectory()) {
+      throw new Error(`cannot strip ${count} component(s) from ${destination}`)
+    }
+    source = join(source, entries[0].name)
+  }
+
+  const flattened = `${destination}.flattened-${process.pid}`
+  await rm(flattened, { recursive: true, force: true })
+  await mkdir(flattened, { recursive: true })
+  try {
+    for (const entry of await readdir(source)) {
+      await rename(join(source, entry), join(flattened, entry))
+    }
+    await rm(destination, { recursive: true, force: true })
+    await rename(flattened, destination)
+  } finally {
+    await rm(flattened, { recursive: true, force: true })
+  }
+}
+
 async function extractAsset(asset, archive, destination) {
   await rm(destination, { recursive: true, force: true })
   await mkdir(destination, { recursive: true })
@@ -209,9 +266,15 @@ async function extractAsset(asset, archive, destination) {
     }
     return
   }
-  const args = ['-xf', archive, '-C', destination]
-  if (asset.stripComponents > 0) args.push(`--strip-components=${asset.stripComponents}`)
-  runChecked('tar', args)
+  if (process.platform === 'win32' && asset.archiveType === 'zip') {
+    const spec = windowsZipExtractSpec(archive, destination)
+    runChecked(spec.command, spec.args, {
+      env: { ...process.env, ...spec.environment },
+    })
+    await stripExtractedComponents(destination, asset.stripComponents)
+    return
+  }
+  runChecked('tar', tarExtractArgs(archive, destination, asset.stripComponents))
 }
 
 function targetAssets(manifest, target) {
