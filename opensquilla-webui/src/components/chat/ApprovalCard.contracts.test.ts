@@ -65,6 +65,26 @@ describe('ApprovalCard safe context', () => {
     app.unmount()
   })
 
+  it('presents destructive target and backup status as compact semantic rows', async () => {
+    const { app, root } = await mountCard(approval({
+      toolName: 'sandbox_elevation',
+      args: { action_kind: 'fs.recursive_delete', internal_policy: true },
+      displayKind: 'delete',
+      displayTarget: '/workspace/archive',
+      destructive: true,
+      irreversible: false,
+      backupState: 'enabled',
+    }))
+
+    expect(root.querySelector('.approval-card__target')?.textContent).toBe('/workspace/archive')
+    expect(root.querySelector('.approval-card__risk-icon')).not.toBeNull()
+    expect(root.querySelector('.approval-card__risk-copy')?.textContent).toContain('recoverable backup')
+    expect(root.textContent).not.toContain('sandbox_elevation')
+    expect(root.textContent).not.toContain('fs.recursive_delete')
+    expect(root.textContent).not.toContain('internal_policy')
+    app.unmount()
+  })
+
   it('renders the public network target without dumping its argument object', async () => {
     const { app, root } = await mountCard(approval({
       approvalKind: 'sandbox_network',

@@ -46,7 +46,7 @@
       <dl v-if="showTarget" class="approval-card__context">
         <div class="approval-card__context-row">
           <dt>{{ t('chat.approval.target') }}</dt>
-          <dd>{{ approval.displayTarget }}</dd>
+          <dd><code class="approval-card__target">{{ approval.displayTarget }}</code></dd>
         </div>
       </dl>
       <template v-if="showCommand">
@@ -59,9 +59,14 @@
         :class="riskClass"
         role="note"
       >
-        <strong>{{ riskTitle }}</strong>
-        <p v-if="riskBody">{{ riskBody }}</p>
-        <p v-if="riskSecondary">{{ riskSecondary }}</p>
+        <span class="approval-card__risk-icon" aria-hidden="true">
+          <Icon :name="riskIcon" :size="14" />
+        </span>
+        <div class="approval-card__risk-copy">
+          <strong>{{ riskTitle }}</strong>
+          <p v-if="riskBody">{{ riskBody }}</p>
+          <p v-if="riskSecondary">{{ riskSecondary }}</p>
+        </div>
       </section>
       <p v-if="visibleWarning" class="approval-card__warning">{{ visibleWarning }}</p>
     </div>
@@ -264,6 +269,9 @@ const riskClass = computed(() =>
     ? 'approval-card__risk--backup'
     : 'approval-card__risk--danger')
 
+const riskIcon = computed(() =>
+  props.approval.backupState === 'enabled' ? 'check' : 'info')
+
 const visibleWarning = computed(() =>
   props.approval.destructive ? '' : props.approval.warning)
 
@@ -322,10 +330,11 @@ function emitDeny() {
 
 .approval-card {
   width: var(--chat-col, min(calc(100% - 48px), 980px));
+  max-width: 780px;
   margin: var(--sp-2) auto;
-  background: var(--bg-surface);
-  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
-  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-surface) 97%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
@@ -337,7 +346,7 @@ function emitDeny() {
 }
 
 .approval-card--danger {
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-color: color-mix(in srgb, var(--border) 82%, transparent);
 }
 
 .approval-card:focus-visible {
@@ -349,37 +358,39 @@ function emitDeny() {
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  padding: var(--sp-4) var(--sp-4) 0;
+  padding: var(--sp-4) var(--sp-5) 0;
 }
 
 .approval-card__icon {
   align-items: center;
-  background: color-mix(in srgb, var(--warn) 12%, var(--bg));
-  border: 1px solid color-mix(in srgb, var(--warn) 28%, var(--border));
-  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warn) 9%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--warn) 20%, var(--border));
+  border-radius: var(--radius-sm);
   color: var(--warn);
   display: inline-flex;
-  height: 34px;
+  flex: 0 0 auto;
+  height: 30px;
   justify-content: center;
-  width: 34px;
+  width: 30px;
 }
 
 .approval-card--danger .approval-card__icon {
-  background: color-mix(in srgb, var(--danger) 10%, var(--bg));
-  border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--danger) 18%, var(--border));
   color: var(--danger);
 }
 
 .approval-card__heading {
+  display: grid;
+  gap: 1px;
   min-width: 0;
 }
 
 .approval-card__eyebrow {
-  color: var(--warn);
+  color: var(--text-muted);
   font-size: var(--fs-xs);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: var(--fw-eyebrow);
+  letter-spacing: var(--eyebrow-track);
 }
 
 .approval-card__title {
@@ -387,7 +398,7 @@ function emitDeny() {
   font-size: var(--fs-md);
   font-weight: 650;
   line-height: 1.35;
-  margin: 2px 0 0;
+  margin: 0;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -395,12 +406,12 @@ function emitDeny() {
 }
 
 .approval-card__body {
-  max-height: 280px;
+  max-height: 260px;
   overflow: auto;
-  padding: var(--sp-3) var(--sp-4);
+  padding: var(--sp-3) var(--sp-5) var(--sp-4);
   display: flex;
   flex-direction: column;
-  gap: var(--sp-2);
+  gap: 10px;
 }
 
 .approval-card__label {
@@ -436,33 +447,61 @@ function emitDeny() {
 }
 
 .approval-card__risk {
+  align-items: start;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   color: var(--text);
-  padding: var(--sp-3);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 22px minmax(0, 1fr);
+  padding: 10px var(--sp-3);
+}
+
+.approval-card__risk-icon {
+  align-items: center;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  height: 22px;
+  justify-content: center;
+  width: 22px;
+}
+
+.approval-card__risk-copy {
+  min-width: 0;
 }
 
 .approval-card__risk strong {
   display: block;
   font-size: var(--fs-sm);
-  line-height: 1.45;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .approval-card__risk p {
   color: var(--text-muted);
-  font-size: var(--fs-sm);
-  line-height: 1.5;
-  margin: var(--sp-1) 0 0;
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  margin: 3px 0 0;
 }
 
 .approval-card__risk--backup {
-  background: color-mix(in srgb, var(--ok) 7%, var(--bg));
-  border-color: color-mix(in srgb, var(--ok) 30%, var(--border));
+  background: color-mix(in srgb, var(--ok) 4%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--ok) 16%, var(--border));
+}
+
+.approval-card__risk--backup .approval-card__risk-icon {
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+  color: var(--ok);
 }
 
 .approval-card__risk--danger {
-  background: color-mix(in srgb, var(--danger) 7%, var(--bg));
-  border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
+  background: color-mix(in srgb, var(--danger) 4%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--danger) 16%, var(--border));
+}
+
+.approval-card__risk--danger .approval-card__risk-icon {
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  color: var(--danger);
 }
 
 .approval-card__risk--danger strong {
@@ -470,21 +509,25 @@ function emitDeny() {
 }
 
 .approval-card__context {
-  display: grid;
-  gap: var(--sp-2);
   margin: 0;
 }
 
 .approval-card__context-row {
+  align-items: start;
+  background: color-mix(in srgb, var(--bg) 58%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: var(--radius-md);
   display: grid;
-  grid-template-columns: minmax(88px, auto) 1fr;
-  gap: var(--sp-3);
+  gap: var(--sp-2);
+  grid-template-columns: 58px minmax(0, 1fr);
+  padding: 10px var(--sp-3);
 }
 
 .approval-card__context-row dt {
   color: var(--text-dim);
   font-size: var(--fs-xs);
   font-weight: 600;
+  line-height: 1.5;
 }
 
 .approval-card__context-row dd {
@@ -496,16 +539,23 @@ function emitDeny() {
   white-space: pre-wrap;
 }
 
+.approval-card__target {
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+}
+
 /* Sticky action bar: the body above scrolls, this footer stays visible. */
 .approval-card__footer {
   position: sticky;
   bottom: 0;
-  background: var(--bg-surface);
+  background: color-mix(in srgb, var(--bg-surface) 97%, var(--bg));
   border-top: 1px solid var(--hairline);
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
-  padding: var(--sp-3) var(--sp-4);
+  padding: 10px var(--sp-5) var(--sp-3);
 }
 
 .approval-card__timer {
@@ -543,15 +593,18 @@ function emitDeny() {
   display: flex;
   flex-wrap: wrap;
   gap: var(--sp-2);
+  justify-content: flex-end;
 }
 
 .approval-card__deny {
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
-  color: var(--danger);
+  border-color: transparent;
+  color: var(--text-muted);
 }
 
-.approval-card__deny:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--danger) 10%, var(--bg-surface));
+.approval-card__deny:hover:not(:disabled),
+.approval-card__deny:focus-visible:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg-surface));
+  color: var(--danger);
 }
 
 .approval-card__error {
@@ -611,11 +664,33 @@ function emitDeny() {
 
 .approval-card--timeline {
   width: 100%;
+  max-width: none;
   margin: var(--sp-2) 0;
   box-shadow: none;
 }
 
 @media (max-width: 768px) {
+  .approval-card {
+    width: calc(100% - 24px);
+  }
+
+  .approval-card__head {
+    padding: var(--sp-3) var(--sp-3) 0;
+  }
+
+  .approval-card__body {
+    padding: var(--sp-3);
+  }
+
+  .approval-card__context-row {
+    gap: var(--sp-1);
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .approval-card__footer {
+    padding: 10px var(--sp-3) var(--sp-3);
+  }
+
   .approval-card__actions {
     flex-direction: column;
     align-items: stretch;
