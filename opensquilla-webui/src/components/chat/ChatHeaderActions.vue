@@ -24,6 +24,18 @@
 
     <div v-if="layout === 'wide'" class="chat-header__actions">
       <button
+        v-if="promptCacheKeepaliveAvailable"
+        ref="wideKeepaliveRef"
+        type="button"
+        class="chat-header__action chat-header__action--icon-small"
+        :title="t('chat.promptCacheKeepalive.action')"
+        :aria-label="t('chat.promptCacheKeepalive.action')"
+        data-testid="chat-session-action-keepalive"
+        @click="emit('open-prompt-cache-keepalive')"
+      >
+        <Icon name="clock" :size="15" />
+      </button>
+      <button
         v-if="deliverableCount > 0"
         ref="wideDeliverablesRef"
         type="button"
@@ -125,6 +137,17 @@
           </span>
         </button>
         <button
+          v-if="menuActions.includes('keepalive')"
+          type="button"
+          class="chat-header__menu-item"
+          role="menuitem"
+          data-testid="chat-session-action-keepalive"
+          @click="invoke('keepalive', true)"
+        >
+          <Icon name="clock" :size="16" />
+          <span>{{ t('chat.promptCacheKeepalive.action') }}</span>
+        </button>
+        <button
           type="button"
           class="chat-header__menu-item"
           role="menuitem"
@@ -148,7 +171,7 @@ import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { IconName } from '@/utils/icons'
 
 type Layout = 'wide' | 'compact' | 'tight'
-type Action = 'deliverables' | 'share' | 'copy-session-key'
+type Action = 'deliverables' | 'share' | 'keepalive' | 'copy-session-key'
 
 const props = defineProps<{
   title: string
@@ -159,12 +182,14 @@ const props = defineProps<{
   deliverableCount: number
   shareMode: boolean
   shareableMessageCount: number
+  promptCacheKeepaliveAvailable: boolean
 }>()
 
 const emit = defineEmits<{
   'open-deliverables': []
   'start-share': []
   'copy-session-key': []
+  'open-prompt-cache-keepalive': []
 }>()
 
 const { t } = useI18n()
@@ -176,6 +201,7 @@ const primaryActionRef = ref<HTMLButtonElement | null>(null)
 const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
 const wideShareRef = ref<HTMLButtonElement | null>(null)
 const wideCopyRef = ref<HTMLButtonElement | null>(null)
+const wideKeepaliveRef = ref<HTMLButtonElement | null>(null)
 const layout = ref<Layout>('wide')
 const menuOpen = ref(false)
 useDialogLayer(computed(() => menuOpen.value))
@@ -205,6 +231,7 @@ const menuActions = computed<Action[]>(() => {
   const actions: Action[] = []
   if (props.deliverableCount > 0 && primaryAction.value !== 'deliverables') actions.push('deliverables')
   if (!props.shareMode && primaryAction.value !== 'share') actions.push('share')
+  if (props.promptCacheKeepaliveAvailable) actions.push('keepalive')
   actions.push('copy-session-key')
   return actions
 })
@@ -269,6 +296,7 @@ function invoke(action: Action, fromMenu = false) {
   if (fromMenu) closeMenu(true)
   if (action === 'deliverables') emit('open-deliverables')
   if (action === 'share') emit('start-share')
+  if (action === 'keepalive') emit('open-prompt-cache-keepalive')
   if (action === 'copy-session-key') emit('copy-session-key')
 }
 
@@ -300,6 +328,8 @@ function focusAction(action: Action): boolean {
     ? wideDeliverablesRef.value
     : action === 'share'
       ? wideShareRef.value
+      : action === 'keepalive'
+        ? wideKeepaliveRef.value
       : wideCopyRef.value
   if (isVisible(direct)) {
     direct.focus()
@@ -334,6 +364,7 @@ watch(() => [
   props.deliverableCount,
   props.shareMode,
   props.shareableMessageCount,
+  props.promptCacheKeepaliveAvailable,
 ], () => {
   if (menuOpen.value) closeMenu(true)
 })
@@ -477,6 +508,11 @@ defineExpose({ focusAction, closeMenu })
   min-width: 44px;
   padding: 0;
   width: 44px;
+}
+
+.chat-header__action--icon-small {
+  min-width: 30px;
+  padding: 0.25rem;
 }
 
 .chat-header__menu {

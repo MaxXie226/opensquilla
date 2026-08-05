@@ -3342,6 +3342,16 @@ class OpenAIProvider:
                 cfg.provider_request_correlation,
             )
         )
+        correlation = cfg.provider_request_correlation
+        if (
+            self._provider_kind == "openrouter"
+            and correlation is not None
+            and correlation.session_id
+        ):
+            # OpenRouter accepts an opaque session identifier for cache/routing
+            # affinity. Use the durable random session id, never the canonical
+            # key (which may contain user-visible channel identifiers).
+            headers["X-Session-Id"] = correlation.session_id
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
 

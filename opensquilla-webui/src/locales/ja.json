@@ -3095,6 +3095,18 @@
     }
   },
   "chat": {
+    "promptCacheKeepalive": {
+      "action": "プロンプトキャッシュの維持",
+      "title": "プロンプトキャッシュの維持",
+      "description": "アイドル中、このセッションで確認済みのプロバイダープレフィックスを維持します。",
+      "enable": "このセッションで有効化",
+      "enableHint": "既定ではオフで、Gateway の再起動後もオフに戻ります。",
+      "ttlMinutes": "プロバイダーキャッシュ TTL（分）",
+      "intervalHint": "OpenSquilla は約 {minutes} 分後（TTL の 80%）にプローブします。",
+      "costWarning": "各プローブは実際のプロバイダーリクエストで、トークン料金が発生する場合があります。会話への書き込みやツール実行は行いません。",
+      "statusLabel": "状態", "targetLabel": "プロバイダー / モデル", "lastHitLabel": "前回のキャッシュトークン",
+      "states": { "off": "オフ", "waiting": "安定したプレフィックスを待機", "scheduled": "予定済み", "probing": "プローブ中", "stopped": "失敗後に停止" }
+    },
     "send": "送信",
     "sendQueues": "送信（現在の応答後にキューへ追加）",
     "sendSteers": "送信（現在の応答を今すぐ誘導）",

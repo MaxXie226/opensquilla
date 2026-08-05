@@ -3095,6 +3095,18 @@
     }
   },
   "chat": {
+    "promptCacheKeepalive": {
+      "action": "Prompt-Cache aktiv halten",
+      "title": "Prompt-Cache aktiv halten",
+      "description": "Hält den bestätigten Provider-Präfix dieser Sitzung im Leerlauf warm.",
+      "enable": "Für diese Sitzung aktivieren",
+      "enableHint": "Standardmäßig aus; nach einem Gateway-Neustart wieder aus.",
+      "ttlMinutes": "Provider-Cache-TTL (Minuten)",
+      "intervalHint": "OpenSquilla prüft nach etwa {minutes} Minuten (80 % der TTL).",
+      "costWarning": "Jede Prüfung ist eine echte Provider-Anfrage und kann Token-Kosten verursachen. Sie ändert den Chat nicht und führt keine Tools aus.",
+      "statusLabel": "Status", "targetLabel": "Provider / Modell", "lastHitLabel": "Zuletzt gecachte Tokens",
+      "states": { "off": "Aus", "waiting": "Wartet auf stabilen Präfix", "scheduled": "Geplant", "probing": "Prüfung läuft", "stopped": "Nach Fehlschlag gestoppt" }
+    },
     "send": "Senden",
     "sendQueues": "Senden (wird nach der aktuellen Antwort in die Warteschlange gestellt)",
     "sendSteers": "Senden (lenkt die aktuelle Antwort jetzt)",

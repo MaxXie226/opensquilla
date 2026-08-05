@@ -5,7 +5,7 @@ import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
 
-type Action = 'deliverables' | 'share' | 'copy-session-key'
+type Action = 'deliverables' | 'share' | 'keepalive' | 'copy-session-key'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -20,6 +20,7 @@ const BASE_PROPS = {
   deliverableCount: 2,
   shareMode: false,
   shareableMessageCount: 3,
+  promptCacheKeepaliveAvailable: false,
 }
 
 const messages = {
@@ -64,6 +65,7 @@ async function mountHeader(
   const handlers = {
     deliverables: vi.fn(),
     share: vi.fn(),
+    keepalive: vi.fn(),
     copy: vi.fn(),
   }
   const el = document.createElement('div')
@@ -73,6 +75,7 @@ async function mountHeader(
     ...overrides,
     onOpenDeliverables: handlers.deliverables,
     onStartShare: handlers.share,
+    onOpenPromptCacheKeepalive: handlers.keepalive,
     onCopySessionKey: handlers.copy,
   })
   app.use(createI18n({
@@ -226,6 +229,18 @@ describe('ChatHeaderActions', () => {
     expect(handlers.deliverables).toHaveBeenCalledTimes(1)
     expect(handlers.share).toHaveBeenCalledTimes(1)
     expect(handlers.copy).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows keepalive only when the gateway advertises both RPCs', async () => {
+    const hidden = await mountHeader(800)
+    expect(hidden.el.querySelector('[data-testid="chat-session-action-keepalive"]')).toBeNull()
+
+    const available = await mountHeader(800, { promptCacheKeepaliveAvailable: true })
+    const action = available.el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-keepalive"]',
+    )!
+    action.click()
+    expect(available.handlers.keepalive).toHaveBeenCalledTimes(1)
   })
 
   it('focusAction targets direct controls and falls back to the compact menu trigger', async () => {

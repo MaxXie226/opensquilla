@@ -3146,6 +3146,20 @@
     }
   },
   "chat": {
+    "promptCacheKeepalive": {
+      "action": "Prompt cache keepalive",
+      "title": "Prompt cache keepalive",
+      "description": "Keep this session's proven provider prompt prefix warm while it is idle.",
+      "enable": "Enable for this session",
+      "enableHint": "Off by default and reset to off whenever the Gateway restarts.",
+      "ttlMinutes": "Provider cache TTL (minutes)",
+      "intervalHint": "OpenSquilla probes at about {minutes} minutes (80% of TTL).",
+      "costWarning": "Each probe is a real provider request and may incur input and output token charges. It never writes to the conversation or runs tools.",
+      "statusLabel": "Status",
+      "targetLabel": "Provider / model",
+      "lastHitLabel": "Last cached tokens",
+      "states": { "off": "Off", "waiting": "Waiting for a stable prefix", "scheduled": "Scheduled", "probing": "Probing", "stopped": "Stopped after a miss or error" }
+    },
     "send": "Send",
     "sendQueues": "Send (queues for after current response)",
     "sendSteers": "Send (steers the current response now)",

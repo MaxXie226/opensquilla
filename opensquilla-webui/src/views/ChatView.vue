@@ -38,9 +38,11 @@
         :deliverable-count="headerDeliverableCount"
         :share-mode="shareMode"
         :shareable-message-count="shareableMessageCount"
+        :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
         @open-deliverables="openDeliverables"
         @start-share="startShareMode"
         @copy-session-key="onSessionCopyClick"
+        @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
       />
     </Teleport>
 
@@ -582,6 +584,13 @@
       @set-theme="onShareSetTheme"
     />
 
+    <PromptCacheKeepaliveDialog
+      v-if="promptCacheKeepaliveAvailable"
+      :open="promptCacheKeepaliveOpen"
+      :session-key="sessionKey"
+      @close="promptCacheKeepaliveOpen = false"
+    />
+
     <!-- Persistent completion announcer: the live block's role="status" phase
          label unmounts with the block when streaming ends, so on its own the
          settle would never reach a screen reader. This region stays mounted
@@ -607,6 +616,7 @@ import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
+import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
@@ -879,13 +889,18 @@ const pendingAutoSend = ref('')
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
 type ChatHeaderActionsHandle = {
-  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
+  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'keepalive' | 'copy-session-key') => boolean
 }
 const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const promptCacheKeepaliveOpen = ref(false)
+const promptCacheKeepaliveAvailable = computed(() => (
+  rpc.supportsMethod('sessions.promptCacheKeepalive.status')
+  && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
+))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
 const inputText = ref('')
 const composerRevision = ref(0)

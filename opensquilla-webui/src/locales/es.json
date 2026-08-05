@@ -3095,6 +3095,18 @@
     }
   },
   "chat": {
+    "promptCacheKeepalive": {
+      "action": "Mantener caché del prompt",
+      "title": "Mantener caché del prompt",
+      "description": "Mantiene activo el prefijo de proveedor confirmado de esta sesión mientras está inactiva.",
+      "enable": "Activar para esta sesión",
+      "enableHint": "Desactivado por defecto; vuelve a desactivarse al reiniciar el Gateway.",
+      "ttlMinutes": "TTL de caché del proveedor (minutos)",
+      "intervalHint": "OpenSquilla sondea aproximadamente a los {minutes} minutos (80 % del TTL).",
+      "costWarning": "Cada sondeo es una solicitud real al proveedor y puede generar costes de tokens. No modifica el chat ni ejecuta herramientas.",
+      "statusLabel": "Estado", "targetLabel": "Proveedor / modelo", "lastHitLabel": "Últimos tokens en caché",
+      "states": { "off": "Desactivado", "waiting": "Esperando un prefijo estable", "scheduled": "Programado", "probing": "Sondeando", "stopped": "Detenido tras fallo" }
+    },
     "send": "Enviar",
     "sendQueues": "Enviar (se pone en cola hasta después de la respuesta actual)",
     "sendSteers": "Enviar (redirige la respuesta actual ahora)",

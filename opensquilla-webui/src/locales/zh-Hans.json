@@ -3146,6 +3146,20 @@
     }
   },
   "chat": {
+    "promptCacheKeepalive": {
+      "action": "提示词缓存保活",
+      "title": "提示词缓存保活",
+      "description": "会话空闲时，保活已被供应商处理过的稳定提示词前缀。",
+      "enable": "为当前会话开启",
+      "enableHint": "默认关闭；Gateway 重启后会自动恢复为关闭。",
+      "ttlMinutes": "供应商缓存 TTL（分钟）",
+      "intervalHint": "OpenSquilla 将约每 {minutes} 分钟探测一次（TTL 的 80%）。",
+      "costWarning": "每次探测都是真实的供应商请求，可能产生输入和输出 token 费用；不会写入对话，也不会执行工具。",
+      "statusLabel": "状态",
+      "targetLabel": "供应商 / 模型",
+      "lastHitLabel": "上次缓存命中 token",
+      "states": { "off": "已关闭", "waiting": "等待稳定前缀", "scheduled": "已计划", "probing": "正在探测", "stopped": "未命中或出错后已停止" }
+    },
     "send": "发送",
     "sendQueues": "发送（排队等待当前回复结束）",
     "sendSteers": "发送（立即引导当前回复）",
