@@ -14431,6 +14431,45 @@ async def test_g1_dry_build_records_registry_all_candidate_allowlist(module) -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+async def test_g1_dry_build_applies_cli_timeout_overrides(module) -> None:
+    experiment = module.load_draco_experiment_config(
+        module.DEFAULT_B2_EXPERIMENT_CONFIG_PATH
+    ).config
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        }
+    )
+    contract = _resolved_g1_registry_contract(module, experiment, config)
+
+    result = await module.build_experiment_provider(
+        config=config,
+        inherited=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        group="G1",
+        prompt="dry timeout projection prompt",
+        dry_run=True,
+        enable_proposer_tools=False,
+        ensemble_proposer_timeout=907.5,
+        ensemble_aggregator_timeout=2_662.5,
+        experiment_config=experiment,
+        g1_registry_contract=contract,
+        generation_policy={},
+    )
+
+    plan = result.routing_trace["selection_plan"]
+    assert plan["effective_proposer_timeout_seconds"] == pytest.approx(907.5)
+    assert plan["effective_aggregator_timeout_seconds"] == pytest.approx(2_662.5)
+    assert result.provider.selection_plan == plan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
 @pytest.mark.parametrize(
     ("wait_for_all_proposers", "quorum_grace_seconds"),
     [(True, 0.0), (False, 7.5)],

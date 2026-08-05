@@ -4195,6 +4195,16 @@ async def build_experiment_provider(
             if g1_ensemble is not None:
                 dry_ensemble.shuffle_candidates = g1_ensemble.shuffle_candidates
                 dry_ensemble.candidate_order_seed = g1_ensemble.candidate_order_seed
+            if (
+                ensemble_proposer_timeout is not None
+                and ensemble_proposer_timeout > 0
+            ):
+                dry_ensemble.proposer_timeout_seconds = float(ensemble_proposer_timeout)
+            if (
+                ensemble_aggregator_timeout is not None
+                and ensemble_aggregator_timeout > 0
+            ):
+                dry_ensemble.aggregator_timeout_seconds = float(ensemble_aggregator_timeout)
             apply_aggregator_recovery_policy(dry_ensemble, recovery_policy)
             apply_aggregator_recovery_policy(dry_ensemble, proposer_policy)
             dry_ensemble.min_successful_proposers = (
