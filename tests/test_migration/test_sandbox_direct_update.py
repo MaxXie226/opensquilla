@@ -141,6 +141,76 @@ def _mock_windows_acl(
     monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
 
 
+def test_frozen_windows_acl_process_restores_packaged_dll_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    events: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(upgrade_migration, "_running_on_windows", lambda: True)
+    monkeypatch.setattr(upgrade_migration.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        upgrade_migration.sys,
+        "_MEIPASS",
+        "C:/synthetic/bundle/_internal",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_set_windows_dll_directory",
+        lambda path: events.append(("dll", path)),
+    )
+
+    def run(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        events.append(("run", None))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(upgrade_migration.subprocess, "run", run)
+
+    upgrade_migration._protect_private_path(
+        snapshot,
+        directory=True,
+        windows_user_sid="S-1-5-21-1234",
+    )
+
+    assert events == [
+        ("dll", None),
+        ("run", None),
+        ("dll", "C:/synthetic/bundle/_internal"),
+    ]
+
+
+def test_frozen_windows_acl_process_restores_dll_directory_after_launch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(upgrade_migration, "_running_on_windows", lambda: True)
+    monkeypatch.setattr(upgrade_migration.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        upgrade_migration.sys,
+        "_MEIPASS",
+        "C:/synthetic/bundle/_internal",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        upgrade_migration,
+        "_set_windows_dll_directory",
+        lambda path: events.append(("dll", path)),
+    )
+
+    with pytest.raises(OSError, match="synthetic launch failure"):
+        with upgrade_migration._system_windows_process_context():
+            events.append(("run", None))
+            raise OSError("synthetic launch failure")
+
+    assert events == [
+        ("dll", None),
+        ("run", None),
+        ("dll", "C:/synthetic/bundle/_internal"),
+    ]
+
+
 def test_windows_snapshot_acl_is_applied_in_copy_and_promotion_order(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

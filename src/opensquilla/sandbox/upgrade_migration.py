@@ -10,9 +10,13 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -98,19 +102,48 @@ foreach ($sidText in $allowed) {
 _WINDOWS_PRIVATE_ACL_ENCODED = base64.b64encode(
     _WINDOWS_PRIVATE_ACL_SCRIPT.encode("utf-16-le")
 ).decode("ascii")
+_WINDOWS_DLL_DIRECTORY_LOCK = threading.Lock()
 
 
 def _running_on_windows() -> bool:
     return os.name == "nt"
 
 
+def _set_windows_dll_directory(path: str | None) -> None:
+    import ctypes
+
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    setter = kernel32.SetDllDirectoryW
+    setter.argtypes = [ctypes.c_wchar_p]
+    setter.restype = ctypes.c_bool
+    if not setter(path):
+        error_code = int(getattr(ctypes, "get_last_error")())
+        raise OSError(error_code, "SetDllDirectoryW failed")
+
+
+@contextmanager
+def _system_windows_process_context() -> Iterator[None]:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if not _running_on_windows() or not getattr(sys, "frozen", False) or not bundle_root:
+        yield
+        return
+
+    with _WINDOWS_DLL_DIRECTORY_LOCK:
+        _set_windows_dll_directory(None)
+        try:
+            yield
+        finally:
+            _set_windows_dll_directory(str(bundle_root))
+
+
 def _current_windows_user_sid() -> str:
-    completed = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    with _system_windows_process_context():
+        completed = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     if completed.returncode != 0:
         raise OSError("cannot resolve the current Windows user SID")
     try:
@@ -144,21 +177,24 @@ def _protect_private_path(
             "OPENSQUILLA_UPGRADE_ACL_USER_SID": windows_user_sid,
             "OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY": "1" if directory else "0",
         }
-        completed = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-EncodedCommand",
-                _WINDOWS_PRIVATE_ACL_ENCODED,
-            ],
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        with _system_windows_process_context():
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-EncodedCommand",
+                    _WINDOWS_PRIVATE_ACL_ENCODED,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         if completed.returncode != 0:
-            raise OSError(f"cannot protect upgrade snapshot path: {path}")
+            detail = " ".join((completed.stderr or completed.stdout).strip().split())
+            suffix = f" ({detail[-500:]})" if detail else ""
+            raise OSError(f"cannot protect upgrade snapshot path: {path}{suffix}")
         return
 
     mode = 0o700 if directory else 0o600
