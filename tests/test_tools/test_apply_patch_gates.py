@@ -113,7 +113,7 @@ async def test_patch_update_approval_backs_up_existing_target_before_apply(
         )
     )
     try:
-        first, elevated = await patch_tool._gate_patch_ops(
+        first, elevated, first_backups = await patch_tool._gate_patch_ops(
             ops,
             workspace,
             None,
@@ -123,13 +123,14 @@ async def test_patch_update_approval_backs_up_existing_target_before_apply(
         )
         assert first is not None
         assert elevated is False
+        assert first_backups == ()
         approval_id = str(first["approval_id"])
         action = get_approval_queue().get(approval_id).params["action"]
         assert action["display"]["kind"] == "modify"
         assert action["display"]["backup_state"] == "enabled"
         get_approval_queue().resolve(approval_id, True)
 
-        resumed, elevated = await patch_tool._gate_patch_ops(
+        resumed, elevated, backup_summaries = await patch_tool._gate_patch_ops(
             ops,
             workspace,
             approval_id,
@@ -140,6 +141,14 @@ async def test_patch_update_approval_backs_up_existing_target_before_apply(
 
         assert resumed is None
         assert elevated is True
+        assert len(backup_summaries) == 1
+        assert set(backup_summaries[0]) == {
+            "backupId",
+            "target",
+            "sizeBytes",
+            "createdAt",
+        }
+        assert backup_summaries[0]["target"] == str(target.resolve())
         receipts = tuple((state_dir / "backup-vault" / "entries").iterdir())
         assert len(receipts) == 1
         assert (receipts[0] / "content").read_text(encoding="utf-8") == "before\n"

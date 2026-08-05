@@ -84,7 +84,7 @@ from opensquilla.sandbox.path_validation import (
     normalize_mount_access,
     normalize_path,
 )
-from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
 from opensquilla.sandbox.policy import LevelHints, build_policy, select_level
 from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
 from opensquilla.sandbox.run_context import DomainGrant, PackageBundleGrant, RunContext
@@ -413,11 +413,10 @@ def active_file_system_profile(
             authority_roots=authority_roots,
             writable_roots=writable_roots,
         )
-        return safe_profile
 
     runtime = get_runtime()
     if runtime is None or not runtime.effective.sandbox_enabled:
-        return None
+        return safe_profile
     effective_workspace = (
         workspace.expanduser().resolve(strict=False)
         if workspace is not None
@@ -436,7 +435,19 @@ def active_file_system_profile(
     if base_profile is None:
         return safe_profile.as_read_only()
     return FileSystemPermissionProfile(
-        entries=(*base_profile.entries, *safe_profile.entries),
+        # The stored Safe policy describes host-level write carve-outs and may
+        # contain broad baseline grants (POSIX ``/`` or the Windows user
+        # profile).  A live runtime sandbox is the outer boundary: retain only
+        # the stored policy's READ/DENY restrictions so it can narrow, never
+        # widen, the runtime's writable roots.
+        entries=(
+            *base_profile.entries,
+            *(
+                entry
+                for entry in safe_profile.entries
+                if entry.access is not FileSystemAccess.WRITE
+            ),
+        ),
         denied_read_globs=tuple(
             dict.fromkeys(
                 (*base_profile.denied_read_globs, *safe_profile.denied_read_globs)

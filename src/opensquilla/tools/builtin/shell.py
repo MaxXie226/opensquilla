@@ -54,7 +54,12 @@ from opensquilla.sandbox.backend.seatbelt import (
     seatbelt_env_for_policy,
 )
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
-from opensquilla.sandbox.backup_vault import BackupTooLarge, BackupUnavailable, BackupVault
+from opensquilla.sandbox.backup_vault import (
+    BackupTooLarge,
+    BackupUnavailable,
+    BackupVault,
+    summarize_backup_receipts,
+)
 from opensquilla.sandbox.command_policy import (
     CommandAction,
     decide_shell_command,
@@ -424,10 +429,10 @@ def _delete_target(
         while index < len(tokens):
             folded = tokens[index].casefold()
             if folded in {"-c", "-command"} and index + 1 < len(tokens):
-                script = _script_command(index + 1)
+                wrapped_script = _script_command(index + 1)
                 return (
-                    _delete_target(script, cwd, windows=native_windows)
-                    if script is not None
+                    _delete_target(wrapped_script, cwd, windows=native_windows)
+                    if wrapped_script is not None
                     else None
                 )
             if folded in safe_flags:
@@ -439,10 +444,10 @@ def _delete_target(
         for index, token in enumerate(tokens[1:], start=1):
             option = token.strip("'\"").casefold()
             if option in {"/c", "/k"}:
-                script = _script_command(index + 1)
+                wrapped_script = _script_command(index + 1)
                 return (
-                    _delete_target(script, cwd, windows=native_windows)
-                    if script is not None
+                    _delete_target(wrapped_script, cwd, windows=native_windows)
+                    if wrapped_script is not None
                     else None
                 )
             if option in {"/d", "/s", "/q", "/a", "/u"} or re.fullmatch(
@@ -468,10 +473,10 @@ def _delete_target(
         while index < len(tokens):
             token = tokens[index]
             if token in {"-S", "--split-string"}:
-                script = _script_command(index + 1)
+                wrapped_script = _script_command(index + 1)
                 return (
-                    _delete_target(script, cwd, windows=native_windows)
-                    if script is not None
+                    _delete_target(wrapped_script, cwd, windows=native_windows)
+                    if wrapped_script is not None
                     else (
                         None,
                         bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)),
@@ -987,11 +992,7 @@ async def _gate_recursive_delete(
             "target": str(plan.target),
             "recursive": plan.recursive,
             "backup": (
-                {
-                    "backupId": result.backup.backup_id,
-                    "entryPath": str(result.backup.entry_path),
-                    "sizeBytes": result.backup.size_bytes,
-                }
+                summarize_backup_receipts((result.backup,))[0]
                 if result.backup is not None
                 else None
             ),

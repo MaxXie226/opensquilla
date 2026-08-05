@@ -32,7 +32,10 @@ from opensquilla.channels.approval_prompt import (
     render_approval_prompt,
 )
 from opensquilla.channels.contract import channel_capability_profile
-from opensquilla.channels.system_messages import render_channel_message
+from opensquilla.channels.system_messages import (
+    ChannelSystemMessageKey,
+    render_channel_message,
+)
 from opensquilla.session.keys import derive_chat_type
 
 log = structlog.get_logger(__name__)
@@ -75,10 +78,19 @@ def _approval_summary(params: dict[str, Any], *, config: Any = None) -> tuple[st
         action = action if isinstance(action, dict) else {}
         display = action.get("display")
         display = display if isinstance(display, dict) else {}
-        if str(display.get("kind") or "") == "delete":
-            target = str(display.get("target") or "").strip()
-            if target:
-                return render_channel_message("approval_label_path", config=config), target
+        display_kind = str(display.get("kind") or "").strip()
+        target = str(display.get("target") or "").strip()
+        if target:
+            label_key: ChannelSystemMessageKey = "approval_label_path"
+            if display_kind == "network_access":
+                label_key = "approval_label_network_host"
+            elif display_kind == "run_code":
+                label_key = "approval_label_code"
+            elif display_kind == "run_command":
+                label_key = "approval_label_command"
+            return render_channel_message(label_key, config=config), target
+        justification = str(action.get("justification") or params.get("justification") or "")
+        return render_channel_message("approval_label_command", config=config), justification
     command = str(params.get("command") or "")
     if command:
         return render_channel_message("approval_label_command", config=config), command
@@ -96,11 +108,13 @@ def _approval_notice(params: dict[str, Any], *, config: Any = None) -> str:
     if str(display.get("kind") or "") != "delete":
         return ""
     backup_state = str(display.get("backup_state") or "")
-    key = {
-        "enabled": "approval_delete_backup_enabled",
-        "disabled": "approval_delete_backup_disabled",
-        "unavailable_requires_confirmation": "approval_delete_backup_unavailable",
-    }.get(backup_state)
+    key: ChannelSystemMessageKey | None = None
+    if backup_state == "enabled":
+        key = "approval_delete_backup_enabled"
+    elif backup_state == "disabled":
+        key = "approval_delete_backup_disabled"
+    elif backup_state == "unavailable_requires_confirmation":
+        key = "approval_delete_backup_unavailable"
     return render_channel_message(key, config=config) if key else ""
 
 

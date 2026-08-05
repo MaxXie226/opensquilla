@@ -313,7 +313,7 @@ def test_sandbox_elevation_uses_typed_user_display_without_internal_names() -> N
                 "action_kind": "fs.recursive_delete",
                 "display": {
                     "kind": "delete",
-                    "target": "/Users/demo/old-project",
+                    "target": "/srv/demo/old-project",
                     "destructive": True,
                     "irreversible": True,
                     "backup_state": "enabled",
@@ -327,13 +327,13 @@ def test_sandbox_elevation_uses_typed_user_display_without_internal_names() -> N
 
     assert push["tool_name"] == ""
     assert push["display_kind"] == "delete"
-    assert push["display_target"] == "/Users/demo/old-project"
+    assert push["display_target"] == "/srv/demo/old-project"
     assert push["destructive"] is True
     assert push["irreversible"] is True
     assert push["backup_state"] == "enabled"
     assert snapshot["toolName"] == ""
     assert snapshot["displayKind"] == "delete"
-    assert snapshot["displayTarget"] == "/Users/demo/old-project"
+    assert snapshot["displayTarget"] == "/srv/demo/old-project"
     assert snapshot["destructive"] is True
     assert snapshot["irreversible"] is True
     assert snapshot["backupState"] == "enabled"

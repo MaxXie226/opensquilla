@@ -50,7 +50,7 @@ const destructiveApproval: MockApproval = {
   args: { action_kind: 'fs.recursive_delete', internal_policy: true },
   sessionKey: SESSION_KEY,
   displayKind: 'delete',
-  displayTarget: '/Users/demo/old-project',
+  displayTarget: '/srv/demo/old-project',
   destructive: true,
   irreversible: false,
   backupState: 'enabled',
@@ -106,7 +106,7 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
 
     const card = page.getByTestId('approval-card')
     await expect(card.getByRole('heading', { name: 'Delete files or folders' })).toBeVisible()
-    await expect(card).toContainText('/Users/demo/old-project')
+    await expect(card).toContainText('/srv/demo/old-project')
     await expect(card).toContainText('A recoverable backup will be created before this change.')
     await expect(card).toContainText('Older backups may be removed automatically to make room.')
     await expect(card).not.toContainText('sandbox_elevation')

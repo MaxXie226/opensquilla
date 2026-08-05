@@ -888,7 +888,7 @@ async def test_workspace_lockdown_allows_configured_scratch_dir_write(
     ctx.scratch_dir = str(scratch)  # type: ignore[attr-defined]
     ctx.workspace_lockdown = True  # type: ignore[attr-defined]
 
-    result, elevated = await filesystem._gate_out_of_workspace_write(
+    result, elevated, _backups = await filesystem._gate_out_of_workspace_write(
         "write_file",
         target.resolve(strict=False),
         str(target),

@@ -355,6 +355,36 @@ def test_sandbox_path_prompt_names_the_path() -> None:
     assert "(unknown command)" not in message.content
 
 
+@pytest.mark.parametrize("display_kind", ("modify", "create", "sensitive_operation"))
+def test_sandbox_elevation_prompt_never_exposes_internal_tool_names(
+    display_kind: str,
+) -> None:
+    adapter = _FakeAdapter(interactive_cards=False)
+    _run_notifier_with(
+        session_manager=_FakeSessionManager(),
+        channel_manager=_FakeChannelManager(adapter),
+        params={
+            "approvalKind": "sandbox_elevation",
+            "toolName": "sandbox_elevation",
+            "action_kind": "fs.edit_source",
+            "sessionKey": "agent:main:chat",
+            "senderId": "owner-1",
+            "action": {
+                "display": {
+                    "kind": display_kind,
+                    "target": "/srv/data/config.toml",
+                },
+            },
+        },
+    )
+
+    assert len(adapter.sent) == 1
+    content = adapter.sent[0].content
+    assert "Path: /srv/data/config.toml" in content
+    assert "sandbox_elevation" not in content
+    assert "fs.edit_source" not in content
+
+
 @pytest.mark.parametrize(
     ("backup_state", "expected_notice"),
     (

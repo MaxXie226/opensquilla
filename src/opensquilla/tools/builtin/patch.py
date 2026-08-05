@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.identity.workspace import BOOTSTRAP_FILENAMES
+from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
 from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
@@ -434,8 +435,8 @@ async def _gate_patch_ops(
     sandbox_permissions: str = "use_default",
     justification: str = "",
     prefix_rule: list[str] | None = None,
-) -> tuple[dict[str, object] | None, bool]:
-    """Return ``(block, elevated)`` for a canonical multi-path patch."""
+) -> tuple[dict[str, object] | None, bool, tuple[BackupReceiptSummary, ...]]:
+    """Return ``(block, elevated, backups)`` for a canonical multi-path patch."""
 
     from opensquilla.sandbox.sensitive_paths import build_block_envelope, sensitive_path_marker
     from opensquilla.tools.builtin import filesystem
@@ -451,7 +452,7 @@ async def _gate_patch_ops(
     if elevated_full:
         for op in ops:
             _resolve_path(op.path, root)
-        return None, False
+        return None, False, ()
 
     if sandbox_permissions not in {"use_default", "require_escalated"}:
         return (
@@ -460,6 +461,7 @@ async def _gate_patch_ops(
                 "reason": "invalid_sandbox_permissions",
             },
             False,
+            (),
         )
 
     for op in ops:
@@ -475,6 +477,7 @@ async def _gate_patch_ops(
                         tool_name="apply_patch",
                     ),
                     False,
+                    (),
                 )
 
         filesystem._gate_workspace_lockdown_write("apply_patch", resolved, op.path)
@@ -484,7 +487,7 @@ async def _gate_patch_ops(
             workspace=workspace,
         )
         if deny_match is not None:
-            return workspace_write_deny_block("apply_patch", deny_match), False
+            return workspace_write_deny_block("apply_patch", deny_match), False, ()
 
         if filesystem._memory_source_rel_path(resolved) is not None:
             continue
@@ -501,7 +504,7 @@ async def _gate_patch_ops(
                 logical_path=logical,
             )
             if decision.status == "blocked":
-                return filesystem._path_access_blocked_envelope(decision), False
+                return filesystem._path_access_blocked_envelope(decision), False, ()
             if decision.status == "request":
                 boundary_targets.append((resolved, op, decision.reason))
             continue
@@ -520,10 +523,11 @@ async def _gate_patch_ops(
                     op.path,
                 ),
                 False,
+                (),
             )
 
     if not boundary_targets:
-        return None, False
+        return None, False, ()
     if sandbox_permissions == "use_default":
         reasons = {reason for _path, _op, reason in boundary_targets}
         reason = (
@@ -541,6 +545,7 @@ async def _gate_patch_ops(
                 ),
             },
             False,
+            (),
         )
     if not justification.strip():
         return (
@@ -550,6 +555,7 @@ async def _gate_patch_ops(
                 "message": "A precise justification is required for elevated execution.",
             },
             False,
+            (),
         )
 
     target_paths: list[tuple[str, str]] = []
@@ -603,16 +609,16 @@ async def _gate_patch_ops(
             session_key=ctx.session_key if ctx is not None else None,
         )
         if not destructive.allowed:
-            return destructive.envelope, False
-        return None, True
+            return destructive.envelope, False, ()
+        return None, True, summarize_backup_receipts(destructive.receipts)
     gate = gate_elevated_action(
         action,
         approval_id=approval_id,
         session_key=ctx.session_key if ctx is not None else None,
     )
     if not gate.allowed:
-        return gate.to_envelope(), False
-    return None, True
+        return gate.to_envelope(), False, ()
+    return None, True, ()
 
 
 # ---------------------------------------------------------------------------
@@ -1073,7 +1079,7 @@ async def apply_patch(
             "directory and pass its `path`."
         )
     ops = _parse_patch(patch)
-    blocked, elevated = await _gate_patch_ops(
+    blocked, elevated, backup_summaries = await _gate_patch_ops(
         ops,
         root,
         approval_id,
@@ -1114,7 +1120,9 @@ async def apply_patch(
         )
         _notify_memory_source_writes(ops, root)
         _notify_bootstrap_source_writes(ops, root)
-        return str(getattr(sandbox_result, "message"))
+        return str(getattr(sandbox_result, "message")) + filesystem._backup_receipt_note(
+            backup_summaries
+        )
 
     def _run() -> tuple[int, int, int, list[PlannedPatchWrite]]:
         if outside_root_authorized:
@@ -1180,4 +1188,7 @@ async def apply_patch(
     if deleted:
         parts.append(f"{deleted} file(s) deleted")
     summary = ", ".join(parts) if parts else "no changes"
-    return f"Applied patch: {summary}{write_note_summary}{write_progress_note}"
+    return (
+        f"Applied patch: {summary}{write_note_summary}{write_progress_note}"
+        f"{filesystem._backup_receipt_note(backup_summaries)}"
+    )

@@ -875,6 +875,62 @@ def test_saved_file_policy_compiles_into_the_live_safe_profile(tmp_path) -> None
     assert ordinary_write.status == "allowed"
 
 
+def test_saved_file_policy_cannot_widen_runtime_sandbox_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside" / "notes.txt"
+    protected = workspace / "protected"
+    snapshot = SandboxPolicy()
+
+    from opensquilla.sandbox import file_policy
+
+    monkeypatch.setattr(
+        file_policy,
+        "compile_safe_file_profile",
+        lambda *_args, **_kwargs: FileSystemPermissionProfile(
+            entries=(
+                FileSystemPermissionEntry(outside.parent, FileSystemAccess.WRITE),
+                FileSystemPermissionEntry(protected, FileSystemAccess.READ),
+            ),
+            default_access=FileSystemAccess.WRITE,
+        ),
+    )
+    configure_runtime(
+        SandboxSettings(
+            run_mode="standard",
+            backend="noop",
+            allow_legacy_mode=True,
+            exclude_slash_tmp=True,
+            exclude_tmpdir_env_var=True,
+        ),
+        workspace=workspace,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            run_mode="safe",
+            workspace_dir=str(workspace),
+            sandbox_policy=snapshot,
+        )
+    )
+    try:
+        profile = active_file_system_profile(workspace)
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+    assert profile is not None
+    decision = decide_path_access(
+        outside,
+        workspace=workspace,
+        write=True,
+        profile=profile,
+    )
+    assert decision.status == "request"
+
+
 def test_guest_safe_profile_keeps_workspace_boundary_and_protected_carveouts(
     tmp_path,
 ) -> None:
@@ -1013,7 +1069,7 @@ async def test_guest_safe_outside_write_cannot_request_or_consume_an_approval(
             write=True,
             approval_id="forged-or-stale-approval",
         )
-        file_gate_payload, elevated = await filesystem._gate_out_of_workspace_write(
+        file_gate_payload, elevated, _backups = await filesystem._gate_out_of_workspace_write(
             "write_file",
             outside,
             str(outside),
@@ -1142,6 +1198,8 @@ async def test_approved_recursive_delete_is_backed_up_then_removed(
     payload = json.loads(result or "{}")
     assert payload["status"] == "deleted"
     assert payload["backup"]["sizeBytes"] > 0
+    assert payload["backup"]["createdAt"] > 0
+    assert "entryPath" not in payload["backup"]
     assert not target.exists()
     assert (tmp_path / "state" / "backup-vault" / "entries").is_dir()
     assert offloaded == ["plan_delete", "execute"]

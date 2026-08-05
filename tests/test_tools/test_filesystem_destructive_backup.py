@@ -44,7 +44,7 @@ async def test_approved_existing_file_write_is_backed_up_before_mutation(
     )
     token = current_tool_context.set(context)
     try:
-        first, elevated = await filesystem._gate_out_of_workspace_write(
+        first, elevated, first_backups = await filesystem._gate_out_of_workspace_write(
             "write_file",
             target,
             str(target),
@@ -55,13 +55,14 @@ async def test_approved_existing_file_write_is_backed_up_before_mutation(
         )
         assert first is not None
         assert elevated is False
+        assert first_backups == ()
         approval_id = str(first["approval_id"])
         pending_action = get_approval_queue().get(approval_id).params["action"]
         assert pending_action["display"]["kind"] == "modify"
         assert pending_action["display"]["backup_state"] == "enabled"
         get_approval_queue().resolve(approval_id, True)
 
-        resumed, elevated = await filesystem._gate_out_of_workspace_write(
+        resumed, elevated, backup_summaries = await filesystem._gate_out_of_workspace_write(
             "write_file",
             target,
             str(target),
@@ -73,6 +74,14 @@ async def test_approved_existing_file_write_is_backed_up_before_mutation(
 
         assert resumed is None
         assert elevated is True
+        assert len(backup_summaries) == 1
+        assert set(backup_summaries[0]) == {
+            "backupId",
+            "target",
+            "sizeBytes",
+            "createdAt",
+        }
+        assert backup_summaries[0]["target"] == str(target.resolve())
         receipts = tuple((state_dir / "backup-vault" / "entries").iterdir())
         assert len(receipts) == 1
         assert (receipts[0] / "content").read_text(encoding="utf-8") == "before"

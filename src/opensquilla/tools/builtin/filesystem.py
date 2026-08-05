@@ -21,6 +21,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
 from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
 from opensquilla.sandbox.elevation import (
@@ -1277,10 +1278,10 @@ async def _gate_out_of_workspace_write(
     justification: str = "",
     content_digest: str | None = None,
     prefix_rule: list[str] | None = None,
-) -> tuple[dict[str, object] | None, bool]:
-    """Return ``(block, elevated)`` after hard policy and exact-action gating."""
+) -> tuple[dict[str, object] | None, bool, tuple[BackupReceiptSummary, ...]]:
+    """Return ``(block, elevated, backups)`` after exact-action gating."""
     if full_host_access_active():
-        return None, False
+        return None, False, ()
 
     # Sensitive-path hard block — takes precedence over approval flow.
     from opensquilla.sandbox.sensitive_paths import build_block_envelope, sensitive_path_marker
@@ -1293,6 +1294,7 @@ async def _gate_out_of_workspace_write(
                     f"{tool_name} {original_path}", sensitive, tool_name=tool_name
                 ),
                 False,
+                (),
             )
 
     _gate_workspace_lockdown_write(tool_name, resolved, original_path)
@@ -1321,6 +1323,7 @@ async def _gate_out_of_workspace_write(
                 "reason": "invalid_sandbox_permissions",
             },
             False,
+            (),
         )
 
     if _sandbox_path_access_enabled():
@@ -1344,7 +1347,7 @@ async def _gate_out_of_workspace_write(
             logical_path=original_path,
         )
         if decision.status == "blocked":
-            return _path_access_blocked_envelope(decision), False
+            return _path_access_blocked_envelope(decision), False, ()
         if decision.status == "request":
             ctx = current_tool_context.get()
             if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
@@ -1353,6 +1356,7 @@ async def _gate_out_of_workspace_write(
                         replace(decision, status="blocked", reason="guest_boundary")
                     ),
                     False,
+                    (),
                 )
             if sandbox_permissions == "use_default":
                 return (
@@ -1369,6 +1373,7 @@ async def _gate_out_of_workspace_write(
                         ),
                     },
                     False,
+                    (),
                 )
             if not justification.strip():
                 return (
@@ -1378,6 +1383,7 @@ async def _gate_out_of_workspace_write(
                         "message": ("A precise justification is required for elevated execution."),
                     },
                     False,
+                    (),
                 )
             action_kinds = {
                 "write_file": "fs.write",
@@ -1411,26 +1417,26 @@ async def _gate_out_of_workspace_write(
                     session_key=ctx.session_key if ctx is not None else None,
                 )
                 if not destructive.allowed:
-                    return destructive.envelope, False
-                return None, True
+                    return destructive.envelope, False, ()
+                return None, True, summarize_backup_receipts(destructive.receipts)
             gate = gate_elevated_action(
                 action,
                 approval_id=approval_id,
                 session_key=ctx.session_key if ctx is not None else None,
             )
             if not gate.allowed:
-                return gate.to_envelope(), False
-            return None, True
+                return gate.to_envelope(), False, ()
+            return None, True, ()
 
     if not _is_outside_workspace(resolved):
-        return None, False
+        return None, False, ()
     if _is_inside_scratch(resolved):
-        return None, False
+        return None, False, ()
     if _memory_source_rel_path(resolved) is not None:
-        return None, False
+        return None, False, ()
     if _active_sandbox_mount_allows(resolved, write=True):
-        return None, False
-    return _outside_workspace_write_block(tool_name, resolved, original_path), False
+        return None, False, ()
+    return _outside_workspace_write_block(tool_name, resolved, original_path), False, ()
 
 
 async def _gate_safe_policy_file_mutation(
@@ -1442,7 +1448,11 @@ async def _gate_safe_policy_file_mutation(
     justification: str,
     content_digest: str | None,
     prefix_rule: list[str] | None,
-) -> tuple[dict[str, object] | None, bool] | None:
+) -> tuple[
+    dict[str, object] | None,
+    bool,
+    tuple[BackupReceiptSummary, ...],
+] | None:
     """Gate one exact structured mutation against the pinned Safe file policy.
 
     A protected user path can be approved because the structured filesystem
@@ -1474,6 +1484,7 @@ async def _gate_safe_policy_file_mutation(
                 ),
             },
             False,
+            (),
         )
     if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
         return (
@@ -1487,6 +1498,7 @@ async def _gate_safe_policy_file_mutation(
                 ),
             },
             False,
+            (),
         )
 
     action_kinds = {
@@ -1540,8 +1552,8 @@ async def _gate_safe_policy_file_mutation(
                     ),
                 }
             )
-            return envelope, False
-        return None, True
+            return envelope, False, ()
+        return None, True, summarize_backup_receipts(destructive.receipts)
     gate = gate_elevated_action(
         action,
         approval_id=approval_id,
@@ -1559,8 +1571,20 @@ async def _gate_safe_policy_file_mutation(
                 ),
             }
         )
-        return envelope, False
-    return None, True
+        return envelope, False, ()
+    return None, True, ()
+
+
+def _backup_receipt_note(
+    summaries: tuple[BackupReceiptSummary, ...],
+) -> str:
+    if not summaries:
+        return ""
+    return "\n" + json.dumps(
+        {"recoverableBackups": list(summaries)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 @tool(
@@ -2029,7 +2053,7 @@ async def write_file(
         _notify_bootstrap_source_write(p)
         return f"Written {len(content)} bytes to {p}"
 
-    approval, elevated = await _gate_out_of_workspace_write(
+    approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
         "write_file",
         p,
         path,
@@ -2078,7 +2102,9 @@ async def write_file(
             record_scratch_file_write(p)
             _notify_memory_source_write(p)
             _notify_bootstrap_source_write(p)
-            return str(getattr(sandbox_result, "message"))
+            return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
+                backup_summaries
+            )
 
     def _write() -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -2100,7 +2126,10 @@ async def write_file(
     record_scratch_file_write(p)
     _notify_memory_source_write(p)
     _notify_bootstrap_source_write(p)
-    return f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
+    return (
+        f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
+        f"{_backup_receipt_note(backup_summaries)}"
+    )
 
 
 def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
@@ -2569,7 +2598,7 @@ async def edit_file(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    approval, elevated = await _gate_out_of_workspace_write(
+    approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
         "edit_file",
         p,
         path,
@@ -2615,7 +2644,9 @@ async def edit_file(
                 record_scratch_file_write(p)
                 _notify_memory_source_write(p)
                 _notify_bootstrap_source_write(p)
-                return str(getattr(sandbox_result, "message"))
+                return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
+                    backup_summaries
+                )
         elif _sandbox_path_access_enabled() and not elevated:
             raise RetryableToolInputError(
                 "edit_file accepts only one replacement per call when edits are "
@@ -2655,8 +2686,12 @@ async def edit_file(
         return (
             f"Edited {p}: replaced {len(replacement.old_text)} chars with "
             f"{len(replacement.new_text)} chars{_write_scope_suffix(p)}"
+            f"{_backup_receipt_note(backup_summaries)}"
         )
-    return f"Edited {p}: applied {len(replacements)} replacements{_write_scope_suffix(p)}"
+    return (
+        f"Edited {p}: applied {len(replacements)} replacements{_write_scope_suffix(p)}"
+        f"{_backup_receipt_note(backup_summaries)}"
+    )
 
 
 @tool(
@@ -2750,7 +2785,7 @@ async def edit_source(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    approval, elevated = await _gate_out_of_workspace_write(
+    approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
         "edit_source",
         p,
         path,
@@ -2840,6 +2875,7 @@ async def edit_source(
                     "after_revision": after_revision,
                     "workspace_epoch": workspace_epoch,
                     "diff_summary": build_diff_summary(original, updated, path=display_path),
+                    "recoverableBackups": list(backup_summaries),
                 },
                 ensure_ascii=False,
             )
@@ -2911,6 +2947,7 @@ async def edit_source(
         "after_revision": after_revision,
         "workspace_epoch": workspace_epoch,
         "diff_summary": build_diff_summary(original, updated, path=display_path),
+        "recoverableBackups": list(backup_summaries),
     }
     return json.dumps(result, ensure_ascii=False)
 

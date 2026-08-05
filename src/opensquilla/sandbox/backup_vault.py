@@ -39,6 +39,24 @@ class BackupReceipt:
     created_at: int
 
 
+BackupReceiptSummary = dict[str, str | int]
+
+
+def summarize_backup_receipts(
+    receipts: tuple[BackupReceipt, ...] | list[BackupReceipt],
+) -> tuple[BackupReceiptSummary, ...]:
+    """Return model-safe backup metadata without exposing vault authority paths."""
+    return tuple(
+        {
+            "backupId": receipt.backup_id,
+            "target": receipt.original_path,
+            "sizeBytes": receipt.size_bytes,
+            "createdAt": receipt.created_at,
+        }
+        for receipt in receipts
+    )
+
+
 def _tree_size(path: Path) -> int:
     if path.is_symlink() or path.is_file():
         try:
