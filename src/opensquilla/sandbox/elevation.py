@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -12,6 +13,45 @@ from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 
 SandboxPermissionIntent = Literal["use_default", "require_escalated"]
 ApprovalReviewerName = Literal["user", "auto_review"]
+ApprovalDisplayKind = Literal[
+    "delete",
+    "modify",
+    "create",
+    "run_command",
+    "run_code",
+    "network_access",
+    "path_access",
+    "plugin_permission",
+    "sensitive_operation",
+]
+BackupState = Literal[
+    "not_applicable",
+    "enabled",
+    "disabled",
+    "unavailable_requires_confirmation",
+]
+
+_APPROVAL_DISPLAY_KINDS = frozenset(
+    {
+        "delete",
+        "modify",
+        "create",
+        "run_command",
+        "run_code",
+        "network_access",
+        "path_access",
+        "plugin_permission",
+        "sensitive_operation",
+    }
+)
+_BACKUP_STATES = frozenset(
+    {
+        "not_applicable",
+        "enabled",
+        "disabled",
+        "unavailable_requires_confirmation",
+    }
+)
 
 _CHANNEL_APPROVAL_ROUTING_UNAVAILABLE = (
     "This elevated action cannot request channel approval because the authenticated "
@@ -36,6 +76,49 @@ def effective_approval_reviewer(
 
 
 @dataclass(frozen=True)
+class ApprovalDisplay:
+    """Fingerprint-bound, browser-safe meaning of an approval request."""
+
+    kind: ApprovalDisplayKind
+    target: str = ""
+    destructive: bool = False
+    irreversible: bool = False
+    backup_state: BackupState = "not_applicable"
+
+    def canonical_payload(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "target": self.target,
+            "destructive": self.destructive,
+            "irreversible": self.irreversible,
+            "backup_state": self.backup_state,
+        }
+
+    @classmethod
+    def from_canonical_payload(cls, payload: Mapping[str, Any]) -> ApprovalDisplay:
+        kind = str(payload.get("kind") or "")
+        if kind not in _APPROVAL_DISPLAY_KINDS:
+            raise ValueError("invalid_approval_display_kind")
+        backup_state = str(payload.get("backup_state") or "")
+        if backup_state not in _BACKUP_STATES:
+            raise ValueError("invalid_approval_backup_state")
+        destructive = payload.get("destructive", False)
+        irreversible = payload.get("irreversible", False)
+        if not isinstance(destructive, bool) or not isinstance(irreversible, bool):
+            raise ValueError("invalid_approval_display_flags")
+        target = payload.get("target", "")
+        if not isinstance(target, str):
+            raise ValueError("invalid_approval_display_target")
+        return cls(
+            kind=cast("ApprovalDisplayKind", kind),
+            target=target,
+            destructive=destructive,
+            irreversible=irreversible,
+            backup_state=cast("BackupState", backup_state),
+        )
+
+
+@dataclass(frozen=True)
 class ElevationAction:
     """The material side effects an approval is allowed to authorize."""
 
@@ -52,11 +135,12 @@ class ElevationAction:
     risk_markers: tuple[str, ...] = ()
     tty: bool = False
     prefix_rule: tuple[str, ...] | None = None
+    display: ApprovalDisplay | None = None
 
     def canonical_payload(self) -> dict[str, object]:
         """Return the stable JSON-compatible representation used for review."""
 
-        return {
+        payload: dict[str, object] = {
             "tool_name": self.tool_name,
             "action_kind": self.action_kind,
             "argv": list(self.argv),
@@ -71,6 +155,11 @@ class ElevationAction:
             "tty": self.tty,
             "prefix_rule": list(self.prefix_rule) if self.prefix_rule is not None else None,
         }
+        # Keep legacy action fingerprints stable when no typed display contract
+        # has been supplied by the call site.
+        if self.display is not None:
+            payload["display"] = self.display.canonical_payload()
+        return payload
 
     @classmethod
     def from_canonical_payload(cls, payload: dict[str, Any]) -> ElevationAction:
@@ -110,6 +199,9 @@ class ElevationAction:
             or raw_content_length < 0
         ):
             raise ValueError("invalid_content_length")
+        raw_display = payload.get("display")
+        if raw_display is not None and not isinstance(raw_display, Mapping):
+            raise ValueError("invalid_approval_display")
 
         return cls(
             tool_name=str(payload.get("tool_name") or ""),
@@ -135,6 +227,11 @@ class ElevationAction:
             prefix_rule=(
                 tuple(str(item) for item in raw_prefix_rule)
                 if raw_prefix_rule is not None
+                else None
+            ),
+            display=(
+                ApprovalDisplay.from_canonical_payload(raw_display)
+                if isinstance(raw_display, Mapping)
                 else None
             ),
         )
