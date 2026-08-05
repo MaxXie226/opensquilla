@@ -1030,6 +1030,19 @@ def test_desktop_local_web_build_installs_locked_dependencies_first() -> None:
     )
 
 
+def test_desktop_local_packaging_hydrates_and_verifies_bundled_runtimes() -> None:
+    scripts = json.loads(_read("desktop/electron/package.json"))["scripts"]
+
+    for local_script in ("dist:local", "pack:local"):
+        commands = scripts[local_script].split(" && ")
+        assert commands.index("npm run fetch:runtimes") < commands.index(
+            "npm run build:gateway"
+        )
+
+    assert scripts["dist"].endswith(" && npm run verify:package")
+    assert scripts["pack"].endswith(" && npm run verify:package")
+
+
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     onboarding = _section(

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { EffectScope } from 'vue'
+import type { SandboxPolicy } from '@/types/sandbox'
 
-const policy = {
+const policy: SandboxPolicy = {
   schemaVersion: 2,
   policyVersion: 0,
   files: {
@@ -227,6 +228,105 @@ describe('useSandboxSettings auto-save', () => {
           }),
         }),
       }))
+    scope.stop()
+  })
+
+  it('preserves newer same-section edits when an in-flight save fails', async () => {
+    let rejectFirst!: (reason?: unknown) => void
+    const first = new Promise((_resolve, reject) => { rejectFirst = reject })
+    const { scope, settings } = await createSandboxSettings({
+      policyUpdate: async () => first,
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    const saving = settings.flushSectionSave('network')
+    await settle()
+
+    settings.draft.value!.network.denyDomains.push('telemetry.example.com')
+    rejectFirst(new Error('save rejected'))
+
+    await expect(saving).resolves.toBe(false)
+    expect(settings.draft.value!.network).toEqual({
+      blockAllNetwork: true,
+      allowDomains: [],
+      denyDomains: ['telemetry.example.com'],
+    })
+    scope.stop()
+  })
+
+  it('adopts the current policy after a version conflict and can save again', async () => {
+    const currentPolicy = structuredClone(policy)
+    currentPolicy.policyVersion = 1
+    currentPolicy.network.denyDomains = ['desktop.example.com']
+    const conflict = Object.assign(new Error('policy version conflict'), {
+      code: 'POLICY_VERSION_CONFLICT',
+      details: { currentPolicy },
+    })
+    let updateCount = 0
+    const { call, scope, settings } = await createSandboxSettings({
+      policyUpdate: async (params) => {
+        updateCount += 1
+        if (updateCount === 1) throw conflict
+        const saved = structuredClone(params.policy as typeof policy)
+        saved.policyVersion = Number(params.basePolicyVersion) + 1
+        return saved
+      },
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+
+    await expect(settings.flushSectionSave('network')).resolves.toBe(false)
+
+    expect(settings.baseline.value).toEqual(currentPolicy)
+    expect(settings.draft.value).toEqual(currentPolicy)
+
+    settings.draft.value!.network.blockAllNetwork = true
+    await expect(settings.flushSectionSave('network')).resolves.toBe(true)
+
+    const updates = call.mock.calls.filter(([method]) => method === 'sandbox.policy.update')
+    expect(updates).toHaveLength(2)
+    expect(updates[1]?.[1]).toEqual(expect.objectContaining({
+      basePolicyVersion: 1,
+      policy: expect.objectContaining({
+        network: expect.objectContaining({
+          blockAllNetwork: true,
+          denyDomains: ['desktop.example.com'],
+        }),
+      }),
+    }))
+    scope.stop()
+  })
+
+  it('keeps concurrent local drafts while adopting a conflict baseline', async () => {
+    let rejectFirst!: (reason?: unknown) => void
+    const first = new Promise((_resolve, reject) => { rejectFirst = reject })
+    const currentPolicy = structuredClone(policy)
+    currentPolicy.policyVersion = 1
+    currentPolicy.network.denyDomains = ['desktop.example.com']
+    const conflict = Object.assign(new Error('policy version conflict'), {
+      code: 'POLICY_VERSION_CONFLICT',
+      details: { currentPolicy },
+    })
+    const { scope, settings } = await createSandboxSettings({
+      policyUpdate: async () => first,
+    })
+    await settings.load()
+    settings.draft.value!.network.blockAllNetwork = true
+    const saving = settings.flushSectionSave('network')
+    await settle()
+
+    settings.draft.value!.network.denyDomains.push('web.example.com')
+    settings.draft.value!.files.customDenyWritePaths.push('/keep-local')
+    rejectFirst(conflict)
+
+    await expect(saving).resolves.toBe(false)
+    expect(settings.baseline.value).toEqual(currentPolicy)
+    expect(settings.draft.value!.network).toEqual({
+      blockAllNetwork: true,
+      allowDomains: [],
+      denyDomains: ['web.example.com'],
+    })
+    expect(settings.draft.value!.files.customDenyWritePaths).toEqual(['/keep-local'])
     scope.stop()
   })
 })

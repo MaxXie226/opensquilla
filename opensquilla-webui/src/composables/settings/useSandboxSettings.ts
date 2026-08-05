@@ -2,6 +2,7 @@ import { computed, onScopeDispose, reactive, ref } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
+import type { RpcClientError } from '@/lib/rpc'
 import { usePlatform } from '@/platform'
 import { useRpcStore } from '@/stores/rpc'
 import {
@@ -28,6 +29,15 @@ function clonePolicy(policy: SandboxPolicy): SandboxPolicy {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function currentPolicyFromConflict(error: unknown): SandboxPolicy | null {
+  const rpcError = error as RpcClientError | null | undefined
+  if (rpcError?.code !== 'POLICY_VERSION_CONFLICT') return null
+  if (!rpcError.details || typeof rpcError.details !== 'object') return null
+  const currentPolicy = (rpcError.details as { currentPolicy?: unknown }).currentPolicy
+  if (!currentPolicy || typeof currentPolicy !== 'object') return null
+  return clonePolicy(currentPolicy as SandboxPolicy)
 }
 
 export function useSandboxSettings() {
@@ -286,12 +296,13 @@ export function useSandboxSettings() {
     if (!baseline.value || !draft.value || !sectionDirty(section)) return true
     sectionPending[section] = true
     sectionError[section] = ''
+    const submittedBaseline = clonePolicy(baseline.value)
     const submittedSection = JSON.parse(JSON.stringify(draft.value[section]))
     try {
-      const candidate = clonePolicy(baseline.value)
+      const candidate = clonePolicy(submittedBaseline)
       Object.assign(candidate, { [section]: submittedSection })
       const saved = await rpc.call<SandboxPolicy>('sandbox.policy.update', {
-        basePolicyVersion: baseline.value.policyVersion,
+        basePolicyVersion: submittedBaseline.policyVersion,
         policy: candidate,
       })
       const currentDraft = clonePolicy(draft.value)
@@ -310,7 +321,28 @@ export function useSandboxSettings() {
       return true
     } catch (error) {
       sectionError[section] = errorMessage(error)
-      if (baseline.value && draft.value) {
+      const currentDraft = draft.value ? clonePolicy(draft.value) : null
+      const sectionChangedWhileSaving = currentDraft !== null && (
+        JSON.stringify(currentDraft[section]) !== JSON.stringify(submittedSection)
+      )
+      const currentPolicy = currentPolicyFromConflict(error)
+      if (currentPolicy) {
+        baseline.value = clonePolicy(currentPolicy)
+        draft.value = clonePolicy(currentPolicy)
+        if (currentDraft) {
+          for (const other of ['files', 'commands', 'network', 'runtimes'] as const) {
+            if (
+              other !== section
+              && JSON.stringify(currentDraft[other]) !== JSON.stringify(submittedBaseline[other])
+            ) {
+              Object.assign(draft.value, { [other]: currentDraft[other] })
+            }
+          }
+          if (sectionChangedWhileSaving) {
+            Object.assign(draft.value, { [section]: currentDraft[section] })
+          }
+        }
+      } else if (!sectionChangedWhileSaving && baseline.value && draft.value) {
         Object.assign(draft.value, {
           [section]: JSON.parse(JSON.stringify(baseline.value[section])),
         })
