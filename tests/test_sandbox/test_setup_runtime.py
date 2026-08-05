@@ -159,6 +159,32 @@ def test_windows_available_report_requires_current_readiness_capabilities() -> N
     assert ready.available is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell redirection regression")
+def test_native_write_denial_canary_suppresses_expected_redirection_error(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.sandbox import setup_runtime
+
+    target = tmp_path / "missing-parent" / "protected.txt"
+    marker = "opensquilla-deny-write-ok"
+    argv = setup_runtime._native_denial_canary_argv(
+        target,
+        operation="write",
+        marker=marker,
+    )
+
+    result = subprocess.run(
+        argv,
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert setup_runtime._exact_process_result(result, marker)
+    assert result.stderr == ""
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows command-line parsing regression")
 @pytest.mark.parametrize(
     ("operation", "marker", "unexpected_exit"),

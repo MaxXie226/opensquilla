@@ -213,11 +213,7 @@ def test_saved_file_policy_compiles_into_the_live_safe_profile(tmp_path) -> None
         current_tool_context.reset(token)
 
     assert profile is not None
-    assert any(
-        entry.access is FileSystemAccess.WRITE
-        and entry.path == tmp_path.resolve(strict=False)
-        for entry in profile.entries
-    )
+    assert profile.default_access is FileSystemAccess.WRITE
     protected_write = decide_path_access(
         protected / "secret.txt",
         workspace=tmp_path,

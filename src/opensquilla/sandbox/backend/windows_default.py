@@ -1364,9 +1364,14 @@ def _split_windows_path(value: str) -> list[str]:
 
 
 def _directory_has_windows_tool(path: Path) -> bool:
-    if not path.exists() or not path.is_dir():
+    try:
+        if not path.exists() or not path.is_dir():
+            return False
+        return any((path / name).exists() for name in _WINDOWS_TOOL_PATH_EXECUTABLES)
+    except OSError:
+        # Ignore malformed or oversized PATH entries instead of aborting the
+        # entire sandbox request while probing for optional Windows tools.
         return False
-    return any((path / name).exists() for name in _WINDOWS_TOOL_PATH_EXECUTABLES)
 
 
 def _windows_path_is_apps_alias_dir(path: Path) -> bool:

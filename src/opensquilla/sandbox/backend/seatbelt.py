@@ -956,6 +956,15 @@ def _runtime_readonly_roots() -> tuple[Path, ...]:
         if not link_target.is_absolute():
             link_target = executable.parent / link_target
         symlink_roots = (link_target.parent, link_target.parent.parent)
+    base_executable = Path(
+        getattr(sys, "_base_executable", "") or executable
+    ).expanduser()
+    base_runtime_root = base_executable.parent.parent.absolute()
+    base_runtime_alias_roots = (
+        (base_runtime_root,)
+        if base_runtime_root != base_runtime_root.resolve(strict=False)
+        else ()
+    )
     prefix = Path(sys.prefix).expanduser().resolve(strict=False)
     base_prefix = Path(sys.base_prefix).expanduser().resolve(strict=False)
     configured = sysconfig.get_paths()
@@ -965,6 +974,7 @@ def _runtime_readonly_roots() -> tuple[Path, ...]:
         executable.resolve(strict=False).parent,
         executable.resolve(strict=False).parent.parent,
         *((prefix,) if prefix != base_prefix else ()),
+        *base_runtime_alias_roots,
         *(
             Path(configured[name])
             for name in ("stdlib", "platstdlib", "purelib", "platlib")

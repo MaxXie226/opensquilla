@@ -226,7 +226,11 @@ def _native_denial_canary_argv(
             marker,
         )
     if operation == "write":
-        attempt = 'printf changed > "$1" 2>/dev/null'
+        # POSIX shells apply redirections left-to-right. Redirect stderr first
+        # so an expected Seatbelt failure while opening the protected output
+        # path does not leak a diagnostic that makes the exact canary result
+        # look like a capability failure.
+        attempt = 'printf changed 2>/dev/null > "$1"'
         unexpected_exit = 41
     else:
         attempt = 'cat -- "$1" >/dev/null 2>&1'

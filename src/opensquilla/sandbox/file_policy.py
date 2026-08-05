@@ -206,9 +206,11 @@ def _normalized_text(
     platform: Literal["windows", "macos", "linux"],
 ) -> str:
     if platform == "windows":
-        if os.name == "nt":
+        raw_path = os.fspath(path)
+        host_path = Path(raw_path).expanduser()
+        if os.name == "nt" or host_path.is_absolute():
             try:
-                canonical = Path(os.fspath(path)).expanduser().resolve(strict=False)
+                canonical = host_path.resolve(strict=False)
                 return PureWindowsPath(str(canonical)).as_posix().rstrip("/").casefold()
             except (OSError, RuntimeError, ValueError):
                 pass
