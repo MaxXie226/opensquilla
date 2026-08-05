@@ -8,6 +8,7 @@ import os
 import secrets
 import shutil
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -26,13 +27,22 @@ RECURSIVE_DELETE_WARNING = (
     "如果已开启文件安全备份，OpenSquilla 会在删除前创建可恢复副本，"
     "并可能自动清理最旧的备份以腾出空间；如果仍无法备份，会再次明确询问是否无备份继续。"
 )
+FILE_DELETE_WARNING = (
+    "删除会永久移除该文件，无法撤回。"
+    "如果已开启文件安全备份，OpenSquilla 会在删除前创建可恢复副本，"
+    "并可能自动清理最旧的备份以腾出空间；如果仍无法备份，会再次明确询问是否无备份继续。"
+)
 OVERSIZE_BACKUP_WARNING = (
-    "该目录的备份大小为 {size_bytes} 字节，超过备份空间上限 {quota_bytes} 字节。"
-    "继续将递归删除全部内容且不会创建备份，此操作不可撤回。"
+    "该对象的备份大小为 {size_bytes} 字节，超过备份空间上限 {quota_bytes} 字节。"
+    "继续将删除目标且不会创建备份，此操作不可撤回。"
 )
 UNAVAILABLE_BACKUP_WARNING = (
-    "OpenSquilla 已自动清理旧备份，但仍无法为该目录创建新备份。"
-    "继续将递归删除全部内容且不会创建备份，此操作不可撤回。"
+    "OpenSquilla 已自动清理旧备份，但仍无法为该目标创建新备份。"
+    "继续将删除目标且不会创建备份，此操作不可撤回。"
+)
+BACKUP_STORAGE_UNAVAILABLE_WARNING = (
+    "文件安全备份存储当前不可用，或旧备份无法完成清理。"
+    "继续将删除目标且不会创建备份，此操作不可撤回。"
 )
 
 
@@ -148,11 +158,13 @@ class FileMutationBroker:
         self,
         *,
         policy: SandboxPolicy,
-        vault: BackupVault,
+        vault: BackupVault | None = None,
+        vault_factory: Callable[[], BackupVault] | None = None,
         authority_roots: tuple[Path, ...] = (),
     ) -> None:
         self._policy = policy.model_copy(deep=True)
         self._vault = vault
+        self._vault_factory = vault_factory
         self._authority_roots = authority_roots
         self._approvals: dict[str, str] = {}
         self._backup_overrides: dict[str, tuple[str, str]] = {}
@@ -176,7 +188,7 @@ class FileMutationBroker:
         )
         if not decision.allowed and not decision.approval_required:
             raise MutationDenied(decision.code or "file_mutation_denied")
-        approval_required = bool(recursive or decision.approval_required)
+        approval_required = True
         return MutationPlan(
             operation="delete",
             target=path,
@@ -185,7 +197,7 @@ class FileMutationBroker:
             parent_identity=ObjectIdentity.capture(path.parent),
             tree_digest=_tree_digest(path),
             approval_required=approval_required,
-            warning=RECURSIVE_DELETE_WARNING if recursive else None,
+            warning=RECURSIVE_DELETE_WARNING if recursive else FILE_DELETE_WARNING,
             policy_version=self._policy.policy_version,
         )
 
@@ -200,9 +212,7 @@ class FileMutationBroker:
         plan: MutationPlan,
         error: BackupUnavailable,
     ) -> MutationPlan:
-        """Issue exact one-use approval for an unbacked recursive delete."""
-        if not plan.recursive:
-            raise ValueError("backup override is only valid for recursive deletes")
+        """Issue exact one-use approval for a delete that cannot be backed up."""
         if isinstance(error, BackupTooLarge) and error.size_bytes <= error.quota_bytes:
             raise ValueError("backup override requires an oversize backup")
         approval_token = secrets.token_urlsafe(24)
@@ -218,6 +228,8 @@ class FileMutationBroker:
                 )
                 if isinstance(error, BackupTooLarge)
                 else UNAVAILABLE_BACKUP_WARNING
+                if error.reason == "io_error"
+                else BACKUP_STORAGE_UNAVAILABLE_WARNING
             ),
         )
         fingerprint = approved.fingerprint()
@@ -254,6 +266,19 @@ class FileMutationBroker:
             and secrets.compare_digest(error_key, self._backup_error_key(error))
         )
 
+    def _backup_vault(self) -> BackupVault:
+        if self._vault is not None:
+            return self._vault
+        if self._vault_factory is None:
+            raise BackupUnavailable(reason="backup_vault_unavailable")
+        try:
+            self._vault = self._vault_factory()
+        except BackupUnavailable:
+            raise
+        except OSError as exc:
+            raise BackupUnavailable(reason="backup_vault_unavailable") from exc
+        return self._vault
+
     @staticmethod
     def _verify_identity(plan: MutationPlan) -> None:
         try:
@@ -272,9 +297,9 @@ class FileMutationBroker:
         self._consume_approval(plan)
         self._verify_identity(plan)
         backup: BackupReceipt | None = None
-        if plan.recursive and self._policy.files.recursive_delete_backup_enabled:
+        if self._policy.files.recursive_delete_backup_enabled:
             try:
-                backup = self._vault.backup_many(
+                backup = self._backup_vault().backup_many(
                     (plan.target,),
                     quota_bytes=self._policy.files.backup_quota_bytes,
                 )[0]
@@ -284,6 +309,8 @@ class FileMutationBroker:
             self._verify_identity(plan)
         if plan.recursive:
             shutil.rmtree(plan.target)
+        elif plan.target.is_symlink():
+            plan.target.unlink()
         elif plan.target.is_dir():
             plan.target.rmdir()
         else:
@@ -293,6 +320,8 @@ class FileMutationBroker:
 
 __all__ = [
     "ApprovalRequired",
+    "BACKUP_STORAGE_UNAVAILABLE_WARNING",
+    "FILE_DELETE_WARNING",
     "FileMutationBroker",
     "MutationDenied",
     "MutationPlan",

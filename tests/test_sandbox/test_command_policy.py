@@ -52,6 +52,61 @@ def test_quoted_control_character_does_not_split_segment() -> None:
     assert segments[1].argv == ("node", "build.js")
 
 
+def test_heredoc_body_is_not_split_into_shell_segments() -> None:
+    segments = parse_shell_segments(
+        "cat > test_bug.php << 'EOF'\n<?php echo 'debug';\nEOF\n",
+        platform="linux",
+    )
+
+    assert len(segments) == 1
+    assert segments[0].argv[0] == "cat"
+
+
+def test_command_after_heredoc_terminator_is_still_split() -> None:
+    segments = parse_shell_segments(
+        "cat <<'EOF'\nrm body-only.txt\nEOF\nrm real-target.txt",
+        platform="linux",
+    )
+
+    assert len(segments) == 2
+    assert segments[1].argv == ("rm", "real-target.txt")
+
+
+def test_heredoc_marker_inside_posix_comment_does_not_hide_later_command() -> None:
+    segments = parse_shell_segments(
+        "echo ok # <<EOF\nrm real-target.txt\nEOF",
+        platform="linux",
+    )
+
+    assert len(segments) == 3
+    assert segments[1].argv == ("rm", "real-target.txt")
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ": $((1 << EOF))\nrm real-target.txt\nEOF",
+        ": $[1 << EOF ]\nrm real-target.txt\nEOF",
+        "((1 << EOF))\nrm real-target.txt\nEOF",
+    ),
+)
+def test_arithmetic_shift_does_not_hide_later_command(command: str) -> None:
+    segments = parse_shell_segments(command, platform="linux")
+
+    assert len(segments) == 3
+    assert segments[1].argv == ("rm", "real-target.txt")
+
+
+def test_windows_segment_parser_does_not_apply_posix_heredoc_rules() -> None:
+    segments = parse_shell_segments(
+        "echo <<EOF\ndel real-target.txt",
+        platform="windows",
+    )
+
+    assert len(segments) == 2
+    assert segments[1].argv == ("del", "real-target.txt")
+
+
 def test_shell_wrapper_is_unwrapped_for_matching() -> None:
     decision = decide_shell_command(
         'bash -lc "git push origin main"',

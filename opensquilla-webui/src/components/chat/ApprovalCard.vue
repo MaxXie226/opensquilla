@@ -51,7 +51,7 @@
       </dl>
       <template v-if="showCommand">
         <div class="approval-card__label">{{ t('chat.approval.command') }}</div>
-        <pre class="approval-card__pre approval-card__pre--cmd">{{ approval.command }}</pre>
+        <pre class="approval-card__pre approval-card__pre--cmd">{{ displayCommand }}</pre>
       </template>
       <section
         v-if="riskTitle"
@@ -222,8 +222,13 @@ const showTarget = computed(() =>
   Boolean(props.approval.displayTarget)
   && props.approval.displayKind !== 'run_command')
 
+const displayCommand = computed(() =>
+  props.approval.displayKind === 'run_command'
+    ? props.approval.displayTarget || props.approval.command
+    : '')
+
 const showCommand = computed(() =>
-  props.approval.displayKind === 'run_command' && Boolean(props.approval.command))
+  Boolean(displayCommand.value))
 
 const isSandboxApproval = computed(() =>
   !props.approval.destructive
@@ -289,8 +294,9 @@ const outcomeIcon = computed(() => {
 })
 
 const summary = computed(() => {
-  const text = props.approval.displayTarget
-    || (props.approval.displayKind === 'run_command' ? props.approval.command : '')
+  const text = props.approval.displayKind === 'run_command'
+    ? displayCommand.value
+    : props.approval.displayTarget || ''
   return text.length > 60 ? text.slice(0, 60) + '…' : text
 })
 

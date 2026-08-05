@@ -1968,7 +1968,7 @@ async def test_managed_shell_nested_sh_workspace_write_reaches_backend(
         ctx.sandbox_file_system_profile = profile
         result = await shell.exec_command(
             "sh -lc 'printf shell-workspace-ok > sandbox_probe_shell.txt "
-            "&& cat sandbox_probe_shell.txt && rm sandbox_probe_shell.txt'"
+            "&& cat sandbox_probe_shell.txt'"
         )
 
     assert result == "exit_code=0\nshell-workspace-ok\n"
@@ -2846,7 +2846,7 @@ async def test_trusted_shell_powershell_read_path_outside_workspace_needs_no_mou
 
 
 @pytest.mark.asyncio
-async def test_trusted_shell_delete_existing_file_requires_elevation(
+async def test_trusted_shell_delete_existing_file_requires_destructive_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2871,10 +2871,12 @@ async def test_trusted_shell_delete_existing_file_requires_elevation(
     with tool_context(workspace, run_mode="trusted") as ctx:
         payload = json.loads(await shell.exec_command(f'del "{outside}"'))
 
-    assert payload["status"] == "elevation_required"
+    assert payload["status"] == "approval_required"
     assert payload["target"] == str(outside.resolve(strict=False))
+    assert payload["backup_state"] == "enabled"
+    assert payload["irreversible"] is False
     assert backend_calls == []
-    assert get_approval_queue().list_pending("exec") == []
+    assert len(get_approval_queue().list_pending("exec")) == 1
     assert ctx.sandbox_mounts == []
 
 
@@ -2972,7 +2974,7 @@ async def test_full_host_access_shell_write_to_protected_metadata_uses_host(
 
 
 @pytest.mark.asyncio
-async def test_trusted_shell_delete_existing_file_under_rw_mount_uses_existing_mount(
+async def test_trusted_shell_delete_under_rw_mount_still_requires_destructive_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3001,16 +3003,16 @@ async def test_trusted_shell_delete_existing_file_under_rw_mount_uses_existing_m
         run_mode="trusted",
         sandbox_mounts=[{"path": str(mounted.resolve(strict=False)), "access": "rw"}],
     ) as ctx:
-        result = await shell.exec_command(f'del "{outside}"')
+        payload = json.loads(await shell.exec_command(f'del "{outside}"'))
 
-    assert "exit_code=0" in result
-    assert backend_calls
-    assert get_approval_queue().list_pending("exec") == []
+    assert payload["status"] == "approval_required"
+    assert payload["target"] == str(outside.resolve(strict=False))
+    assert payload["backup_state"] == "enabled"
+    assert backend_calls == []
+    assert len(get_approval_queue().list_pending("exec")) == 1
     assert ctx.sandbox_mounts == [
         {"path": str(mounted.resolve(strict=False)), "access": "rw"},
     ]
-    request = backend_calls[0]
-    assert any(mount.host_path == mounted for mount in request.policy.mounts)
 
 
 def test_windows_shell_policy_ignores_deleted_active_file_mount(

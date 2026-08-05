@@ -37,8 +37,13 @@ class CommandDecision:
 _WINDOWS_SYSTEM_TOOLS = frozenset({"wsl", "wmic", "sc", "reg", "schtasks"})
 _DARWIN_SYSTEM_TOOLS = frozenset({"launchctl", "crontab", "sudo"})
 _LINUX_SYSTEM_TOOLS = frozenset({"systemctl", "crontab", "sudo"})
-_BOUNDARY_RE = re.compile(r"(?:&&|\|\||[;|\n])")
+_BOUNDARY_RE = re.compile(r"(?:&&|\|\||[;&|\n])")
 _UNSAFE_RULE_TOKEN_RE = re.compile(r"(?:&&|\|\||[;|<>`$()]|\r|\n)")
+_HEREDOC_RE = re.compile(
+    r"(?<!<)<<(?P<strip_tabs>-?)(?!<)\s*"
+    r"(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_]\w*)(?P=quote)"
+    r"(?=$|[\s;&|()<>])"
+)
 
 
 def _platform_name(platform: str | None) -> Literal["windows", "darwin", "linux"]:
@@ -117,7 +122,109 @@ def _tokenize(source: str, *, platform: str) -> tuple[str, ...]:
     return _strip_wrappers(tokens, platform=platform)
 
 
-def _split_segments(command: str) -> tuple[str, ...]:
+def _heredoc_delimiters(
+    line: str,
+    quote: str | None,
+    arithmetic_closers: tuple[str, ...],
+) -> tuple[list[tuple[str, bool]], str | None, tuple[str, ...]]:
+    delimiters: list[tuple[str, bool]] = []
+    index = 0
+    word_start = quote is None and not arithmetic_closers
+    while index < len(line):
+        char = line[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            word_start = False
+            index += 2
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            index += 1
+            continue
+        if arithmetic_closers:
+            if char in "([":
+                arithmetic_closers = (
+                    *arithmetic_closers,
+                    ")" if char == "(" else "]",
+                )
+            elif char == arithmetic_closers[-1]:
+                arithmetic_closers = arithmetic_closers[:-1]
+            index += 1
+            continue
+        if line.startswith("$((", index):
+            arithmetic_closers = (")", ")")
+            word_start = False
+            index += 3
+            continue
+        if line.startswith("$[", index):
+            arithmetic_closers = ("]",)
+            word_start = False
+            index += 2
+            continue
+        if word_start and line.startswith("((", index):
+            arithmetic_closers = (")", ")")
+            word_start = False
+            index += 2
+            continue
+        if char == "#" and word_start:
+            break
+        if char in {"'", '"'}:
+            quote = char
+            word_start = False
+            index += 1
+            continue
+        if char == "<":
+            match = _HEREDOC_RE.match(line, index)
+            if match is not None:
+                delimiters.append(
+                    (match.group("delimiter"), bool(match.group("strip_tabs")))
+                )
+                word_start = False
+                index = match.end()
+                continue
+        if char.isspace() or char in ";&|()<>":
+            word_start = True
+            index += 1
+            continue
+        word_start = False
+        index += 1
+    return delimiters, quote, arithmetic_closers
+
+
+def strip_shell_heredoc_bodies(command: str) -> str:
+    """Remove POSIX heredoc data while retaining executable command lines."""
+
+    if "<<" not in command:
+        return command
+    output_lines: list[str] = []
+    pending: list[tuple[str, bool]] = []
+    quote: str | None = None
+    arithmetic_closers: tuple[str, ...] = ()
+    for line in command.split("\n"):
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if candidate == delimiter:
+                pending.pop(0)
+            continue
+        delimiters, quote, arithmetic_closers = _heredoc_delimiters(
+            line,
+            quote,
+            arithmetic_closers,
+        )
+        pending.extend(delimiters)
+        output_lines.append(line)
+    return "\n".join(output_lines)
+
+
+def _split_segments(command: str, *, strip_heredocs: bool) -> tuple[str, ...]:
+    if strip_heredocs:
+        command = strip_shell_heredoc_bodies(command)
     segments: list[str] = []
     start = 0
     quote = ""
@@ -166,7 +273,7 @@ def parse_shell_segments(
 ) -> tuple[CommandSegment, ...]:
     target = _platform_name(platform)
     parsed: list[CommandSegment] = []
-    for source in _split_segments(command):
+    for source in _split_segments(command, strip_heredocs=target != "windows"):
         argv = _tokenize(source, platform=target)
         if not argv:
             raise ValueError("empty shell command segment")

@@ -653,6 +653,7 @@ class ApprovalQueue:
         *,
         elevated_mode: str | None = None,
         allow_idempotent: bool = True,
+        resolution_metadata: dict | None = None,
     ) -> None:
         self._release_stale_claims()
         self._conn.execute("BEGIN IMMEDIATE")
@@ -673,16 +674,31 @@ class ApprovalQueue:
                 return
             raise ValueError(f"Approval already resolved: {approval_id}")
 
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET resolved = 1, approved = ?, resolution = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-            (
-                1 if approved else 0,
-                RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
-                approval_id,
-            ),
-        )
+        if resolution_metadata:
+            merged_params = dict(entry.params)
+            merged_params.update(resolution_metadata)
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = ?, resolution = ?, params = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    1 if approved else 0,
+                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                    self._serialize_params(merged_params),
+                    approval_id,
+                ),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = ?, resolution = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    1 if approved else 0,
+                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                    approval_id,
+                ),
+            )
         if cursor.rowcount != 1:
             self._conn.rollback()
             entry = self.get(approval_id)
@@ -705,7 +721,12 @@ class ApprovalQueue:
 
         del elevated_mode
 
-    def claim_resolution(self, approval_id: str) -> str:
+    def claim_resolution(
+        self,
+        approval_id: str,
+        *,
+        resolution_metadata: dict | None = None,
+    ) -> str:
         self._release_stale_claims()
         token = uuid.uuid4().hex
         now = time.time()
@@ -724,12 +745,27 @@ class ApprovalQueue:
             self._pending[approval_id] = entry
             entry._event.set()
             raise ValueError(f"Approval already resolved: {approval_id}")
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET claim_token = ?, claim_started_at = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-            (token, now, approval_id),
-        )
+        if resolution_metadata:
+            merged_params = dict(entry.params)
+            merged_params.update(resolution_metadata)
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = ?, claim_started_at = ?, params = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    token,
+                    now,
+                    self._serialize_params(merged_params),
+                    approval_id,
+                ),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = ?, claim_started_at = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (token, now, approval_id),
+            )
         if cursor.rowcount != 1:
             self._conn.rollback()
             entry = self.get(approval_id)

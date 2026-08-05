@@ -401,7 +401,7 @@ async def test_exec_command_approved_locked_action_uses_host_once(
 
 
 @pytest.mark.asyncio
-async def test_nonrecursive_delete_stays_in_sandbox_without_locked_approval(
+async def test_nonrecursive_delete_requires_exact_recoverable_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -442,8 +442,11 @@ async def test_nonrecursive_delete_stays_in_sandbox_without_locked_approval(
     )
     result = await shell.exec_command(command, workdir=str(tmp_path))
 
-    assert result.startswith("exit_code=0\n")
-    assert "sandboxed" in result
+    payload = json.loads(result)
+    assert payload["status"] == "approval_required"
+    assert payload["target"] == str(target)
+    assert payload["backup_state"] == "enabled"
+    assert payload["irreversible"] is False
     assert target.exists() is True
     assert queue.params is None
     assert queue.request_count == 0

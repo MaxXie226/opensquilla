@@ -29,6 +29,9 @@ ChannelSystemMessageKey = Literal[
     "approval_label_path",
     "approval_label_code",
     "approval_packages",
+    "approval_delete_backup_enabled",
+    "approval_delete_backup_disabled",
+    "approval_delete_backup_unavailable",
     "approval_unknown_command",
     "approval_probe_throttled",
     "approval_no_pending",
@@ -104,6 +107,18 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "Path",
         "approval_label_code": "Code",
         "approval_packages": "packages: {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "This deletion is permanent. Backup is enabled; OpenSquilla will create a "
+            "recoverable copy before deleting the target."
+        ),
+        "approval_delete_backup_disabled": (
+            "This deletion is permanent and backup is off. Turn it on in Sandbox Settings "
+            "before continuing if you want a recoverable copy."
+        ),
+        "approval_delete_backup_unavailable": (
+            "Backup is unavailable. Continuing will permanently delete the target without "
+            "a recoverable copy."
+        ),
         "approval_unknown_command": "(unknown command)",
         "approval_probe_throttled": (
             "Too many failed approval attempts — wait a minute and try again."
@@ -187,6 +202,15 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "路径",
         "approval_label_code": "代码",
         "approval_packages": "软件包：{bundle_id}",
+        "approval_delete_backup_enabled": (
+            "此删除操作不可撤回。文件安全备份已开启，OpenSquilla 会在删除前创建可恢复副本。"
+        ),
+        "approval_delete_backup_disabled": (
+            "此删除操作不可撤回，且文件安全备份未开启。如需可恢复副本，请先在沙箱设置中开启备份。"
+        ),
+        "approval_delete_backup_unavailable": (
+            "文件安全备份当前不可用。继续会永久删除目标，且不会留下可恢复副本。"
+        ),
         "approval_unknown_command": "（未知命令）",
         "approval_probe_throttled": "失败的批准尝试过多，请等待一分钟后重试。",
         "approval_no_pending": "没有待处理的批准 {code}。",
@@ -268,6 +292,16 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "パス",
         "approval_label_code": "コード",
         "approval_packages": "パッケージ: {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "この削除は取り消せません。バックアップは有効で、削除前に復元可能なコピーを作成します。"
+        ),
+        "approval_delete_backup_disabled": (
+            "この削除は取り消せず、バックアップは無効です。復元可能なコピーが必要な場合は、"
+            "先にサンドボックス設定で有効にしてください。"
+        ),
+        "approval_delete_backup_unavailable": (
+            "バックアップを利用できません。続行すると、復元可能なコピーなしで対象を完全に削除します。"
+        ),
         "approval_unknown_command": "(不明なコマンド)",
         "approval_probe_throttled": (
             "承認コードの試行回数が多すぎます。1 分待ってからもう一度試してください。"
@@ -355,6 +389,18 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "Chemin",
         "approval_label_code": "Code",
         "approval_packages": "paquets : {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "Cette suppression est irréversible. La sauvegarde est activée et OpenSquilla "
+            "créera une copie récupérable avant la suppression."
+        ),
+        "approval_delete_backup_disabled": (
+            "Cette suppression est irréversible et la sauvegarde est désactivée. Activez-la "
+            "d'abord dans les paramètres du bac à sable pour conserver une copie récupérable."
+        ),
+        "approval_delete_backup_unavailable": (
+            "La sauvegarde est indisponible. Continuer supprimera définitivement la cible "
+            "sans copie récupérable."
+        ),
         "approval_unknown_command": "(commande inconnue)",
         "approval_probe_throttled": (
             "Trop de tentatives d'approbation ont échoué. Attendez une minute et réessayez."
@@ -449,6 +495,18 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "Pfad",
         "approval_label_code": "Code",
         "approval_packages": "Pakete: {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "Dieser Löschvorgang kann nicht rückgängig gemacht werden. Die Sicherung ist "
+            "aktiviert; OpenSquilla erstellt vor dem Löschen eine wiederherstellbare Kopie."
+        ),
+        "approval_delete_backup_disabled": (
+            "Dieser Löschvorgang kann nicht rückgängig gemacht werden und die Sicherung ist "
+            "deaktiviert. Aktivieren Sie sie zuerst in den Sandbox-Einstellungen."
+        ),
+        "approval_delete_backup_unavailable": (
+            "Die Sicherung ist nicht verfügbar. Beim Fortfahren wird das Ziel dauerhaft und "
+            "ohne wiederherstellbare Kopie gelöscht."
+        ),
         "approval_unknown_command": "(unbekannter Befehl)",
         "approval_probe_throttled": (
             "Zu viele fehlgeschlagene Freigabeversuche. Warten Sie eine Minute und versuchen "
@@ -539,6 +597,18 @@ _MESSAGES: dict[str, dict[ChannelSystemMessageKey, str]] = {
         "approval_label_path": "Ruta",
         "approval_label_code": "Código",
         "approval_packages": "paquetes: {bundle_id}",
+        "approval_delete_backup_enabled": (
+            "Esta eliminación es irreversible. La copia de seguridad está activada y "
+            "OpenSquilla creará una copia recuperable antes de eliminar el destino."
+        ),
+        "approval_delete_backup_disabled": (
+            "Esta eliminación es irreversible y la copia de seguridad está desactivada. "
+            "Actívala primero en la configuración del entorno aislado para conservar una copia."
+        ),
+        "approval_delete_backup_unavailable": (
+            "La copia de seguridad no está disponible. Si continúas, el destino se eliminará "
+            "permanentemente sin una copia recuperable."
+        ),
         "approval_unknown_command": "(comando desconocido)",
         "approval_probe_throttled": (
             "Demasiados intentos de aprobación fallidos. Espera un minuto e inténtalo de nuevo."

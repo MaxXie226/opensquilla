@@ -42,6 +42,650 @@ class _PendingGate:
         return {"status": "approval_required", "approval_id": "pending"}
 
 
+class _DeniedGate:
+    allowed = False
+    approval_id = "pending"
+    status = "approval_denied"
+
+    @staticmethod
+    def to_envelope() -> dict[str, object]:
+        return {"status": "approval_denied", "approval_id": "pending"}
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "rm discard.txt",
+        "sh -lc 'rm discard.txt'",
+        "powershell -Command \"Remove-Item -Force 'discard.txt'\"",
+        'cmd /c "del /F discard.txt"',
+        "command rm discard.txt",
+        "env OPENSQUILLA_TEST=1 rm discard.txt",
+        "sudo rm discard.txt",
+        "ri -Force discard.txt",
+    ),
+)
+def test_literal_file_delete_parser_covers_direct_shell_wrappers(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    parsed = shell._delete_target(command, str(tmp_path))
+
+    assert parsed == (target.resolve(), False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        'cmd /c "del /F discard.txt"',
+        "powershell -Command \"Remove-Item -Force 'discard.txt'\"",
+    ),
+)
+def test_literal_delete_parser_uses_native_windows_tokenization(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    assert shell._delete_target(command, str(tmp_path), windows=True) == (
+        target.resolve(),
+        False,
+    )
+
+
+def test_cmd_wrapper_accepts_common_startup_switches_before_delete(tmp_path: Path) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    assert shell._delete_target(
+        'cmd /d /s /c "del /F discard.txt"',
+        str(tmp_path),
+        windows=True,
+    ) == (target.resolve(), False)
+
+
+def test_busybox_delete_is_unwrapped_to_the_exact_target(tmp_path: Path) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    assert shell._delete_target("busybox rm discard.txt", str(tmp_path)) == (
+        target.resolve(),
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "FOO=1 rm discard.txt",
+        "nice rm discard.txt",
+        "nohup rm discard.txt",
+        "exec rm discard.txt",
+        "time rm discard.txt",
+    ),
+)
+def test_assignment_and_process_wrappers_reach_the_exact_delete_target(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    assert shell._delete_target(command, str(tmp_path)) == (
+        target.resolve(),
+        False,
+    )
+
+
+@pytest.mark.parametrize("command", (r"r\m discard.txt", "r''m discard.txt"))
+def test_shell_lexical_escapes_still_reach_the_exact_delete_target(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    assert shell._delete_target(command, str(tmp_path)) == (
+        target.resolve(),
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "env -C nested rm discard.txt",
+        "env --chdir=nested rm discard.txt",
+        "sudo -D nested rm discard.txt",
+        "sudo --chdir=nested rm discard.txt",
+    ),
+)
+def test_chdir_wrappers_require_an_explicit_tool_workdir(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    target = nested / "discard.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+def test_missing_chdir_wrapper_cannot_turn_failed_command_into_absolute_delete(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "important.txt"
+    target.write_text("important", encoding="utf-8")
+
+    assert shell._delete_target(
+        f"env -C missing rm {target}",
+        str(tmp_path),
+    ) == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_env_split_string_delete_fails_closed_when_not_exact(tmp_path: Path) -> None:
+    target = tmp_path / "important.txt"
+    target.write_text("important", encoding="utf-8")
+
+    result = await shell._gate_recursive_delete(
+        "env -S 'rm -v important.txt'",
+        cwd=str(tmp_path),
+        approval_id=None,
+        require_exact=False,
+    )
+
+    payload = json.loads(result or "{}")
+    assert payload["status"] == "blocked"
+    assert target.read_text(encoding="utf-8") == "important"
+
+
+def test_non_executing_echo_of_delete_name_is_not_treated_as_delete(tmp_path: Path) -> None:
+    assert shell._delete_target("echo rm important.txt", str(tmp_path)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    (
+        "echo $(rm important.txt)",
+        "printf '%s' \"$(rm important.txt)\"",
+        "rg --pre rm needle important.txt",
+    ),
+)
+async def test_outer_commands_that_can_execute_delete_subprocesses_fail_closed(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "important.txt"
+    target.write_text("important", encoding="utf-8")
+
+    result = await shell._gate_recursive_delete(
+        command,
+        cwd=str(tmp_path),
+        approval_id=None,
+        require_exact=False,
+    )
+
+    payload = json.loads(result or "{}")
+    assert payload["status"] == "blocked"
+    assert target.read_text(encoding="utf-8") == "important"
+
+
+def test_posix_sh_c_only_treats_the_next_token_as_script(tmp_path: Path) -> None:
+    target = tmp_path / "important.txt"
+    target.write_text("important", encoding="utf-8")
+
+    assert shell._delete_target("sh -c rm important.txt", str(tmp_path)) == (
+        None,
+        False,
+    )
+    assert shell._delete_target("sh -c 'rm important.txt'", str(tmp_path)) == (
+        target.resolve(),
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "env --help rm important.txt",
+        "sudo --help rm important.txt",
+        "sh --help -c 'rm important.txt'",
+    ),
+)
+def test_wrapper_help_or_unknown_options_never_become_brokered_deletes(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "important.txt"
+    target.write_text("important", encoding="utf-8")
+
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+def test_command_lookup_of_rm_is_not_treated_as_execution(tmp_path: Path) -> None:
+    assert shell._delete_target("command -v rm", str(tmp_path)) is None
+    assert shell._delete_target("command -V rm", str(tmp_path)) is None
+
+
+@pytest.mark.parametrize("command", ("env -i rm discard.txt", "sudo -n rm discard.txt"))
+def test_supported_wrapper_options_still_reach_exact_delete(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    assert shell._delete_target(command, str(tmp_path)) == (
+        target.resolve(),
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_escaped_delete_inside_command_substitution_fails_closed(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "important.txt"
+    target.write_text("important", encoding="utf-8")
+
+    result = await shell._gate_recursive_delete(
+        r"echo $(r\m important.txt)",
+        cwd=str(tmp_path),
+        approval_id=None,
+        require_exact=False,
+    )
+
+    payload = json.loads(result or "{}")
+    assert payload["status"] == "blocked"
+    assert target.exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "r${OPENSQUILLA_REVIEW_UNSET_91F3}m important.txt",
+        "$DELETE_CMD important.txt",
+        '"$DELETE_CMD" important.txt',
+    ),
+)
+def test_dynamic_executable_is_never_treated_as_a_non_delete(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "command $DELETE_CMD important.txt",
+        "nice $DELETE_CMD important.txt",
+        "nohup $DELETE_CMD important.txt",
+        "env DELETE_CMD=rm sh -c '$DELETE_CMD important.txt'",
+    ),
+)
+def test_dynamic_executable_behind_known_wrapper_fails_closed(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        'cmd /v:on /c "!DELETE_CMD! /Q important.txt"',
+        'cmd /v:on /c "!DELETE-CMD! /Q important.txt"',
+        'cmd /v:on /c "!DELETE""! /Q important.txt"',
+        'cmd /c "%9.DELETE(CMD)% /Q important.txt"',
+        'cmd /c "%DELETE""% /Q important.txt"',
+        'cmd /c "d^el /Q important.txt"',
+        'cmd /c d""el /Q important.txt',
+        'cmd /s /c "d""el /Q important.txt"',
+        'Remove-"Item" important.txt',
+    ),
+)
+def test_cmd_dynamic_or_caret_executable_fails_closed(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path), windows=True) == (None, False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "call %DELETE_CMD% important.txt",
+        "start %DELETE_CMD% important.txt",
+        "& $DELETE_CMD important.txt",
+        "eval $DELETE_CMD important.txt",
+        "xargs $DELETE_CMD",
+    ),
+)
+def test_execution_carriers_with_dynamic_command_fail_closed(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path), windows=True) == (None, False)
+
+
+def test_quoted_static_windows_executable_path_is_not_a_dynamic_delete(
+    tmp_path: Path,
+) -> None:
+    command = r'& "C:\Program Files\Acme\tool.exe" --version'
+
+    assert shell._delete_target(command, str(tmp_path), windows=True) is None
+
+
+def test_echo_of_fragmented_windows_variable_is_not_treated_as_execution(
+    tmp_path: Path,
+) -> None:
+    assert (
+        shell._delete_target('echo "%PATH""%"', str(tmp_path), windows=True) is None
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("sh script.sh", "command ls", "env FOO=1 printf ok", "nice echo ok"),
+)
+def test_known_wrappers_without_delete_or_dynamic_executable_are_ignored(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path)) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "echo ok; $DELETE_CMD important.txt",
+        "echo ok && $DELETE_CMD important.txt",
+        "echo ok & $DELETE_CMD important.txt",
+        "printf ok | $DELETE_CMD important.txt",
+        "Write-Output ok; & $DELETE_CMD important.txt",
+    ),
+)
+def test_dynamic_delete_in_later_compound_segment_fails_closed(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+def test_compound_inert_commands_without_delete_are_ignored(tmp_path: Path) -> None:
+    assert shell._delete_target("echo ok; printf done", str(tmp_path)) is None
+
+
+def test_heredoc_body_delete_words_are_data_not_commands(tmp_path: Path) -> None:
+    command = "cat <<'EOF'\nrm important.txt\n<?php echo 'debug';\nEOF\n"
+
+    assert shell._delete_target(command, str(tmp_path)) is None
+
+
+def test_delete_after_heredoc_terminator_fails_closed(tmp_path: Path) -> None:
+    command = "cat <<'EOF'\nrm body-only.txt\nEOF\nrm important.txt"
+
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+def test_heredoc_marker_inside_comment_cannot_hide_later_delete(tmp_path: Path) -> None:
+    command = "echo ok # <<EOF\nrm important.txt\nEOF"
+
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ": $((1 << EOF))\nrm important.txt\nEOF",
+        ": $[1 << EOF ]\nrm important.txt\nEOF",
+        "((1 << EOF))\nrm important.txt\nEOF",
+    ),
+)
+def test_arithmetic_shift_cannot_hide_later_delete(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "Remove-Item first.txt,second.txt",
+        "Remove-Item -Path first.txt,second.txt",
+        "Remove-Item -LiteralPath first.txt,second.txt",
+        "ri first.txt,second.txt",
+        "rm first.txt,second.txt",
+    ),
+)
+def test_powershell_unquoted_path_lists_fail_closed(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path), windows=True) == (None, False)
+
+
+def test_powershell_quoted_comma_stays_one_literal_path(tmp_path: Path) -> None:
+    target = tmp_path / "first.txt,second.txt"
+    target.write_text("discard", encoding="utf-8")
+
+    assert shell._delete_target(
+        'Remove-Item "first.txt,second.txt"',
+        str(tmp_path),
+        windows=True,
+    ) == (target.resolve(), False)
+
+
+def test_recursive_windows_directory_alias_is_parsed_exactly(tmp_path: Path) -> None:
+    target = tmp_path / "discard"
+    target.mkdir()
+
+    parsed = shell._delete_target("rd /S discard", str(tmp_path))
+
+    assert parsed == (target.resolve(), True)
+
+
+def test_rm_dir_flag_preserves_nonrecursive_empty_directory_semantics(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "discard"
+    target.mkdir()
+
+    assert shell._delete_target("rm -d discard", str(tmp_path)) == (
+        target.resolve(),
+        False,
+    )
+
+
+@pytest.mark.parametrize("command", ("rm discard", "unlink discard", "del discard"))
+def test_file_only_delete_commands_do_not_gain_directory_semantics(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    (tmp_path / "discard").mkdir()
+
+    assert shell._delete_target(command, str(tmp_path)) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "rm --help important.txt",
+        "rm --invalid-option important.txt",
+        "Remove-Item -WhatIf important.txt",
+    ),
+)
+def test_delete_options_that_change_or_prevent_execution_are_not_brokered(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "important.txt"
+    target.write_text("important", encoding="utf-8")
+
+    assert shell._delete_target(command, str(tmp_path)) == (None, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    (
+        "rm -v important.txt",
+        "rm --verbose important.txt",
+        "Remove-Item -Verbose important.txt",
+    ),
+)
+async def test_unmodelled_delete_options_fail_closed_even_without_legacy_approval(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    target = tmp_path / "important.txt"
+    target.write_text("important", encoding="utf-8")
+
+    result = await shell._gate_recursive_delete(
+        command,
+        cwd=str(tmp_path),
+        approval_id=None,
+        require_exact=False,
+    )
+
+    payload = json.loads(result or "{}")
+    assert payload["status"] == "blocked"
+    assert target.read_text(encoding="utf-8") == "important"
+
+
+@pytest.mark.parametrize("command", ("rm -rf .", "rm -rf .."))
+def test_rm_dot_operands_are_never_converted_to_structured_deletes(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    assert shell._delete_target(command, str(tmp_path)) == (None, True)
+
+
+@pytest.mark.parametrize("command", ("rmdir important.txt", "rd important.txt"))
+def test_directory_delete_commands_do_not_gain_file_unlink_semantics(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    (tmp_path / "important.txt").write_text("important", encoding="utf-8")
+
+    assert shell._delete_target(command, str(tmp_path)) is None
+
+
+@pytest.mark.asyncio
+async def test_file_delete_preserves_symlink_referent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(shell, "_PENDING_RECURSIVE_DELETES", {})
+    referent = tmp_path / "workspace" / "important.txt"
+    referent.parent.mkdir(parents=True)
+    referent.write_text("important", encoding="utf-8")
+    link = referent.parent / "discard-link"
+    link.symlink_to(referent)
+    context = ToolContext(
+        run_mode="safe",
+        workspace_dir=str(referent.parent),
+        session_key="test",
+        sandbox_policy=SandboxPolicy(),
+        sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
+    )
+    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: _AllowedGate())
+    token = current_tool_context.set(context)
+    try:
+        result = await shell._gate_recursive_delete(
+            f"rm '{link}'",
+            cwd=str(referent.parent),
+            approval_id=None,
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    payload = json.loads(result or "{}")
+    assert payload["status"] == "deleted"
+    assert not link.exists()
+    assert not link.is_symlink()
+    assert referent.read_text(encoding="utf-8") == "important"
+
+
+@pytest.mark.asyncio
+async def test_compound_delete_is_blocked_when_command_requires_approval(
+    tmp_path,
+) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("keep", encoding="utf-8")
+
+    sandboxed = await shell._gate_recursive_delete(
+        f"rm '{target}' && echo cleanup",
+        cwd=str(tmp_path),
+        approval_id=None,
+        require_exact=False,
+    )
+    elevated = await shell._gate_recursive_delete(
+        f"rm '{target}' && echo cleanup",
+        cwd=str(tmp_path),
+        approval_id=None,
+        require_exact=True,
+    )
+
+    sandboxed_payload = json.loads(sandboxed or "{}")
+    elevated_payload = json.loads(elevated or "{}")
+    assert sandboxed_payload["status"] == "blocked"
+    assert elevated_payload["status"] == "blocked"
+    assert elevated_payload["reason"] == "recursive_delete_target_not_static"
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    (
+        "echo ok && rm discard.txt",
+        "cd . && rm discard.txt",
+        "echo ok && busybox rm discard.txt",
+    ),
+)
+async def test_non_delete_leading_compound_fails_closed_when_approval_is_required(
+    tmp_path,
+    command: str,
+) -> None:
+    target = tmp_path / "discard.txt"
+    target.write_text("keep", encoding="utf-8")
+
+    result = await shell._gate_recursive_delete(
+        command,
+        cwd=str(tmp_path),
+        approval_id=None,
+        require_exact=True,
+    )
+
+    payload = json.loads(result or "{}")
+    assert payload["status"] == "blocked"
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_intermediate_symlink_is_resolved_while_final_target_is_preserved(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    nested = outside / "nested"
+    nested.mkdir(parents=True)
+    victim = outside / "victim.txt"
+    victim.write_text("victim", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(nested, target_is_directory=True)
+
+    assert shell._delete_target("rm link/../victim.txt", str(tmp_path)) == (
+        victim.resolve(),
+        False,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "process_call",
@@ -128,9 +772,7 @@ async def test_windows_guest_file_tools_still_use_filesystem_worker(
                 request.path.write_text(request.content, encoding="utf-8")
                 return SandboxOperationResult(message="written", created=True)
             if operation.kind == "read_file":
-                return SandboxOperationResult(
-                    message=request.path.read_text(encoding="utf-8")
-                )
+                return SandboxOperationResult(message=request.path.read_text(encoding="utf-8"))
             raise AssertionError(f"unexpected filesystem operation: {operation.kind}")
 
         async def run(self, _request):
@@ -176,9 +818,7 @@ def test_active_policy_comes_from_turn_snapshot() -> None:
         policy_version=7,
         files=FilePolicySettings(backup_quota_bytes=1234),
     )
-    token = current_tool_context.set(
-        ToolContext(run_mode="safe", sandbox_policy=snapshot)
-    )
+    token = current_tool_context.set(ToolContext(run_mode="safe", sandbox_policy=snapshot))
     try:
         first = active_sandbox_policy()
         first.files.backup_quota_bytes = 9999
@@ -196,9 +836,7 @@ def test_saved_file_policy_compiles_into_the_live_safe_profile(tmp_path) -> None
     protected.mkdir()
     state = tmp_path / "state"
     state.mkdir()
-    snapshot = SandboxPolicy(
-        files=FilePolicySettings(custom_deny_write_paths=[str(protected)])
-    )
+    snapshot = SandboxPolicy(files=FilePolicySettings(custom_deny_write_paths=[str(protected)]))
     token = current_tool_context.set(
         ToolContext(
             run_mode="safe",
@@ -257,9 +895,7 @@ def test_guest_safe_profile_keeps_workspace_boundary_and_protected_carveouts(
         ),
         workspace=workspace,
     )
-    snapshot = SandboxPolicy(
-        files=FilePolicySettings(custom_deny_write_paths=[str(protected)])
-    )
+    snapshot = SandboxPolicy(files=FilePolicySettings(custom_deny_write_paths=[str(protected)]))
     token = current_tool_context.set(
         ToolContext(
             run_mode="safe",
@@ -339,10 +975,7 @@ def test_guest_safe_profile_keeps_workspace_boundary_and_protected_carveouts(
     assert outside_write.status != "allowed"
     assert sensitive_read.status == "blocked"
     assert ordinary_read.status != "allowed"
-    assert (
-        profile.resolve(tmp_path / "ordinary-host-file.txt")
-        is FileSystemAccess.DENY
-    )
+    assert profile.resolve(tmp_path / "ordinary-host-file.txt") is FileSystemAccess.DENY
     assert home_write.status == "allowed"
     assert temp_write.status == "allowed"
     assert runtime_read.status == "allowed"
@@ -512,6 +1145,173 @@ async def test_approved_recursive_delete_is_backed_up_then_removed(
     assert not target.exists()
     assert (tmp_path / "state" / "backup-vault" / "entries").is_dir()
     assert offloaded == ["plan_delete", "execute"]
+
+
+@pytest.mark.asyncio
+async def test_literal_file_delete_uses_the_same_approval_and_backup_gate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(shell, "_PENDING_RECURSIVE_DELETES", {})
+    target = tmp_path / "workspace" / "discard.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("keep a backup", encoding="utf-8")
+    context = ToolContext(
+        run_mode="safe",
+        workspace_dir=str(target.parent),
+        session_key="test",
+        sandbox_policy=SandboxPolicy(),
+        sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
+    )
+    gates = iter((_PendingGate(), _AllowedGate()))
+    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: next(gates))
+    token = current_tool_context.set(context)
+    try:
+        first = await shell._gate_recursive_delete(
+            f"rm '{target}'",
+            cwd=str(target.parent),
+            approval_id=None,
+        )
+        second = await shell._gate_recursive_delete(
+            f"rm '{target}'",
+            cwd=str(target.parent),
+            approval_id="pending",
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    first_payload = json.loads(first or "{}")
+    result = json.loads(second or "{}")
+    assert first_payload["status"] == "approval_required"
+    assert first_payload["recursive"] is False
+    assert first_payload["backup_state"] == "enabled"
+    assert result["status"] == "deleted"
+    assert result["recursive"] is False
+    assert result["backup"]["sizeBytes"] > 0
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_missing_state_dir_is_reported_only_after_first_delete_approval(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(shell, "_PENDING_RECURSIVE_DELETES", {})
+    target = tmp_path / "workspace" / "discard.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("important", encoding="utf-8")
+    context = ToolContext(
+        run_mode="safe",
+        workspace_dir=str(target.parent),
+        session_key="test",
+        sandbox_policy=SandboxPolicy(),
+        sandbox_gateway_config=SimpleNamespace(state_dir=""),
+    )
+    gates = iter((_PendingGate(), _AllowedGate(), _PendingGate()))
+    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: next(gates))
+    token = current_tool_context.set(context)
+    try:
+        first = await shell._gate_recursive_delete(
+            f"rm '{target}'",
+            cwd=str(target.parent),
+            approval_id=None,
+        )
+        second = await shell._gate_recursive_delete(
+            f"rm '{target}'",
+            cwd=str(target.parent),
+            approval_id="pending",
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    first_payload = json.loads(first or "{}")
+    second_payload = json.loads(second or "{}")
+    assert first_payload["status"] == "approval_required"
+    assert second_payload["status"] == "approval_required"
+    assert second_payload["backup_state"] == "unavailable_requires_confirmation"
+    assert second_payload["irreversible"] is True
+    assert target.exists()
+
+
+@pytest.mark.asyncio
+async def test_file_delete_with_backup_disabled_warns_then_deletes_without_backup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(shell, "_PENDING_RECURSIVE_DELETES", {})
+    target = tmp_path / "workspace" / "discard.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("discard", encoding="utf-8")
+    policy = SandboxPolicy.model_validate({"files": {"recursiveDeleteBackupEnabled": False}})
+    context = ToolContext(
+        run_mode="safe",
+        workspace_dir=str(target.parent),
+        session_key="test",
+        sandbox_policy=policy,
+        sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
+    )
+    gates = iter((_PendingGate(), _AllowedGate()))
+    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: next(gates))
+    token = current_tool_context.set(context)
+    try:
+        first = await shell._gate_recursive_delete(
+            f"unlink '{target}'",
+            cwd=str(target.parent),
+            approval_id=None,
+        )
+        second = await shell._gate_recursive_delete(
+            f"unlink '{target}'",
+            cwd=str(target.parent),
+            approval_id="pending",
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    warning = json.loads(first or "{}")
+    result = json.loads(second or "{}")
+    assert warning["backup_state"] == "disabled"
+    assert warning["irreversible"] is True
+    assert result["status"] == "deleted"
+    assert result["backup"] is None
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_denied_file_delete_keeps_the_exact_target(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(shell, "_PENDING_RECURSIVE_DELETES", {})
+    target = tmp_path / "workspace" / "discard.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("keep", encoding="utf-8")
+    context = ToolContext(
+        run_mode="safe",
+        workspace_dir=str(target.parent),
+        session_key="test",
+        sandbox_policy=SandboxPolicy(),
+        sandbox_gateway_config=SimpleNamespace(state_dir=str(tmp_path / "state")),
+    )
+    gates = iter((_PendingGate(), _DeniedGate()))
+    monkeypatch.setattr(shell, "gate_elevated_action", lambda *_a, **_k: next(gates))
+    token = current_tool_context.set(context)
+    try:
+        first = await shell._gate_recursive_delete(
+            f"rm '{target}'",
+            cwd=str(target.parent),
+            approval_id=None,
+        )
+        denied = await shell._gate_recursive_delete(
+            f"rm '{target}'",
+            cwd=str(target.parent),
+            approval_id="pending",
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert json.loads(first or "{}")["status"] == "approval_required"
+    assert json.loads(denied or "{}")["status"] == "approval_denied"
+    assert target.read_text(encoding="utf-8") == "keep"
 
 
 @pytest.mark.asyncio

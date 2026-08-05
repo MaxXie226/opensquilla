@@ -79,6 +79,35 @@ describe('ApprovalCard safe context', () => {
     app.unmount()
   })
 
+  it('renders the fingerprint-bound command when the legacy command field is empty', async () => {
+    const exactCommand = "rm '/workspace/old report.txt'"
+    const { app, root } = await mountCard(approval({
+      toolName: 'exec_command',
+      command: '',
+      approvalKind: 'sandbox_elevation',
+      args: { sandbox_permissions: 'require_escalated', internal_tool: 'legacy_escalate' },
+      displayKind: 'run_command',
+      displayTarget: exactCommand,
+    }))
+
+    expect(root.querySelector('.approval-card__pre--cmd')?.textContent).toBe(exactCommand)
+    expect(root.textContent).not.toContain('legacy_escalate')
+    app.unmount()
+  })
+
+  it('prefers the fingerprint-bound command over a stale legacy command', async () => {
+    const exactCommand = "rm '/workspace/exact.txt'"
+    const { app, root } = await mountCard(approval({
+      command: 'legacy_escalation_tool --opaque-id 123',
+      displayKind: 'run_command',
+      displayTarget: exactCommand,
+    }))
+
+    expect(root.querySelector('.approval-card__pre--cmd')?.textContent).toBe(exactCommand)
+    expect(root.textContent).not.toContain('legacy_escalation_tool')
+    app.unmount()
+  })
+
   it('keeps untimed human approvals free of countdown controls', async () => {
     const { app, root } = await mountCard(approval({ deadline: 0 }))
     expect(root.querySelector('.approval-card__timer')).toBeNull()

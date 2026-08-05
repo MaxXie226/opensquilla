@@ -47,6 +47,27 @@ def test_broker_rejects_identity_change_after_approval(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "replacement"
 
 
+def test_non_recursive_symlink_delete_never_deletes_directory_referent(
+    tmp_path: Path,
+) -> None:
+    referent = tmp_path / "referent"
+    referent.mkdir()
+    (referent / "important.txt").write_text("important", encoding="utf-8")
+    link = tmp_path / "discard-link"
+    link.symlink_to(referent, target_is_directory=True)
+    broker = FileMutationBroker(
+        policy=_policy(),
+        vault=BackupVault(tmp_path / "vault"),
+    )
+
+    result = broker.execute(broker.approve(broker.plan_delete(link)))
+
+    assert result.deleted is True
+    assert not link.exists()
+    assert not link.is_symlink()
+    assert (referent / "important.txt").read_text(encoding="utf-8") == "important"
+
+
 def test_recursive_delete_requires_approval_with_strong_warning(tmp_path: Path) -> None:
     target = tmp_path / "tree"
     target.mkdir()
@@ -87,7 +108,9 @@ def test_recursive_delete_backs_up_then_deletes_and_consumes_approval(
         broker.execute(approved)
 
 
-def test_non_recursive_ordinary_file_delete_needs_no_approval(tmp_path: Path) -> None:
+def test_non_recursive_file_delete_requires_approval_and_creates_backup(
+    tmp_path: Path,
+) -> None:
     target = tmp_path / "ordinary.txt"
     target.write_text("remove", encoding="utf-8")
     broker = FileMutationBroker(
@@ -95,9 +118,43 @@ def test_non_recursive_ordinary_file_delete_needs_no_approval(tmp_path: Path) ->
         vault=BackupVault(tmp_path / "vault"),
     )
 
-    result = broker.execute(broker.plan_delete(target))
+    plan = broker.plan_delete(target)
+
+    assert plan.approval_required is True
+    with pytest.raises(ApprovalRequired):
+        broker.execute(plan)
+
+    result = broker.execute(broker.approve(plan))
 
     assert result.deleted is True
+    assert result.backup is not None
+    assert (result.backup.entry_path / "content").read_text(encoding="utf-8") == "remove"
+    assert not target.exists()
+
+
+def test_lazy_vault_failure_requires_second_confirmation_for_file_delete(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "ordinary.txt"
+    target.write_text("remove", encoding="utf-8")
+
+    def unavailable_vault() -> BackupVault:
+        raise OSError("state directory is unavailable")
+
+    broker = FileMutationBroker(
+        policy=_policy(),
+        vault_factory=unavailable_vault,
+    )
+    approved = broker.approve(broker.plan_delete(target))
+
+    with pytest.raises(BackupUnavailable) as raised:
+        broker.execute(approved)
+
+    assert target.exists()
+    second = broker.approve_without_backup(approved, raised.value)
+    assert "已自动清理旧备份" not in str(second.warning)
+    assert "备份存储" in str(second.warning)
+    assert broker.execute(second).deleted is True
     assert not target.exists()
 
 

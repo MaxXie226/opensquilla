@@ -70,6 +70,15 @@ def _approval_summary(params: dict[str, Any], *, config: Any = None) -> tuple[st
                 render_channel_message("approval_label_path", config=config),
                 f"{path} ({access})" if access else path,
             )
+    elif kind == "sandbox_elevation":
+        action = params.get("action")
+        action = action if isinstance(action, dict) else {}
+        display = action.get("display")
+        display = display if isinstance(display, dict) else {}
+        if str(display.get("kind") or "") == "delete":
+            target = str(display.get("target") or "").strip()
+            if target:
+                return render_channel_message("approval_label_path", config=config), target
     command = str(params.get("command") or "")
     if command:
         return render_channel_message("approval_label_command", config=config), command
@@ -77,6 +86,22 @@ def _approval_summary(params: dict[str, Any], *, config: Any = None) -> tuple[st
         render_channel_message("approval_label_command", config=config),
         str(params.get("toolName") or params.get("action_kind") or ""),
     )
+
+
+def _approval_notice(params: dict[str, Any], *, config: Any = None) -> str:
+    action = params.get("action")
+    action = action if isinstance(action, dict) else {}
+    display = action.get("display")
+    display = display if isinstance(display, dict) else {}
+    if str(display.get("kind") or "") != "delete":
+        return ""
+    backup_state = str(display.get("backup_state") or "")
+    key = {
+        "enabled": "approval_delete_backup_enabled",
+        "disabled": "approval_delete_backup_disabled",
+        "unavailable_requires_confirmation": "approval_delete_backup_unavailable",
+    }.get(backup_state)
+    return render_channel_message(key, config=config) if key else ""
 
 
 def _offers_always(params: dict[str, Any]) -> bool:
@@ -107,7 +132,16 @@ def _deny_undeliverable(approval_id: str, reason: str, channel_name: str = "") -
         channel=channel_name,
     )
     try:
-        _get_queue().resolve(approval_id, False, elevated_mode=None)
+        queue = _get_queue()
+        queue.resolve(
+            approval_id,
+            False,
+            elevated_mode=None,
+            resolution_metadata={
+                "resolutionSource": "approval_delivery_failure",
+                "resolutionReason": reason,
+            },
+        )
     except Exception:  # noqa: BLE001 - already resolved or expired.
         log.info(
             "approval_notify.fail_closed_deny_skipped",
@@ -188,6 +222,7 @@ async def _deliver_channel_prompt(
         short_code=short_code,
         offer_always=_offers_always(params),
         summary_label=summary_label,
+        notice=_approval_notice(params, config=config),
         origin_channel_id=str(channel_id or ""),
         origin_is_group=origin_is_group,
         origin_chat_type=origin_chat_type if origin_chat_type != "unknown" else "",

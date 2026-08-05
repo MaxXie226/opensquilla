@@ -355,7 +355,7 @@ async def test_shell_exact_elevation_grant_runs_host_once(
 
 
 @pytest.mark.asyncio
-async def test_shell_create_then_delete_uses_two_one_shot_elevation_audits(
+async def test_shell_compound_delete_requires_separate_exact_actions_after_create(
     managed_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -433,24 +433,6 @@ async def test_shell_create_then_delete_uses_two_one_shot_elevation_audits(
                 **kwargs,
             )
         )
-        delete_id = str(delete_pending["approval_id"])
-        get_approval_queue().resolve(delete_id, True)
-        delete_result = await shell.exec_command(
-            delete,
-            sandbox_permissions="require_escalated",
-            justification="Delete the exact probe and its empty directory.",
-            approval_id=delete_id,
-            **kwargs,
-        )
-        delete_replay = json.loads(
-            await shell.exec_command(
-                delete,
-                sandbox_permissions="require_escalated",
-                justification="Delete the exact probe and its empty directory.",
-                approval_id=delete_id,
-                **kwargs,
-            )
-        )
     finally:
         current_tool_context.reset(token)
         target.unlink(missing_ok=True)
@@ -458,21 +440,17 @@ async def test_shell_create_then_delete_uses_two_one_shot_elevation_audits(
             outside.rmdir()
 
     create_entry = get_approval_queue().get(create_id)
-    delete_entry = get_approval_queue().get(delete_id)
     assert create_preflight["status"] == "elevation_required"
-    assert delete_preflight["status"] == "elevation_required"
+    assert delete_preflight["status"] == "blocked"
+    assert delete_preflight["reason"] == "recursive_delete_target_not_static"
     assert create_pending["status"] == "approval_required"
-    assert delete_pending["status"] == "approval_required"
-    assert create_id != delete_id
-    assert create_entry.params["fingerprint"] != delete_entry.params["fingerprint"]
+    assert delete_pending["status"] == "blocked"
+    assert delete_pending["reason"] == "recursive_delete_target_not_static"
+    assert "仅包含一个字面量路径" in delete_pending["message"]
     assert create_entry.consumed is True
-    assert delete_entry.consumed is True
     assert create_result == "exit_code=0\ncreated\n"
-    assert delete_result == "exit_code=0\ndeleted\n"
-    assert host_calls == [create, delete]
+    assert host_calls == [create]
     assert create_replay["status"] == "approval_invalid"
-    assert delete_replay["status"] == "approval_invalid"
-    assert not target.exists()
     assert not outside.exists()
 
 

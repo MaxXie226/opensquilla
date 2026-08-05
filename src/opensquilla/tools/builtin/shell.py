@@ -55,7 +55,12 @@ from opensquilla.sandbox.backend.seatbelt import (
 )
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
 from opensquilla.sandbox.backup_vault import BackupTooLarge, BackupUnavailable, BackupVault
-from opensquilla.sandbox.command_policy import CommandAction, decide_shell_command
+from opensquilla.sandbox.command_policy import (
+    CommandAction,
+    decide_shell_command,
+    parse_shell_segments,
+    strip_shell_heredoc_bodies,
+)
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
@@ -69,6 +74,7 @@ from opensquilla.sandbox.escalation import (
     request_sandbox_approval,
 )
 from opensquilla.sandbox.file_mutation_broker import (
+    FILE_DELETE_WARNING,
     OVERSIZE_BACKUP_WARNING,
     RECURSIVE_DELETE_WARNING,
     UNAVAILABLE_BACKUP_WARNING,
@@ -219,14 +225,77 @@ class _PendingRecursiveDelete:
 
 _PENDING_RECURSIVE_DELETES: dict[str, _PendingRecursiveDelete] = {}
 _MAX_PENDING_RECURSIVE_DELETES = 256
+_DELETE_RISK_RE = re.compile(r"(?i)\b(?:rm|unlink|Remove-Item|ri|del|erase|rmdir|rd)(?:\.exe)?\b")
+_DELETE_COMMAND_BASENAMES = frozenset(
+    {"del", "erase", "rd", "remove-item", "ri", "rm", "rmdir", "unlink"}
+)
+_DELETE_WRAPPER_BASENAMES = frozenset(
+    {
+        "&",
+        ".",
+        "bash",
+        "busybox",
+        "call",
+        "chrt",
+        "cmd",
+        "command",
+        "env",
+        "eval",
+        "exec",
+        "find",
+        "fish",
+        "ionice",
+        "nice",
+        "nohup",
+        "parallel",
+        "powershell",
+        "pwsh",
+        "setsid",
+        "sh",
+        "start",
+        "stdbuf",
+        "sudo",
+        "time",
+        "timeout",
+        "xargs",
+        "zsh",
+    }
+)
+_INERT_DELETE_WORD_COMMANDS = frozenset(
+    {
+        "basename",
+        "cat",
+        "dirname",
+        "echo",
+        "egrep",
+        "fgrep",
+        "file",
+        "grep",
+        "head",
+        "ls",
+        "printf",
+        "pwd",
+        "stat",
+        "tail",
+        "type",
+        "wc",
+        "whence",
+        "where",
+        "which",
+    }
+)
 _RECURSIVE_DELETE_RISK_RE = re.compile(
     r"(?is)(?:"
     r"\brm(?:\.exe)?\b[^\r\n;&|]*(?:\s-[A-Za-z]*r[A-Za-z]*\b|\s--recursive\b)"
-    r"|\bRemove-Item\b[^\r\n;&|]*\s-Recurse\b"
-    r"|\brmdir(?:\.exe)?\b[^\r\n;&|]*\s/(?:s|S)\b"
+    r"|\b(?:Remove-Item|ri)\b[^\r\n;&|]*\s-Recurse\b"
+    r"|\b(?:rmdir|rd)(?:\.exe)?\b[^\r\n;&|]*\s/(?:s|S)\b"
     r")"
 )
 _DYNAMIC_DELETE_PATH_RE = re.compile(r"[*?\[\]{}$`]|%\w+%")
+_WINDOWS_DYNAMIC_VARIABLE_RE = re.compile(r'''%[^%"'\r\n]+%|![^!"'\r\n]+!''')
+_WINDOWS_DYNAMIC_EXECUTABLE_RE = re.compile(
+    rf'''{_WINDOWS_DYNAMIC_VARIABLE_RE.pattern}|\^|["']'''
+)
 
 
 def _remember_pending_recursive_delete(
@@ -243,53 +312,404 @@ def _remember_pending_recursive_delete(
         _PENDING_RECURSIVE_DELETES.pop(oldest, None)
 
 
-def _recursive_delete_target(command: str, cwd: str) -> Path | None:
-    """Return one literal recursive-delete target, or ``None`` if dynamic."""
+def _delete_target(
+    command: str,
+    cwd: str,
+    *,
+    windows: bool | None = None,
+) -> tuple[Path | None, bool] | None:
+    """Parse one standalone literal shell deletion and its recursive scope."""
 
-    if not _RECURSIVE_DELETE_RISK_RE.search(command):
-        return None
-    if re.search(r"&&|\|\||[;\r\n|]", command):
-        # A compound script is not one exact, fingerprintable deletion.
-        return None
+    native_windows = os.name == "nt" if windows is None else windows
+    analysis_command = (
+        command if native_windows else strip_shell_heredoc_bodies(command)
+    )
+    folded_delete = False
+    folded_dynamic = False
+    if native_windows:
+        quote_folded = analysis_command.replace('"', "").replace("'", "")
+        folded_delete = bool(
+            not _DELETE_RISK_RE.search(analysis_command)
+            and _DELETE_RISK_RE.search(quote_folded)
+        )
+        folded_dynamic = bool(
+            not _WINDOWS_DYNAMIC_VARIABLE_RE.search(analysis_command)
+            and _WINDOWS_DYNAMIC_VARIABLE_RE.search(quote_folded)
+        )
+
+    def _dynamic_executable_token(token: str) -> bool:
+        candidate = token.strip()
+        if (
+            len(candidate) >= 2
+            and candidate[0] == candidate[-1]
+            and candidate[0] in {"'", '"'}
+        ):
+            candidate = candidate[1:-1]
+        return bool(_DYNAMIC_DELETE_PATH_RE.search(candidate)) or (
+            native_windows and bool(_WINDOWS_DYNAMIC_EXECUTABLE_RE.search(candidate))
+        )
+
     try:
-        tokens = shlex.split(command, posix=os.name != "nt")
+        tokens = shlex.split(analysis_command, posix=not native_windows)
     except ValueError:
         return None
     if not tokens:
         return None
-    executable = _shell_command_basename(tokens[0])
-    target_tokens: list[str] = []
-    skip_next = False
-    value_flags = {
-        "-filter",
-        "-include",
-        "-exclude",
-        "-erroraction",
-        "-ea",
-    }
-    for token in tokens[1:]:
-        cleaned = token.strip("'\"")
-        folded = cleaned.casefold()
-        if skip_next:
-            skip_next = False
-            continue
-        if folded in value_flags:
-            skip_next = True
-            continue
-        if cleaned.startswith("-") or (
-            executable == "rmdir" and cleaned.startswith("/")
+    try:
+        segments = parse_shell_segments(
+            command,
+            platform="windows" if native_windows else None,
+        )
+    except ValueError:
+        segments = ()
+    if len(segments) > 1:
+        parsed_segments = tuple(
+            _delete_target(segment.source, cwd, windows=native_windows)
+            for segment in segments
+        )
+        delete_segments = tuple(item for item in parsed_segments if item is not None)
+        if delete_segments:
+            return (None, any(recursive for _target, recursive in delete_segments))
+        return None
+    assignment_index = 0
+    if not native_windows:
+        while assignment_index < len(tokens) and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*",
+            tokens[assignment_index],
         ):
+            assignment_index += 1
+    tokens = tokens[assignment_index:]
+    if not tokens:
+        return None
+    if _dynamic_executable_token(tokens[0]):
+        return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+    executable = _shell_command_basename(tokens[0])
+    if (folded_delete or folded_dynamic) and executable not in _INERT_DELETE_WORD_COMMANDS:
+        return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+    delete_syntax_present = bool(_DELETE_RISK_RE.search(analysis_command)) or any(
+        _DELETE_RISK_RE.search(token)
+        or _shell_command_basename(token) in _DELETE_COMMAND_BASENAMES
+        for token in tokens
+    )
+    dynamic_wrapper_payload = executable in _DELETE_WRAPPER_BASENAMES and any(
+        _dynamic_executable_token(token) for token in tokens[1:]
+    )
+    if not delete_syntax_present and not dynamic_wrapper_payload:
+        return None
+    recursive_hint = bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command))
+    if re.search(r"\$\(|`|[<>]\(", analysis_command):
+        return (None, recursive_hint)
+
+    def _nested_command(start: int) -> str | None:
+        if start >= len(tokens):
+            return None
+        return " ".join(shlex.quote(token) for token in tokens[start:])
+
+    def _script_command(start: int) -> str | None:
+        if start >= len(tokens):
+            return None
+        script = " ".join(tokens[start:]).strip()
+        if len(script) >= 2 and script[0] == script[-1] and script[0] in {"'", '"'}:
+            script = script[1:-1]
+        return script or None
+
+    if executable in {"bash", "fish", "sh", "zsh"}:
+        if len(tokens) >= 3 and tokens[1] in {"-c", "-lc"}:
+            script = tokens[2].strip()
+            return _delete_target(script, cwd, windows=native_windows)
+        return (None, recursive_hint)
+    if executable in {"powershell", "pwsh"}:
+        index = 1
+        safe_flags = {"-nologo", "-noninteractive", "-noprofile", "-mta", "-sta"}
+        while index < len(tokens):
+            folded = tokens[index].casefold()
+            if folded in {"-c", "-command"} and index + 1 < len(tokens):
+                script = _script_command(index + 1)
+                return (
+                    _delete_target(script, cwd, windows=native_windows)
+                    if script is not None
+                    else None
+                )
+            if folded in safe_flags:
+                index += 1
+                continue
+            return (None, recursive_hint)
+        return (None, recursive_hint)
+    if executable == "cmd":
+        for index, token in enumerate(tokens[1:], start=1):
+            option = token.strip("'\"").casefold()
+            if option in {"/c", "/k"}:
+                script = _script_command(index + 1)
+                return (
+                    _delete_target(script, cwd, windows=native_windows)
+                    if script is not None
+                    else None
+                )
+            if option in {"/d", "/s", "/q", "/a", "/u"} or re.fullmatch(
+                r"/[efv]:(?:on|off)", option
+            ):
+                continue
+            break
+        return None
+    if executable == "command":
+        if any(token in {"-v", "-V"} for token in tokens[1:]):
+            return None
+        index = 1
+        while index < len(tokens) and tokens[index] in {"-p", "--"}:
+            index += 1
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable == "env":
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-S", "--split-string"}:
+                script = _script_command(index + 1)
+                return (
+                    _delete_target(script, cwd, windows=native_windows)
+                    if script is not None
+                    else (
+                        None,
+                        bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)),
+                    )
+                )
+            if token in {"-C", "--chdir"}:
+                return (None, recursive_hint)
+            if token.startswith("--chdir="):
+                return (None, recursive_hint)
+            if token in {"-u", "--unset"}:
+                if index + 1 >= len(tokens):
+                    return (None, recursive_hint)
+                index += 2
+                continue
+            if token.startswith("--unset="):
+                index += 1
+                continue
+            if token in {"-i", "--ignore-environment", "-0", "--null"}:
+                index += 1
+                continue
+            if token == "--":
+                index += 1
+                break
+            if token.startswith("-"):
+                return (None, recursive_hint)
+            if "=" in token:
+                index += 1
+                continue
+            break
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable == "sudo":
+        index = 1
+        value_flags = {"-g", "--group", "-h", "--host", "-p", "--prompt", "-u", "--user"}
+        safe_flags = {
+            "-E",
+            "--preserve-env",
+            "-H",
+            "--set-home",
+            "-k",
+            "--reset-timestamp",
+            "-n",
+            "--non-interactive",
+            "-S",
+            "--stdin",
+        }
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-D", "--chdir"}:
+                return (None, recursive_hint)
+            if token.startswith("--chdir="):
+                return (None, recursive_hint)
+            if token in value_flags:
+                if index + 1 >= len(tokens):
+                    return (None, recursive_hint)
+                index += 2
+                continue
+            if token.startswith(("--group=", "--host=", "--prompt=", "--user=")):
+                index += 1
+                continue
+            if token in safe_flags or token.startswith("--preserve-env="):
+                index += 1
+                continue
+            if token == "--":
+                index += 1
+                break
+            if token.startswith("-"):
+                return (None, recursive_hint)
+            break
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable == "busybox":
+        nested = _nested_command(1)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable in {"exec", "nohup", "time"}:
+        index = 1
+        if executable == "time" and index < len(tokens) and tokens[index] == "-p":
+            index += 1
+        if index < len(tokens) and tokens[index] == "--":
+            index += 1
+        if index < len(tokens) and tokens[index].startswith("-"):
+            return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable == "nice":
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-n", "--adjustment"}:
+                index += 2
+                continue
+            if token.startswith("--adjustment=") or re.fullmatch(r"-\d+", token):
+                index += 1
+                continue
+            if token == "--":
+                index += 1
+            break
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable not in {
+        "rm",
+        "unlink",
+        "remove-item",
+        "ri",
+        "del",
+        "erase",
+        "rmdir",
+        "rd",
+    }:
+        try:
+            segments = parse_shell_segments(
+                command,
+                platform="windows" if native_windows else None,
+            )
+        except ValueError:
+            segments = ()
+        if len(segments) > 1 and any(
+            _DELETE_RISK_RE.search(segment.source) for segment in segments
+        ):
+            return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+        if executable not in _INERT_DELETE_WORD_COMMANDS:
+            return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+        return None
+    if re.search(r"&&|\|\||[;\r\n|]", analysis_command):
+        # Preserve the fact that this is a recognizable deletion while making
+        # the unrepresentable target explicit to the caller.
+        return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+    recursive = bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command))
+    target_tokens: list[str] = []
+    operands_only = False
+    path_value_expected = False
+    rm_directory_allowed = False
+    for token in tokens[1:]:
+        raw_token = token.strip()
+        quoted_token = (
+            len(raw_token) >= 2
+            and raw_token[0] == raw_token[-1]
+            and raw_token[0] in {"'", '"'}
+        )
+        cleaned = raw_token.strip("'\"")
+        folded = cleaned.casefold()
+        if path_value_expected:
+            if native_windows and "," in cleaned and not quoted_token:
+                return (None, recursive)
+            target_tokens.append(cleaned)
+            path_value_expected = False
             continue
+        if not operands_only and cleaned == "--":
+            operands_only = True
+            continue
+        if not operands_only:
+            if executable == "rm" and cleaned.startswith("-"):
+                if cleaned in {"--force", "--recursive", "--dir"}:
+                    recursive = recursive or cleaned == "--recursive"
+                    rm_directory_allowed = rm_directory_allowed or cleaned == "--dir"
+                    continue
+                if not cleaned.startswith("--") and set(cleaned[1:]) <= {
+                    "f",
+                    "r",
+                    "R",
+                    "d",
+                }:
+                    recursive = recursive or "r" in cleaned[1:].lower()
+                    rm_directory_allowed = rm_directory_allowed or "d" in cleaned[1:]
+                    continue
+                return (None, recursive)
+            if executable in {"remove-item", "ri"} and cleaned.startswith("-"):
+                if folded in {"-force", "-recurse"}:
+                    recursive = recursive or folded == "-recurse"
+                    continue
+                if folded in {"-literalpath", "-path"}:
+                    path_value_expected = True
+                    continue
+                return (None, recursive)
+            if executable in {"del", "erase"} and re.fullmatch(
+                r"/[^/\\]+", cleaned
+            ):
+                if re.fullmatch(r"/[FQ]+", cleaned, re.IGNORECASE):
+                    continue
+                return (None, recursive)
+            if executable in {"rmdir", "rd"} and re.fullmatch(
+                r"/[^/\\]+", cleaned
+            ):
+                if re.fullmatch(r"/[SQ]+", cleaned, re.IGNORECASE):
+                    continue
+                return (None, recursive)
+            if executable in {"unlink", "rmdir"} and cleaned.startswith("-"):
+                return (None, recursive)
+        if native_windows and "," in cleaned and not quoted_token:
+            return (None, recursive)
         target_tokens.append(cleaned)
-    if len(target_tokens) != 1:
-        return None
+    if path_value_expected or len(target_tokens) != 1:
+        return (None, recursive)
     raw_target = target_tokens[0]
-    if _DYNAMIC_DELETE_PATH_RE.search(raw_target):
-        return None
+    if re.search(r"(?:^|[\\/])\.{1,2}[\\/]*$", raw_target):
+        return (None, recursive)
+    if _dynamic_executable_token(raw_target):
+        return (None, recursive)
     candidate = Path(os.path.expandvars(raw_target)).expanduser()
     if not candidate.is_absolute():
         candidate = Path(cwd) / candidate
-    return candidate.resolve(strict=False)
+    target = candidate.parent.resolve(strict=False) / candidate.name
+    # Recursive flags applied to a regular file still describe one file
+    # deletion. Symlinks are likewise deleted as links, never traversed.
+    recursive = recursive and target.is_dir() and not target.is_symlink()
+    if (
+        executable in {"rm", "unlink", "del", "erase"}
+        and target.is_dir()
+        and not target.is_symlink()
+        and not recursive
+        and not rm_directory_allowed
+    ):
+        return None
+    if executable in {"rmdir", "rd"} and (
+        not target.is_dir() or target.is_symlink()
+    ):
+        return None
+    return target, recursive
 
 
 def _recursive_delete_action(
@@ -300,31 +720,31 @@ def _recursive_delete_action(
     without_backup: bool = False,
     backup_enabled: bool = True,
 ) -> ElevationAction:
-    warning = (
-        plan.warning
-        or (
-            OVERSIZE_BACKUP_WARNING
-            if without_backup
-            else RECURSIVE_DELETE_WARNING
-        )
+    warning = plan.warning or (
+        OVERSIZE_BACKUP_WARNING
+        if without_backup
+        else RECURSIVE_DELETE_WARNING
+        if plan.recursive
+        else FILE_DELETE_WARNING
     )
+    operation_marker = "recursive-delete" if plan.recursive else "file-delete"
+    if plan.recursive:
+        action_kind = (
+            "fs.recursive_delete_without_backup" if without_backup else "fs.recursive_delete"
+        )
+    else:
+        action_kind = "fs.file_delete_without_backup" if without_backup else "fs.file_delete"
     return ElevationAction(
         tool_name="exec_command",
-        action_kind=(
-            "fs.recursive_delete_without_backup"
-            if without_backup
-            else "fs.recursive_delete"
-        ),
-        argv=("recursive-delete", str(plan.target)),
+        action_kind=action_kind,
+        argv=(operation_marker, str(plan.target)),
         cwd=cwd,
         sandbox_permissions="require_escalated",
         justification=warning,
         target_paths=((str(plan.target), "delete"),),
         content_digest=plan.fingerprint(),
         risk_markers=(
-            ("recursive-delete", "without-backup")
-            if without_backup
-            else ("recursive-delete",)
+            (operation_marker, "without-backup") if without_backup else (operation_marker,)
         ),
         display=ApprovalDisplay(
             kind="delete",
@@ -347,6 +767,7 @@ def _recursive_delete_approval_envelope(
     *,
     warning: str,
     action: ElevationAction,
+    recursive: bool,
 ) -> str:
     display = action.display or ApprovalDisplay(kind="sensitive_operation")
     payload = gate.to_envelope()
@@ -354,7 +775,7 @@ def _recursive_delete_approval_envelope(
         {
             "warning": warning,
             "target": display.target,
-            "recursive": True,
+            "recursive": recursive,
             "irreversible": display.irreversible,
             "backup_state": display.backup_state,
         }
@@ -367,12 +788,16 @@ async def _gate_recursive_delete(
     *,
     cwd: str | None,
     approval_id: str | None,
+    require_exact: bool = False,
 ) -> str | None:
-    """Approve, back up, and execute one literal recursive delete in Safe."""
+    """Approve, back up, and execute one literal shell delete in Safe."""
 
-    if full_host_access_active() or not _RECURSIVE_DELETE_RISK_RE.search(command):
+    if full_host_access_active():
         return None
     effective_cwd = cwd or str(Path.cwd())
+    parsed_delete = _delete_target(command, effective_cwd)
+    if parsed_delete is None:
+        return None
     pending = _PENDING_RECURSIVE_DELETES.get(str(approval_id or ""))
     if approval_id and pending is None:
         return json.dumps(
@@ -382,51 +807,52 @@ async def _gate_recursive_delete(
                 "allowed": False,
                 "approval_id": approval_id,
                 "reason": "approval_action_mismatch",
-                "recursive": True,
+                "recursive": bool(_RECURSIVE_DELETE_RISK_RE.search(command)),
                 "irreversible": True,
             },
             ensure_ascii=False,
         )
     if pending is None:
-        target = _recursive_delete_target(command, effective_cwd)
+        target, recursive = parsed_delete
         if target is None:
             return json.dumps(
                 {
                     "status": "blocked",
                     "reason": "recursive_delete_target_not_static",
-                    "recursive": True,
+                    "recursive": recursive,
                     "irreversible": True,
                     "message": (
-                        f"{RECURSIVE_DELETE_WARNING} "
-                        "请把递归删除改成仅包含一个字面量路径的独立命令，"
+                        f"{RECURSIVE_DELETE_WARNING if recursive else FILE_DELETE_WARNING} "
+                        "请把删除改成仅包含一个字面量路径的独立命令，"
                         "OpenSquilla 才能在审批后先备份再删除。"
                     ),
                 },
                 ensure_ascii=False,
             )
+        if not target.exists() and not target.is_symlink():
+            # Preserve normal no-op/error semantics for commands such as
+            # ``rm -f missing``; there is no current object to approve or back up.
+            return None
         context = current_tool_context.get()
         config = getattr(context, "sandbox_gateway_config", None)
         state_dir = str(getattr(config, "state_dir", "") or "").strip()
-        if not state_dir:
-            return json.dumps(
-                {
-                    "status": "blocked",
-                    "reason": "backup_vault_unavailable",
-                    "message": "递归删除需要可用的备份目录；当前未配置 state_dir。",
-                },
-                ensure_ascii=False,
-            )
         policy = active_sandbox_policy()
+
+        def _create_backup_vault() -> BackupVault:
+            if not state_dir:
+                raise BackupUnavailable(reason="state_dir_unavailable")
+            return BackupVault(Path(state_dir) / "backup-vault")
+
         broker = FileMutationBroker(
             policy=policy,
-            vault=BackupVault(Path(state_dir) / "backup-vault"),
-            authority_roots=authority_roots_for_state(state_dir),
+            vault_factory=_create_backup_vault,
+            authority_roots=(authority_roots_for_state(state_dir) if state_dir else ()),
         )
         try:
             plan = await asyncio.to_thread(
                 broker.plan_delete,
                 target,
-                recursive=True,
+                recursive=recursive,
             )
         except MutationDenied as exc:
             return json.dumps(
@@ -434,7 +860,7 @@ async def _gate_recursive_delete(
                     "status": "blocked",
                     "reason": str(exc) or "file_mutation_denied",
                     "target": str(target),
-                    "message": "This recursive delete target cannot be approved.",
+                    "message": "This delete target cannot be approved.",
                 },
                 ensure_ascii=False,
             )
@@ -442,7 +868,9 @@ async def _gate_recursive_delete(
             return json.dumps(
                 {
                     "status": "blocked",
-                    "reason": "recursive_delete_target_invalid",
+                    "reason": (
+                        "recursive_delete_target_invalid" if recursive else "delete_target_invalid"
+                    ),
                     "target": str(target),
                     "message": str(exc),
                 },
@@ -480,8 +908,10 @@ async def _gate_recursive_delete(
             _remember_pending_recursive_delete(gate.approval_id, pending)
         return _recursive_delete_approval_envelope(
             gate,
-            warning=pending.plan.warning or RECURSIVE_DELETE_WARNING,
+            warning=pending.plan.warning
+            or (RECURSIVE_DELETE_WARNING if pending.plan.recursive else FILE_DELETE_WARNING),
             action=pending.action,
+            recursive=pending.plan.recursive,
         )
     if approval_id:
         _PENDING_RECURSIVE_DELETES.pop(approval_id, None)
@@ -525,12 +955,15 @@ async def _gate_recursive_delete(
                 else UNAVAILABLE_BACKUP_WARNING
             ),
             action=override_pending.action,
+            recursive=override_pending.plan.recursive,
         )
     except ObjectIdentityChanged as exc:
         return json.dumps(
             {
                 "status": "blocked",
-                "reason": "recursive_delete_target_changed",
+                "reason": (
+                    "recursive_delete_target_changed" if plan.recursive else "delete_target_changed"
+                ),
                 "target": str(plan.target),
                 "message": str(exc),
             },
@@ -540,7 +973,9 @@ async def _gate_recursive_delete(
         return json.dumps(
             {
                 "status": "blocked",
-                "reason": "recursive_delete_backup_failed",
+                "reason": (
+                    "recursive_delete_backup_failed" if plan.recursive else "delete_backup_failed"
+                ),
                 "target": str(plan.target),
                 "message": str(exc),
             },
@@ -550,7 +985,7 @@ async def _gate_recursive_delete(
         {
             "status": "deleted",
             "target": str(plan.target),
-            "recursive": True,
+            "recursive": plan.recursive,
             "backup": (
                 {
                     "backupId": result.backup.backup_id,
@@ -4304,11 +4739,7 @@ def _interpreter_code_write_targets(code: str) -> list[str]:
 
     def add(path: str) -> None:
         cleaned = path.strip()
-        if (
-            cleaned
-            and not _is_special_shell_write_target(cleaned)
-            and cleaned not in targets
-        ):
+        if cleaned and not _is_special_shell_write_target(cleaned) and cleaned not in targets:
             targets.append(cleaned)
 
     for match in _INTERPRETER_OPEN_CALL_RE.finditer(code):
@@ -4382,9 +4813,7 @@ def _interpreter_write_targets_from_command(command: str, depth: int = 0) -> lis
         argv = _segment_argv(segment)
         if hardened and depth < _SHELL_WRAPPER_MAX_DEPTH:
             for inner_command in _shell_wrapper_inner_commands(argv):
-                for target in _interpreter_write_targets_from_command(
-                    inner_command, depth + 1
-                ):
+                for target in _interpreter_write_targets_from_command(inner_command, depth + 1):
                     if target not in targets:
                         targets.append(target)
         for target in _interpreter_write_targets(argv):
@@ -4936,9 +5365,7 @@ def _workspace_write_deny_shell_block(
             if extra_target not in candidate_targets:
                 candidate_targets.append(extra_target)
                 mutator_targets.add(extra_target)
-    if _write_deny_lever_enabled(
-        "OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS"
-    ):
+    if _write_deny_lever_enabled("OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS"):
         for extra_target in _interpreter_write_targets_from_inputs(command, stdin):
             if extra_target not in candidate_targets:
                 candidate_targets.append(extra_target)
@@ -5630,9 +6057,7 @@ async def _communicate_windows_host_shell_process(
 ) -> bool:
     """Write finite Windows stdin outside Proactor and bound the worker wait."""
 
-    communicate_task = asyncio.create_task(
-        asyncio.to_thread(proc.communicate, input=stdin_bytes)
-    )
+    communicate_task = asyncio.create_task(asyncio.to_thread(proc.communicate, input=stdin_bytes))
     done, _pending = await asyncio.wait(
         {communicate_task},
         timeout=max(0.0, timeout),
@@ -5744,9 +6169,7 @@ async def _run_host_shell_command(
             def timeout_result() -> str:
                 output_file.flush()
                 output_file.seek(0)
-                return _exec_timeout_output(
-                    effective_timeout, command, output_file.read()
-                )
+                return _exec_timeout_output(effective_timeout, command, output_file.read())
 
             proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
             stdin_writer: asyncio.Task[None] | None = None
@@ -5988,6 +6411,7 @@ async def exec_command(
         command,
         cwd=cwd,
         approval_id=approval_id,
+        require_exact=(result.needs_approval or sandbox_permissions == "require_escalated"),
     )
     if recursive_delete is not None:
         return recursive_delete
@@ -6293,9 +6717,7 @@ async def _start_host_background_process(
 
     session_id = str(uuid.uuid4())[:8]
     base_env = dict(env) if env is not None else _base_shell_environment()
-    host_env = apply_utf8_child_env(
-        _host_shell_env(_runtime_shell_environment(base_env))
-    )
+    host_env = apply_utf8_child_env(_host_shell_env(_runtime_shell_environment(base_env)))
     _append_windows_app_alias_path(host_env, runtime=runtime)
     host_env = _dedupe_windows_env_keys(host_env)
 
@@ -6459,6 +6881,7 @@ async def background_process(
         command,
         cwd=cwd,
         approval_id=approval_id,
+        require_exact=(result.needs_approval or sandbox_permissions == "require_escalated"),
     )
     if recursive_delete is not None:
         return recursive_delete

@@ -11648,6 +11648,7 @@ class Agent:
                         if mutex_result is not None and (
                             mutex_result.terminates_turn
                             or tc.tool_name == "request_user_input"
+                            or _pending_approval_payload(mutex_result.content) is not None
                         ):
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
@@ -11802,23 +11803,48 @@ class Agent:
                                 break
                             if not approval_entry.approved:
                                 suspended.deny(str(pending_approval["approval_id"]))
+                                resolution = str(approval_entry.resolution or "")
+                                reviewer = str(
+                                    approval_entry.params.get("reviewer") or "user"
+                                )
+                                resolution_source = str(
+                                    approval_entry.params.get("resolutionSource") or ""
+                                )
+                                explicit_human_denial = (
+                                    resolution == "denied"
+                                    and reviewer == "user"
+                                    and resolution_source
+                                    in {"", "user", "user_web", "user_channel"}
+                                    and approval_entry.params.get("humanActionable")
+                                    is not False
+                                )
                                 rationale = str(
                                     approval_entry.params.get("reviewRationale") or ""
                                 ).strip()
+                                result_status = (
+                                    "approval_expired"
+                                    if resolution == "expired"
+                                    else "approval_denied"
+                                )
                                 result = ToolResult(
                                     tool_use_id=tc.tool_use_id,
                                     tool_name=tc.tool_name,
                                     content=json.dumps(
                                         {
-                                            "status": "approval_denied",
+                                            "status": result_status,
                                             "approval_id": pending_approval["approval_id"],
                                             "message": rationale
-                                            or "The exact elevated action was not approved.",
+                                            or (
+                                                "The approval expired before the exact "
+                                                "action was authorized."
+                                                if resolution == "expired"
+                                                else "The exact elevated action was not approved."
+                                            ),
                                         },
                                         ensure_ascii=False,
                                     ),
                                     is_error=False,
-                                    terminates_turn=True,
+                                    terminates_turn=explicit_human_denial,
                                 )
                                 projected_result = (
                                     await self._project_tool_result_for_delivery(
@@ -11834,10 +11860,11 @@ class Agent:
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
                                 )
-                                # A denial is the user's terminal decision for this
-                                # task. Never give the model another chance to retry
-                                # the same side effect through a different tool.
-                                turn_yielded = True
+                                # Only a deliberate human refusal is terminal. An
+                                # expired record or an internal rule decision must
+                                # still reach the model as a non-terminal tool result.
+                                if explicit_human_denial:
+                                    turn_yielded = True
                                 break
 
                             resumed_call = suspended.approve(

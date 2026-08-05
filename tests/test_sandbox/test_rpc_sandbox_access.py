@@ -576,7 +576,7 @@ async def test_rpc_run_context_get_includes_bundles_and_temporary_grants() -> No
 
 @pytest.mark.asyncio
 async def test_exec_approval_resolve_allows_non_owner_chat_scoped_sandbox_grant() -> None:
-    from opensquilla.gateway.approval_queue import reset_approval_queue
+    from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
     from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
     from opensquilla.sandbox.escalation import build_network_approval_params
     from opensquilla.sandbox.network_guard import NetworkDecision
@@ -608,6 +608,7 @@ async def test_exec_approval_resolve_allows_non_owner_chat_scoped_sandbox_grant(
 
     assert result["resolved"] is True
     assert result["approved"] is True
+    assert get_approval_queue().get(approval_id).params["resolutionSource"] == "user_web"
     context = await get_run_context(
         manager,
         manager.node.session_key,
