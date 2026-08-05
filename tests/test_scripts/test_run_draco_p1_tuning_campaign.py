@@ -151,6 +151,8 @@ def _plan() -> dict:
             "openrouter_credential_scope": "dedicated_key",
             "schedule": {
                 "mode": "hit_gated_serial",
+                "strict_task_interleaving": False,
+                "design_label": "anchored_serial_not_task_interleaved",
                 "arm_order": order,
                 "anchor_by_arm_id": anchors,
             },
@@ -237,6 +239,14 @@ def test_authoritative_matrix_validates_and_expands() -> None:
     } == module.SUPPORTED_GROUPS
     arm_ids = [arm.arm_id for arm in arms]
     assert arm_ids.index("P1-35-E1") < arm_ids.index("P1-15-E1")
+    assert module.screening_design_contract(plan) == {
+        "design_label": "anchored_serial_not_task_interleaved",
+        "strict_task_interleaving": False,
+        "task_interleaving_contract_satisfied": False,
+        "mini_diagnostic_screening_only": True,
+        "automatic_winner_promotion": False,
+        "winner_or_combination_requires": "strict_task_interleaved_confirmatory",
+    }
 
 
 def test_missing_or_tampered_matrix_is_rejected() -> None:
@@ -248,6 +258,10 @@ def test_missing_or_tampered_matrix_is_rejected() -> None:
     target = next(row for row in plan["experiments"] if row["id"] == "P1-35")
     target["variants"][0]["override"]["runner"]["retrieval_loop_finalization_threshold"] = 2
     with pytest.raises(module.ControllerError, match="parameter contract"):
+        module.validate_plan(plan, allow_placeholders=False)
+    plan = _plan()
+    plan["execution"]["schedule"]["strict_task_interleaving"] = True
+    with pytest.raises(module.ControllerError, match="anchored serial screening design"):
         module.validate_plan(plan, allow_placeholders=False)
 
 
@@ -554,6 +568,28 @@ def test_prepare_derived_consumes_controller_owned_source_package(
     assert observed["replay_schema"] == "opensquilla.draco.frozen-task-analysis/v2"
     assert observed["source_import_evidence"] == source_import
     assert derived["preexisting_source_import_receipt_sha256"] == "e" * 64
+    assert derived["screening_design"] == module.screening_design_contract(plan)
+
+    status = module.initialize_status(
+        plan,
+        arms,
+        {"commit": "4" * 40, "tree": "5" * 40},
+    )
+    assert status["screening_design"] == module.screening_design_contract(plan)
+    module.atomic_write_json(run_root / "status.json", status)
+    assert module.load_or_initialize_status(
+        plan,
+        arms,
+        {"commit": "4" * 40, "tree": "5" * 40},
+    )["screening_design"] == module.screening_design_contract(plan)
+    status["screening_design"]["task_interleaving_contract_satisfied"] = True
+    module.atomic_write_json(run_root / "status.json", status)
+    with pytest.raises(module.ControllerError, match="another campaign"):
+        module.load_or_initialize_status(
+            plan,
+            arms,
+            {"commit": "4" * 40, "tree": "5" * 40},
+        )
 
 
 def test_p1_15_progression_skips_only_with_complete_sufficient_evidence(

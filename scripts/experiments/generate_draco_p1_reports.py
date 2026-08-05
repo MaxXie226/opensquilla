@@ -341,6 +341,7 @@ def build_group_markdown(
     *,
     plan: Mapping[str, Any],
     hit_decisions: Mapping[str, Any],
+    screening_design: Mapping[str, Any],
 ) -> str:
     lines = [
         f"# {group} — DRACO mini P1 条件切片实验",
@@ -349,6 +350,13 @@ def build_group_markdown(
         "- 冻结 commit/tree："
         f"`{plan['freeze']['snapshot_commit']}` / `{plan['freeze']['snapshot_tree']}`",
         "- 样本：G1 10 题 mini，仅用于诊断/淘汰，不等同正式定稿。",
+        "- 方法学：diagnostic/screening only；"
+        f"design_label=`{screening_design['design_label']}`；"
+        "`strict_task_interleaving=false`；"
+        "`task_interleaving_contract_satisfied=false`；"
+        "`automatic_winner_promotion=false`。",
+        "- 任何 winner 或组合配置都必须完成 strict task-interleaved "
+        "confirmatory evaluation 后才能考虑晋级。",
         "- DRACO mini 未提供独立 SafetyGate；"
         "不得把 execution/policy/audit 状态当作 SafetyGate。",
         "",
@@ -444,6 +452,7 @@ def build_group_markdown(
 
 
 def build_root_markdown(report: Mapping[str, Any]) -> str:
+    screening_design = report["screening_design"]
     lines = [
         "# P1 DRACO mini 条件切片实验结果",
         "",
@@ -452,7 +461,14 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
         f"- 正式完整臂：{report['formal_valid_arm_count']}/{report['arm_count']}",
         "- 本报告先用 E0 取证命中切片；no-hit 臂未调用模型。"
         "P1-35 优先，P1-15 仅在其降本不足或证据不确定时解锁。",
-        "- DRACO mini 未提供独立 SafetyGate；10 题结果只用于诊断/淘汰。",
+        "- 方法学：10 题 mini 是 diagnostic/screening only；"
+        f"design_label=`{screening_design['design_label']}`；"
+        "`strict_task_interleaving=false`；"
+        "`task_interleaving_contract_satisfied=false`；"
+        "`automatic_winner_promotion=false`。",
+        "- 任何 winner 或组合配置都必须完成 strict task-interleaved "
+        "confirmatory evaluation 后才能考虑晋级。",
+        "- DRACO mini 未提供独立 SafetyGate。",
         "",
         TABLE_HEADER,
     ]
@@ -500,11 +516,13 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
     except Exception as exc:
         raise ReportError(f"frozen controller validation failed: {exc}") from exc
+    screening_design = controller.screening_design_contract(plan)
     status_path = args.status or Path(str(plan["paths"]["run_root"])) / "status.json"
     status = load_json(status_path)
     if (
         status.get("schema") != STATUS_SCHEMA
         or status.get("campaign_plan_sha256") != canonical_sha256(plan)
+        or status.get("screening_design") != screening_design
     ):
         raise ReportError("controller status identity differs")
     phase = str(status.get("phase") or "")
@@ -584,6 +602,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             group_comparisons,
             plan=plan,
             hit_decisions=hit_decisions if isinstance(hit_decisions, Mapping) else {},
+            screening_design=screening_design,
         )
         group_root = output_root / group
         atomic_write(group_root / "EXPERIMENT_RESULTS.md", markdown)
@@ -591,6 +610,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "schema": "opensquilla.draco-p1-group-report/v1",
             "campaign_plan_sha256": canonical_sha256(plan),
             "experiment_id": group,
+            "screening_design": copy.deepcopy(screening_design),
             "arms": [compact_for_json(arm) for arm in group_arms],
             "comparisons": group_comparisons,
         }
@@ -619,6 +639,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "snapshot_commit": snapshot_identity["commit"],
         "snapshot_tree": snapshot_identity["tree"],
         "source_plan": copy.deepcopy(plan["source_plan"]),
+        "screening_design": copy.deepcopy(screening_design),
         "arm_count": len(arms),
         "formal_valid_arm_count": sum(
             arm["formal_evidence_valid"] is True for arm in loaded.values()

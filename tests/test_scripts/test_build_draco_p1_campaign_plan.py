@@ -68,3 +68,14 @@ def test_cli_freezes_p1_35_progression_threshold() -> None:
     )
     assert args.p1_35_sufficient_cost_reduction == pytest.approx(0.10)
     assert args.output is None
+
+    controller = type(
+        "Controller",
+        (),
+        {"SCREENING_DESIGN_LABEL": "anchored_serial_not_task_interleaved"},
+    )()
+    schedule = module._screening_schedule(
+        controller, ["common-E0-source", "P1-35-E1"], {"P1-35-E1": "common-E0-source"}
+    )
+    assert schedule["strict_task_interleaving"] is False
+    assert schedule["design_label"] == "anchored_serial_not_task_interleaved"

@@ -74,6 +74,14 @@ def test_metric_row_uses_required_draco_columns() -> None:
 
 
 def test_group_markdown_discloses_cost_and_safety_boundaries() -> None:
+    screening_design = {
+        "design_label": "anchored_serial_not_task_interleaved",
+        "strict_task_interleaving": False,
+        "task_interleaving_contract_satisfied": False,
+        "mini_diagnostic_screening_only": True,
+        "automatic_winner_promotion": False,
+        "winner_or_combination_requires": "strict_task_interleaved_confirmatory",
+    }
     markdown = module.build_group_markdown(
         "P1-35",
         [_arm()],
@@ -96,11 +104,17 @@ def test_group_markdown_discloses_cost_and_safety_boundaries() -> None:
         hit_decisions={
             "P1-35-E1": {"decision": "eligible", "matched_task_count": 3}
         },
+        screening_design=screening_design,
     )
     assert "DRACO mini 未提供独立 SafetyGate" in markdown
     assert "cache-aware" in markdown
     assert "Judge、失败/被替换 retry 不计入" in markdown
     assert "W/T/L=5/1/4" in markdown
+    assert "diagnostic/screening only" in markdown
+    assert "strict_task_interleaving=false" in markdown
+    assert "task_interleaving_contract_satisfied=false" in markdown
+    assert "automatic_winner_promotion=false" in markdown
+    assert "strict task-interleaved confirmatory evaluation" in markdown
 
 
 def test_root_report_keeps_account_and_theoretical_cost_separate() -> None:
@@ -110,6 +124,14 @@ def test_root_report_keeps_account_and_theoretical_cost_separate() -> None:
         "formal_valid_arm_count": 1,
         "arm_count": 1,
         "arms": [_arm()],
+        "screening_design": {
+            "design_label": "anchored_serial_not_task_interleaved",
+            "strict_task_interleaving": False,
+            "task_interleaving_contract_satisfied": False,
+            "mini_diagnostic_screening_only": True,
+            "automatic_winner_promotion": False,
+            "winner_or_combination_requires": "strict_task_interleaved_confirmatory",
+        },
         "excluded": [
             {"id": "P1-06", "kind": "missing_feature", "reason": "unavailable"}
         ],
@@ -126,7 +148,11 @@ def test_root_report_keeps_account_and_theoretical_cost_separate() -> None:
     markdown = module.build_root_markdown(report)
     assert "账户实际支出只取 reconciliation delta" in markdown
     assert "不与理论估算相加" in markdown
-    assert "10 题结果只用于诊断/淘汰" in markdown
+    assert "10 题 mini 是 diagnostic/screening only" in markdown
+    assert "strict_task_interleaving=false" in markdown
+    assert "task_interleaving_contract_satisfied=false" in markdown
+    assert "automatic_winner_promotion=false" in markdown
+    assert "strict task-interleaved confirmatory evaluation" in markdown
 
 
 def test_natural_sort_splits_group_numbers() -> None:

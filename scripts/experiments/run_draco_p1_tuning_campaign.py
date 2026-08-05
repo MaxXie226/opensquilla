@@ -38,6 +38,8 @@ REPLAY_CONTROL_IDS = ("common-E0-R1", "common-E0-R2", "common-E0-R3")
 EXPECTED_TASK_COUNT = 10
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLACEHOLDER_PREFIX = "TODO_"
+SCREENING_DESIGN_LABEL = "anchored_serial_not_task_interleaved"
+CONFIRMATORY_DESIGN_LABEL = "strict_task_interleaved_confirmatory"
 
 # These exclusions are facts about the frozen DRACO-mini slice/runtime, not
 # tuning conclusions.  They must be represented in the plan as explicit
@@ -79,6 +81,36 @@ TERMINAL_ARM_STATES = frozenset(
 
 class ControllerError(RuntimeError):
     pass
+
+
+def screening_design_contract(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the frozen screening-only methodology disclosure."""
+
+    execution = plan.get("execution")
+    schedule = execution.get("schedule") if isinstance(execution, Mapping) else None
+    reporting = plan.get("reporting")
+    return {
+        "design_label": (
+            schedule.get("design_label") if isinstance(schedule, Mapping) else None
+        ),
+        "strict_task_interleaving": (
+            schedule.get("strict_task_interleaving")
+            if isinstance(schedule, Mapping)
+            else None
+        ),
+        "task_interleaving_contract_satisfied": False,
+        "mini_diagnostic_screening_only": (
+            reporting.get("mini_is_diagnostic_only")
+            if isinstance(reporting, Mapping)
+            else None
+        ),
+        "automatic_winner_promotion": (
+            reporting.get("automatic_winner_promotion")
+            if isinstance(reporting, Mapping)
+            else None
+        ),
+        "winner_or_combination_requires": CONFIRMATORY_DESIGN_LABEL,
+    }
 
 
 @dataclass(frozen=True)
@@ -723,8 +755,15 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
         ):
             raise ControllerError(f"{arm_id} explicit control differs")
     schedule = execution.get("schedule")
-    if not isinstance(schedule, Mapping) or schedule.get("mode") != "hit_gated_serial":
-        raise ControllerError("execution.schedule must use hit_gated_serial")
+    if (
+        not isinstance(schedule, Mapping)
+        or schedule.get("mode") != "hit_gated_serial"
+        or schedule.get("strict_task_interleaving") is not False
+        or schedule.get("design_label") != SCREENING_DESIGN_LABEL
+    ):
+        raise ControllerError(
+            "execution.schedule must freeze the anchored serial screening design"
+        )
     arm_order = schedule.get("arm_order")
     if (
         not isinstance(arm_order, list)
@@ -807,6 +846,15 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
         or reporting.get("bootstrap_repetitions") != 20_000
     ):
         raise ControllerError("reporting contract differs from DRACO mini policy")
+    if screening_design_contract(plan) != {
+        "design_label": SCREENING_DESIGN_LABEL,
+        "strict_task_interleaving": False,
+        "task_interleaving_contract_satisfied": False,
+        "mini_diagnostic_screening_only": True,
+        "automatic_winner_promotion": False,
+        "winner_or_combination_requires": CONFIRMATORY_DESIGN_LABEL,
+    }:
+        raise ControllerError("P1 screening methodology contract differs")
     if not allow_placeholders:
         for key in ("snapshot_commit", "snapshot_tree"):
             value = str(freeze.get(key) or "")
@@ -1313,6 +1361,7 @@ def prepare_derived(
         "snapshot_commit": snapshot_identity["commit"],
         "snapshot_tree": snapshot_identity["tree"],
         "source_arm_id": SOURCE_ARM_ID,
+        "screening_design": screening_design_contract(plan),
         "preexisting_source_import_receipt_sha256": source_import["receipt_sha256"],
         "analyzer_artifact_path": str(artifact_path.resolve()),
         "analyzer_artifact_raw_sha256": file_sha256(artifact_path),
@@ -1338,6 +1387,7 @@ def load_derived(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any
         derived.get("schema") != DERIVED_SCHEMA
         or embedded != canonical_sha256(unsigned)
         or derived.get("campaign_plan_sha256") != canonical_sha256(plan)
+        or derived.get("screening_design") != screening_design_contract(plan)
     ):
         raise ControllerError("derived plan identity differs")
     artifact_path = Path(str(derived.get("analyzer_artifact_path") or ""))
@@ -1592,6 +1642,7 @@ def initialize_status(
         "campaign_plan_sha256": canonical_sha256(plan),
         "snapshot_commit": snapshot_identity["commit"],
         "snapshot_tree": snapshot_identity["tree"],
+        "screening_design": screening_design_contract(plan),
         "phase": "initialized",
         "created_at": utc_now(),
         "started_at": None,
@@ -1628,6 +1679,7 @@ def load_or_initialize_status(
         or status.get("campaign_plan_sha256") != canonical_sha256(plan)
         or status.get("snapshot_commit") != snapshot_identity["commit"]
         or status.get("snapshot_tree") != snapshot_identity["tree"]
+        or status.get("screening_design") != screening_design_contract(plan)
         or set(status.get("arms") or {}) != {arm.arm_id for arm in arms}
     ):
         raise ControllerError("existing controller status belongs to another campaign")

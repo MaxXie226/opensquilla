@@ -64,6 +64,18 @@ def _raw_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _screening_schedule(
+    controller: Any, arm_order: Sequence[str], anchor_by_arm_id: dict[str, str]
+) -> dict[str, Any]:
+    return {
+        "mode": "hit_gated_serial",
+        "strict_task_interleaving": False,
+        "design_label": controller.SCREENING_DESIGN_LABEL,
+        "arm_order": list(arm_order),
+        "anchor_by_arm_id": dict(anchor_by_arm_id),
+    }
+
+
 def _preexisting_source_contract(
     args: argparse.Namespace, *, controller: Any, common: Any
 ) -> dict[str, Any]:
@@ -273,11 +285,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "global_openrouter_lock": str(args.global_openrouter_lock),
             "openrouter_secret_file": str(args.openrouter_secret_file),
             "openrouter_credential_scope": "dedicated_key",
-            "schedule": {
-                "mode": "hit_gated_serial",
-                "arm_order": order,
-                "anchor_by_arm_id": anchors,
-            },
+            "schedule": _screening_schedule(controller, order, anchors),
         },
         "comparison_controls": {
             "source_arm_id": controller.SOURCE_ARM_ID,
