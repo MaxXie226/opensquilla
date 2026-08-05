@@ -1234,6 +1234,59 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(not_applicable["status"], "not_applicable")
         self.assertEqual(not_applicable["aggregation_call_count"], 0)
 
+    def test_aggregator_prompt_evidence_is_authoritative_with_optional_ranking_version(
+        self,
+    ) -> None:
+        def prompt_evidence(version: str) -> dict[str, object]:
+            payload: dict[str, object] = {
+                "schema": controller.AGGREGATOR_PROMPT_SCHEMA,
+                "version": version,
+                "description": f"prompt contract for {version}",
+                "additional_instructions": [],
+            }
+            return {**payload, "sha256": controller.canonical_sha256(payload)}
+
+        version = "aggregator-v1-current"
+        evidence = prompt_evidence(version)
+        helpers = {"aggregator_prompt_version_evidence": prompt_evidence}
+
+        without_ranking_version = {
+            "aggregator_prompt": copy.deepcopy(evidence),
+            "ranking_parameters": {"aggregator": {"candidate_count": 3}},
+        }
+        self.assertEqual(
+            controller._validated_aggregator_prompt(
+                without_ranking_version,
+                helpers=helpers,
+            ),
+            evidence,
+        )
+
+        with_matching_ranking_version = copy.deepcopy(without_ranking_version)
+        with_matching_ranking_version["ranking_parameters"]["aggregator"][
+            "prompt_version"
+        ] = version
+        self.assertEqual(
+            controller._validated_aggregator_prompt(
+                with_matching_ranking_version,
+                helpers=helpers,
+            ),
+            evidence,
+        )
+
+        with_conflicting_ranking_version = copy.deepcopy(without_ranking_version)
+        with_conflicting_ranking_version["ranking_parameters"]["aggregator"][
+            "prompt_version"
+        ] = "aggregator-v2-verify-first"
+        with self.assertRaisesRegex(
+            controller.ControllerError,
+            "differs from ranking parameters",
+        ):
+            controller._validated_aggregator_prompt(
+                with_conflicting_ranking_version,
+                helpers=helpers,
+            )
+
     def test_selection_projection_rejects_duplicate_or_mismatched_proposers(self) -> None:
         base = {
             "selected_P": ["openrouter:model-a", "openrouter:model-b"],

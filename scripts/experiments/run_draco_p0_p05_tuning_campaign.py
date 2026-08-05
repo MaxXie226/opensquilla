@@ -2945,13 +2945,15 @@ def _validated_aggregator_prompt(
     aggregator_policy = (
         ranking_parameters.get("aggregator") if isinstance(ranking_parameters, Mapping) else None
     )
-    version = (
-        str(aggregator_policy.get("prompt_version") or "")
-        if isinstance(aggregator_policy, Mapping)
-        else ""
-    )
+    version = str(evidence.get("version") or "") if isinstance(evidence, Mapping) else ""
     if version not in AGGREGATOR_PROMPT_VERSIONS or not isinstance(evidence, Mapping):
         raise ControllerError("selection plan lacks a versioned Aggregator prompt")
+    if isinstance(aggregator_policy, Mapping) and "prompt_version" in aggregator_policy:
+        declared_version = str(aggregator_policy.get("prompt_version") or "")
+        if declared_version != version:
+            raise ControllerError(
+                "selection plan Aggregator prompt version differs from ranking parameters"
+            )
     expected = helpers["aggregator_prompt_version_evidence"](version)
     if (
         set(evidence) != {"schema", "version", "description", "additional_instructions", "sha256"}
