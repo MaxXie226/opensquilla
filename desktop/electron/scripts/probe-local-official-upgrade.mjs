@@ -24,6 +24,81 @@ const userDataDir = requiredOption('--user-data-dir')
 const isolatedHome = requiredOption('--home')
 const stateDir = requiredOption('--state-dir')
 const requireChatNew = process.argv.includes('--require-chat-new')
+const sandboxModeIndex = process.argv.indexOf('--expect-sandbox-mode')
+const expectedSandboxMode = sandboxModeIndex >= 0 ? process.argv[sandboxModeIndex + 1] : ''
+if (expectedSandboxMode && !['safe', 'full'].includes(expectedSandboxMode)) {
+  throw new Error('--expect-sandbox-mode must be safe or full')
+}
+
+async function probeSandboxSettings(page, expectedMode) {
+  const sandboxTab = page.locator('#settings-rail-sandbox')
+  if (!await sandboxTab.isVisible().catch(() => false)) {
+    await page.locator('.sidebar-fn-item[data-icon="settings"]').click()
+  }
+  try {
+    await sandboxTab.waitFor({ state: 'visible', timeout: 30_000 })
+  } catch (error) {
+    const diagnostics = await page.evaluate(() => ({
+      href: window.location.href,
+      settingsModalCount: document.querySelectorAll('.settings-modal').length,
+      settingsRailIds: Array.from(
+        document.querySelectorAll('[id^="settings-rail-"]'),
+        element => element.id,
+      ),
+      bodyText: document.body.innerText.slice(0, 1_000),
+    })).catch(() => ({ href: page.url(), diagnosticsUnavailable: true }))
+    process.stderr.write(`Sandbox settings probe diagnostics: ${JSON.stringify(diagnostics)}\n`)
+    throw error
+  }
+  await sandboxTab.click()
+
+  const overview = page.getByTestId('sandbox-overview')
+  await overview.waitFor({ state: 'visible', timeout: 30_000 })
+  const capabilityStatus = page.locator('.sandbox-settings__status')
+  await waitFor(
+    async () => await capabilityStatus.evaluate(element => element.classList.contains('is-ready')),
+    'live sandbox capability readiness',
+    60_000,
+  )
+
+  const safeButton = page.getByTestId('sandbox-safe-mode')
+  const fullButton = page.getByTestId('sandbox-full-mode')
+  assert.equal(await safeButton.isDisabled(), false, 'Safe mode must be selectable')
+  const expectedButton = expectedMode === 'safe' ? safeButton : fullButton
+  const alternateButton = expectedMode === 'safe' ? fullButton : safeButton
+  assert.equal(
+    await expectedButton.evaluate(element => element.classList.contains('is-selected')),
+    true,
+    `Expected ${expectedMode} mode to be selected`,
+  )
+
+  await page.getByTestId('sandbox-open-files').click()
+  await page.getByTestId('sandbox-detail').waitFor({ state: 'visible', timeout: 10_000 })
+  await page.getByTestId('sandbox-detail-back').click()
+  await overview.waitFor({ state: 'visible', timeout: 10_000 })
+
+  await alternateButton.click()
+  await waitFor(
+    async () => await alternateButton.evaluate(element => element.classList.contains('is-selected')),
+    `switch to ${expectedMode === 'safe' ? 'full' : 'safe'} mode`,
+    30_000,
+  )
+  await expectedButton.click()
+  await waitFor(
+    async () => await expectedButton.evaluate(element => element.classList.contains('is-selected')),
+    `restore ${expectedMode} mode`,
+    30_000,
+  )
+
+  return {
+    available: true,
+    status: (await capabilityStatus.innerText()).trim(),
+    expectedMode,
+    safeSelectable: true,
+    detailNavigation: true,
+    modeRoundTrip: true,
+  }
+}
 
 async function closePackagedApp(application, page) {
   const child = application.process()
@@ -102,6 +177,9 @@ try {
       120_000,
     )
   }
+  const sandboxSettings = expectedSandboxMode
+    ? await probeSandboxSettings(page, expectedSandboxMode)
+    : null
   const listeningAddresses = []
   if (process.platform === 'win32') {
     const { stdout } = await execFile('netstat.exe', ['-ano', '-p', 'tcp'], {
@@ -127,6 +205,7 @@ try {
     route: new URL(page.url()).pathname,
     gateway,
     listeningAddresses,
+    sandboxSettings,
   })}\n`)
 
   await closePackagedApp(app, page)
