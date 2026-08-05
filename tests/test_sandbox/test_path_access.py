@@ -2257,16 +2257,39 @@ async def test_apply_patch_exact_elevation_uses_digest_and_bypasses_worker(
         assert "-old" not in json.dumps(pending.params)
         get_approval_queue().resolve(approval_id, True)
 
+        backup_warning = json.loads(
+            await patch_tool.apply_patch(
+                patch=patch_text,
+                sandbox_permissions="require_escalated",
+                justification="Apply the exact one-file patch requested by the user.",
+                approval_id=approval_id,
+            )
+        )
+        assert backup_warning["status"] == "approval_required"
+        second_approval_id = backup_warning["approval_id"]
+        assert second_approval_id != approval_id
+        second_pending = get_approval_queue().get(second_approval_id)
+        assert second_pending.params["action"]["action_kind"] == (
+            "patch.apply_without_backup"
+        )
+        assert second_pending.params["action"]["display"]["backup_state"] == (
+            "unavailable_requires_confirmation"
+        )
+        assert second_pending.params["action"]["content_digest"]
+        assert "-old" not in json.dumps(second_pending.params)
+        get_approval_queue().resolve(second_approval_id, True)
+
         result = await patch_tool.apply_patch(
             patch=patch_text,
             sandbox_permissions="require_escalated",
             justification="Apply the exact one-file patch requested by the user.",
-            approval_id=approval_id,
+            approval_id=second_approval_id,
         )
 
     assert "1 file(s) modified" in result
     assert outside.read_text(encoding="utf-8") == "new\n"
     assert get_approval_queue().get(approval_id).consumed is True
+    assert get_approval_queue().get(second_approval_id).consumed is True
 
 
 @pytest.mark.asyncio
@@ -2294,13 +2317,27 @@ async def test_edit_file_exact_elevation_edits_one_outside_file(
         )
         approval_id = requested["approval_id"]
         get_approval_queue().resolve(approval_id, True)
+        backup_warning = json.loads(
+            await fs.edit_file(
+                str(outside),
+                "old value",
+                "new value",
+                sandbox_permissions="require_escalated",
+                justification="Edit the exact outside file requested by the user.",
+                approval_id=approval_id,
+            )
+        )
+        second_approval_id = backup_warning["approval_id"]
+        assert backup_warning["backup_state"] == "unavailable_requires_confirmation"
+        assert second_approval_id != approval_id
+        get_approval_queue().resolve(second_approval_id, True)
         result = await fs.edit_file(
             str(outside),
             "old value",
             "new value",
             sandbox_permissions="require_escalated",
             justification="Edit the exact outside file requested by the user.",
-            approval_id=approval_id,
+            approval_id=second_approval_id,
         )
 
     assert "Edited" in result
@@ -2334,7 +2371,7 @@ async def test_edit_source_exact_elevation_preserves_revision_contract(
         )
         approval_id = requested["approval_id"]
         get_approval_queue().resolve(approval_id, True)
-        result = json.loads(
+        backup_warning = json.loads(
             await fs.edit_source(
                 str(outside),
                 revision,
@@ -2342,6 +2379,20 @@ async def test_edit_source_exact_elevation_preserves_revision_contract(
                 sandbox_permissions="require_escalated",
                 justification="Apply the exact revision-gated edit requested by the user.",
                 approval_id=approval_id,
+            )
+        )
+        second_approval_id = backup_warning["approval_id"]
+        assert backup_warning["backup_state"] == "unavailable_requires_confirmation"
+        assert second_approval_id != approval_id
+        get_approval_queue().resolve(second_approval_id, True)
+        result = json.loads(
+            await fs.edit_source(
+                str(outside),
+                revision,
+                edits,
+                sandbox_permissions="require_escalated",
+                justification="Apply the exact revision-gated edit requested by the user.",
+                approval_id=second_approval_id,
             )
         )
 
