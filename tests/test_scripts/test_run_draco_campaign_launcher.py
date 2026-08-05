@@ -77,6 +77,8 @@ def test_embedded_python_blocks_compile_without_executing_them() -> None:
 def test_confirmatory_mode_freezes_pair_order_and_global_concurrency() -> None:
     script = _script()
     assert "--confirmatory-schedule" in script
+    assert "--confirmatory-schedule-fd" in script
+    assert "confirmatory schedule fd is not fully sealed" in script
     assert "confirmatory schedule must freeze five AB and five BA tasks" in script
     assert "confirmatory schedule must use 6+4 tranches" in script
     assert "Confirmatory phase exceeds global task concurrency" in script

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -1912,6 +1914,641 @@ print(json.dumps({"value": snapshot_probe.VALUE}))
                 descriptor["file_sha256"],
                 controller.file_sha256(Path(descriptor["path"])),
             )
+
+    def test_bridge_quality_gate_recomputes_mean_median_wtl_and_floor(self) -> None:
+        passing = controller._bridge_quality_projection(
+            task_deltas={f"task-{index}": float(index - 4) for index in range(10)},
+            label="passing",
+        )
+        self.assertTrue(passing["pass"])
+        self.assertAlmostEqual(passing["mean_delta_quality"], 0.5)
+        self.assertAlmostEqual(passing["median_delta_quality"], 0.5)
+        self.assertEqual(
+            (passing["wins"], passing["ties"], passing["losses"]),
+            (5, 1, 4),
+        )
+        failing = controller._bridge_quality_projection(
+            task_deltas={
+                **{f"task-{index}": 2.0 for index in range(9)},
+                "task-9": -10.01,
+            },
+            label="floor",
+        )
+        self.assertFalse(failing["pass"])
+        self.assertFalse(failing["gates"]["no_task_delta_below_minus_10"])
+
+    def test_bridge_replicates_are_judged_as_one_task_mean_group(self) -> None:
+        members = [
+            controller.Arm(
+                arm_id=f"P0.5-11-E1-R{replicate}",
+                experiment_id="P0.5-11",
+                directory_name="P0-5-11",
+                variant="E1",
+                replicate=replicate,
+                analyzer_mode="frozen_replay",
+                override={},
+                dynamic=None,
+                wire_gate=None,
+                output_name=f"replicate-{replicate}",
+                control_arm_id=f"common-E0-R{replicate}",
+            )
+            for replicate in (1, 2, 3)
+        ]
+        controls = [
+            controller.Arm(
+                arm_id=f"common-E0-R{replicate}",
+                experiment_id="common-E0",
+                directory_name="common",
+                variant="E0-replay",
+                replicate=replicate,
+                analyzer_mode="frozen_replay",
+                override={},
+                dynamic=None,
+                wire_gate=None,
+                output_name=f"control-{replicate}",
+                control_arm_id=None,
+            )
+            for replicate in (1, 2, 3)
+        ]
+        by_id = {arm.arm_id: arm for arm in [*members, *controls]}
+        individual = {
+            member.arm_id: {
+                "task_deltas": {f"task-{index}": value for index in range(10)},
+                "pass": value >= 0,
+            }
+            for member, value in zip(members, (-2.0, 1.0, 4.0), strict=True)
+        }
+        repeated_values = {f"task-{index}": 1.0 for index in range(10)}
+        report = {
+            "experiments": {
+                "P0.5-11": {
+                    "repeated_pairing": {
+                        "replicate_count": 3,
+                        "task_count": 10,
+                        "complete_task_id_pairing": True,
+                        "mean_delta_quality": 1.0,
+                        "wins": 10,
+                        "ties": 0,
+                        "losses": 0,
+                        "per_task_mean_delta": repeated_values,
+                    }
+                }
+            }
+        }
+        with (
+            mock.patch.object(
+                controller,
+                "_bridge_arm_completion_gate",
+                return_value={"pass": True},
+            ),
+            mock.patch.object(
+                controller,
+                "_bridge_individual_quality_gate",
+                side_effect=lambda _report, arm, _control: individual[arm.arm_id],
+            ),
+        ):
+            gate = controller._bridge_group_gate(
+                members=members,
+                by_id=by_id,
+                source_plan={},
+                terminal_status={},
+                report=report,
+            )
+        self.assertTrue(gate["pass"])
+        self.assertEqual(gate["quality_basis"], "replicate_task_mean_pairing")
+        self.assertEqual(gate["candidate_arm_ids"], [arm.arm_id for arm in members])
+        self.assertEqual(gate["quality"]["task_deltas"], repeated_values)
+
+    def test_bridge_and_legacy_commands_fail_before_creating_run_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            legacy_plan_path = root / "legacy-plan.json"
+            write_json(legacy_plan_path, {"paths": {"run_root": str(root / "legacy-run")}})
+            with (
+                mock.patch.object(controller, "validate_plan", return_value=[]),
+                self.assertRaisesRegex(controller.ControllerError, "screening/legacy plan"),
+            ):
+                controller.launch_confirmatory_schedule(
+                    legacy_plan_path,
+                    root / "schedule.json",
+                )
+            self.assertFalse((root / "legacy-run").exists())
+
+            bridge_plan_path = root / "bridge-plan.json"
+            write_json(
+                bridge_plan_path,
+                {
+                    "confirmatory_bridge": {"mode": "confirmatory_only"},
+                    "paths": {"run_root": str(root / "bridge-run")},
+                },
+            )
+            with (
+                mock.patch.object(controller, "validate_plan", return_value=[]),
+                self.assertRaisesRegex(controller.ControllerError, "refuses ordinary campaign"),
+            ):
+                controller.run_campaign(bridge_plan_path)
+            self.assertFalse((root / "bridge-run").exists())
+
+    def test_bridge_immutable_json_is_idempotent_and_tamper_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "receipt.json"
+            controller._write_new_or_identical_json(path, {"bound": True})
+            first = path.read_bytes()
+            controller._write_new_or_identical_json(path, {"bound": True})
+            self.assertEqual(first, path.read_bytes())
+            with self.assertRaisesRegex(controller.ControllerError, "refusing to overwrite"):
+                controller._write_new_or_identical_json(path, {"bound": False})
+
+    def test_bridge_launcher_support_rejects_old_launcher_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            launcher = root / "old-launcher.sh"
+            launcher.write_text("#!/usr/bin/env bash\necho legacy\n", encoding="utf-8")
+            plan = {
+                "paths": {"launcher_relative": "old-launcher.sh"},
+                "freeze": {
+                    "sources": {"launcher_raw_sha256": controller.file_sha256(launcher)}
+                },
+                "confirmatory_bridge": {
+                    "launcher_contract": {
+                        "raw_sha256": controller.file_sha256(launcher),
+                        "flag": "--confirmatory-schedule",
+                        "fd_flag": "--confirmatory-schedule-fd",
+                        "schedule_schema": controller.CONFIRMATORY_SCHEDULE_SCHEMA,
+                    }
+                },
+            }
+            with self.assertRaisesRegex(controller.ControllerError, "does not support"):
+                controller.validate_confirmatory_launcher_support(plan, snapshot=root)
+
+    def test_bridge_launcher_replacement_after_authentication_fails_before_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            snapshot = Path(raw)
+            launcher = snapshot / "launcher.sh"
+            launcher.write_text(
+                "#!/usr/bin/env bash\n"
+                "# --confirmatory-schedule --confirmatory-schedule-fd\n"
+                "run_confirmatory_pair() { :; }\n",
+                encoding="utf-8",
+            )
+            digest = controller.file_sha256(launcher)
+            plan = {
+                "paths": {"launcher_relative": "launcher.sh"},
+                "freeze": {"sources": {"launcher_raw_sha256": digest}},
+                "confirmatory_bridge": {
+                    "launcher_contract": {
+                        "raw_sha256": digest,
+                        "flag": "--confirmatory-schedule",
+                        "fd_flag": "--confirmatory-schedule-fd",
+                        "schedule_schema": controller.CONFIRMATORY_SCHEDULE_SCHEMA,
+                    }
+                },
+            }
+            fd, evidence, payload = controller.open_authenticated_confirmatory_launcher(
+                plan, snapshot=snapshot
+            )
+            try:
+                replacement = snapshot / "replacement.sh"
+                replacement.write_text(
+                    "#!/usr/bin/env bash\necho attacker\n", encoding="utf-8"
+                )
+                os.replace(replacement, launcher)
+                with self.assertRaisesRegex(
+                    controller.ControllerError, "replaced after authentication"
+                ):
+                    controller._assert_fd_still_names_path(
+                        fd, launcher, label="confirmatory launcher"
+                    )
+                os.lseek(fd, 0, os.SEEK_SET)
+                self.assertNotIn(b"attacker", os.read(fd, 4096))
+            finally:
+                os.close(fd)
+
+    def test_bridge_sealed_launcher_and_schedule_ignore_in_place_source_mutation(
+        self,
+    ) -> None:
+        if not hasattr(os, "memfd_create"):
+            self.skipTest("Linux memfd is required")
+        with tempfile.TemporaryDirectory() as raw:
+            snapshot = Path(raw)
+            marker = snapshot / "attacker-ran"
+            launcher = snapshot / "launcher.sh"
+            launcher.write_text(
+                "#!/usr/bin/env bash\n# --confirmatory-schedule --confirmatory-schedule-fd\n"
+                "run_confirmatory_pair() { :; }\nexit 0\n",
+                encoding="utf-8",
+            )
+            digest = controller.file_sha256(launcher)
+            plan = {
+                "paths": {"launcher_relative": "launcher.sh"},
+                "freeze": {"sources": {"launcher_raw_sha256": digest}},
+                "confirmatory_bridge": {
+                    "launcher_contract": {
+                        "raw_sha256": digest,
+                        "flag": "--confirmatory-schedule",
+                        "fd_flag": "--confirmatory-schedule-fd",
+                        "schedule_schema": controller.CONFIRMATORY_SCHEDULE_SCHEMA,
+                    }
+                },
+            }
+            source_fd, evidence, launcher_payload = (
+                controller.open_authenticated_confirmatory_launcher(
+                    plan, snapshot=snapshot
+                )
+            )
+            schedule_path = snapshot / "schedule.json"
+            schedule_payload = b'{"safe":true}\n'
+            schedule_path.write_bytes(schedule_payload)
+            launcher_memfd = controller.sealed_memfd(
+                launcher_payload, label="launcher-test", executable=True
+            )
+            schedule_memfd = controller.sealed_memfd(
+                schedule_payload, label="schedule-test", executable=False
+            )
+            try:
+                # Same-inode truncation/rewrite is detected, while the executed bytes
+                # remain the already sealed safe payload.
+                launcher.write_text(
+                    "#!/usr/bin/env bash\ntouch " + str(marker) + "\n",
+                    encoding="utf-8",
+                )
+                schedule_path.write_bytes(b'{"evil":true}\n')
+                with self.assertRaisesRegex(
+                    controller.ControllerError, "bytes changed"
+                ):
+                    controller._assert_authenticated_fd_bytes(
+                        source_fd,
+                        launcher,
+                        label="confirmatory launcher",
+                        expected_sha256=evidence["raw_sha256"],
+                    )
+                completed = subprocess.run(
+                    [f"/proc/self/fd/{launcher_memfd}"],
+                    pass_fds=(launcher_memfd,),
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0)
+                self.assertFalse(marker.exists())
+                self.assertEqual(
+                    os.pread(schedule_memfd, len(schedule_payload), 0),
+                    schedule_payload,
+                )
+                with self.assertRaises(OSError):
+                    os.write(schedule_memfd, b"tamper")
+            finally:
+                for fd in (source_fd, launcher_memfd, schedule_memfd):
+                    os.close(fd)
+
+    def test_bridge_rejects_parent_symlink_and_writable_root_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            real = root / "real"
+            real.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            with self.assertRaisesRegex(controller.ControllerError, "must not traverse"):
+                controller.secure_future_absolute_path(
+                    alias / "new-run", label="confirmatory run root"
+                )
+
+            source_run = root / "source-run"
+            source_report = root / "source-report"
+            source_snapshot = root / "source-snapshot"
+            current_snapshot = root / "current-snapshot"
+            for path in (source_run, source_report, source_snapshot, current_snapshot):
+                path.mkdir()
+            source_plan = {
+                "paths": {
+                    "run_root": str(source_run),
+                    "report_root": str(source_report),
+                    "snapshot": str(source_snapshot),
+                }
+            }
+            source_plan_path = source_run / "campaign-plan.json"
+            write_json(source_plan_path, source_plan)
+            source = {
+                "screening_plan": {"path": str(source_plan_path)},
+                "immutable_roots": {
+                    "run_root": str(source_run),
+                    "report_root": str(source_report),
+                    "snapshot": str(source_snapshot),
+                },
+            }
+            with self.assertRaisesRegex(controller.ControllerError, "overlaps immutable"):
+                controller.validate_confirmatory_root_isolation(
+                    run_root=current_snapshot / "nested-run",
+                    report_root=root / "new-report",
+                    snapshot=current_snapshot,
+                    screening_source=source,
+                )
+
+            # Even after validation, replacing the mutable source plan cannot
+            # redefine the immutable safety boundary recorded in source evidence.
+            source_plan["paths"]["snapshot"] = str(root / "forged-snapshot")
+            (root / "forged-snapshot").mkdir()
+            write_json(source_plan_path, source_plan)
+            with self.assertRaisesRegex(
+                controller.ControllerError, "roots differ from immutable root contract"
+            ):
+                controller.validate_confirmatory_root_isolation(
+                    run_root=source_snapshot / "would-escape",
+                    report_root=root / "other-report",
+                    snapshot=current_snapshot,
+                    screening_source=source,
+                )
+
+    def test_bridge_snapshot_post_operation_tamper_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            snapshot = Path(raw)
+            subprocess.run(["git", "init", "-q"], cwd=snapshot, check=True)
+            tracked = snapshot / "tracked.txt"
+            tracked.write_text("frozen\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=snapshot, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Codex Test",
+                    "-c",
+                    "user.email=codex@example.invalid",
+                    "commit",
+                    "-qm",
+                    "freeze",
+                ],
+                cwd=snapshot,
+                check=True,
+            )
+            identity = controller.git_identity(snapshot)
+            controller.assert_bridge_snapshot_unchanged(snapshot, identity)
+            tracked.write_text("tampered\n", encoding="utf-8")
+            with self.assertRaisesRegex(controller.ControllerError, "snapshot changed"):
+                controller.assert_bridge_snapshot_unchanged(snapshot, identity)
+
+    def test_bridge_resealed_derived_triple_without_terminal_report_binding_is_rejected(
+        self,
+    ) -> None:
+        derived_path = Path("/immutable/run/derived-plan.json")
+        descriptor = {
+            "path": "/immutable/run/analyzer.json",
+            "file_sha256": "a" * 64,
+            "artifact_sha256": "b" * 64,
+        }
+        p99 = {"receipt_sha256": "c" * 64, "value": 100}
+        derived = {
+            "derived_plan_sha256": "d" * 64,
+            "p0_5_06": p99,
+            "frozen_analyzer_artifact": descriptor,
+        }
+        status = {
+            "derived_plan": {
+                "path": str(derived_path),
+                "sha256": derived["derived_plan_sha256"],
+            }
+        }
+        report = {
+            "paths": {"derived_plan": str(derived_path)},
+            "derived": {
+                "valid": True,
+                "derived_plan_sha256": derived["derived_plan_sha256"],
+                "p0_5_06": p99,
+                "frozen_analyzer_artifact": descriptor,
+            },
+        }
+        controller._assert_screening_derived_evidence_closure(
+            status=status,
+            report=report,
+            derived_path=derived_path,
+            derived=derived,
+            analyzer_descriptor=descriptor,
+            p99=p99,
+        )
+        resealed = copy.deepcopy(derived)
+        resealed["derived_plan_sha256"] = "e" * 64
+        resealed_p99 = {"receipt_sha256": "f" * 64, "value": 101}
+        with self.assertRaisesRegex(controller.ControllerError, "not jointly bound"):
+            controller._assert_screening_derived_evidence_closure(
+                status=status,
+                report=report,
+                derived_path=derived_path,
+                derived=resealed,
+                analyzer_descriptor={**descriptor, "artifact_sha256": "0" * 64},
+                p99=resealed_p99,
+            )
+
+    def test_bridge_post_report_formal_or_group_tamper_is_rejected(self) -> None:
+        hashes = {
+            "manifest.json": "1" * 64,
+            "results.jsonl": "2" * 64,
+            "trace.jsonl": "3" * 64,
+            "audit.json": "4" * 64,
+            "openrouter-non-byok-campaign-proof.json": "5" * 64,
+        }
+        evidence = {
+            "artifact_sha256": {
+                "manifest": hashes["manifest.json"],
+                "results": hashes["results.jsonl"],
+                "trace": hashes["trace.jsonl"],
+                "audit": hashes["audit.json"],
+                "proof": hashes["openrouter-non-byok-campaign-proof.json"],
+            }
+        }
+        status_arm = {"completion_evidence": copy.deepcopy(evidence)}
+        report_arm = {
+            "completion_evidence": copy.deepcopy(evidence),
+            "controller_reinspection": {"evidence": copy.deepcopy(evidence)},
+        }
+        controller._assert_formal_artifact_evidence_closure(
+            arm_id="P0-12-E1",
+            actual=hashes,
+            status_arm=status_arm,
+            report_arm=report_arm,
+        )
+        for key in list(hashes):
+            tampered = dict(hashes)
+            tampered[key] = "0" * 64
+            with self.assertRaisesRegex(controller.ControllerError, "formal artifact hashes"):
+                controller._assert_formal_artifact_evidence_closure(
+                    arm_id="P0-12-E1",
+                    actual=tampered,
+                    status_arm=status_arm,
+                    report_arm=report_arm,
+                )
+        with tempfile.TemporaryDirectory() as raw:
+            group_root = Path(raw)
+            markdown = group_root / "EXPERIMENT_RESULTS.md"
+            group_json = group_root / "EXPERIMENT_RESULTS.json"
+            markdown.write_text("good\n", encoding="utf-8")
+            group_json.write_text("{}\n", encoding="utf-8")
+            descriptors = {
+                "markdown": {
+                    "path": str(markdown),
+                    "sha256": controller.file_sha256(markdown),
+                    "size_bytes": markdown.stat().st_size,
+                },
+                "json": {
+                    "path": str(group_json),
+                    "sha256": controller.file_sha256(group_json),
+                    "size_bytes": group_json.stat().st_size,
+                },
+            }
+            report_doc = {"group_report_artifacts": {"P0-12": descriptors}}
+            controller._assert_group_report_artifact_closure(
+                experiment_id="P0-12",
+                group_root=group_root,
+                report=report_doc,
+            )
+            markdown.write_text("tampered\n", encoding="utf-8")
+            with self.assertRaisesRegex(controller.ControllerError, "differs"):
+                controller._assert_group_report_artifact_closure(
+                    experiment_id="P0-12",
+                    group_root=group_root,
+                    report=report_doc,
+                )
+
+    def test_terminal_report_receipt_fails_closed_on_group_or_formal_tamper(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            report_root = root / "reports"
+            run_root.mkdir()
+            report_root.mkdir()
+            reporter = root / "reporter.py"
+            reporter.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            plan_path = run_root / "campaign-plan.json"
+            status_path = run_root / "terminal-status-input.json"
+            write_json(plan_path, {"fixture": True})
+            write_json(status_path, {"fixture": True})
+            plan = {
+                "paths": {
+                    "run_root": str(run_root),
+                    "report_root": str(report_root),
+                    "reporter": str(reporter),
+                    "python": sys.executable,
+                },
+                "freeze": {
+                    "sources": {
+                        "reporter_raw_sha256": controller.file_sha256(reporter)
+                    }
+                },
+            }
+            for message in (
+                "published group artifact changed",
+                "formal arm changed after report generation",
+            ):
+                with mock.patch.object(
+                    controller,
+                    "validate_terminal_report_closure",
+                    side_effect=controller.ControllerError(message),
+                ):
+                    receipt, success = controller.run_terminal_report(
+                        plan,
+                        plan_path=plan_path,
+                        terminal_status_path=status_path,
+                    )
+                self.assertFalse(success)
+                self.assertEqual(receipt["status"], "failed")
+                self.assertIsNone(receipt["report_closure_sha256"])
+
+    def test_terminal_closure_rejects_archived_source_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "formal"
+            archive = root / "archive" / "waves" / "wave-1"
+            archive.mkdir(parents=True)
+            source_manifest = archive / "manifest.json"
+            source_result = archive / "draco_ensemble_G1.jsonl"
+            source_manifest.write_text('{"status":"complete"}\n', encoding="utf-8")
+            source_result.write_text('{"task_id":"1"}\n', encoding="utf-8")
+            write_json(
+                root / "manifest.json",
+                {
+                    "source_manifests": [
+                        {
+                            "path": str(source_manifest),
+                            "sha256": controller.file_sha256(source_manifest),
+                            "result_path": str(source_result),
+                            "result_sha256": controller.file_sha256(source_result),
+                        }
+                    ]
+                },
+            )
+            observed = controller._bridge_archived_source_hashes(
+                root, label="fixture"
+            )
+            self.assertEqual(set(observed), {str(source_manifest), str(source_result)})
+            source_result.write_text('{"tampered":true}\n', encoding="utf-8")
+            with self.assertRaisesRegex(
+                controller.ControllerError, "archived result 0 hash/path differs"
+            ):
+                controller._bridge_archived_source_hashes(root, label="fixture")
+
+    def test_screening_cost_identity_scope_includes_non_survivor_and_rejects_reuse(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            def write_arm(arm_id: str, seed: str) -> tuple[Path, str]:
+                arm_root = root / arm_id
+                arm_root.mkdir()
+                source_sha256 = {
+                    key: hashlib.sha256(f"{seed}:{key}".encode()).hexdigest()
+                    for key in (
+                        "account_before",
+                        "account_after",
+                        "account_reconciliation",
+                        "runtime_environment",
+                    )
+                }
+                write_json(
+                    arm_root / "manifest.json",
+                    {
+                        "cost_attribution": {
+                            "account_windows": [
+                                {"source_sha256": source_sha256}
+                            ]
+                        }
+                    },
+                )
+                identity = controller.canonical_sha256(
+                    {
+                        "account_before_sha256": source_sha256["account_before"],
+                        "account_after_sha256": source_sha256["account_after"],
+                        "account_reconciliation_sha256": source_sha256[
+                            "account_reconciliation"
+                        ],
+                        "runtime_environment_sha256": source_sha256[
+                            "runtime_environment"
+                        ],
+                    }
+                )
+                return arm_root, identity
+
+            arms = {}
+            expected_identities = []
+            for arm_id in ("control", "survivor", "non-survivor"):
+                arm_root, identity = write_arm(arm_id, arm_id)
+                expected_identities.append(identity)
+                arms[arm_id] = {
+                    "formal_evidence_valid": True,
+                    "rows": [{"task_id": "1"}],
+                    "output_dir": str(arm_root),
+                }
+            ids, identities = controller._screening_cost_identity_scope(
+                {"arms": arms}
+            )
+            self.assertEqual(ids, ["control", "non-survivor", "survivor"])
+            self.assertEqual(identities, sorted(expected_identities))
+
+            survivor_manifest = (root / "survivor" / "manifest.json").read_bytes()
+            (root / "non-survivor" / "manifest.json").write_bytes(
+                survivor_manifest
+            )
+            with self.assertRaisesRegex(
+                controller.ControllerError, "reuse one account-window identity"
+            ):
+                controller._screening_cost_identity_scope({"arms": arms})
 
 
 if __name__ == "__main__":

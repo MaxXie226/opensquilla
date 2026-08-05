@@ -27,7 +27,6 @@ import os
 import random
 import stat
 import sys
-import tempfile
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -49,6 +48,10 @@ CONFIRMATORY_COHORT_MANIFEST_SCHEMA = (
 )
 CONFIRMATORY_SCHEDULE_SCHEMA = "opensquilla.draco-p0-p05-confirmatory-schedule/v1"
 CONFIRMATORY_REPORT_INPUT_INDEX_NAME = "confirmatory-report-inputs.json"
+CONFIRMATORY_BRIDGE_SCHEMA = "opensquilla.draco-p0-p05-confirmatory-bridge/v1"
+CONFIRMATORY_BRIDGE_REPORT_SCHEMA = (
+    "opensquilla.draco-p0-p05-confirmatory-bridge-report/v1"
+)
 TERMINAL_STATUS_INPUT_SCHEMA = "opensquilla.draco-p0-p05-terminal-status-input/v1"
 BOOTSTRAP_SEED = 20260803
 BOOTSTRAP_SAMPLES = 20_000
@@ -134,6 +137,14 @@ class FrozenControllerVerifier:
     derived_error: str | None
 
 
+@dataclass(frozen=True)
+class BoundJson:
+    path: Path
+    payload: bytes
+    file_sha256: str
+    value: dict[str, Any]
+
+
 FROZEN_CONTROLLER_RELATIVE = Path("scripts/experiments/run_draco_p0_p05_tuning_campaign.py")
 
 
@@ -155,20 +166,22 @@ def load_frozen_controller_verifier(
         raise ReportError("plan.freeze.sources.controller_raw_sha256 is malformed")
     snapshot_root = Path(str(plan.get("paths", {}).get("snapshot") or ""))
     controller_path = snapshot_root / FROZEN_CONTROLLER_RELATIVE
-    regular_file(controller_path)
-    actual_sha = file_sha256(controller_path)
+    controller_payload = stable_regular_file_bytes(controller_path)
+    actual_sha = hashlib.sha256(controller_payload).hexdigest()
     if actual_sha != expected_sha:
         raise ReportError(
             "frozen controller raw hash differs from plan.freeze.sources.controller_raw_sha256"
         )
     module_name = f"_draco_p0_p05_frozen_controller_{actual_sha}"
-    spec = importlib.util.spec_from_file_location(module_name, controller_path)
-    if spec is None or spec.loader is None:
+    spec = importlib.util.spec_from_loader(module_name, loader=None, origin=str(controller_path))
+    if spec is None:
         raise ReportError("cannot create frozen controller import specification")
     module = importlib.util.module_from_spec(spec)
+    module.__file__ = str(controller_path)
     sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
+        code = compile(controller_payload, str(controller_path), "exec")
+        exec(code, module.__dict__)
     except Exception as exc:
         sys.modules.pop(module_name, None)
         raise ReportError(f"cannot import frozen controller: {exc}") from exc
@@ -259,6 +272,82 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _open_absolute_regular_nofollow(path: Path) -> tuple[int, int]:
+    if not path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts[1:]):
+        raise ReportError(f"artifact path must be canonical and absolute: {path}")
+    directory_fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in path.parts[1:-1]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        fd = os.open(
+            path.parts[-1],
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        return fd, directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def stable_regular_file_bytes(path: Path) -> bytes:
+    try:
+        fd, parent_fd = _open_absolute_regular_nofollow(path)
+    except OSError as exc:
+        raise ReportError(f"cannot securely open artifact: {path}") from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ReportError(f"artifact is not a regular non-symlink file: {path}")
+        chunks: list[bytes] = []
+        while block := os.read(fd, 1024 * 1024):
+            chunks.append(block)
+        after = os.fstat(fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ReportError(f"artifact changed while being read: {path}")
+        payload = b"".join(chunks)
+        if len(payload) != before.st_size:
+            raise ReportError(f"artifact size changed while being read: {path}")
+        return payload
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
+def load_bound_json(path: Path) -> BoundJson:
+    payload = stable_regular_file_bytes(path)
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReportError(f"cannot read JSON {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReportError(f"JSON root is not an object: {path}")
+    return BoundJson(
+        path=path,
+        payload=payload,
+        file_sha256=hashlib.sha256(payload).hexdigest(),
+        value=value,
+    )
+
+
 def regular_file(path: Path) -> None:
     try:
         mode = path.lstat().st_mode
@@ -303,6 +392,41 @@ def absolute_receipt_path(value: Any, *, label: str) -> Path:
     if resolved != path:
         raise ReportError(f"{label} is not a canonical non-symlink path: {path}")
     return path
+
+
+def archived_source_paths_from_manifest_bytes(
+    *, root: Path, manifest_payload: bytes, label: str
+) -> list[Path]:
+    """Return the exact archive files consumed through source_manifests."""
+
+    try:
+        manifest = json.loads(manifest_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReportError(f"{label} manifest cannot be parsed: {exc}") from exc
+    if not isinstance(manifest, Mapping):
+        raise ReportError(f"{label} manifest is not an object")
+    sources = manifest.get("source_manifests")
+    if not isinstance(sources, list) or not sources:
+        raise ReportError(f"{label} source manifest inventory is missing")
+    archive_root = root / "archive"
+    paths: list[Path] = []
+    for index, source in enumerate(sources):
+        if not isinstance(source, Mapping):
+            raise ReportError(f"{label} source manifest {index} is malformed")
+        for field, kind in (("path", "manifest"), ("result_path", "result")):
+            path = absolute_receipt_path(
+                source.get(field), label=f"{label} archived {kind} {index}"
+            )
+            try:
+                path.relative_to(archive_root)
+            except ValueError as exc:
+                raise ReportError(
+                    f"{label} archived {kind} {index} escapes archive root"
+                ) from exc
+            if path in paths:
+                raise ReportError(f"{label} archived source path is duplicated")
+            paths.append(path)
+    return paths
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -398,20 +522,58 @@ def result_evidence_valid(row: Mapping[str, Any]) -> bool:
 
 
 def atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    if not path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts[1:]):
+        raise ReportError(f"report destination must be canonical and absolute: {path}")
+    parent_fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    temporary = (
+        f".{path.name}.{os.getpid()}."
+        + hashlib.sha256(os.urandom(16)).hexdigest()[:12]
+    )
     try:
+        for component in path.parts[1:-1]:
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+        fd = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        try:
+            existing = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            raise ReportError(f"report destination is a symlink: {path}")
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
     finally:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
+        os.close(parent_fd)
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -1567,30 +1729,71 @@ def artifact_binding_valid(root: Path, manifest: Mapping[str, Any], name: str) -
     return True, "ok"
 
 
+def artifact_binding_bytes_valid(
+    manifest: Mapping[str, Any],
+    name: str,
+    payload: bytes,
+) -> tuple[bool, str]:
+    entry = artifact_entry(manifest, name)
+    if entry is None:
+        return False, f"manifest omits {name}"
+    if entry.get("path") != name:
+        return False, f"manifest path binding differs for {name}"
+    if entry.get("size_bytes") != len(payload):
+        return False, f"manifest size differs for {name}"
+    expected = str(entry.get("sha256") or "").removeprefix("sha256:")
+    if expected != hashlib.sha256(payload).hexdigest():
+        return False, f"manifest sha256 differs for {name}"
+    return True, "ok"
+
+
+def _decoded_jsonl_lines(payload: bytes, *, label: str) -> list[str]:
+    try:
+        # split("\n") preserves U+2028/U+2029 inside JSON strings.
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReportError(f"invalid UTF-8 JSONL {label}: {exc}") from exc
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def read_compact_rows_bytes(
+    payload: bytes,
+    prices: Mapping[str, Price],
+    *,
+    label: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    rows: list[dict[str, Any]] = []
+    reasons: list[str] = []
+    for line_number, raw in enumerate(_decoded_jsonl_lines(payload, label=label), start=1):
+        if not raw.strip():
+            raise ReportError(f"empty JSONL record {label}:{line_number}")
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ReportError(f"invalid JSONL {label}:{line_number}: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ReportError(f"non-object JSONL row {label}:{line_number}")
+        if not result_evidence_valid(row):
+            reasons.append(f"result evidence hash invalid at line {line_number}")
+        compact = compact_row(row, prices)
+        compact["result_evidence_schema"] = row.get("result_evidence_schema")
+        compact["result_evidence_sha256"] = row.get("result_evidence_sha256")
+        rows.append(compact)
+    return rows, reasons
+
+
 def read_compact_rows(
     path: Path,
     prices: Mapping[str, Price],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    regular_file(path)
-    rows: list[dict[str, Any]] = []
-    reasons: list[str] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, raw in enumerate(handle, start=1):
-            if not raw.strip():
-                raise ReportError(f"empty JSONL record {path}:{line_number}")
-            try:
-                row = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise ReportError(f"invalid JSONL {path}:{line_number}: {exc}") from exc
-            if not isinstance(row, dict):
-                raise ReportError(f"non-object JSONL row {path}:{line_number}")
-            if not result_evidence_valid(row):
-                reasons.append(f"result evidence hash invalid at line {line_number}")
-            compact = compact_row(row, prices)
-            compact["result_evidence_schema"] = row.get("result_evidence_schema")
-            compact["result_evidence_sha256"] = row.get("result_evidence_sha256")
-            rows.append(compact)
-    return rows, reasons
+    return read_compact_rows_bytes(
+        stable_regular_file_bytes(path),
+        prices,
+        label=str(path),
+    )
 
 
 def aggregator_request_started(call: Mapping[str, Any]) -> bool:
@@ -1697,6 +1900,41 @@ def read_trace_evidence(
             candidate_order_calls[task_id] = trace_candidate_order_calls(row)
     if row_count != 10:
         reasons.append(f"trace row count is {row_count}, expected 10")
+    return bindings, candidate_order_calls, reasons
+
+
+def read_trace_evidence_bytes(
+    payload: bytes,
+    *,
+    label: str,
+) -> tuple[dict[str, str], dict[str, list[dict[str, Any]]], list[str]]:
+    bindings: dict[str, str] = {}
+    candidate_order_calls: dict[str, list[dict[str, Any]]] = {}
+    reasons: list[str] = []
+    lines = _decoded_jsonl_lines(payload, label=label)
+    for line_number, raw in enumerate(lines, start=1):
+        if not raw.strip():
+            raise ReportError(f"empty JSONL record {label}:{line_number}")
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ReportError(f"invalid JSONL {label}:{line_number}: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ReportError(f"non-object JSONL row {label}:{line_number}")
+        if row.get("result_evidence_schema") is not None and not result_evidence_valid(row):
+            reasons.append(f"trace result evidence hash invalid at line {line_number}")
+        task_id = str(row.get("task_id") or "")
+        evidence_sha = str(row.get("result_evidence_sha256") or "")
+        if not task_id:
+            reasons.append(f"trace task id missing at line {line_number}")
+            continue
+        if task_id in bindings:
+            reasons.append(f"duplicate trace task id {task_id}")
+            continue
+        bindings[task_id] = evidence_sha
+        candidate_order_calls[task_id] = trace_candidate_order_calls(row)
+    if len(lines) != 10:
+        reasons.append(f"trace row count is {len(lines)}, expected 10")
     return bindings, candidate_order_calls, reasons
 
 
@@ -1992,11 +2230,42 @@ def account_evidence(
         "account_window_count": len(attribution.get("account_windows") or []),
         "scope": "campaign account delta including Judge; separate from selected generation",
     }
+    identity_projections: list[dict[str, str]] = []
+    for window in attribution.get("account_windows") or []:
+        source_hashes = (
+            window.get("source_sha256") if isinstance(window, Mapping) else None
+        )
+        if not isinstance(source_hashes, Mapping):
+            continue
+        projection = {
+            "account_before_sha256": str(source_hashes.get("account_before") or ""),
+            "account_after_sha256": str(source_hashes.get("account_after") or ""),
+            "account_reconciliation_sha256": str(
+                source_hashes.get("account_reconciliation") or ""
+            ),
+            "runtime_environment_sha256": str(
+                source_hashes.get("runtime_environment") or ""
+            ),
+        }
+        if all(raw_sha256(value) is not None for value in projection.values()):
+            identity_projections.append(projection)
     if cohort is not None:
+        cohort_projection = dict(cohort.get("account_evidence") or {})
+        identity_projections = [cohort_projection] if all(
+            raw_sha256(value) is not None for value in cohort_projection.values()
+        ) else []
         result["account_window_cohort"] = copy.deepcopy(dict(cohort))
         result["cohort_id"] = cohort.get("cohort_id")
         result["cohort_role"] = cohort.get("role")
         result["cohort_sha256"] = cohort.get("cohort_sha256")
+    identities = sorted({canonical_sha256(value) for value in identity_projections})
+    result["account_evidence_identities"] = identities
+    result["account_evidence_identity_complete"] = bool(identities) and len(
+        identities
+    ) == len(attribution.get("account_windows") or [cohort])
+    result["account_evidence_identity_sha256"] = (
+        identities[0] if len(identities) == 1 else None
+    )
     return result
 
 
@@ -2529,6 +2798,8 @@ def load_confirmatory_formal_role(
     plan: Mapping[str, Any],
     cohort_id: str,
     expected_cohort_sha256: str,
+    formal_payloads: Mapping[str, bytes],
+    archived_source_payloads: Mapping[str, bytes],
 ) -> dict[str, Any]:
     """Load one receipt-authenticated role without legacy controller assumptions."""
 
@@ -2586,20 +2857,23 @@ def load_confirmatory_formal_role(
         "audit.json",
         "openrouter-non-byok-campaign-proof.json",
     )
-    required = [root / name for name in required_names]
-    try:
-        for path in required:
-            regular_file(path)
-    except ReportError as exc:
-        reasons.append(str(exc))
+    if set(formal_payloads) != set(required_names):
+        reasons.append(f"confirmatory {role} formal byte snapshot is incomplete")
         return result
-    if file_sha256(root / "manifest.json") != expected_manifest_sha:
+    if hashlib.sha256(formal_payloads["manifest.json"]).hexdigest() != expected_manifest_sha:
         reasons.append(f"confirmatory {role} manifest file hash differs from receipt")
         return result
 
-    manifest = load_json(root / "manifest.json")
-    audit = load_json(root / "audit.json")
-    proof = load_json(root / "openrouter-non-byok-campaign-proof.json")
+    try:
+        manifest = json.loads(formal_payloads["manifest.json"])
+        audit = json.loads(formal_payloads["audit.json"])
+        proof = json.loads(formal_payloads["openrouter-non-byok-campaign-proof.json"])
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        reasons.append(f"confirmatory {role} formal JSON cannot be parsed: {exc}")
+        return result
+    if any(not isinstance(value, Mapping) for value in (manifest, audit, proof)):
+        reasons.append(f"confirmatory {role} formal JSON root is not an object")
+        return result
     account_window_cohort, cohort_reasons = validate_account_window_cohort(
         manifest,
         audit,
@@ -2627,17 +2901,24 @@ def load_confirmatory_formal_role(
         "audit.json",
         "openrouter-non-byok-campaign-proof.json",
     ):
-        valid, detail = artifact_binding_valid(root, manifest, name)
+        valid, detail = artifact_binding_bytes_valid(
+            manifest, name, formal_payloads[name]
+        )
         if not valid:
             reasons.append(detail)
     try:
-        rows, row_reasons = read_compact_rows(root / "results.jsonl", prices)
+        rows, row_reasons = read_compact_rows_bytes(
+            formal_payloads["results.jsonl"],
+            prices,
+            label=str(root / "results.jsonl"),
+        )
     except ReportError as exc:
         rows, row_reasons = [], [str(exc)]
     reasons.extend(row_reasons)
     try:
-        trace_bindings, trace_candidate_calls, trace_reasons = read_trace_evidence(
-            root / "trace.jsonl"
+        trace_bindings, trace_candidate_calls, trace_reasons = read_trace_evidence_bytes(
+            formal_payloads["trace.jsonl"],
+            label=str(root / "trace.jsonl"),
         )
     except ReportError as exc:
         trace_bindings, trace_candidate_calls, trace_reasons = {}, {}, [str(exc)]
@@ -2712,14 +2993,17 @@ def load_confirmatory_formal_role(
                         label=f"confirmatory source {source_index} {label}",
                     )
                     source_path.relative_to(archive_root)
-                    regular_file(source_path)
                 except (ReportError, ValueError) as exc:
                     reasons.append(str(exc))
                     continue
                 expected_source_sha = raw_sha256(source.get(hash_field))
                 if (
                     expected_source_sha is None
-                    or file_sha256(source_path) != expected_source_sha
+                    or source_path.as_posix() not in archived_source_payloads
+                    or hashlib.sha256(
+                        archived_source_payloads.get(source_path.as_posix(), b"")
+                    ).hexdigest()
+                    != expected_source_sha
                     or source_path in seen_archived_sources
                 ):
                     reasons.append(
@@ -4886,6 +5170,88 @@ def build_group_json(
     return document
 
 
+def validate_generated_report_output_closure(
+    *,
+    report: Mapping[str, Any],
+    output_root: Path,
+) -> None:
+    """Final fence over published reports and every formal input they consumed."""
+
+    json_path = output_root / "EXPERIMENT_RESULTS.json"
+    markdown_path = output_root / "EXPERIMENT_RESULTS.md"
+    bound_report = load_bound_json(json_path)
+    if bound_report.value != dict(report) or not validate_embedded_hash(
+        bound_report.value, "report_sha256"
+    ):
+        raise ReportError("published comprehensive report JSON closure differs")
+    markdown_payload = stable_regular_file_bytes(markdown_path)
+    expected_markdown = {
+        "path": str(markdown_path),
+        "sha256": hashlib.sha256(markdown_payload).hexdigest(),
+        "size_bytes": len(markdown_payload),
+    }
+    if report.get("root_artifacts", {}).get("markdown") != expected_markdown:
+        raise ReportError("published comprehensive report Markdown closure differs")
+    groups = report.get("group_report_artifacts")
+    experiments = report.get("experiments")
+    if (
+        not isinstance(groups, Mapping)
+        or not isinstance(experiments, Mapping)
+        or set(groups) != set(experiments)
+    ):
+        raise ReportError("published group report coverage differs")
+    for experiment_id, descriptors in groups.items():
+        if not isinstance(descriptors, Mapping):
+            raise ReportError(f"published group descriptor is malformed: {experiment_id}")
+        for key, name in (
+            ("markdown", "EXPERIMENT_RESULTS.md"),
+            ("json", "EXPERIMENT_RESULTS.json"),
+        ):
+            descriptor = descriptors.get(key)
+            if not isinstance(descriptor, Mapping):
+                raise ReportError(f"published group descriptor is missing: {experiment_id}")
+            path = Path(str(descriptor.get("path") or ""))
+            payload = stable_regular_file_bytes(path)
+            actual = {
+                "path": str(path),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+            if dict(descriptor) != actual:
+                raise ReportError(f"published group artifact changed: {experiment_id}/{name}")
+        group_json = load_bound_json(
+            Path(str(descriptors["json"]["path"]))
+        ).value
+        if not validate_embedded_hash(
+            group_json, "group_report_sha256"
+        ):
+            raise ReportError(f"published group JSON self-hash differs: {experiment_id}")
+    arms = report.get("arms")
+    if not isinstance(arms, Mapping):
+        raise ReportError("published report arm map is missing")
+    for arm_id, arm in arms.items():
+        if not isinstance(arm, Mapping) or arm.get("formal_evidence_valid") is not True:
+            continue
+        evidence = arm.get("completion_evidence")
+        hashes = evidence.get("artifact_sha256") if isinstance(evidence, Mapping) else None
+        if not isinstance(hashes, Mapping):
+            raise ReportError(f"formal arm completion evidence is missing: {arm_id}")
+        root = Path(str(arm.get("output_dir") or ""))
+        names = {
+            "manifest": "manifest.json",
+            "results": "results.jsonl",
+            "trace": "trace.jsonl",
+            "audit": "audit.json",
+            "proof": "openrouter-non-byok-campaign-proof.json",
+        }
+        actual = {
+            key: hashlib.sha256(stable_regular_file_bytes(root / name)).hexdigest()
+            for key, name in names.items()
+        }
+        if dict(hashes) != actual:
+            raise ReportError(f"formal arm changed after report generation: {arm_id}")
+
+
 def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     formal_items = [
         (arm_id, arm)
@@ -4904,6 +5270,7 @@ def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any
         if number(arm.get("metrics", {}).get("judge_cost_counted_usd")) is not None
     ]
     account_groups: dict[str, dict[str, Any]] = {}
+    account_identity_owners: dict[str, str] = {}
     cohort_arm_count = 0
     for arm_id, arm in formal_items:
         account = arm.get("account") if isinstance(arm.get("account"), Mapping) else {}
@@ -4917,12 +5284,41 @@ def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any
             cohort_id = None
             cohort_sha = None
             role = None
+            account_identities = account.get("account_evidence_identities")
+            if (
+                not isinstance(account_identities, list)
+                or not account_identities
+                or any(raw_sha256(value) is None for value in account_identities)
+                or account.get("account_evidence_identity_complete") is not True
+            ):
+                raise ReportError(
+                    f"formal arm {arm_id!r} lacks complete account evidence identities"
+                )
         else:
             cohort_arm_count += 1
             cohort_id = str(cohort.get("cohort_id") or "")
             cohort_sha = str(cohort.get("cohort_sha256") or "")
             role = str(cohort.get("role") or "")
             key = f"cohort:{cohort_id}"
+            account_identities = account.get("account_evidence_identities")
+            if (
+                not isinstance(account_identities, list)
+                or len(account_identities) != 1
+                or raw_sha256(account_identities[0]) is None
+                or account.get("account_evidence_identity_complete") is not True
+            ):
+                raise ReportError(
+                    f"account-window cohort {cohort_id!r} lacks account evidence identity"
+                )
+        identity_owner = cohort_id or f"arm:{arm_id}"
+        for account_identity in account_identities:
+            prior_owner = account_identity_owners.get(account_identity)
+            if prior_owner is not None and prior_owner != identity_owner:
+                raise ReportError(
+                    "different account scopes reuse one account evidence identity: "
+                    f"{prior_owner!r} and {identity_owner!r}"
+                )
+            account_identity_owners.setdefault(account_identity, identity_owner)
         delta = number(account.get("account_delta_usd"))
         byok = number(account.get("byok_delta_usd"))
         current = account_groups.get(key)
@@ -4930,6 +5326,7 @@ def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any
             account_groups[key] = {
                 "cohort_id": cohort_id,
                 "cohort_sha256": cohort_sha,
+                "account_evidence_identities": list(account_identities),
                 "roles": {role} if role else set(),
                 "account_delta_usd": delta,
                 "byok_delta_usd": byok,
@@ -4939,6 +5336,7 @@ def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any
             continue
         if (
             current["cohort_sha256"] != cohort_sha
+            or current["account_evidence_identities"] != account_identities
             or delta != current["account_delta_usd"]
             or byok != current["byok_delta_usd"]
             or role in current["roles"]
@@ -5009,6 +5407,7 @@ def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any
         if byok_values
         else None,
         "account_windows_complete": account_complete,
+        "account_evidence_identities": sorted(account_identity_owners),
         "note": "unique arms only; shared common E0 is counted once; account actual includes Judge and is never added to theoretical cost",
     }
     if cohort_arm_count:
@@ -5023,6 +5422,9 @@ def compute_unique_costs(arms: Mapping[str, Mapping[str, Any]]) -> dict[str, Any
                     {
                         "cohort_id": value["cohort_id"],
                         "cohort_sha256": value["cohort_sha256"],
+                        "account_evidence_identities": value[
+                            "account_evidence_identities"
+                        ],
                         "roles": sorted(value["roles"]),
                         "arm_ids": sorted(value["arm_ids"]),
                         "account_delta_usd": value["account_delta_usd"],
@@ -5122,6 +5524,7 @@ def load_confirmatory_report_input_entry(
     prices: Mapping[str, Price],
     plan: Mapping[str, Any],
     plan_sha256: str,
+    frozen_payloads: Mapping[str, bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Authenticate and load exactly one receipt-declared confirmatory cohort."""
 
@@ -5195,18 +5598,33 @@ def load_confirmatory_report_input_entry(
     if cohort_manifest_path != cohort_root / "cohort-manifest.json":
         reasons.append("confirmatory cohort manifest path is outside its fixed cohort location")
     try:
-        regular_file(schedule_path)
-        regular_file(cohort_manifest_path)
+        schedule_bound = (
+            frozen_bridge_json(schedule_path, frozen_payloads)
+            if frozen_payloads is not None
+            else load_bound_json(schedule_path)
+        )
+        cohort_manifest_bound = (
+            frozen_bridge_json(cohort_manifest_path, frozen_payloads)
+            if frozen_payloads is not None
+            else load_bound_json(cohort_manifest_path)
+        )
     except ReportError as exc:
         reasons.append(str(exc))
-    if schedule_file_sha is not None and file_sha256(schedule_path) != schedule_file_sha:
+        return _partial_confirmatory_entry(entry, reasons=reasons), {}
+    if (
+        schedule_file_sha is not None
+        and schedule_bound.file_sha256 != schedule_file_sha
+    ):
         reasons.append("confirmatory schedule file hash differs from receipt")
-    if cohort_manifest_sha is not None and file_sha256(cohort_manifest_path) != cohort_manifest_sha:
+    if (
+        cohort_manifest_sha is not None
+        and cohort_manifest_bound.file_sha256 != cohort_manifest_sha
+    ):
         reasons.append("confirmatory cohort manifest file hash differs from receipt")
     if reasons:
         return _partial_confirmatory_entry(entry, reasons=reasons), {}
 
-    schedule = load_json(schedule_path)
+    schedule = schedule_bound.value
     if schedule.get("schema") != CONFIRMATORY_SCHEDULE_SCHEMA:
         reasons.append("confirmatory schedule schema differs")
     if not validate_embedded_hash(schedule, "schedule_sha256", prefixed=False):
@@ -5239,7 +5657,7 @@ def load_confirmatory_report_input_entry(
     if Counter(schedule_orders) != Counter({"AB": 5, "BA": 5}):
         reasons.append("confirmatory schedule is not balanced 5 AB / 5 BA")
 
-    cohort_manifest = load_json(cohort_manifest_path)
+    cohort_manifest = cohort_manifest_bound.value
     if cohort_manifest.get("schema") != CONFIRMATORY_COHORT_MANIFEST_SCHEMA:
         reasons.append("confirmatory cohort manifest schema differs")
     if not validate_embedded_hash(cohort_manifest, "manifest_sha256", prefixed=False):
@@ -5269,7 +5687,16 @@ def load_confirmatory_report_input_entry(
     }:
         reasons.append("confirmatory schedule roles are incomplete")
         schedule_roles = {}
-    role_context: dict[str, tuple[ArmSpec, Mapping[str, Any], Path]] = {}
+    role_context: dict[
+        str,
+        tuple[
+            ArmSpec,
+            Mapping[str, Any],
+            Path,
+            dict[str, bytes],
+            dict[str, bytes],
+        ],
+    ] = {}
     for role in ("control", "candidate"):
         receipt = roles.get(role) if isinstance(roles.get(role), Mapping) else {}
         if receipt.get("publication_status") != "complete":
@@ -5304,14 +5731,41 @@ def load_confirmatory_report_input_entry(
             continue
         if root != cohort_root / role:
             reasons.append(f"confirmatory {role} root is outside its fixed cohort location")
-        formal_manifest_path = root / "manifest.json"
+        required_names = (
+            "manifest.json",
+            "results.jsonl",
+            "trace.jsonl",
+            "audit.json",
+            "openrouter-non-byok-campaign-proof.json",
+        )
+        formal_payloads: dict[str, bytes] = {}
         try:
-            regular_file(formal_manifest_path)
+            for name in required_names:
+                formal_payloads[name] = (
+                    frozen_bridge_payload(root / name, frozen_payloads)
+                    if frozen_payloads is not None
+                    else stable_regular_file_bytes(root / name)
+                )
         except ReportError as exc:
             reasons.append(str(exc))
             continue
-        if file_sha256(formal_manifest_path) != manifest_sha:
+        formal_manifest_path = root / "manifest.json"
+        if hashlib.sha256(formal_payloads["manifest.json"]).hexdigest() != manifest_sha:
             reasons.append(f"confirmatory {role} manifest hash differs from receipt")
+        archived_source_payloads: dict[str, bytes] = {}
+        try:
+            for source_path in archived_source_paths_from_manifest_bytes(
+                root=root,
+                manifest_payload=formal_payloads["manifest.json"],
+                label=f"confirmatory {role}",
+            ):
+                archived_source_payloads[source_path.as_posix()] = (
+                    frozen_bridge_payload(source_path, frozen_payloads)
+                    if frozen_payloads is not None
+                    else stable_regular_file_bytes(source_path)
+                )
+        except ReportError as exc:
+            reasons.append(str(exc))
         manifest_role = (
             manifest_roles.get(role)
             if isinstance(manifest_roles.get(role), Mapping)
@@ -5325,7 +5779,13 @@ def load_confirmatory_report_input_entry(
             or manifest_role.get("sha256") != manifest_sha
         ):
             reasons.append(f"confirmatory {role} cohort-manifest binding differs")
-        role_context[role] = (spec, receipt, root)
+        role_context[role] = (
+            spec,
+            receipt,
+            root,
+            formal_payloads,
+            archived_source_payloads,
+        )
     if set(role_context) == {"control", "candidate"}:
         control_spec = role_context["control"][0]
         candidate_spec = role_context["candidate"][0]
@@ -5338,7 +5798,13 @@ def load_confirmatory_report_input_entry(
         return _partial_confirmatory_entry(entry, reasons=reasons), {}
 
     internal_roles: dict[str, dict[str, Any]] = {}
-    for role, (spec, receipt, root) in role_context.items():
+    for role, (
+        spec,
+        receipt,
+        root,
+        formal_payloads,
+        archived_source_payloads,
+    ) in role_context.items():
         internal_roles[role] = load_confirmatory_formal_role(
             role=role,
             receipt=receipt,
@@ -5348,6 +5814,8 @@ def load_confirmatory_report_input_entry(
             plan=plan,
             cohort_id=cohort_id,
             expected_cohort_sha256=str(account_cohort_sha),
+            formal_payloads=formal_payloads,
+            archived_source_payloads=archived_source_payloads,
         )
         reasons.extend(internal_roles[role].get("formal_evidence_reasons") or [])
     if all(role in internal_roles for role in ("control", "candidate")):
@@ -5434,13 +5902,12 @@ def load_confirmatory_report_inputs(
     plan_sha256: str,
     specs: Sequence[ArmSpec],
     prices: Mapping[str, Price],
+    frozen_payloads: Mapping[str, bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Load only the controller-published fixed receipt; never scan directories."""
 
     index_path = run_root / CONFIRMATORY_REPORT_INPUT_INDEX_NAME
-    try:
-        mode = index_path.lstat().st_mode
-    except FileNotFoundError:
+    if frozen_payloads is not None and str(index_path) not in frozen_payloads:
         return {
             "status": "absent",
             "available": False,
@@ -5451,11 +5918,34 @@ def load_confirmatory_report_inputs(
             "partial_cohort_count": 0,
             "cohorts": {},
         }, {}
-    except OSError as exc:
-        raise ReportError(f"cannot inspect confirmatory report-input index: {exc}") from exc
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise ReportError("confirmatory report-input index is not a regular non-symlink file")
-    index = load_json(index_path)
+    if frozen_payloads is None:
+        try:
+            mode = index_path.lstat().st_mode
+        except FileNotFoundError:
+            return {
+                "status": "absent",
+                "available": False,
+                "valid": True,
+                "path": str(index_path),
+                "cohort_count": 0,
+                "complete_cohort_count": 0,
+                "partial_cohort_count": 0,
+                "cohorts": {},
+            }, {}
+        except OSError as exc:
+            raise ReportError(
+                f"cannot inspect confirmatory report-input index: {exc}"
+            ) from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ReportError(
+                "confirmatory report-input index is not a regular non-symlink file"
+            )
+    index_bound = (
+        frozen_bridge_json(index_path, frozen_payloads)
+        if frozen_payloads is not None
+        else load_bound_json(index_path)
+    )
+    index = index_bound.value
     if index.get("schema") != CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA:
         raise ReportError("confirmatory report-input index schema differs")
     if index.get("campaign_plan_sha256") != plan_sha256:
@@ -5480,6 +5970,7 @@ def load_confirmatory_report_inputs(
             prices=prices,
             plan=plan,
             plan_sha256=plan_sha256,
+            frozen_payloads=frozen_payloads,
         )
         key = str(cohort.get("cohort_id") or f"invalid-{len(cohorts) + 1}")
         cohorts[key] = cohort
@@ -5495,7 +5986,7 @@ def load_confirmatory_report_inputs(
         "available": True,
         "valid": status == "complete",
         "path": str(index_path),
-        "file_sha256": file_sha256(index_path),
+        "file_sha256": index_bound.file_sha256,
         "index_sha256": index.get("index_sha256"),
         "campaign_plan_sha256": index.get("campaign_plan_sha256"),
         "cohort_count": len(cohorts),
@@ -5518,9 +6009,597 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--allow-nonterminal", action="store_true")
     parser.add_argument(
+        "--confirmatory-bridge",
+        action="store_true",
+        help="generate the confirmatory-only bridge report; --status is not used",
+    )
+    parser.add_argument(
         "--strict", action="store_true", help="return 2 when completion/evidence is partial"
     )
     return parser.parse_args(argv)
+
+
+def _bridge_markdown(report: Mapping[str, Any]) -> str:
+    source = report.get("source_screening") or {}
+    completion = report.get("completion") or {}
+    lines = [
+        "# P0/P0.5 DRACO-mini screening + strict confirmatory report",
+        "",
+        f"- Status: `{completion.get('status')}`。这是 10 题 mini 诊断，不自动晋级配置。",
+        f"- Screening report: `{source.get('report_path')}` (`{source.get('report_file_sha256')}`)。",
+        f"- Screening plan: `{source.get('plan_path')}` (`{source.get('plan_canonical_sha256')}`)。",
+        f"- Confirmatory bridge plan: `{report.get('bridge_plan_path')}` (`{report.get('bridge_plan_sha256')}`)。",
+        f"- Survivors/cohorts: {completion.get('survivor_count')}/{completion.get('complete_cohort_count')}；partial={completion.get('partial_cohort_count')}。",
+        "- Screening 账户窗口保留原报告口径；每个 paired confirmatory cohort 的共享账户 delta 只计一次。Selected generation 与 Judge 仍逐臂分列。",
+        "",
+        "## Screening survivors",
+        "",
+        "| Candidate group | Arms | Quality basis | Mean ΔQ | Median ΔQ | W/T/L | Min ΔQ | Gate |",
+        "|---|---|---|---:|---:|---|---:|---|",
+    ]
+    gates = source.get("survivor_groups") if isinstance(source, Mapping) else {}
+    for group_id, gate in sorted((gates or {}).items()):
+        quality = gate.get("quality") if isinstance(gate, Mapping) else {}
+        lines.append(
+            f"| `{group_id}` | {', '.join(gate.get('candidate_arm_ids') or [])} | "
+            f"`{gate.get('quality_basis')}` | {fmt(quality.get('mean_delta_quality'), 4)} | "
+            f"{fmt(quality.get('median_delta_quality'), 4)} | "
+            f"{integer(quality.get('wins'))}/{integer(quality.get('ties'))}/{integer(quality.get('losses'))} | "
+            f"{fmt(quality.get('minimum_task_delta_quality'), 4)} | "
+            f"{'pass' if gate.get('pass') is True else 'fail'} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Confirmatory paired cohorts",
+            "",
+            "| Cohort | Role | Arm | Rows | Done | AvgQ | JudgeErr | Total Gen$ | Judge$ | Account Δ$ |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    cohorts = report.get("confirmatory_cohorts", {}).get("cohorts", {})
+    for cohort_id, cohort in sorted((cohorts or {}).items()):
+        roles = cohort.get("roles") if isinstance(cohort, Mapping) else {}
+        for role in ("control", "candidate"):
+            arm = roles.get(role) if isinstance(roles, Mapping) else {}
+            metric = arm.get("metrics") if isinstance(arm, Mapping) else {}
+            account = arm.get("account") if isinstance(arm, Mapping) else {}
+            arm_id = arm.get("spec", {}).get("arm_id") if isinstance(arm, Mapping) else None
+            account_text = (
+                fmt(account.get("account_delta_usd"), 9) if role == "control" else "shared"
+            )
+            lines.append(
+                f"| `{cohort_id}` | {role} | {arm_id or '—'} | "
+                f"{integer(metric.get('row_count'))} | {integer(metric.get('done_count'))} | "
+                f"{fmt(metric.get('avg_quality_total'), 4)} | "
+                f"{integer(metric.get('judge_error_count'))} | "
+                f"{fmt(metric.get('selected_generation_cost_counted_usd'), 6)} | "
+                f"{fmt(metric.get('judge_cost_counted_usd'), 6)} | {account_text} |"
+            )
+        comparison = cohort.get("comparison") if isinstance(cohort, Mapping) else None
+        if isinstance(comparison, Mapping):
+            lines.append(
+                f"| `{cohort_id}` | paired | candidate-control | {integer(comparison.get('pair_count'))} | — | "
+                f"Δ={fmt(comparison.get('mean_delta_quality'), 4)} | "
+                f"{integer(comparison.get('wins'))}/{integer(comparison.get('ties'))}/{integer(comparison.get('losses'))} | — | — | — |"
+            )
+    costs = report.get("costs") or {}
+    lines.extend(
+        [
+            "",
+            "## Cost scopes",
+            "",
+            "| Scope | Selected Gen$ | Judge$ | Account Δ$ | Account windows/cohorts |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for label in ("screening", "confirmatory", "combined"):
+        item = costs.get(label) if isinstance(costs, Mapping) else {}
+        lines.append(
+            f"| {label} | {fmt(item.get('selected_generation_counted_usd'), 6)} | "
+            f"{fmt(item.get('judge_counted_usd'), 6)} | "
+            f"{fmt(item.get('account_delta_usd'), 9)} | "
+            f"{integer(item.get('unique_account_window_count') or item.get('paired_cohort_count'))} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Selected Gen$ 只统计最终成功且 selected 的 generation；actual USD 优先，缺失时按 cache-aware token 价格估算，排除 Judge 与失败/被替换 retry。Judge 独立分列；账户实际增量不能与理论 Gen$ 相加。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _sum_optional_cost(left: Mapping[str, Any], right: Mapping[str, Any], field: str) -> float | None:
+    values = [number(left.get(field)), number(right.get(field))]
+    known = [value for value in values if value is not None]
+    return sum(known) if known else None
+
+
+def authenticated_bridge_input_snapshot(
+    *,
+    plan: Mapping[str, Any],
+    plan_path: Path,
+    run_root: Path,
+    payloads: dict[str, bytes] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Freeze every receipt-declared bridge input without directory scanning."""
+
+    paths: set[Path] = {plan_path}
+    captured: dict[Path, bytes] = {}
+
+    def capture(path: Path) -> bytes:
+        payload = stable_regular_file_bytes(path)
+        prior = captured.get(path)
+        if prior is not None and prior != payload:
+            raise ReportError(f"bridge input changed during snapshot discovery: {path}")
+        captured[path] = payload
+        return payload
+
+    def captured_json(path: Path, *, label: str) -> dict[str, Any]:
+        payload = capture(path)
+        try:
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReportError(f"cannot parse {label}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ReportError(f"{label} is not an object")
+        return value
+
+    capture(plan_path)
+    source = plan.get("confirmatory_bridge", {}).get("screening_source", {})
+    for section in ("screening_plan", "terminal_status", "terminal_report_receipt"):
+        descriptor = source.get(section) if isinstance(source, Mapping) else None
+        if isinstance(descriptor, Mapping) and descriptor.get("path"):
+            paths.add(Path(str(descriptor["path"])))
+    comprehensive = (
+        source.get("comprehensive_report") if isinstance(source, Mapping) else None
+    )
+    artifacts = (
+        comprehensive.get("artifacts") if isinstance(comprehensive, Mapping) else None
+    )
+    for descriptor in (artifacts or {}).values():
+        if isinstance(descriptor, Mapping) and descriptor.get("path"):
+            paths.add(Path(str(descriptor["path"])))
+    for arm in (source.get("arms") or {}).values() if isinstance(source, Mapping) else []:
+        if not isinstance(arm, Mapping):
+            continue
+        root = Path(str(arm.get("output_dir") or ""))
+        for name in (arm.get("formal_artifacts") or {}):
+            paths.add(root / str(name))
+        for descriptor in (arm.get("group_reports") or {}).values():
+            if isinstance(descriptor, Mapping) and descriptor.get("path"):
+                paths.add(Path(str(descriptor["path"])))
+    provenance = source.get("derived_provenance") if isinstance(source, Mapping) else None
+    if isinstance(provenance, Mapping):
+        for field in ("derived_path", "analyzer_path", "p99_path"):
+            if provenance.get(field):
+                paths.add(Path(str(provenance[field])))
+
+    current_derived = plan.get("confirmatory_bridge", {}).get("derived_contract", {})
+    if isinstance(current_derived, Mapping):
+        for field in ("path", "analyzer_path", "p99_path"):
+            if current_derived.get(field):
+                paths.add(Path(str(current_derived[field])))
+        derived_path = Path(str(current_derived.get("path") or ""))
+        if derived_path.is_absolute():
+            derived_value = captured_json(
+                derived_path, label="bridge derived plan"
+            )
+            schedules = derived_value.get("schedules")
+            survivors = plan.get("confirmatory_bridge", {}).get("survivor_arm_ids")
+            if (
+                not isinstance(schedules, Mapping)
+                or not isinstance(survivors, list)
+                or set(schedules) != set(survivors)
+            ):
+                raise ReportError("bridge derived schedule inventory differs")
+            for arm_id in survivors:
+                descriptor = schedules.get(arm_id)
+                if not isinstance(descriptor, Mapping) or not descriptor.get("path"):
+                    raise ReportError("bridge derived schedule descriptor is malformed")
+                paths.add(Path(str(descriptor["path"])))
+
+    index_path = run_root / CONFIRMATORY_REPORT_INPUT_INDEX_NAME
+    if index_path.exists() or index_path.is_symlink():
+        index_value = captured_json(
+            index_path, label="confirmatory report-input index"
+        )
+        paths.add(index_path)
+        entries = index_value.get("entries")
+        if not isinstance(entries, list):
+            raise ReportError("confirmatory report-input index entries are malformed")
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise ReportError("confirmatory report-input entry is malformed")
+            for field in ("schedule_path", "cohort_manifest_path"):
+                if entry.get(field):
+                    paths.add(Path(str(entry[field])))
+            roles = entry.get("roles")
+            for role in (roles or {}).values() if isinstance(roles, Mapping) else []:
+                if not isinstance(role, Mapping) or not role.get("root"):
+                    continue
+                root = Path(str(role["root"]))
+                manifest_payload = capture(root / "manifest.json")
+                for name in (
+                    "manifest.json",
+                    "results.jsonl",
+                    "trace.jsonl",
+                    "audit.json",
+                    "openrouter-non-byok-campaign-proof.json",
+                ):
+                    paths.add(root / name)
+                paths.update(
+                    archived_source_paths_from_manifest_bytes(
+                        root=root,
+                        manifest_payload=manifest_payload,
+                        label="confirmatory bridge role",
+                    )
+                )
+    result: dict[str, dict[str, Any]] = {}
+    for path in sorted(paths, key=str):
+        if path in captured:
+            payload = captured[path]
+            if stable_regular_file_bytes(path) != payload:
+                raise ReportError(
+                    f"bridge input changed after snapshot discovery: {path}"
+                )
+        else:
+            payload = capture(path)
+        if payloads is not None:
+            payloads[str(path)] = payload
+        result[str(path)] = {
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        }
+    return result
+
+
+def frozen_bridge_payload(path: Path, payloads: Mapping[str, bytes]) -> bytes:
+    """Return initial authenticated bridge bytes; never reread a mutable path."""
+
+    payload = payloads.get(str(path))
+    if payload is None:
+        raise ReportError(f"bridge loader requested an unauthenticated path: {path}")
+    return payload
+
+
+def frozen_bridge_json(path: Path, payloads: Mapping[str, bytes]) -> BoundJson:
+    payload = frozen_bridge_payload(path, payloads)
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReportError(f"cannot parse authenticated bridge JSON {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReportError(f"authenticated bridge JSON root is not an object: {path}")
+    return BoundJson(
+        path=path,
+        payload=payload,
+        file_sha256=hashlib.sha256(payload).hexdigest(),
+        value=value,
+    )
+
+
+def validate_bridge_output_closure(
+    *,
+    report: Mapping[str, Any],
+    markdown_path: Path,
+    json_path: Path,
+) -> None:
+    json_bound = load_bound_json(json_path)
+    if json_bound.value != dict(report) or not validate_embedded_hash(
+        json_bound.value, "report_sha256"
+    ):
+        raise ReportError("published confirmatory bridge JSON closure differs")
+    markdown_payload = stable_regular_file_bytes(markdown_path)
+    descriptor = report.get("root_artifacts", {}).get("markdown")
+    actual = {
+        "path": str(markdown_path),
+        "sha256": hashlib.sha256(markdown_payload).hexdigest(),
+        "size_bytes": len(markdown_payload),
+    }
+    if not isinstance(descriptor, Mapping) or dict(descriptor) != actual:
+        raise ReportError("published confirmatory bridge Markdown closure differs")
+
+
+def generate_confirmatory_bridge(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """Merge immutable screening evidence with new plan-bound paired cohorts."""
+
+    plan_bound = load_bound_json(args.plan)
+    plan = plan_bound.value
+    if plan.get("schema") != PLAN_SCHEMA or not isinstance(
+        plan.get("confirmatory_bridge"), Mapping
+    ):
+        raise ReportError("--confirmatory-bridge requires a confirmatory-only bridge plan")
+    plan_sha = canonical_sha256(plan)
+    verifier = load_frozen_controller_verifier(plan, plan_sha256=plan_sha)
+    validate_bridge = getattr(
+        verifier.module, "validate_confirmatory_bridge_document", None
+    )
+    if not callable(validate_bridge):
+        raise ReportError("frozen controller lacks confirmatory bridge validation")
+    try:
+        bridge_validation = validate_bridge(
+            plan,
+            plan_path=args.plan,
+            plan_file_sha256=plan_bound.file_sha256,
+        )
+    except Exception as exc:
+        raise ReportError(f"confirmatory bridge validation failed: {exc}") from exc
+    if (
+        bridge_validation.get("campaign_plan_sha256") != plan_sha
+        or bridge_validation.get("campaign_plan_file_sha256")
+        != plan_bound.file_sha256
+    ):
+        raise ReportError(
+            "frozen bridge validation is not bound to the in-memory plan bytes"
+        )
+    bridge = plan["confirmatory_bridge"]
+    source = bridge["screening_source"]
+    run_root = Path(str(plan["paths"]["run_root"]))
+    input_payloads: dict[str, bytes] = {}
+    input_snapshot = authenticated_bridge_input_snapshot(
+        plan=plan,
+        plan_path=args.plan,
+        run_root=run_root,
+        payloads=input_payloads,
+    )
+    if frozen_bridge_payload(args.plan, input_payloads) != plan_bound.payload:
+        raise ReportError("bridge plan bytes changed before input freeze")
+    source_report_descriptor = source["comprehensive_report"]["artifacts"][
+        "EXPERIMENT_RESULTS.json"
+    ]
+    source_report_path = Path(str(source_report_descriptor["path"]))
+    source_report_bound = frozen_bridge_json(source_report_path, input_payloads)
+    if (
+        source_report_bound.file_sha256 != source_report_descriptor["sha256"]
+        or len(source_report_bound.payload) != source_report_descriptor.get("size_bytes")
+    ):
+        raise ReportError("screening comprehensive report drifted after bridge validation")
+    source_report = source_report_bound.value
+    if not validate_embedded_hash(source_report, "report_sha256"):
+        raise ReportError("screening comprehensive report self-hash differs")
+    registry_path = (
+        args.price_registry or Path(str(plan["paths"]["snapshot"])) / PRICE_REGISTRY_RELATIVE
+    )
+    prices, price_metadata = load_prices(
+        registry_path,
+        plan.get("freeze", {}).get("model_registry"),
+    )
+    specs = expand_arms(plan)
+    cohorts, cost_arms = load_confirmatory_report_inputs(
+        run_root=run_root,
+        plan=plan,
+        plan_sha256=plan_sha,
+        specs=specs,
+        prices=prices,
+        frozen_payloads=input_payloads,
+    )
+    if authenticated_bridge_input_snapshot(
+        plan=plan,
+        plan_path=args.plan,
+        run_root=run_root,
+    ) != input_snapshot:
+        raise ReportError("confirmatory bridge evidence changed while being loaded")
+    survivors = list(bridge["survivor_arm_ids"])
+    observed_candidates: list[str] = []
+    for cohort in cohorts.get("cohorts", {}).values():
+        if not isinstance(cohort, Mapping) or cohort.get("state") != "complete":
+            continue
+        candidate = cohort.get("roles", {}).get("candidate")
+        arm_id = (
+            str(candidate.get("spec", {}).get("arm_id") or "")
+            if isinstance(candidate, Mapping)
+            else ""
+        )
+        observed_candidates.append(arm_id)
+    exact_coverage = sorted(observed_candidates) == survivors and len(observed_candidates) == len(
+        set(observed_candidates)
+    )
+    complete = bool(
+        cohorts.get("valid") is True
+        and cohorts.get("complete_cohort_count") == len(survivors)
+        and cohorts.get("partial_cohort_count") == 0
+        and cohorts.get("cohort_count") == len(survivors)
+        and exact_coverage
+    )
+    confirmatory_costs = compute_unique_costs(cost_arms)
+    screening_costs = source_report.get("unique_arm_costs")
+    if not isinstance(screening_costs, Mapping):
+        raise ReportError("screening report lacks unique cost evidence")
+    source_report_arms = source_report.get("arms")
+    observed_screening_costed_ids = sorted(
+        str(arm_id)
+        for arm_id, arm in (source_report_arms or {}).items()
+        if isinstance(arm, Mapping)
+        and arm.get("formal_evidence_valid") is True
+        and bool(arm.get("rows"))
+    ) if isinstance(source_report_arms, Mapping) else []
+    if source.get("screening_costed_arm_ids") != observed_screening_costed_ids:
+        raise ReportError(
+            "screening account identity scope differs from costed formal arms"
+        )
+    screening_account_identities = source.get(
+        "screening_account_evidence_identities"
+    )
+    reported_screening_identities = screening_costs.get(
+        "account_evidence_identities"
+    )
+    confirmatory_account_identities = confirmatory_costs.get(
+        "account_evidence_identities"
+    )
+    if (
+        not isinstance(screening_account_identities, list)
+        or not isinstance(confirmatory_account_identities, list)
+        or any(raw_sha256(value) is None for value in screening_account_identities)
+        or any(raw_sha256(value) is None for value in confirmatory_account_identities)
+    ):
+        raise ReportError("combined cost scopes lack authenticated account identities")
+    if reported_screening_identities is not None and (
+        not isinstance(reported_screening_identities, list)
+        or sorted(reported_screening_identities)
+        != sorted(screening_account_identities)
+    ):
+        raise ReportError(
+            "screening report account identities differ from authenticated source evidence"
+        )
+    duplicate_account_identities = sorted(
+        set(screening_account_identities) & set(confirmatory_account_identities)
+    )
+    if duplicate_account_identities:
+        raise ReportError(
+            "screening and confirmatory scopes reuse account evidence identity: "
+            + ",".join(duplicate_account_identities)
+        )
+    combined_costs = {
+        "selected_generation_counted_usd": _sum_optional_cost(
+            screening_costs, confirmatory_costs, "selected_generation_counted_usd"
+        ),
+        "judge_counted_usd": _sum_optional_cost(
+            screening_costs, confirmatory_costs, "judge_counted_usd"
+        ),
+        "account_delta_usd": _sum_optional_cost(
+            screening_costs, confirmatory_costs, "account_delta_usd"
+        ),
+        "unique_account_window_count": integer(
+            screening_costs.get("unique_account_window_count")
+            or screening_costs.get("unique_formal_arm_count")
+        )
+        + integer(confirmatory_costs.get("paired_cohort_count")),
+        "screening_windows_plus_confirmatory_cohorts": True,
+        "account_evidence_identities": sorted(
+            set(screening_account_identities) | set(confirmatory_account_identities)
+        ),
+    }
+    bound_ids = sorted(
+        set(survivors)
+        | {
+            str(spec.control_arm_id)
+            for spec in specs
+            if spec.arm_id in survivors and spec.control_arm_id is not None
+        }
+    )
+    screening_arms = source_report.get("arms")
+    if not isinstance(screening_arms, Mapping) or any(
+        arm_id not in screening_arms for arm_id in bound_ids
+    ):
+        raise ReportError("screening report lacks survivor/control arm evidence")
+    planned_output_root = Path(str(plan["paths"]["report_root"]))
+    output_root = args.output_root or planned_output_root
+    if output_root != planned_output_root:
+        raise ReportError(
+            "confirmatory bridge output root must equal the plan-bound report root"
+        )
+    old_output_root = source_report_path.parent.resolve()
+    if output_root == old_output_root:
+        raise ReportError("bridge reporter refuses to write into the screening report root")
+    try:
+        verifier.module.validate_confirmatory_root_isolation(
+            run_root=Path(str(plan["paths"]["run_root"])),
+            report_root=output_root,
+            snapshot=Path(str(plan["paths"]["snapshot"])),
+            screening_source=source,
+        )
+        verifier.module.secure_mkdir_absolute(output_root)
+    except Exception as exc:
+        raise ReportError(f"confirmatory bridge output root is unsafe: {exc}") from exc
+    completion = {
+        "status": "complete" if complete else "partial_or_failed",
+        "survivor_count": len(survivors),
+        "cohort_count": cohorts.get("cohort_count"),
+        "complete_cohort_count": cohorts.get("complete_cohort_count"),
+        "partial_cohort_count": cohorts.get("partial_cohort_count"),
+        "exact_one_complete_cohort_per_survivor": exact_coverage and complete,
+        "screening_source_authenticated": True,
+        "bridge_plan_and_derived_authenticated": True,
+    }
+    report: dict[str, Any] = {
+        "schema": CONFIRMATORY_BRIDGE_REPORT_SCHEMA,
+        "generated_at": now_iso(),
+        "run_id": plan.get("run_id"),
+        "bridge_plan_path": str(args.plan.resolve()),
+        "bridge_plan_file_sha256": plan_bound.file_sha256,
+        "bridge_plan_sha256": plan_sha,
+        "bridge_validation": bridge_validation,
+        "mini_is_diagnostic_only": True,
+        "automatic_winner_promotion": False,
+        "completion": completion,
+        "source_screening": {
+            "plan_path": source["screening_plan"]["path"],
+            "plan_file_sha256": source["screening_plan"]["file_sha256"],
+            "plan_canonical_sha256": source["screening_plan"]["canonical_sha256"],
+            "terminal_status_path": source["terminal_status"]["path"],
+            "terminal_status_file_sha256": source["terminal_status"]["file_sha256"],
+            "terminal_report_receipt_path": source["terminal_report_receipt"]["path"],
+            "terminal_report_receipt_file_sha256": source["terminal_report_receipt"][
+                "file_sha256"
+            ],
+            "report_path": str(source_report_path),
+            "report_file_sha256": source_report_bound.file_sha256,
+            "report_sha256": source_report.get("report_sha256"),
+            "survivor_arm_ids": survivors,
+            "survivor_groups": copy.deepcopy(source["survivor_groups"]),
+            "arms": {arm_id: copy.deepcopy(screening_arms[arm_id]) for arm_id in bound_ids},
+            "unique_arm_costs": copy.deepcopy(dict(screening_costs)),
+        },
+        "confirmatory_cohorts": cohorts,
+        "costs": {
+            "screening": copy.deepcopy(dict(screening_costs)),
+            "confirmatory": confirmatory_costs,
+            "combined": combined_costs,
+        },
+        "cost_policy": {
+            "selected_generation": "final selected generation attempt only; actual USD then cache-aware token estimate",
+            "judge_separate_per_role": True,
+            "screening_account_windows_from_source_report": True,
+            "confirmatory_account_delta_once_per_authenticated_cohort_id": True,
+        },
+        "paths": {
+            "output_root": str(output_root.resolve()),
+            "confirmatory_report_inputs": cohorts.get("path"),
+        },
+    }
+    markdown_destination = output_root / "EXPERIMENT_RESULTS.md"
+    json_destination = output_root / "EXPERIMENT_RESULTS.json"
+    if authenticated_bridge_input_snapshot(
+        plan=plan,
+        plan_path=args.plan,
+        run_root=run_root,
+    ) != input_snapshot:
+        raise ReportError("confirmatory bridge evidence changed before publication")
+    try:
+        verifier.module.secure_atomic_write_bytes(
+            markdown_destination,
+            _bridge_markdown(report).encode("utf-8"),
+        )
+    except Exception as exc:
+        raise ReportError(f"cannot securely publish bridge Markdown: {exc}") from exc
+    markdown_payload = stable_regular_file_bytes(markdown_destination)
+    report["root_artifacts"] = {
+        "markdown": {
+            "path": str(markdown_destination),
+            "sha256": hashlib.sha256(markdown_payload).hexdigest(),
+            "size_bytes": len(markdown_payload),
+        }
+    }
+    report["report_sha256"] = "sha256:" + canonical_sha256(report)
+    try:
+        verifier.module.secure_atomic_write_json(json_destination, report)
+    except Exception as exc:
+        raise ReportError(f"cannot securely publish bridge JSON: {exc}") from exc
+    validate_bridge_output_closure(
+        report=report,
+        markdown_path=markdown_destination,
+        json_path=json_destination,
+    )
+    if authenticated_bridge_input_snapshot(
+        plan=plan,
+        plan_path=args.plan,
+        run_root=run_root,
+    ) != input_snapshot:
+        raise ReportError("confirmatory bridge evidence changed during publication")
+    return report, 0 if complete or not args.strict else 2
 
 
 def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -5787,20 +6866,31 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     }
     report["report_sha256"] = "sha256:" + canonical_sha256(report)
     atomic_write_json(json_destination, report)
+    validate_generated_report_output_closure(
+        report=report,
+        output_root=output_root,
+    )
     exit_code = 2 if args.strict and report_status != "complete" else 0
     return report, exit_code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    report, exit_code = generate(args)
+    report, exit_code = (
+        generate_confirmatory_bridge(args) if args.confirmatory_bridge else generate(args)
+    )
+    completion = report["completion"]
     print(
         json.dumps(
             {
-                "status": report["completion"]["status"],
+                "status": completion["status"],
                 "run_id": report["run_id"],
-                "planned_arm_count": report["completion"]["planned_arm_count"],
-                "formal_succeeded_arm_count": report["completion"]["formal_succeeded_arm_count"],
+                "planned_arm_count": completion.get(
+                    "planned_arm_count", completion.get("survivor_count")
+                ),
+                "formal_succeeded_arm_count": completion.get(
+                    "formal_succeeded_arm_count", completion.get("complete_cohort_count")
+                ),
                 "output_root": report["paths"]["output_root"],
             },
             ensure_ascii=False,

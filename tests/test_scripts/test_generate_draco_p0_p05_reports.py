@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
@@ -469,6 +470,7 @@ class AccountWindowCohortTests(unittest.TestCase):
 
     @classmethod
     def _arm(cls, role: str, generation: float, judge: float) -> dict:
+        identity = report.canonical_sha256(cls._descriptor(role)["account_evidence"])
         return {
             "formal_evidence_valid": True,
             "rows": [{}],
@@ -487,6 +489,9 @@ class AccountWindowCohortTests(unittest.TestCase):
                 "byok_delta_usd": 0.0,
                 "reconciliation_stable": True,
                 "account_window_cohort": cls._descriptor(role),
+                "account_evidence_identities": [identity],
+                "account_evidence_identity_complete": True,
+                "account_evidence_identity_sha256": identity,
             },
         }
 
@@ -521,6 +526,30 @@ class AccountWindowCohortTests(unittest.TestCase):
                 {"E0": self._arm("control", 1.0, 0.1), "E1": conflicting}
             )
 
+    def test_different_cohort_ids_cannot_double_count_same_account_identity(self) -> None:
+        def arm_for(cohort_id: str, role: str) -> dict:
+            arm = self._arm(role, 1.0, 0.1)
+            arm["account"]["account_delta_usd"] = 7.0
+            descriptor = arm["account"]["account_window_cohort"]
+            descriptor["cohort_id"] = cohort_id
+            stable = {
+                key: copy.deepcopy(descriptor[key])
+                for key in ("schema", "cohort_id", "members", "account_evidence")
+            }
+            descriptor["cohort_sha256"] = "sha256:" + report.canonical_sha256(stable)
+            return arm
+
+        arms = {
+            "A-control": arm_for("cohort-a", "control"),
+            "A-candidate": arm_for("cohort-a", "candidate"),
+            "B-control": arm_for("cohort-b", "control"),
+            "B-candidate": arm_for("cohort-b", "candidate"),
+        }
+        with self.assertRaisesRegex(
+            report.ReportError, "reuse one account evidence identity"
+        ):
+            report.compute_unique_costs(arms)
+
     def test_formal_artifacts_must_bind_the_same_cohort_descriptor(self) -> None:
         descriptor = self._descriptor("control")
         manifest = {"account_window_cohort": descriptor}
@@ -541,6 +570,13 @@ class AccountWindowCohortTests(unittest.TestCase):
         for arm_id, delta in (("E0", 3.0), ("E1", 4.0)):
             arm = self._arm("control", 1.0, 0.1)
             arm["account"].pop("account_window_cohort")
+            arm["account"]["account_evidence_identity_sha256"] = (
+                report.canonical_sha256({"delta": delta})
+            )
+            arm["account"]["account_evidence_identities"] = [
+                arm["account"]["account_evidence_identity_sha256"]
+            ]
+            arm["account"]["account_evidence_identity_complete"] = True
             arm["account"]["account_delta_usd"] = delta
             arms[arm_id] = arm
         costs = report.compute_unique_costs(arms)
@@ -551,6 +587,22 @@ class AccountWindowCohortTests(unittest.TestCase):
             costs["note"],
             "unique arms only; shared common E0 is counted once; account actual includes Judge and is never added to theoretical cost",
         )
+
+    def test_screening_arms_cannot_reuse_one_account_identity(self) -> None:
+        arms = {}
+        identity = report.canonical_sha256({"same": "account-window"})
+        for arm_id, delta in (("E0", 7.0), ("E1", 7.0)):
+            arm = self._arm("control", 1.0, 0.1)
+            arm["account"].pop("account_window_cohort")
+            arm["account"]["account_evidence_identities"] = [identity]
+            arm["account"]["account_evidence_identity_complete"] = True
+            arm["account"]["account_evidence_identity_sha256"] = identity
+            arm["account"]["account_delta_usd"] = delta
+            arms[arm_id] = arm
+        with self.assertRaisesRegex(
+            report.ReportError, "different account scopes reuse"
+        ):
+            report.compute_unique_costs(arms)
 
 
 class AnalyzerOriginTests(unittest.TestCase):
@@ -1587,7 +1639,24 @@ class EndToEndTests(unittest.TestCase):
                 "artifacts": artifacts,
                 "cost_attribution": {
                     "campaign_bound_account_window_total_usd": 3.0,
-                    "account_windows": [{"stable_poll_count": 6, "required_stable_poll_count": 6}],
+                    "account_windows": [{
+                        "stable_poll_count": 6,
+                        "required_stable_poll_count": 6,
+                        "source_sha256": {
+                            "account_before": hashlib.sha256(
+                                f"{arm_id}:before".encode()
+                            ).hexdigest(),
+                            "account_after": hashlib.sha256(
+                                f"{arm_id}:after".encode()
+                            ).hexdigest(),
+                            "account_reconciliation": hashlib.sha256(
+                                f"{arm_id}:reconciliation".encode()
+                            ).hexdigest(),
+                            "runtime_environment": hashlib.sha256(
+                                f"{arm_id}:runtime".encode()
+                            ).hexdigest(),
+                        },
+                    }],
                 },
                 "reconciliation": {"status": "stable", "stable": True},
             },
@@ -2031,6 +2100,719 @@ class EndToEndTests(unittest.TestCase):
                     strict=True,
                 )
             )
+
+    def test_bridge_rejects_archived_source_tamper_after_role_load_before_publish(
+        self,
+    ) -> None:
+        _, entry = self._write_confirmatory_index()
+        plan = json.loads(self.plan_path.read_text(encoding="utf-8"))
+        before = report.authenticated_bridge_input_snapshot(
+            plan=plan,
+            plan_path=self.plan_path,
+            run_root=self.run_root,
+        )
+        candidate_root = Path(entry["roles"]["candidate"]["root"])
+        formal_manifest = json.loads(
+            (candidate_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        archived_result = Path(
+            formal_manifest["source_manifests"][0]["result_path"]
+        )
+        archived_result.write_text('{"tampered_after_load":true}\n', encoding="utf-8")
+        after = report.authenticated_bridge_input_snapshot(
+            plan=plan,
+            plan_path=self.plan_path,
+            run_root=self.run_root,
+        )
+        self.assertNotEqual(before, after)
+        self.assertIn(str(archived_result), before)
+
+    def test_bridge_loader_consumes_initial_frozen_bytes_across_aba_swap(self) -> None:
+        _, entry = self._write_confirmatory_index()
+        plan = json.loads(self.plan_path.read_text(encoding="utf-8"))
+        index_path = self.run_root / report.CONFIRMATORY_REPORT_INPUT_INDEX_NAME
+        original_index = index_path.read_bytes()
+        original_read = report.stable_regular_file_bytes
+        swapped_index = False
+
+        def swap_index_after_discovery(path):
+            nonlocal swapped_index
+            payload = original_read(path)
+            if Path(path) == index_path and not swapped_index:
+                swapped_index = True
+                mutated = json.loads(payload)
+                mutated["index_sha256"] = "0" * 64
+                write_json(index_path, mutated)
+            return payload
+
+        with (
+            mock.patch.object(
+                report,
+                "stable_regular_file_bytes",
+                side_effect=swap_index_after_discovery,
+            ),
+            self.assertRaisesRegex(
+                report.ReportError, "changed after snapshot discovery"
+            ),
+        ):
+            report.authenticated_bridge_input_snapshot(
+                plan=plan,
+                plan_path=self.plan_path,
+                run_root=self.run_root,
+            )
+        index_path.write_bytes(original_index)
+        payloads: dict[str, bytes] = {}
+        before = report.authenticated_bridge_input_snapshot(
+            plan=plan,
+            plan_path=self.plan_path,
+            run_root=self.run_root,
+            payloads=payloads,
+        )
+        control_root = Path(entry["roles"]["control"]["root"])
+        manifest = json.loads(
+            (control_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        archived_result = Path(manifest["source_manifests"][0]["result_path"])
+        original = archived_result.read_bytes()
+        archived_result.write_text('{"aba_payload":"B"}\n', encoding="utf-8")
+        prices, _ = report.load_prices(
+            self.snapshot / report.PRICE_REGISTRY_RELATIVE,
+            plan.get("freeze", {}).get("model_registry"),
+        )
+        cohorts, _ = report.load_confirmatory_report_inputs(
+            run_root=self.run_root,
+            plan=plan,
+            plan_sha256=report.canonical_sha256(plan),
+            specs=report.expand_arms(plan),
+            prices=prices,
+            frozen_payloads=payloads,
+        )
+        archived_result.write_bytes(original)
+        after = report.authenticated_bridge_input_snapshot(
+            plan=plan,
+            plan_path=self.plan_path,
+            run_root=self.run_root,
+        )
+        self.assertEqual(before, after)
+        self.assertTrue(cohorts["valid"])
+        self.assertEqual(cohorts["complete_cohort_count"], 1)
+
+    def test_bridge_snapshot_detects_derived_or_schedule_post_validation_tamper(
+        self,
+    ) -> None:
+        bridge_root = self.root / "snapshot-fence-run"
+        bridge_root.mkdir()
+        analyzer = bridge_root / "bridge-frozen-analyzer.json"
+        p99 = bridge_root / "bridge-analyzer-p99.json"
+        derived = bridge_root / "bridge-derived-plan.json"
+        schedule = bridge_root / "confirmatory-schedules" / "P0-12-E1.json"
+        for path in (analyzer, p99, schedule):
+            write_json(path, {"fixture": path.name})
+        write_json(
+            derived,
+            {"schedules": {"P0-12-E1": {"path": str(schedule)}}},
+        )
+        plan = {
+            "confirmatory_bridge": {
+                "survivor_arm_ids": ["P0-12-E1"],
+                "screening_source": {},
+                "derived_contract": {
+                    "path": str(derived),
+                    "analyzer_path": str(analyzer),
+                    "p99_path": str(p99),
+                },
+            }
+        }
+        plan_path = bridge_root / "campaign-plan.json"
+        write_json(plan_path, plan)
+        original_read = report.stable_regular_file_bytes
+        swapped = False
+
+        def swap_after_discovery(path):
+            nonlocal swapped
+            payload = original_read(path)
+            if Path(path) == derived and not swapped:
+                swapped = True
+                write_json(
+                    derived,
+                    {
+                        "schedules": {
+                            "P0-12-E1": {"path": str(schedule)}
+                        },
+                        "tampered_after_discovery": True,
+                    },
+                )
+            return payload
+
+        with (
+            mock.patch.object(
+                report,
+                "stable_regular_file_bytes",
+                side_effect=swap_after_discovery,
+            ),
+            self.assertRaisesRegex(
+                report.ReportError, "changed after snapshot discovery"
+            ),
+        ):
+            report.authenticated_bridge_input_snapshot(
+                plan=plan, plan_path=plan_path, run_root=bridge_root
+            )
+        write_json(
+            derived,
+            {"schedules": {"P0-12-E1": {"path": str(schedule)}}},
+        )
+        before = report.authenticated_bridge_input_snapshot(
+            plan=plan, plan_path=plan_path, run_root=bridge_root
+        )
+        schedule.write_text('{"tampered":true}\n', encoding="utf-8")
+        after = report.authenticated_bridge_input_snapshot(
+            plan=plan, plan_path=plan_path, run_root=bridge_root
+        )
+        self.assertNotEqual(before, after)
+        self.assertIn(str(schedule), before)
+
+
+    def _fixture(self, root: Path) -> tuple[argparse.Namespace, dict[str, object]]:
+        old_report_root = root / "old-reports"
+        output_root = root / "new-reports"
+        run_root = root / "bridge-run"
+        old_report = {
+            "schema": report.REPORT_SCHEMA,
+            "campaign_plan_sha256": "a" * 64,
+            "completion": {"status": "complete"},
+            "arms": {
+                "common-E0-R1": {
+                    "spec": {"arm_id": "common-E0-R1"},
+                    "formal_evidence_valid": True,
+                },
+                "P0-99-E1": {
+                    "spec": {"arm_id": "P0-99-E1"},
+                    "formal_evidence_valid": True,
+                    "rows": [{"task_id": "non-survivor-cost-scope"}],
+                },
+                "P0-12-E1": {
+                    "spec": {"arm_id": "P0-12-E1"},
+                    "formal_evidence_valid": True,
+                },
+            },
+            "unique_arm_costs": {
+                "selected_generation_counted_usd": 10.0,
+                "judge_counted_usd": 1.0,
+                "account_delta_usd": 12.0,
+                "unique_account_window_count": 2,
+                "account_evidence_identities": ["a" * 64],
+            },
+        }
+        old_report["report_sha256"] = "sha256:" + report.canonical_sha256(old_report)
+        old_report_path = old_report_root / "EXPERIMENT_RESULTS.json"
+        write_json(old_report_path, old_report)
+        old_run_root = root / "old-run"
+        old_run_root.mkdir()
+        for name in (
+            "campaign-plan.json",
+            "terminal-status-input.json",
+            "terminal-report-receipt.json",
+        ):
+            write_json(old_run_root / name, {"fixture": name})
+        source = {
+            "screening_account_evidence_identities": ["a" * 64],
+            "screening_costed_arm_ids": ["P0-99-E1"],
+            "screening_plan": {
+                "path": str(old_run_root / "campaign-plan.json"),
+                "file_sha256": "b" * 64,
+                "canonical_sha256": "a" * 64,
+            },
+            "terminal_status": {
+                "path": str(old_run_root / "terminal-status-input.json"),
+                "file_sha256": "c" * 64,
+            },
+            "terminal_report_receipt": {
+                "path": str(old_run_root / "terminal-report-receipt.json"),
+                "file_sha256": "d" * 64,
+            },
+            "comprehensive_report": {
+                "artifacts": {
+                    "EXPERIMENT_RESULTS.json": {
+                        "path": str(old_report_path),
+                        "sha256": report.file_sha256(old_report_path),
+                        "size_bytes": old_report_path.stat().st_size,
+                    }
+                }
+            },
+            "survivor_groups": {
+                "P0-12::E1": {
+                    "pass": True,
+                    "candidate_arm_ids": ["P0-12-E1"],
+                    "quality_basis": "individual_task_pairing",
+                    "quality": {
+                        "mean_delta_quality": 1.0,
+                        "median_delta_quality": 1.0,
+                        "wins": 10,
+                        "ties": 0,
+                        "losses": 0,
+                        "minimum_task_delta_quality": 1.0,
+                    },
+                }
+            },
+        }
+        plan = {
+            "schema": report.PLAN_SCHEMA,
+            "run_id": "bridge",
+            "paths": {
+                "run_root": str(run_root),
+                "report_root": str(output_root),
+                "snapshot": str(root / "snapshot"),
+            },
+            "freeze": {"model_registry": {}},
+            "confirmatory_bridge": {
+                "schema": report.CONFIRMATORY_BRIDGE_SCHEMA,
+                "survivor_arm_ids": ["P0-12-E1"],
+                "screening_source": source,
+            },
+        }
+        plan_path = run_root / "campaign-plan.json"
+        write_json(plan_path, plan)
+        args = argparse.Namespace(
+            plan=plan_path,
+            status=None,
+            derived_plan=None,
+            price_registry=None,
+            output_root=output_root,
+            allow_nonterminal=False,
+            strict=True,
+            confirmatory_bridge=True,
+        )
+        return args, plan
+
+    def test_bridge_report_merges_source_and_exact_cohort_without_double_accounting(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, _ = self._fixture(root)
+            specs = [
+                report.ArmSpec(
+                    arm_id="common-E0-R1",
+                    experiment_id="common-E0",
+                    directory_name="common",
+                    title="control",
+                    variant="E0",
+                    replicate=1,
+                    analyzer_mode="frozen_replay",
+                    control_arm_id=None,
+                    override={},
+                    dynamic=None,
+                    wire_gate=None,
+                    output_name="control",
+                ),
+                report.ArmSpec(
+                    arm_id="P0-12-E1",
+                    experiment_id="P0-12",
+                    directory_name="P0-12",
+                    title="candidate",
+                    variant="E1",
+                    replicate=1,
+                    analyzer_mode="frozen_replay",
+                    control_arm_id="common-E0-R1",
+                    override={},
+                    dynamic=None,
+                    wire_gate=None,
+                    output_name="candidate",
+                ),
+            ]
+            cohort = {
+                "cohort": {
+                    "state": "complete",
+                    "roles": {
+                        "control": {
+                            "spec": {"arm_id": "common-E0-R1"},
+                            "metrics": {
+                                "row_count": 10,
+                                "done_count": 10,
+                                "avg_quality_total": 50.0,
+                                "judge_error_count": 0,
+                                "selected_generation_cost_counted_usd": 2.0,
+                                "judge_cost_counted_usd": 0.1,
+                            },
+                            "account": {"account_delta_usd": 5.0},
+                        },
+                        "candidate": {
+                            "spec": {"arm_id": "P0-12-E1"},
+                            "metrics": {
+                                "row_count": 10,
+                                "done_count": 10,
+                                "avg_quality_total": 52.0,
+                                "judge_error_count": 0,
+                                "selected_generation_cost_counted_usd": 2.5,
+                                "judge_cost_counted_usd": 0.1,
+                            },
+                            "account": {"account_delta_usd": 5.0},
+                        },
+                    },
+                    "comparison": {
+                        "pair_count": 10,
+                        "mean_delta_quality": 2.0,
+                        "wins": 8,
+                        "ties": 0,
+                        "losses": 2,
+                    },
+                }
+            }
+            cohorts = {
+                "status": "complete",
+                "valid": True,
+                "cohort_count": 1,
+                "complete_cohort_count": 1,
+                "partial_cohort_count": 0,
+                "path": str(root / "bridge-run" / "confirmatory-report-inputs.json"),
+                "cohorts": cohort,
+            }
+            module = mock.Mock()
+            plan_bound = report.load_bound_json(args.plan)
+            module.validate_confirmatory_bridge_document.return_value = {
+                "status": "valid",
+                "generation_calls": 0,
+                "campaign_plan_sha256": report.canonical_sha256(plan_bound.value),
+                "campaign_plan_file_sha256": plan_bound.file_sha256,
+            }
+            module.validate_confirmatory_root_isolation.return_value = None
+            module.secure_mkdir_absolute.side_effect = lambda path: Path(path).mkdir(
+                parents=True, exist_ok=True
+            )
+            module.secure_atomic_write_bytes.side_effect = (
+                lambda path, payload: Path(path).write_bytes(payload)
+            )
+            module.secure_atomic_write_json.side_effect = (
+                lambda path, value: write_json(Path(path), value)
+            )
+            verifier = mock.Mock(module=module)
+            confirm_costs = {
+                "selected_generation_counted_usd": 4.5,
+                "judge_counted_usd": 0.2,
+                "account_delta_usd": 5.0,
+                "unique_account_window_count": 1,
+                "paired_cohort_count": 1,
+                "account_evidence_identities": ["b" * 64],
+            }
+            with (
+                mock.patch.object(report, "load_frozen_controller_verifier", return_value=verifier),
+                mock.patch.object(report, "load_prices", return_value=({}, {"model_count": 79})),
+                mock.patch.object(report, "expand_arms", return_value=specs),
+                mock.patch.object(
+                    report,
+                    "load_confirmatory_report_inputs",
+                    return_value=(cohorts, {"control": {}, "candidate": {}}),
+                ),
+                mock.patch.object(report, "compute_unique_costs", return_value=confirm_costs),
+            ):
+                document, exit_code = report.generate_confirmatory_bridge(args)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(document["completion"]["status"], "complete")
+            self.assertTrue(
+                document["completion"]["exact_one_complete_cohort_per_survivor"]
+            )
+            self.assertEqual(document["costs"]["combined"]["account_delta_usd"], 17.0)
+            self.assertEqual(document["costs"]["confirmatory"]["paired_cohort_count"], 1)
+            self.assertTrue((args.output_root / "EXPERIMENT_RESULTS.md").is_file())
+            root_json = json.loads((args.output_root / "EXPERIMENT_RESULTS.json").read_text())
+            self.assertTrue(report.validate_embedded_hash(root_json, "report_sha256"))
+
+    def test_bridge_report_strictly_rejects_missing_survivor_cohort(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, _ = self._fixture(root)
+            module = mock.Mock()
+            plan_bound = report.load_bound_json(args.plan)
+            module.validate_confirmatory_bridge_document.return_value = {
+                "status": "valid",
+                "campaign_plan_sha256": report.canonical_sha256(plan_bound.value),
+                "campaign_plan_file_sha256": plan_bound.file_sha256,
+            }
+            module.validate_confirmatory_root_isolation.return_value = None
+            module.secure_mkdir_absolute.side_effect = lambda path: Path(path).mkdir(
+                parents=True, exist_ok=True
+            )
+            module.secure_atomic_write_bytes.side_effect = (
+                lambda path, payload: Path(path).write_bytes(payload)
+            )
+            module.secure_atomic_write_json.side_effect = (
+                lambda path, value: write_json(Path(path), value)
+            )
+            verifier = mock.Mock(module=module)
+            absent = {
+                "status": "absent",
+                "valid": True,
+                "cohort_count": 0,
+                "complete_cohort_count": 0,
+                "partial_cohort_count": 0,
+                "cohorts": {},
+            }
+            specs = [
+                report.ArmSpec(
+                    arm_id="P0-12-E1",
+                    experiment_id="P0-12",
+                    directory_name="P0-12",
+                    title="candidate",
+                    variant="E1",
+                    replicate=1,
+                    analyzer_mode="frozen_replay",
+                    control_arm_id="common-E0-R1",
+                    override={},
+                    dynamic=None,
+                    wire_gate=None,
+                    output_name="candidate",
+                )
+            ]
+            with (
+                mock.patch.object(report, "load_frozen_controller_verifier", return_value=verifier),
+                mock.patch.object(report, "load_prices", return_value=({}, {"model_count": 79})),
+                mock.patch.object(report, "expand_arms", return_value=specs),
+                mock.patch.object(
+                    report,
+                    "load_confirmatory_report_inputs",
+                    return_value=(absent, {}),
+                ),
+                mock.patch.object(
+                    report,
+                    "compute_unique_costs",
+                    return_value={
+                        "paired_cohort_count": 0,
+                        "account_evidence_identities": ["b" * 64],
+                    },
+                ),
+            ):
+                document, exit_code = report.generate_confirmatory_bridge(args)
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(document["completion"]["status"], "partial_or_failed")
+
+    def test_bridge_report_plan_and_source_report_are_bound_to_authenticated_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, _ = self._fixture(root)
+            module = mock.Mock()
+            module.validate_confirmatory_bridge_document.return_value = {
+                "status": "valid",
+                "campaign_plan_sha256": "0" * 64,
+                "campaign_plan_file_sha256": "1" * 64,
+            }
+            with (
+                mock.patch.object(
+                    report,
+                    "load_frozen_controller_verifier",
+                    return_value=mock.Mock(module=module),
+                ),
+                self.assertRaisesRegex(report.ReportError, "in-memory plan bytes"),
+            ):
+                report.generate_confirmatory_bridge(args)
+
+    def test_bridge_report_rejects_plan_aba_before_input_freeze(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, _ = self._fixture(root)
+            plan_bound = report.load_bound_json(args.plan)
+            module = mock.Mock()
+            module.validate_confirmatory_bridge_document.return_value = {
+                "status": "valid",
+                "campaign_plan_sha256": report.canonical_sha256(plan_bound.value),
+                "campaign_plan_file_sha256": plan_bound.file_sha256,
+            }
+            original_snapshot = report.authenticated_bridge_input_snapshot
+
+            def restore_other_plan(**kwargs):
+                replacement = copy.deepcopy(plan_bound.value)
+                replacement["run_id"] = "restored-A"
+                write_json(args.plan, replacement)
+                return original_snapshot(**kwargs)
+
+            with (
+                mock.patch.object(
+                    report,
+                    "load_frozen_controller_verifier",
+                    return_value=mock.Mock(module=module),
+                ),
+                mock.patch.object(
+                    report,
+                    "authenticated_bridge_input_snapshot",
+                    side_effect=restore_other_plan,
+                ),
+                self.assertRaisesRegex(
+                    report.ReportError, "plan bytes changed before input freeze"
+                ),
+            ):
+                report.generate_confirmatory_bridge(args)
+
+    def test_bridge_report_rejects_cross_scope_account_identity_double_count(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, _ = self._fixture(root)
+            plan_bound = report.load_bound_json(args.plan)
+            module = mock.Mock()
+            module.validate_confirmatory_bridge_document.return_value = {
+                "status": "valid",
+                "campaign_plan_sha256": report.canonical_sha256(plan_bound.value),
+                "campaign_plan_file_sha256": plan_bound.file_sha256,
+            }
+            cohorts = {
+                "status": "complete",
+                "valid": True,
+                "cohort_count": 1,
+                "complete_cohort_count": 1,
+                "partial_cohort_count": 0,
+                "cohorts": {},
+            }
+            with (
+                mock.patch.object(
+                    report,
+                    "load_frozen_controller_verifier",
+                    return_value=mock.Mock(module=module),
+                ),
+                mock.patch.object(report, "load_prices", return_value=({}, {})),
+                mock.patch.object(report, "expand_arms", return_value=[]),
+                mock.patch.object(
+                    report,
+                    "load_confirmatory_report_inputs",
+                    return_value=(cohorts, {"one": {}}),
+                ),
+                mock.patch.object(
+                    report,
+                    "compute_unique_costs",
+                    return_value={
+                        "account_evidence_identities": ["a" * 64],
+                        "account_delta_usd": 7.0,
+                    },
+                ),
+                self.assertRaisesRegex(
+                    report.ReportError, "reuse account evidence identity"
+                ),
+            ):
+                report.generate_confirmatory_bridge(args)
+
+    def test_report_atomic_write_rejects_parent_symlink_without_touching_sentinel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            external = root / "external"
+            external.mkdir()
+            sentinel = external / "sentinel.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            alias = root / "alias"
+            alias.symlink_to(external, target_is_directory=True)
+            with self.assertRaises((OSError, report.ReportError)):
+                report.atomic_write(alias / "report.md", "must-not-escape\n")
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
+            self.assertFalse((external / "report.md").exists())
+
+    def test_bridge_input_snapshot_detects_index_and_formal_post_load_tamper(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            formal_root = root / "formal"
+            run_root.mkdir()
+            formal_root.mkdir()
+            plan_path = run_root / "campaign-plan.json"
+            write_json(plan_path, {"fixture": True})
+            source_files = {}
+            for name in ("source-plan.json", "status.json", "receipt.json", "report.json"):
+                path = root / name
+                write_json(path, {"name": name})
+                source_files[name] = path
+            formal_artifacts = {}
+            for name in (
+                "manifest.json",
+                "results.jsonl",
+                "trace.jsonl",
+                "audit.json",
+                "openrouter-non-byok-campaign-proof.json",
+            ):
+                path = formal_root / name
+                path.write_text("{}\n", encoding="utf-8")
+                formal_artifacts[name] = report.file_sha256(path)
+            plan = {
+                "confirmatory_bridge": {
+                    "screening_source": {
+                        "screening_plan": {"path": str(source_files["source-plan.json"])},
+                        "terminal_status": {"path": str(source_files["status.json"])},
+                        "terminal_report_receipt": {
+                            "path": str(source_files["receipt.json"])
+                        },
+                        "comprehensive_report": {
+                            "artifacts": {
+                                "EXPERIMENT_RESULTS.json": {
+                                    "path": str(source_files["report.json"])
+                                }
+                            }
+                        },
+                        "arms": {
+                            "E1": {
+                                "output_dir": str(formal_root),
+                                "formal_artifacts": formal_artifacts,
+                                "group_reports": {},
+                            }
+                        },
+                    }
+                }
+            }
+            initial = report.authenticated_bridge_input_snapshot(
+                plan=plan, plan_path=plan_path, run_root=run_root
+            )
+            (formal_root / "results.jsonl").write_text(
+                '{"tampered":true}\n', encoding="utf-8"
+            )
+            changed = report.authenticated_bridge_input_snapshot(
+                plan=plan, plan_path=plan_path, run_root=run_root
+            )
+            self.assertNotEqual(initial, changed)
+
+            index = {
+                "schema": report.CONFIRMATORY_REPORT_INPUT_INDEX_SCHEMA,
+                "campaign_plan_sha256": "a" * 64,
+                "entries": [],
+            }
+            index["index_sha256"] = report.canonical_sha256(index)
+            index_path = run_root / report.CONFIRMATORY_REPORT_INPUT_INDEX_NAME
+            write_json(index_path, index)
+            before_index_swap = report.authenticated_bridge_input_snapshot(
+                plan=plan, plan_path=plan_path, run_root=run_root
+            )
+            index["extra"] = True
+            write_json(index_path, index)
+            after_index_swap = report.authenticated_bridge_input_snapshot(
+                plan=plan, plan_path=plan_path, run_root=run_root
+            )
+            self.assertNotEqual(before_index_swap, after_index_swap)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, plan = self._fixture(root)
+            plan["confirmatory_bridge"]["screening_source"]["comprehensive_report"][
+                "artifacts"
+            ]["EXPERIMENT_RESULTS.json"]["sha256"] = "0" * 64
+            write_json(args.plan, plan)
+            plan_bound = report.load_bound_json(args.plan)
+            module = mock.Mock()
+            module.validate_confirmatory_bridge_document.return_value = {
+                "status": "valid",
+                "campaign_plan_sha256": report.canonical_sha256(plan_bound.value),
+                "campaign_plan_file_sha256": plan_bound.file_sha256,
+            }
+            with (
+                mock.patch.object(
+                    report,
+                    "load_frozen_controller_verifier",
+                    return_value=mock.Mock(module=module),
+                ),
+                self.assertRaisesRegex(
+                    report.ReportError, "comprehensive report drifted"
+                ),
+            ):
+                report.generate_confirmatory_bridge(args)
 
     def test_controller_manifest_hash_binding_fails_closed(self) -> None:
         status = json.loads(self.status_path.read_text())

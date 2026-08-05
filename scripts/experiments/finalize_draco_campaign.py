@@ -5007,6 +5007,7 @@ _STRUCTURAL_AGGREGATOR_RECOVERY_TRIGGERS = frozenset(
         "continuation_failed",
         "aggregator_error",
         "ensemble_aggregator_incomplete",
+        "incomplete_stream",
     }
 )
 _SEMANTIC_AGGREGATOR_FALLBACK_MARKERS = (

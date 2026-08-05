@@ -21,6 +21,7 @@ Usage:
     [--groups CANONICAL_GROUP_SUBSET]
     [--experiment-config-override-json JSON_OBJECT]
     [--confirmatory-schedule IMMUTABLE_PAIRED_COHORT_JSON]
+    [--confirmatory-schedule-fd SEALED_INHERITED_FD]
 
 By default, output is a new direct child of:
   SNAPSHOT_REPO/reports/draco
@@ -95,6 +96,7 @@ OUTPUT_NAME="${DRACO_CAMPAIGN_OUTPUT_NAME:-}"
 EXPERIMENT_CONFIG_OVERRIDE_JSON=""
 EXPERIMENT_CONFIG_OVERRIDE_JSON_PRESENT=0
 CONFIRMATORY_SCHEDULE=""
+CONFIRMATORY_SCHEDULE_FD=""
 PRIOR_ACCOUNT_WINDOW_SOURCES=()
 if [[ -n "${DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR:-}" ]]; then
   PRIOR_ACCOUNT_WINDOW_SOURCES+=("$DRACO_CAMPAIGN_PRIOR_ACCOUNT_WINDOW_DIR")
@@ -133,6 +135,11 @@ while [[ "$#" -gt 0 ]]; do
       CONFIRMATORY_SCHEDULE="$2"
       shift 2
       ;;
+    --confirmatory-schedule-fd)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      CONFIRMATORY_SCHEDULE_FD="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -146,6 +153,17 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 validate_draco_groups "$DRACO_GROUPS" || exit 2
+if [[ -n "$CONFIRMATORY_SCHEDULE" && -n "$CONFIRMATORY_SCHEDULE_FD" ]]; then
+  echo "Only one confirmatory schedule input mode may be used" >&2
+  exit 2
+fi
+if [[ -n "$CONFIRMATORY_SCHEDULE_FD" ]]; then
+  if [[ ! "$CONFIRMATORY_SCHEDULE_FD" =~ ^[0-9]+$ ]] || [[ ! -r "/proc/self/fd/$CONFIRMATORY_SCHEDULE_FD" ]]; then
+    echo "--confirmatory-schedule-fd must name one readable inherited descriptor" >&2
+    exit 2
+  fi
+  CONFIRMATORY_SCHEDULE="/proc/self/fd/$CONFIRMATORY_SCHEDULE_FD"
+fi
 if [[ -n "$CONFIRMATORY_SCHEDULE" ]]; then
   if [[ "$DRACO_GROUPS" != "G1" ]]; then
     echo "Confirmatory paired cohorts require --groups G1" >&2
@@ -159,11 +177,15 @@ if [[ -n "$CONFIRMATORY_SCHEDULE" ]]; then
     echo "Confirmatory paired cohorts require one new shared account window" >&2
     exit 2
   fi
-  if [[ ! -f "$CONFIRMATORY_SCHEDULE" || -L "$CONFIRMATORY_SCHEDULE" ]]; then
-    echo "Confirmatory schedule must be a regular non-symlink file" >&2
-    exit 2
+  if [[ -z "$CONFIRMATORY_SCHEDULE_FD" ]]; then
+    if [[ ! -f "$CONFIRMATORY_SCHEDULE" || -L "$CONFIRMATORY_SCHEDULE" ]]; then
+      echo "Confirmatory schedule must be a regular non-symlink file" >&2
+      exit 2
+    fi
   fi
-  CONFIRMATORY_SCHEDULE="$(realpath "$CONFIRMATORY_SCHEDULE")"
+  if [[ -z "$CONFIRMATORY_SCHEDULE_FD" ]]; then
+    CONFIRMATORY_SCHEDULE="$(realpath "$CONFIRMATORY_SCHEDULE")"
+  fi
 fi
 readonly DRACO_GROUPS
 DRACO_GROUP_SLUG="${DRACO_GROUPS,,}"
@@ -231,14 +253,32 @@ if [[ -n "$CONFIRMATORY_SCHEDULE" ]]; then
   if ! EFFECTIVE_CONFIG_RUNTIME_VALUES="$(
     "$PYTHON" -c '
 import hashlib
+import fcntl
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[1])
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
 
-schedule = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+schedule_fd = sys.argv[5]
+if schedule_fd:
+    fd = int(schedule_fd)
+    required_seals = (
+        getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+        | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+        | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+        | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+    )
+    seals = fcntl.fcntl(fd, getattr(fcntl, "F_GET_SEALS", 1034))
+    if seals & required_seals != required_seals:
+        raise SystemExit("confirmatory schedule fd is not fully sealed")
+    size = os.fstat(fd).st_size
+    schedule_bytes = os.pread(fd, size, 0)
+else:
+    schedule_bytes = Path(sys.argv[3]).read_bytes()
+schedule = json.loads(schedule_bytes)
 if schedule.get("schema") != "opensquilla.draco-p0-p05-confirmatory-schedule/v1":
     raise SystemExit("confirmatory schedule schema differs")
 
@@ -340,7 +380,7 @@ if roles["control"].get("analyzer_mode") == "frozen_replay":
     ):
         raise SystemExit("confirmatory frozen Analyzer replay must retain ten entries")
 print("\t".join(str(value) for value in (*runtime_values[0], schedule["schedule_sha256"])))
-' "$SNAPSHOT_REPO/src" "$EXPERIMENT_CONFIG" "$CONFIRMATORY_SCHEDULE" "$INPUT"
+' "$SNAPSHOT_REPO/src" "$EXPERIMENT_CONFIG" "$CONFIRMATORY_SCHEDULE" "$INPUT" "$CONFIRMATORY_SCHEDULE_FD"
   )"; then
     echo "Unable to validate the confirmatory schedule/effective configs" >&2
     exit 2
