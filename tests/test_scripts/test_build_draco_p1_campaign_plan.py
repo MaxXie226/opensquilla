@@ -79,3 +79,15 @@ def test_cli_freezes_p1_35_progression_threshold() -> None:
     )
     assert schedule["strict_task_interleaving"] is False
     assert schedule["design_label"] == "anchored_serial_not_task_interleaved"
+
+
+def test_excluded_rows_copy_every_exact_group_contract() -> None:
+    contracts = {
+        "P1-06": {"kind": "missing_feature", "reason": "feature-specific reason"},
+        "P1-01": {"kind": "deterministic_no_hit", "reason": "slice-specific reason"},
+    }
+    controller = type("Controller", (), {"EXCLUDED_GROUP_CONTRACTS": contracts})()
+    assert module._excluded_rows(controller) == [
+        {"id": "P1-01", **contracts["P1-01"]},
+        {"id": "P1-06", **contracts["P1-06"]},
+    ]

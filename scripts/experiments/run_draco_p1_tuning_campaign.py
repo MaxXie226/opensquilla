@@ -29,10 +29,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-PLAN_SCHEMA = "opensquilla.draco-p1-campaign-plan/v1"
-STATUS_SCHEMA = "opensquilla.draco-p1-controller-status/v1"
-DERIVED_SCHEMA = "opensquilla.draco-p1-derived-plan/v1"
-HIT_RECEIPT_SCHEMA = "opensquilla.draco-p1-hit-gate-receipt/v1"
+PLAN_SCHEMA = "opensquilla.draco-p1-campaign-plan/v2"
+STATUS_SCHEMA = "opensquilla.draco-p1-controller-status/v2"
+DERIVED_SCHEMA = "opensquilla.draco-p1-derived-plan/v2"
+HIT_RECEIPT_SCHEMA = "opensquilla.draco-p1-hit-gate-receipt/v2"
+PROGRESSION_SCHEMA = "opensquilla.draco-p1-progression/v2"
+PROGRESSION_RECEIPT_SCHEMA = "opensquilla.draco-p1-15-progression-receipt/v2"
+SEMANTIC_CONTRACT = "opensquilla.draco-p1-semantics/hit-slice-primary/v2"
 SOURCE_ARM_ID = "common-E0-source"
 REPLAY_CONTROL_IDS = ("common-E0-R1", "common-E0-R2", "common-E0-R3")
 EXPECTED_TASK_COUNT = 10
@@ -42,11 +45,90 @@ SCREENING_DESIGN_LABEL = "anchored_serial_not_task_interleaved"
 CONFIRMATORY_DESIGN_LABEL = "strict_task_interleaved_confirmatory"
 
 # These exclusions are facts about the frozen DRACO-mini slice/runtime, not
-# tuning conclusions.  They must be represented in the plan as explicit
-# receipts instead of silently disappearing from the matrix.
-MISSING_FEATURE_GROUPS = frozenset({"P1-06", "P1-31", "P1-33", "P1-41"})
+# tuning conclusions.  The exact per-group kind/reason contract is part of the
+# campaign identity: the builder emits it verbatim and the controller rejects
+# generic, missing, duplicated, or changed explanations.
+EXCLUDED_GROUP_CONTRACTS: dict[str, dict[str, str]] = {
+    "P1-01": {
+        "kind": "deterministic_no_hit",
+        "reason": (
+            "all ten frozen DRACO-mini Analyzer inputs are below the 16k/24k "
+            "truncation boundary, so input_max_chars cannot change a request"
+        ),
+    },
+    "P1-02": {
+        "kind": "deterministic_no_hit",
+        "reason": (
+            "all ten frozen DRACO-mini Analyzer inputs avoid input truncation, "
+            "so analyzer_input_head_fraction is never applied"
+        ),
+    },
+    "P1-06": {
+        "kind": "missing_feature",
+        "reason": (
+            "the frozen runtime has no deterministic Analyzer fault schedule or "
+            "versioned full-fallback-profile receipt required by this group"
+        ),
+    },
+    "P1-09": {
+        "kind": "deterministic_no_hit",
+        "reason": (
+            "the frozen DRACO-mini routing slice has no context-underqualified "
+            "model/task match, so the context penalty multiplier is never applied"
+        ),
+    },
+    "P1-10": {
+        "kind": "deterministic_no_hit",
+        "reason": (
+            "the frozen DRACO-mini tasks are independent new turns with no session "
+            "intent-threshold transition"
+        ),
+    },
+    "P1-11": {
+        "kind": "deterministic_no_hit",
+        "reason": (
+            "the frozen DRACO-mini tasks contain no continuation or redo session "
+            "signal, so session_score_delta is never applied"
+        ),
+    },
+    "P1-12": {
+        "kind": "deterministic_no_hit",
+        "reason": (
+            "the frozen DRACO-mini tasks contain no negative-feedback escalation; "
+            "the observed escalation level remains zero"
+        ),
+    },
+    "P1-31": {
+        "kind": "missing_feature",
+        "reason": (
+            "the frozen runner has no reproducible position-based Aggregator fault "
+            "schedule for the recovery token-cap/reserve contract"
+        ),
+    },
+    "P1-33": {
+        "kind": "missing_feature",
+        "reason": (
+            "the frozen G1 experiment override schema does not expose "
+            "aggregator_serving_chain_timeout_seconds for formal variation"
+        ),
+    },
+    "P1-41": {
+        "kind": "missing_feature",
+        "reason": (
+            "the frozen runner lacks the deterministic position-based Aggregator "
+            "fault schedule needed to exercise recovery top-k"
+        ),
+    },
+}
+MISSING_FEATURE_GROUPS = frozenset(
+    group
+    for group, contract in EXCLUDED_GROUP_CONTRACTS.items()
+    if contract["kind"] == "missing_feature"
+)
 DETERMINISTIC_NO_HIT_GROUPS = frozenset(
-    {"P1-01", "P1-02", "P1-09", "P1-10", "P1-11", "P1-12"}
+    group
+    for group, contract in EXCLUDED_GROUP_CONTRACTS.items()
+    if contract["kind"] == "deterministic_no_hit"
 )
 SUPPORTED_GROUPS = frozenset(
     {
@@ -258,12 +340,13 @@ def expected_variant_contracts() -> dict[str, dict[str, Any]]:
             "priority": priority,
         }
 
+    timeout_gate = HitGate("analyzer_timeout_observed", "true", True)
     retry_gate = HitGate("analyzer_retry_or_fallback", "true", True)
     add(
         "P1-04",
         "E1",
         _ranking_override({"task_analyzer": {"timeout_seconds": 10.0}}),
-        retry_gate,
+        timeout_gate,
         analyzer_mode="live",
         control=SOURCE_ARM_ID,
         priority=20,
@@ -272,7 +355,7 @@ def expected_variant_contracts() -> dict[str, dict[str, Any]]:
         "P1-04",
         "E2",
         _ranking_override({"task_analyzer": {"timeout_seconds": 40.0}}),
-        retry_gate,
+        timeout_gate,
         analyzer_mode="live",
         control=SOURCE_ARM_ID,
         priority=21,
@@ -634,6 +717,8 @@ def expand_arms(plan: Mapping[str, Any]) -> list[Arm]:
 def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[Arm]:
     if plan.get("schema") != PLAN_SCHEMA:
         raise ControllerError("campaign plan schema differs")
+    if plan.get("semantic_contract") != SEMANTIC_CONTRACT:
+        raise ControllerError("campaign semantic contract differs")
     if not allow_placeholders and _contains_placeholder(plan):
         raise ControllerError("campaign plan still contains TODO placeholders")
     run_id = str(plan.get("run_id") or "")
@@ -701,22 +786,21 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
     excluded = plan.get("excluded")
     if not isinstance(excluded, list):
         raise ControllerError("excluded matrix is missing")
-    excluded_ids = {str(item.get("id") or "") for item in excluded if isinstance(item, Mapping)}
-    expected_excluded = MISSING_FEATURE_GROUPS | DETERMINISTIC_NO_HIT_GROUPS
-    if excluded_ids != expected_excluded:
-        raise ControllerError("excluded matrix does not match missing/no-hit P1 groups")
+    if len(excluded) != len(EXCLUDED_GROUP_CONTRACTS):
+        raise ControllerError("excluded matrix must contain each frozen contract exactly once")
+    actual_excluded: dict[str, dict[str, str]] = {}
     for item in excluded:
-        if not isinstance(item, Mapping) or not str(item.get("reason") or "").strip():
-            raise ControllerError("every excluded P1 group needs a reason")
-        kind = str(item.get("kind") or "")
+        if not isinstance(item, Mapping):
+            raise ControllerError("every excluded P1 group must be an object")
         group = str(item.get("id") or "")
-        expected_kind = (
-            "missing_feature"
-            if group in MISSING_FEATURE_GROUPS
-            else "deterministic_no_hit"
-        )
-        if kind != expected_kind:
-            raise ControllerError(f"{group} exclusion kind differs")
+        if group in actual_excluded:
+            raise ControllerError(f"duplicate excluded P1 group: {group}")
+        actual_excluded[group] = {
+            "kind": str(item.get("kind") or ""),
+            "reason": str(item.get("reason") or ""),
+        }
+    if actual_excluded != EXCLUDED_GROUP_CONTRACTS:
+        raise ControllerError("excluded matrix differs from exact per-group reason contracts")
     arms = expand_arms(plan)
     if len({arm.arm_id for arm in arms}) != len(arms):
         raise ControllerError("expanded arm ids are not unique")
@@ -797,7 +881,7 @@ def validate_plan(plan: Mapping[str, Any], *, allow_placeholders: bool) -> list[
     progression = plan.get("progression")
     if (
         not isinstance(progression, Mapping)
-        or progression.get("schema") != "opensquilla.draco-p1-progression/v1"
+        or progression.get("schema") != PROGRESSION_SCHEMA
     ):
         raise ControllerError("P1 progression contract is missing")
     if (
@@ -1091,6 +1175,55 @@ def _soft_deadline_finalizer_with_thinking(trace: Mapping[str, Any]) -> bool:
     )
 
 
+_ANALYZER_TIMEOUT_BOOLEAN_FIELDS = frozenset(
+    {"timed_out", "timeout_observed", "deadline_exceeded", "analyzer_timeout"}
+)
+_ANALYZER_TIMEOUT_REASON_FIELDS = frozenset(
+    {"fallback_reason", "error_type", "exception_type", "error_code", "failure_reason"}
+)
+_ANALYZER_TIMEOUT_REASON_VALUES = frozenset(
+    {
+        "timeout",
+        "timeouterror",
+        "timed_out",
+        "deadline_exceeded",
+        "analyzer_timeout",
+        "analyzer_timeouterror",
+    }
+)
+
+
+def _has_explicit_analyzer_timeout(value: Mapping[str, Any]) -> bool:
+    """Accept only structured Analyzer timeout evidence, never retry/usage gaps."""
+
+    if any(value.get(field) is True for field in _ANALYZER_TIMEOUT_BOOLEAN_FIELDS):
+        return True
+    for field in _ANALYZER_TIMEOUT_REASON_FIELDS:
+        raw = value.get(field)
+        if not isinstance(raw, str):
+            continue
+        normalized = raw.strip().casefold().replace(" ", "_").replace("-", "_")
+        compact = normalized.replace("_", "")
+        if normalized in _ANALYZER_TIMEOUT_REASON_VALUES or compact in {
+            "timeout",
+            "timeouterror",
+            "deadlineexceeded",
+            "analyzertimeout",
+            "analyzertimeouterror",
+        }:
+            return True
+    return False
+
+
+def _analyzer_timeout_observed(
+    analyzer: Mapping[str, Any], attempts: Sequence[Any]
+) -> bool:
+    return _has_explicit_analyzer_timeout(analyzer) or any(
+        isinstance(attempt, Mapping) and _has_explicit_analyzer_timeout(attempt)
+        for attempt in attempts
+    )
+
+
 def derive_source_task_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
     metrics: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -1216,6 +1349,7 @@ def derive_source_task_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, d
         usable = int(ensemble.get("usable_proposers") or 0)
         quorum = int(ensemble.get("execution_quorum_required") or 2)
         metrics[task_id] = {
+            "analyzer_timeout_observed": _analyzer_timeout_observed(analyzer, attempts),
             "analyzer_retry_or_fallback": len(attempts) > 1
             or str(analyzer.get("source") or "") == "router_fallback"
             or any(
@@ -1274,6 +1408,37 @@ def _matches_gate(value: Any, gate: HitGate) -> bool:
     raise ControllerError(f"unknown hit-gate operator: {gate.op}")
 
 
+def authenticate_hit_decision(
+    plan: Mapping[str, Any], arm: Arm, decision: Any
+) -> list[str]:
+    """Validate one frozen per-arm hit decision and return its exact task slice."""
+
+    if arm.hit_gate is None or not isinstance(decision, Mapping):
+        raise ControllerError(f"{arm.arm_id} lacks a structured hit-gate decision")
+    expected_fields = {"decision", "gate", "matched_task_ids", "matched_task_count"}
+    if set(decision) != expected_fields or decision.get("gate") != asdict(arm.hit_gate):
+        raise ControllerError(f"{arm.arm_id} hit-gate decision contract differs")
+    matched = decision.get("matched_task_ids")
+    count = decision.get("matched_task_count")
+    if (
+        not isinstance(matched, list)
+        or any(not isinstance(task_id, str) or not task_id for task_id in matched)
+        or matched != sorted(matched)
+        or len(set(matched)) != len(matched)
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count != len(matched)
+        or not set(matched).issubset(set(plan["benchmark"]["task_ids"]))
+    ):
+        raise ControllerError(f"{arm.arm_id} matched-task slice differs")
+    expected_decision = (
+        "eligible" if len(matched) >= arm.hit_gate.minimum_tasks else "no_hit"
+    )
+    if decision.get("decision") != expected_decision:
+        raise ControllerError(f"{arm.arm_id} hit-gate eligibility differs")
+    return list(matched)
+
+
 def derive_hit_receipt(
     plan: Mapping[str, Any],
     arms: Sequence[Arm],
@@ -1299,6 +1464,7 @@ def derive_hit_receipt(
         }
     receipt: dict[str, Any] = {
         "schema": HIT_RECEIPT_SCHEMA,
+        "semantic_contract": SEMANTIC_CONTRACT,
         "created_at": utc_now(),
         "campaign_plan_sha256": canonical_sha256(plan),
         "source_arm_id": SOURCE_ARM_ID,
@@ -1356,6 +1522,7 @@ def prepare_derived(
     atomic_write_json(hit_path, hit_receipt)
     derived: dict[str, Any] = {
         "schema": DERIVED_SCHEMA,
+        "semantic_contract": SEMANTIC_CONTRACT,
         "created_at": utc_now(),
         "campaign_plan_sha256": canonical_sha256(plan),
         "snapshot_commit": snapshot_identity["commit"],
@@ -1385,6 +1552,7 @@ def load_derived(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any
     unsigned.pop("derived_sha256", None)
     if (
         derived.get("schema") != DERIVED_SCHEMA
+        or derived.get("semantic_contract") != SEMANTIC_CONTRACT
         or embedded != canonical_sha256(unsigned)
         or derived.get("campaign_plan_sha256") != canonical_sha256(plan)
         or derived.get("screening_design") != screening_design_contract(plan)
@@ -1404,13 +1572,38 @@ def load_derived(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any
     hit = load_json(hit_path)
     hit_unsigned = dict(hit)
     hit_hash = hit_unsigned.pop("receipt_sha256", None)
+    task_metrics = hit.get("task_metrics")
     if (
         file_sha256(hit_path) != derived.get("hit_receipt_raw_sha256")
         or hit_hash != canonical_sha256(hit_unsigned)
         or hit_hash != derived.get("hit_receipt_sha256")
+        or hit.get("schema") != HIT_RECEIPT_SCHEMA
+        or hit.get("semantic_contract") != SEMANTIC_CONTRACT
+        or hit.get("campaign_plan_sha256") != canonical_sha256(plan)
+        or hit.get("source_arm_id") != SOURCE_ARM_ID
+        or not isinstance(task_metrics, Mapping)
+        or hit.get("task_metrics_sha256") != canonical_sha256(task_metrics)
         or hit.get("decisions") != derived.get("hit_decisions")
     ):
         raise ControllerError("P1 hit-gate receipt identity differs")
+    decisions = hit.get("decisions")
+    if not isinstance(decisions, Mapping):
+        raise ControllerError("P1 hit-gate decisions are missing")
+    if set(task_metrics) != set(plan["benchmark"]["task_ids"]):
+        raise ControllerError("P1 hit-gate metrics do not cover the frozen benchmark")
+    hit_arms = [arm for arm in expand_arms(plan) if arm.hit_gate is not None]
+    if set(decisions) != {arm.arm_id for arm in hit_arms}:
+        raise ControllerError("P1 hit-gate decision inventory differs")
+    for arm in hit_arms:
+        matched = authenticate_hit_decision(plan, arm, decisions.get(arm.arm_id))
+        recomputed = sorted(
+            task_id
+            for task_id, metrics in task_metrics.items()
+            if isinstance(metrics, Mapping)
+            and _matches_gate(metrics.get(arm.hit_gate.metric), arm.hit_gate)
+        )
+        if matched != recomputed:
+            raise ControllerError(f"{arm.arm_id} hit decision differs from frozen metrics")
     snapshot = Path(str(plan["paths"]["snapshot"]))
     source_import = common_controller(snapshot).materialize_preexisting_source(plan)
     if (
@@ -1466,65 +1659,128 @@ def _progression_cost_runtime(
     return reporter, prices
 
 
+def _progression_scope_metrics(
+    control: Mapping[str, Mapping[str, Any]],
+    variant: Mapping[str, Mapping[str, Any]],
+    task_ids: Sequence[str],
+    *,
+    reporter: Any,
+    prices: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = sorted(task_ids)
+    paired_ids = sorted(set(expected) & set(control) & set(variant))
+    quality_deltas = [
+        float(variant[task_id]["quality_total"])
+        - float(control[task_id]["quality_total"])
+        for task_id in paired_ids
+        if isinstance(control[task_id].get("quality_total"), int | float)
+        and not isinstance(control[task_id].get("quality_total"), bool)
+        and isinstance(variant[task_id].get("quality_total"), int | float)
+        and not isinstance(variant[task_id].get("quality_total"), bool)
+    ]
+    left_costs = [
+        _selected_cost(control[task_id], reporter=reporter, prices=prices)
+        for task_id in paired_ids
+    ]
+    right_costs = [
+        _selected_cost(variant[task_id], reporter=reporter, prices=prices)
+        for task_id in paired_ids
+    ]
+    pairing_complete = bool(expected) and paired_ids == expected
+    quality_complete = pairing_complete and len(quality_deltas) == len(expected)
+    cost_complete = pairing_complete and all(
+        value is not None for value in [*left_costs, *right_costs]
+    )
+    left_total = sum(value or 0.0 for value in left_costs) if cost_complete else None
+    right_total = sum(value or 0.0 for value in right_costs) if cost_complete else None
+    reduction = (
+        (left_total - right_total) / left_total
+        if left_total is not None and right_total is not None and left_total > 0
+        else None
+    )
+    return {
+        "expected_task_ids": expected,
+        "expected_task_count": len(expected),
+        "paired_task_ids": paired_ids,
+        "paired_task_count": len(paired_ids),
+        "pairing_complete_for_scope": pairing_complete,
+        "quality_pair_count": len(quality_deltas),
+        "quality_pairing_complete_for_scope": quality_complete,
+        "mean_delta_quality": (
+            sum(quality_deltas) / len(quality_deltas) if quality_complete else None
+        ),
+        "selected_generation_cost_evidence_complete": cost_complete,
+        "control_selected_generation_cost_usd": left_total,
+        "candidate_selected_generation_cost_usd": right_total,
+        "cost_reduction_fraction": reduction,
+    }
+
+
 def p1_15_progression_decision(
     plan: Mapping[str, Any],
     *,
     snapshot: Path,
     control_dir: Path,
     p1_35_dir: Path,
+    hit_decision: Mapping[str, Any],
+    hit_receipt_sha256: str,
 ) -> dict[str, Any]:
     reporter, prices = _progression_cost_runtime(plan, snapshot)
-    control = {str(row.get("task_id") or ""): row for row in _result_rows(control_dir, snapshot)}
-    variant = {str(row.get("task_id") or ""): row for row in _result_rows(p1_35_dir, snapshot)}
-    common_ids = sorted(set(control) & set(variant))
-    quality_deltas = [
-        float(variant[task_id]["quality_total"]) - float(control[task_id]["quality_total"])
-        for task_id in common_ids
-        if isinstance(control[task_id].get("quality_total"), int | float)
-        and isinstance(variant[task_id].get("quality_total"), int | float)
-    ]
-    left_costs = [
-        _selected_cost(control[task_id], reporter=reporter, prices=prices)
-        for task_id in common_ids
-    ]
-    right_costs = [
-        _selected_cost(variant[task_id], reporter=reporter, prices=prices)
-        for task_id in common_ids
-    ]
-    complete_cost = all(
-        value is not None for value in [*left_costs, *right_costs]
-    ) and bool(common_ids)
-    left_total = sum(value or 0.0 for value in left_costs)
-    right_total = sum(value or 0.0 for value in right_costs)
-    reduction = (
-        (left_total - right_total) / left_total
-        if complete_cost and left_total > 0
-        else None
+    p1_35_arm = next(
+        arm for arm in expand_arms(plan) if arm.arm_id == "P1-35-E1"
     )
-    mean_delta = (
-        sum(quality_deltas) / len(quality_deltas)
-        if len(quality_deltas) == EXPECTED_TASK_COUNT
-        else None
+    matched_task_ids = authenticate_hit_decision(plan, p1_35_arm, hit_decision)
+    if hit_decision.get("decision") != "eligible" or not matched_task_ids:
+        raise ControllerError("P1-35 progression requires an eligible non-empty hit slice")
+    if len(hit_receipt_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in hit_receipt_sha256
+    ):
+        raise ControllerError("P1-35 progression hit receipt hash is malformed")
+    control_rows = _result_rows(control_dir, snapshot)
+    variant_rows = _result_rows(p1_35_dir, snapshot)
+    control = {str(row.get("task_id") or ""): row for row in control_rows}
+    variant = {str(row.get("task_id") or ""): row for row in variant_rows}
+    if len(control) != len(control_rows) or len(variant) != len(variant_rows):
+        raise ControllerError("P1-35 progression rows contain duplicate task ids")
+    primary = _progression_scope_metrics(
+        control,
+        variant,
+        matched_task_ids,
+        reporter=reporter,
+        prices=prices,
+    )
+    secondary = _progression_scope_metrics(
+        control,
+        variant,
+        [str(task_id) for task_id in plan["benchmark"]["task_ids"]],
+        reporter=reporter,
+        prices=prices,
     )
     progression = plan["progression"]
     sufficient = (
-        reduction is not None
-        and reduction >= float(progression["skip_p1_15_if_cost_reduction_fraction_at_least"])
-        and mean_delta is not None
-        and mean_delta >= float(progression["minimum_mean_delta_quality"])
+        primary["pairing_complete_for_scope"] is True
+        and primary["quality_pairing_complete_for_scope"] is True
+        and primary["selected_generation_cost_evidence_complete"] is True
+        and isinstance(primary["cost_reduction_fraction"], int | float)
+        and primary["cost_reduction_fraction"]
+        >= float(progression["skip_p1_15_if_cost_reduction_fraction_at_least"])
+        and isinstance(primary["mean_delta_quality"], int | float)
+        and primary["mean_delta_quality"]
+        >= float(progression["minimum_mean_delta_quality"])
     )
     receipt = {
-        "schema": "opensquilla.draco-p1-15-progression-receipt/v1",
+        "schema": PROGRESSION_RECEIPT_SCHEMA,
+        "semantic_contract": SEMANTIC_CONTRACT,
         "created_at": utc_now(),
+        "campaign_plan_sha256": canonical_sha256(plan),
+        "hit_receipt_sha256": hit_receipt_sha256,
+        "hit_decision_sha256": canonical_sha256(hit_decision),
         "control_arm_id": str(progression.get("control_arm_id") or REPLAY_CONTROL_IDS[0]),
         "predecessor_arm_id": "P1-35-E1",
-        "paired_task_count": len(common_ids),
-        "quality_pair_count": len(quality_deltas),
-        "mean_delta_quality": mean_delta,
-        "selected_generation_cost_evidence_complete": complete_cost,
-        "control_selected_generation_cost_usd": left_total if complete_cost else None,
-        "candidate_selected_generation_cost_usd": right_total if complete_cost else None,
-        "cost_reduction_fraction": reduction,
+        "primary_scope": "hit_gate_matched_tasks",
+        "matched_task_ids": matched_task_ids,
+        **{key: copy.deepcopy(value) for key, value in primary.items()},
+        "secondary_all_tasks": secondary,
         "decision": (
             "skip_p1_15_sufficient"
             if sufficient
@@ -1536,24 +1792,51 @@ def p1_15_progression_decision(
 
 
 def p1_15_uncertain_progression_decision(
-    plan: Mapping[str, Any], *, reason: str
+    plan: Mapping[str, Any],
+    *,
+    reason: str,
+    hit_decision: Mapping[str, Any],
+    hit_receipt_sha256: str,
 ) -> dict[str, Any]:
     """Record why P1-15 remains eligible without fabricating paired evidence."""
 
+    p1_35_arm = next(
+        arm for arm in expand_arms(plan) if arm.arm_id == "P1-35-E1"
+    )
+    matched_task_ids = authenticate_hit_decision(plan, p1_35_arm, hit_decision)
+    if hit_decision.get("decision") != "no_hit" or matched_task_ids:
+        raise ControllerError("uncertain P1-15 progression requires a P1-35 no-hit receipt")
+    if len(hit_receipt_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in hit_receipt_sha256
+    ):
+        raise ControllerError("P1-35 progression hit receipt hash is malformed")
+
     receipt = {
-        "schema": "opensquilla.draco-p1-15-progression-receipt/v1",
+        "schema": PROGRESSION_RECEIPT_SCHEMA,
+        "semantic_contract": SEMANTIC_CONTRACT,
         "created_at": utc_now(),
+        "campaign_plan_sha256": canonical_sha256(plan),
+        "hit_receipt_sha256": hit_receipt_sha256,
+        "hit_decision_sha256": canonical_sha256(hit_decision),
         "control_arm_id": str(
             plan["progression"].get("control_arm_id") or REPLAY_CONTROL_IDS[0]
         ),
         "predecessor_arm_id": "P1-35-E1",
+        "primary_scope": "hit_gate_matched_tasks",
+        "matched_task_ids": matched_task_ids,
+        "expected_task_ids": matched_task_ids,
+        "expected_task_count": len(matched_task_ids),
+        "paired_task_ids": [],
         "paired_task_count": 0,
+        "pairing_complete_for_scope": False,
         "quality_pair_count": 0,
+        "quality_pairing_complete_for_scope": False,
         "mean_delta_quality": None,
         "selected_generation_cost_evidence_complete": False,
         "control_selected_generation_cost_usd": None,
         "candidate_selected_generation_cost_usd": None,
         "cost_reduction_fraction": None,
+        "secondary_all_tasks": None,
         "decision": "run_p1_15_insufficient_or_uncertain",
         "uncertainty_reason": reason,
     }
@@ -1561,15 +1844,24 @@ def p1_15_uncertain_progression_decision(
     return receipt
 
 
-def load_progression_receipt(plan: Mapping[str, Any], path: Path) -> dict[str, Any]:
+def load_progression_receipt(
+    plan: Mapping[str, Any],
+    path: Path,
+    *,
+    hit_decision: Mapping[str, Any],
+    hit_receipt_sha256: str,
+) -> dict[str, Any]:
     receipt = load_json(path)
     embedded = receipt.get("receipt_sha256")
     unsigned = dict(receipt)
     unsigned.pop("receipt_sha256", None)
     if (
-        receipt.get("schema")
-        != "opensquilla.draco-p1-15-progression-receipt/v1"
+        receipt.get("schema") != PROGRESSION_RECEIPT_SCHEMA
+        or receipt.get("semantic_contract") != SEMANTIC_CONTRACT
         or embedded != canonical_sha256(unsigned)
+        or receipt.get("campaign_plan_sha256") != canonical_sha256(plan)
+        or receipt.get("hit_receipt_sha256") != hit_receipt_sha256
+        or receipt.get("hit_decision_sha256") != canonical_sha256(hit_decision)
         or receipt.get("predecessor_arm_id") != "P1-35-E1"
         or receipt.get("control_arm_id")
         != str(plan["progression"].get("control_arm_id") or REPLAY_CONTROL_IDS[0])
@@ -1580,6 +1872,31 @@ def load_progression_receipt(plan: Mapping[str, Any], path: Path) -> dict[str, A
         }
     ):
         raise ControllerError("P1-15 progression receipt identity differs")
+    p1_35_arm = next(
+        arm for arm in expand_arms(plan) if arm.arm_id == "P1-35-E1"
+    )
+    matched_task_ids = authenticate_hit_decision(plan, p1_35_arm, hit_decision)
+    if (
+        receipt.get("primary_scope") != "hit_gate_matched_tasks"
+        or receipt.get("matched_task_ids") != matched_task_ids
+        or receipt.get("expected_task_ids") != matched_task_ids
+        or receipt.get("expected_task_count") != len(matched_task_ids)
+    ):
+        raise ControllerError("P1-15 progression primary scope differs")
+    if receipt.get("decision") == "skip_p1_15_sufficient" and (
+        hit_decision.get("decision") != "eligible"
+        or not matched_task_ids
+        or receipt.get("pairing_complete_for_scope") is not True
+        or receipt.get("quality_pairing_complete_for_scope") is not True
+        or receipt.get("selected_generation_cost_evidence_complete") is not True
+        or not isinstance(receipt.get("cost_reduction_fraction"), int | float)
+        or receipt["cost_reduction_fraction"]
+        < float(plan["progression"]["skip_p1_15_if_cost_reduction_fraction_at_least"])
+        or not isinstance(receipt.get("mean_delta_quality"), int | float)
+        or receipt["mean_delta_quality"]
+        < float(plan["progression"]["minimum_mean_delta_quality"])
+    ):
+        raise ControllerError("P1-15 skip decision lacks sufficient primary-slice evidence")
     return receipt
 
 
@@ -1638,6 +1955,7 @@ def initialize_status(
     anchors = plan["execution"]["schedule"]["anchor_by_arm_id"]
     return {
         "schema": STATUS_SCHEMA,
+        "semantic_contract": SEMANTIC_CONTRACT,
         "run_id": plan["run_id"],
         "campaign_plan_sha256": canonical_sha256(plan),
         "snapshot_commit": snapshot_identity["commit"],
@@ -1675,6 +1993,7 @@ def load_or_initialize_status(
     status = load_json(path)
     if (
         status.get("schema") != STATUS_SCHEMA
+        or status.get("semantic_contract") != SEMANTIC_CONTRACT
         or status.get("run_id") != plan["run_id"]
         or status.get("campaign_plan_sha256") != canonical_sha256(plan)
         or status.get("snapshot_commit") != snapshot_identity["commit"]
@@ -1763,7 +2082,17 @@ def run_campaign(plan_path: Path) -> int:
         progression_receipt: dict[str, Any] | None = None
         progression_path = run_root / "p1-15-progression.json"
         if progression_path.exists():
-            progression_receipt = load_progression_receipt(plan, progression_path)
+            if derived is None:
+                raise ControllerError("P1-15 progression receipt lacks a derived plan")
+            p1_35_hit = derived["hit_decisions"].get("P1-35-E1")
+            if not isinstance(p1_35_hit, Mapping):
+                raise ControllerError("derived plan lacks the P1-35 hit decision")
+            progression_receipt = load_progression_receipt(
+                plan,
+                progression_path,
+                hit_decision=p1_35_hit,
+                hit_receipt_sha256=str(derived["hit_receipt_sha256"]),
+            )
         for arm in arms:
             state = status["arms"][arm.arm_id]
             override: dict[str, Any] | None = None
@@ -1834,7 +2163,10 @@ def run_campaign(plan_path: Path) -> int:
                 if predecessor["state"] == "no_hit_skipped":
                     if progression_receipt is None:
                         progression_receipt = p1_15_uncertain_progression_decision(
-                            plan, reason="p1_35_source_slice_no_hit"
+                            plan,
+                            reason="p1_35_source_slice_no_hit",
+                            hit_decision=derived["hit_decisions"]["P1-35-E1"],
+                            hit_receipt_sha256=str(derived["hit_receipt_sha256"]),
                         )
                         atomic_write_json(progression_path, progression_receipt)
                 elif predecessor["state"] != "succeeded":
@@ -1858,13 +2190,21 @@ def run_campaign(plan_path: Path) -> int:
                         snapshot=snapshot,
                         control_dir=output_dir(plan, by_id[control_id]),
                         p1_35_dir=output_dir(plan, by_id["P1-35-E1"]),
+                        hit_decision=derived["hit_decisions"]["P1-35-E1"],
+                        hit_receipt_sha256=str(derived["hit_receipt_sha256"]),
                     )
                     atomic_write_json(progression_path, progression_receipt)
+                state["progression_receipt_sha256"] = progression_receipt[
+                    "receipt_sha256"
+                ]
                 if progression_receipt.get("decision") == "skip_p1_15_sufficient":
                     state.update(
                         {
                             "state": "progression_skipped",
                             "completed_at": utc_now(),
+                            "hit_gate_evidence": copy.deepcopy(
+                                derived["hit_decisions"][arm.arm_id]
+                            ),
                             "progression_receipt_sha256": progression_receipt[
                                 "receipt_sha256"
                             ],

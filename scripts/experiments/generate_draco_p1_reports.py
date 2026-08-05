@@ -15,9 +15,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-PLAN_SCHEMA = "opensquilla.draco-p1-campaign-plan/v1"
-STATUS_SCHEMA = "opensquilla.draco-p1-controller-status/v1"
-REPORT_SCHEMA = "opensquilla.draco-p1-campaign-report/v1"
+PLAN_SCHEMA = "opensquilla.draco-p1-campaign-plan/v2"
+STATUS_SCHEMA = "opensquilla.draco-p1-controller-status/v2"
+REPORT_SCHEMA = "opensquilla.draco-p1-campaign-report/v2"
+GROUP_REPORT_SCHEMA = "opensquilla.draco-p1-group-report/v2"
+SEMANTIC_CONTRACT = "opensquilla.draco-p1-semantics/hit-slice-primary/v2"
 TERMINAL_PHASES = {"completed", "completed_with_failures"}
 
 
@@ -160,6 +162,9 @@ def load_arm(
         "formal": False,
         "formal_evidence_valid": False,
         "formal_evidence_reasons": [],
+        "comparison_warnings": [],
+        "decision_evidence_valid": None,
+        "decision_evidence_reasons": [],
         "rows": [],
         "metrics": common.summarize_rows([]),
         "statuses": {"execution": "unknown", "policy": "unknown", "audit": "unknown"},
@@ -334,6 +339,208 @@ def compact_for_json(arm: Mapping[str, Any]) -> dict[str, Any]:
     return {key: copy.deepcopy(value) for key, value in arm.items() if key != "rows"}
 
 
+def matched_task_ids_for_arm(
+    arm: Any,
+    hit_decisions: Mapping[str, Any],
+    benchmark_task_ids: Sequence[str],
+) -> list[str]:
+    """Authenticate the frozen hit-gate slice for one successful candidate arm."""
+
+    decision = hit_decisions.get(arm.arm_id)
+    if not isinstance(decision, Mapping):
+        raise ReportError(f"{arm.arm_id} lacks a frozen hit-gate decision")
+    if decision.get("decision") != "eligible":
+        raise ReportError(f"{arm.arm_id} has no eligible frozen hit-gate slice")
+    gate = arm.hit_gate
+    if gate is None:
+        raise ReportError(f"{arm.arm_id} lacks an authoritative hit-gate contract")
+    expected_gate = {
+        "metric": gate.metric,
+        "op": gate.op,
+        "threshold": gate.threshold,
+        "minimum_tasks": gate.minimum_tasks,
+    }
+    declared_gate = decision.get("gate")
+    if not isinstance(declared_gate, Mapping) or dict(declared_gate) != expected_gate:
+        raise ReportError(f"{arm.arm_id} hit-gate contract differs from the frozen plan")
+    matched = decision.get("matched_task_ids")
+    if (
+        not isinstance(matched, list)
+        or not matched
+        or any(not isinstance(task_id, str) or not task_id for task_id in matched)
+        or len(set(matched)) != len(matched)
+        or matched != sorted(matched)
+    ):
+        raise ReportError(f"{arm.arm_id} frozen matched_task_ids are empty or malformed")
+    declared_count = decision.get("matched_task_count")
+    if (
+        isinstance(declared_count, bool)
+        or not isinstance(declared_count, int)
+        or declared_count != len(matched)
+        or len(matched) < gate.minimum_tasks
+    ):
+        raise ReportError(f"{arm.arm_id} frozen matched-task count differs")
+    if not set(matched).issubset(set(benchmark_task_ids)):
+        raise ReportError(f"{arm.arm_id} frozen hit-gate slice contains an unknown task")
+    return list(matched)
+
+
+def build_scoped_comparison(
+    common: Any,
+    control: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    control_arm_id: str,
+    variant_arm_id: str,
+    scope: str,
+    comparison_role: str,
+    expected_task_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Build a paired receipt with completeness relative to its declared scope."""
+
+    expected = sorted(expected_task_ids)
+    paired = common.paired(
+        {
+            **control,
+            "spec": {
+                "arm_id": control_arm_id,
+                "analyzer_mode": control["analyzer_mode"],
+            },
+        },
+        {
+            **candidate,
+            "spec": {
+                "arm_id": variant_arm_id,
+                "analyzer_mode": candidate["analyzer_mode"],
+            },
+        },
+        scope=scope,
+        allowed_task_ids=set(expected),
+    )
+    task_rows = paired.get("task_rows")
+    paired_ids = sorted(
+        str(row.get("task_id") or "")
+        for row in (task_rows if isinstance(task_rows, list) else [])
+        if isinstance(row, Mapping)
+    )
+    missing = sorted(set(expected) - set(paired_ids))
+    unexpected = sorted(set(paired_ids) - set(expected))
+    scope_complete = bool(expected) and (
+        paired.get("pair_count") == len(expected)
+        and len(paired_ids) == len(expected)
+        and len(set(paired_ids)) == len(expected)
+        and not missing
+        and not unexpected
+    )
+    paired["comparison_role"] = comparison_role
+    paired["expected_task_ids"] = expected
+    paired["expected_task_count"] = len(expected)
+    paired["paired_task_ids"] = paired_ids
+    paired["missing_expected_task_ids"] = missing
+    paired["unexpected_task_ids"] = unexpected
+    paired["complete_ten_task_id_pairing"] = paired.get("complete_task_id_pairing") is True
+    paired["pairing_complete_for_scope"] = scope_complete
+    return paired
+
+
+def authenticate_terminal_decisions(
+    plan: Mapping[str, Any],
+    status: Mapping[str, Any],
+    arms: Sequence[Any],
+    loaded: Mapping[str, dict[str, Any]],
+    derived: Mapping[str, Any],
+    *,
+    controller: Any,
+) -> list[str]:
+    """Authenticate every hit-gated terminal state, including all skip receipts."""
+
+    global_reasons: list[str] = []
+    decisions = derived.get("hit_decisions")
+    if not isinstance(decisions, Mapping):
+        reason = "authenticated derived hit decisions are unavailable"
+        global_reasons.append(reason)
+        for arm in arms:
+            result = loaded[arm.arm_id]
+            result["decision_evidence_valid"] = arm.hit_gate is None
+            if arm.hit_gate is not None:
+                result["decision_evidence_reasons"].append(reason)
+        return global_reasons
+    progression_receipt: Mapping[str, Any] | None = None
+    for arm in arms:
+        result = loaded[arm.arm_id]
+        if arm.hit_gate is None:
+            result["decision_evidence_valid"] = True
+            continue
+        decision = decisions.get(arm.arm_id)
+        try:
+            matched = controller.authenticate_hit_decision(plan, arm, decision)
+        except Exception as exc:  # noqa: BLE001
+            result["decision_evidence_valid"] = False
+            result["decision_evidence_reasons"].append(str(exc))
+            global_reasons.append(f"{arm.arm_id}: {exc}")
+            continue
+        state = result["state"]
+        status_row = status.get("arms", {}).get(arm.arm_id)
+        if not isinstance(status_row, Mapping):
+            reason = "controller status row is missing"
+        elif state == "no_hit_skipped":
+            reason = (
+                "no-hit skip lacks its exact frozen decision"
+                if decision.get("decision") != "no_hit"
+                or status_row.get("hit_gate_evidence") != decision
+                else ""
+            )
+        elif state == "progression_skipped":
+            reason = (
+                "progression skip lacks its exact eligible hit decision"
+                if decision.get("decision") != "eligible"
+                or not matched
+                or status_row.get("hit_gate_evidence") != decision
+                or arm.experiment_id != "P1-15"
+                else ""
+            )
+        elif state == "succeeded":
+            reason = (
+                "successful candidate lacks an eligible non-empty frozen hit slice"
+                if decision.get("decision") != "eligible" or not matched
+                else ""
+            )
+        else:
+            reason = ""
+        if (
+            not reason
+            and arm.experiment_id == "P1-15"
+            and state in {"succeeded", "progression_skipped"}
+        ):
+            try:
+                if progression_receipt is None:
+                    progression_receipt = controller.load_progression_receipt(
+                        plan,
+                        Path(str(plan["paths"]["run_root"]))
+                        / "p1-15-progression.json",
+                        hit_decision=decisions["P1-35-E1"],
+                        hit_receipt_sha256=str(derived["hit_receipt_sha256"]),
+                    )
+                expected_progression = (
+                    "skip_p1_15_sufficient"
+                    if state == "progression_skipped"
+                    else "run_p1_15_insufficient_or_uncertain"
+                )
+                if (
+                    progression_receipt.get("decision") != expected_progression
+                    or status_row.get("progression_receipt_sha256")
+                    != progression_receipt.get("receipt_sha256")
+                ):
+                    raise ReportError("progression receipt/status identity differs")
+            except Exception as exc:  # noqa: BLE001
+                reason = f"progression receipt is not authenticated: {exc}"
+        result["decision_evidence_valid"] = not reason
+        if reason:
+            result["decision_evidence_reasons"].append(reason)
+            global_reasons.append(f"{arm.arm_id}: {reason}")
+    return global_reasons
+
+
 def build_group_markdown(
     group: str,
     group_arms: Sequence[Mapping[str, Any]],
@@ -347,6 +554,7 @@ def build_group_markdown(
         f"# {group} — DRACO mini P1 条件切片实验",
         "",
         f"- Run：`{plan['run_id']}`",
+        f"- Semantic contract：`{plan['semantic_contract']}`",
         "- 冻结 commit/tree："
         f"`{plan['freeze']['snapshot_commit']}` / `{plan['freeze']['snapshot_tree']}`",
         "- 样本：G1 10 题 mini，仅用于诊断/淘汰，不等同正式定稿。",
@@ -415,14 +623,47 @@ def build_group_markdown(
             )
         for reason in arm.get("formal_evidence_reasons") or []:
             lines.append(f"  - 证据警告：{reason}")
-    lines.extend(["", "## 配对结果", ""])
+        for warning in arm.get("comparison_warnings") or []:
+            lines.append(f"  - 配对诊断警告：{warning}")
+        for reason in arm.get("decision_evidence_reasons") or []:
+            lines.append(f"  - 决策证据错误：{reason}")
+    lines.extend(
+        [
+            "",
+            "## 配对结果",
+            "",
+            "Primary 口径只比较冻结命中门的 `matched_task_ids`；"
+            "全 10 题结果仅作为 Secondary 诊断，不替代命中切片结论。"
+            "`complete_task_id_pairing` 保留 legacy 10 题含义；短切片完整性只看 "
+            "`pairing_complete_for_scope`。",
+            "",
+        ]
+    )
     if not comparisons:
-        lines.append("无完整、同 Analyzer 模式的 10 题配对结果。")
+        lines.append(
+            "无可验证配对结果；候选臂若已成功但缺少 eligible 非空命中切片，"
+            "报告按 fail-closed 处理。"
+        )
     for comparison in comparisons:
         ci = comparison.get("bootstrap_ci95") or [None, None]
+        role = str(comparison.get("comparison_role") or "unspecified")
+        role_label = (
+            "Primary hit-gated slice"
+            if role == "primary"
+            else "Secondary all-task diagnostic"
+            if role == "secondary"
+            else role
+        )
+        expected_count = comparison.get("expected_task_count")
+        if isinstance(expected_count, bool) or not isinstance(expected_count, int):
+            expected_count = comparison.get("pair_count")
         lines.append(
-            f"- `{comparison['variant_arm_id']}` vs `{comparison['control_arm_id']}`："
-            f"n={comparison['pair_count']}，Mean ΔQ={fmt(comparison['mean_delta_quality'])}，"
+            f"- **{role_label}** `{comparison['variant_arm_id']}` vs "
+            f"`{comparison['control_arm_id']}`：scope=`{comparison.get('scope', 'n/a')}`；"
+            f"n={comparison['pair_count']}/{expected_count}；"
+            "pair_complete="
+            f"`{str(comparison.get('pairing_complete_for_scope') is True).lower()}`；"
+            f"Mean ΔQ={fmt(comparison['mean_delta_quality'])}，"
             f"95% CI=[{fmt(ci[0])}, {fmt(ci[1])}]，W/T/L="
             f"{comparison['wins']}/{comparison['ties']}/{comparison['losses']}。"
         )
@@ -457,10 +698,13 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
         "# P1 DRACO mini 条件切片实验结果",
         "",
         f"- Run：`{report['run_id']}`",
+        f"- Semantic contract：`{report['semantic_contract']}`",
         f"- Controller phase：`{report['phase']}`",
         f"- 正式完整臂：{report['formal_valid_arm_count']}/{report['arm_count']}",
         "- 本报告先用 E0 取证命中切片；no-hit 臂未调用模型。"
         "P1-35 优先，P1-15 仅在其降本不足或证据不确定时解锁。",
+        "- 配对主口径是每臂冻结的非空 `matched_task_ids` 命中切片；"
+        "全 10 题只作为 secondary diagnostic，并分别披露 scope、n 与完整性。",
         "- 方法学：10 题 mini 是 diagnostic/screening only；"
         f"design_label=`{screening_design['design_label']}`；"
         "`strict_task_interleaving=false`；"
@@ -494,6 +738,8 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
             f"skipped={group['skipped_count']}，failed/blocked={group['failed_count']}。"
         )
     lines.extend(["", "## 结论边界", ""])
+    for reason in report.get("report_evidence_reasons") or []:
+        lines.append(f"- 报告证据错误：{reason}")
     lines.append(
         "只有完整 10 题配对、execution 通过且费用证据充分的结果"
         "可用于 mini 淘汰；"
@@ -503,10 +749,33 @@ def build_root_markdown(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def terminal_report_complete(
+    phase: str,
+    loaded: Mapping[str, Mapping[str, Any]],
+    report_evidence_reasons: Sequence[str],
+    *,
+    terminal_arm_states: set[str] | frozenset[str],
+) -> bool:
+    return (
+        phase in TERMINAL_PHASES
+        and all(arm["state"] in terminal_arm_states for arm in loaded.values())
+        and not any(
+            arm["state"] == "succeeded" and arm["formal_evidence_valid"] is not True
+            for arm in loaded.values()
+        )
+        and not report_evidence_reasons
+        and all(
+            arm["decision_evidence_valid"] is True for arm in loaded.values()
+        )
+    )
+
+
 def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     plan = load_json(args.plan)
     if plan.get("schema") != PLAN_SCHEMA:
         raise ReportError("campaign plan schema differs")
+    if plan.get("semantic_contract") != SEMANTIC_CONTRACT:
+        raise ReportError("campaign semantic contract differs")
     controller, common = load_frozen_modules(plan)
     try:
         arms = controller.validate_plan(plan, allow_placeholders=False)
@@ -521,6 +790,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     status = load_json(status_path)
     if (
         status.get("schema") != STATUS_SCHEMA
+        or status.get("semantic_contract") != SEMANTIC_CONTRACT
         or status.get("campaign_plan_sha256") != canonical_sha256(plan)
         or status.get("screening_design") != screening_design
     ):
@@ -553,37 +823,88 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             artifact=artifact,
             prices=prices,
         )
+    report_evidence_reasons: list[str] = []
+    if derived_error is not None:
+        report_evidence_reasons.append(f"derived plan unavailable: {derived_error}")
+    report_evidence_reasons.extend(
+        authenticate_terminal_decisions(
+            plan,
+            status,
+            arms,
+            loaded,
+            derived if isinstance(derived, Mapping) else {},
+            controller=controller,
+        )
+    )
+    hit_decisions = derived.get("hit_decisions") if isinstance(derived, Mapping) else {}
     comparisons: list[dict[str, Any]] = []
     for arm in arms:
         candidate = loaded[arm.arm_id]
         control_id = arm.control_arm_id
         if not control_id or candidate["state"] != "succeeded":
             continue
+        if candidate["decision_evidence_valid"] is not True:
+            candidate["formal_evidence_valid"] = False
+            candidate["formal_evidence_reasons"].append(
+                "primary comparison blocked by invalid hit-decision evidence"
+            )
+            continue
         control = loaded.get(control_id)
         if not control or control["state"] != "succeeded":
+            candidate["formal_evidence_valid"] = False
+            candidate["formal_evidence_reasons"].append(
+                f"primary comparison control {control_id} is unavailable"
+            )
             continue
         try:
-            paired = common.paired(
-                {
-                    **control,
-                    "spec": {
-                        "arm_id": control_id,
-                        "analyzer_mode": control["analyzer_mode"],
-                    },
-                },
-                {
-                    **candidate,
-                    "spec": {
-                        "arm_id": arm.arm_id,
-                        "analyzer_mode": candidate["analyzer_mode"],
-                    },
-                },
+            if not isinstance(hit_decisions, Mapping):
+                raise ReportError("derived hit_decisions is not an object")
+            matched_task_ids = matched_task_ids_for_arm(
+                arm,
+                hit_decisions,
+                [str(task_id) for task_id in plan["benchmark"]["task_ids"]],
+            )
+            primary = build_scoped_comparison(
+                common,
+                control,
+                candidate,
+                control_arm_id=control_id,
+                variant_arm_id=arm.arm_id,
+                scope="hit_gate_matched_tasks",
+                comparison_role="primary",
+                expected_task_ids=matched_task_ids,
             )
         except Exception as exc:  # noqa: BLE001
-            candidate["formal_evidence_reasons"].append(f"paired comparison unavailable: {exc}")
+            candidate["formal_evidence_valid"] = False
+            candidate["formal_evidence_reasons"].append(
+                f"primary hit-gated comparison unavailable: {exc}"
+            )
             continue
-        comparisons.append(paired)
-    hit_decisions = derived.get("hit_decisions") if isinstance(derived, Mapping) else {}
+        comparisons.append(primary)
+        if primary["pairing_complete_for_scope"] is not True:
+            candidate["formal_evidence_valid"] = False
+            candidate["formal_evidence_reasons"].append(
+                "primary hit-gated comparison is incomplete for its frozen slice"
+            )
+        try:
+            comparisons.append(
+                build_scoped_comparison(
+                    common,
+                    control,
+                    candidate,
+                    control_arm_id=control_id,
+                    variant_arm_id=arm.arm_id,
+                    scope="all_tasks_secondary_diagnostic",
+                    comparison_role="secondary",
+                    expected_task_ids=[
+                        str(task_id) for task_id in plan["benchmark"]["task_ids"]
+                    ],
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            candidate["comparison_warnings"].append(
+                f"secondary all-task comparison unavailable: {exc}"
+            )
     output_root = args.output_root or Path(str(plan["paths"]["report_root"]))
     groups: list[dict[str, Any]] = []
     experiment_ids = sorted(
@@ -607,7 +928,8 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         group_root = output_root / group
         atomic_write(group_root / "EXPERIMENT_RESULTS.md", markdown)
         group_receipt = {
-            "schema": "opensquilla.draco-p1-group-report/v1",
+            "schema": GROUP_REPORT_SCHEMA,
+            "semantic_contract": SEMANTIC_CONTRACT,
             "campaign_plan_sha256": canonical_sha256(plan),
             "experiment_id": group,
             "screening_design": copy.deepcopy(screening_design),
@@ -633,6 +955,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
+        "semantic_contract": SEMANTIC_CONTRACT,
         "run_id": plan["run_id"],
         "campaign_plan_sha256": canonical_sha256(plan),
         "phase": phase,
@@ -645,6 +968,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             arm["formal_evidence_valid"] is True for arm in loaded.values()
         ),
         "derived_error": derived_error,
+        "report_evidence_reasons": report_evidence_reasons,
         "hit_receipt_sha256": (
             derived.get("hit_receipt_sha256")
             if isinstance(derived, Mapping)
@@ -654,6 +978,13 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "independent_safety_gate_available": False,
         "arms": [compact_for_json(loaded[arm.arm_id]) for arm in arms],
         "comparisons": comparisons,
+        "comparison_scope": {
+            "primary": "frozen per-arm hit-gate matched_task_ids",
+            "secondary": "all ten benchmark tasks, diagnostic only",
+            "no_hit_policy": "missing, no-hit, empty, or malformed primary scope fails closed",
+            "legacy_complete_task_id_pairing": "true only for complete ten-task pairing",
+            "scope_completeness_field": "pairing_complete_for_scope",
+        },
         "excluded": copy.deepcopy(plan["excluded"]),
         "groups": groups,
         "cost_scope": {
@@ -669,15 +1000,11 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     report["report_sha256"] = canonical_sha256(report)
     atomic_write_json(output_root / "EXPERIMENT_RESULTS.json", report)
     atomic_write(output_root / "EXPERIMENT_RESULTS.md", build_root_markdown(report))
-    complete = (
-        phase in TERMINAL_PHASES
-        and all(
-            arm["state"] in controller.TERMINAL_ARM_STATES for arm in loaded.values()
-        )
-        and not any(
-            arm["state"] == "succeeded" and arm["formal_evidence_valid"] is not True
-            for arm in loaded.values()
-        )
+    complete = terminal_report_complete(
+        phase,
+        loaded,
+        report_evidence_reasons,
+        terminal_arm_states=controller.TERMINAL_ARM_STATES,
     )
     return report, 0 if complete else 2
 
