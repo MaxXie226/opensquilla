@@ -4021,9 +4021,27 @@ class TurnRunner:
                         session_key=session_key,
                         exc_info=True,
                     )
-            agent.set_prompt_cache_keepalive_capture_enabled(
-                keepalive_capture_enabled
+            capture_setter = getattr(
+                agent,
+                "set_prompt_cache_keepalive_capture_enabled",
+                None,
             )
+            if callable(capture_setter):
+                try:
+                    capture_setter(keepalive_capture_enabled)
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    keepalive_capture_enabled = False
+                    log.warning(
+                        "turn_runner.prompt_cache_keepalive_capture_setup_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+            elif keepalive_capture_enabled:
+                keepalive_capture_enabled = False
+                log.warning(
+                    "turn_runner.prompt_cache_keepalive_capture_unavailable",
+                    session_key=session_key,
+                )
             agent_config = ab_out.agent_config
             # These locals are read by the test_agent_bootstrap_stage_snapshot
             # frame-walking probe. Do not remove.
@@ -4681,7 +4699,20 @@ class TurnRunner:
                 and not error_message
                 and self._prompt_cache_keepalive_recorder is not None
             ):
-                candidate = agent.prompt_cache_keepalive_candidate()
+                candidate_getter = getattr(
+                    agent,
+                    "prompt_cache_keepalive_candidate",
+                    None,
+                )
+                try:
+                    candidate = candidate_getter() if callable(candidate_getter) else None
+                except Exception:  # noqa: BLE001 - observer cannot fail a turn
+                    candidate = None
+                    log.warning(
+                        "turn_runner.prompt_cache_keepalive_candidate_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
                 if candidate is not None:
                     try:
                         self._prompt_cache_keepalive_recorder(candidate)
