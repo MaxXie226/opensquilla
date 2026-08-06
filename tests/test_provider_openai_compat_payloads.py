@@ -1228,8 +1228,10 @@ def test_openrouter_header_generation_id_survives_local_stream_cancellation(
     assert [row["event"] for row in rows] == [
         "llm.request",
         "llm.response_headers",
+        "llm.error",
     ]
     assert rows[1]["response_ids"] == ["gen-cancelled-stream-1"]
+    assert rows[2]["code"] == "cancelled"
 
 
 def test_openrouter_non_stream_header_generation_id_is_joined_to_response(
@@ -3476,16 +3478,13 @@ def test_dashscope_request_logs_qwen_provider_profile(monkeypatch: Any) -> None:
         "qwen3.7-flash-2026-07-15",
     ],
 )
-@pytest.mark.parametrize("env_value", [None, "on"])
-def test_dashscope_documented_preserve_model_replays_reasoning_content(
+def test_dashscope_experimental_preserve_model_replays_reasoning_content(
     monkeypatch: Any,
     model: str,
-    env_value: str | None,
 ) -> None:
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
-    if env_value is not None:
-        monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", env_value)
+    monkeypatch.setenv("OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING", "on")
     provider = OpenAIProvider(
         api_key="test",
         model=model,
@@ -3536,6 +3535,52 @@ def test_dashscope_documented_preserve_model_replays_reasoning_content(
     assert captured["payload"]["messages"][0]["reasoning_content"] == (
         "I chose a minimal patch before calling the tool."
     )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "qwen3.6-flash",
+        "qwen3.7-flash-2026-07-15",
+    ],
+)
+def test_dashscope_preserve_thinking_unset_keeps_main_default(
+    monkeypatch: Any,
+    model: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model=model,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider_kind="dashscope",
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content="previous visible answer",
+            reasoning_content="previous DashScope thinking",
+        ),
+        Message(role="user", content="continue"),
+    ]
+    cfg = ChatConfig(
+        thinking=True,
+        model_capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="dashscope",
+        ),
+    )
+
+    async def _run() -> None:
+        async for _ in provider.chat(messages, config=cfg):
+            pass
+
+    asyncio.run(_run())
+
+    assert "preserve_thinking" not in captured["payload"]
+    assert "reasoning_content" not in captured["payload"]["messages"][0]
 
 
 def test_dashscope_preserve_thinking_off_keeps_supported_model_history_hidden(

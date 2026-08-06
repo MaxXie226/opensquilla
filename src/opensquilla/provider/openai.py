@@ -744,9 +744,13 @@ def _should_send_tool_choice(
 
 _DASHSCOPE_PRESERVE_THINKING_MODEL_IDS = frozenset(
     {
+        "qwen3.6-max-preview",
+    }
+)
+_DASHSCOPE_PRESERVE_THINKING_EXPERIMENT_MODEL_IDS = frozenset(
+    {
         "qwen3.6-flash",
         "qwen3.6-flash-2026-04-16",
-        "qwen3.6-max-preview",
         "qwen3.7-flash",
         "qwen3.7-flash-2026-07-15",
     }
@@ -2666,21 +2670,28 @@ def _should_replay_reasoning_content(
         return True
     if not caps or not caps.supports_reasoning:
         return False
-    if effective_thinking and model_name in policy.preserve_thinking_model_ids:
-        return True
     if caps.reasoning_format == "dashscope":
         if not effective_thinking:
             return False
-        supported = _dashscope_supports_preserve_thinking(model)
+        supported_by_default = (
+            model_name in policy.preserve_thinking_model_ids
+            or _dashscope_supports_preserve_thinking(model)
+        )
         override = _dashscope_preserve_thinking_override_from_env()
         if override is None:
-            return supported
-        if override and not supported:
+            return supported_by_default
+        supported_by_override = (
+            supported_by_default
+            or model_name in _DASHSCOPE_PRESERVE_THINKING_EXPERIMENT_MODEL_IDS
+        )
+        if override and not supported_by_override:
             raise ValueError(
                 f"{_DASHSCOPE_PRESERVE_THINKING_ENV}=on is not supported "
                 f"for DashScope model {model!r}"
             )
         return override
+    if effective_thinking and model_name in policy.preserve_thinking_model_ids:
+        return True
     return bool(policy.replay_reasoning_format) and (
         caps.reasoning_format == policy.replay_reasoning_format
     )

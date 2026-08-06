@@ -186,7 +186,7 @@ class _AttemptRegistry:
         return _AttemptProvider(cfg, self)
 
 
-class _AttemptProvider:
+class _AttemptProvider(_ExactProjectionMixin):
     """Fake provider whose plan advances on every same-model request."""
 
     provider_name = "fake"
@@ -194,6 +194,7 @@ class _AttemptProvider:
     def __init__(self, cfg: ProviderConfig, registry: _AttemptRegistry) -> None:
         self._cfg = cfg
         self._registry = registry
+        self._projection_model = cfg.model
 
     def chat(
         self,
@@ -3741,7 +3742,7 @@ async def test_aggregator_timeout_before_content_is_retried_in_place(
     )
     call_count = [0]
 
-    class _TimeoutOnceAggregator:
+    class _TimeoutOnceAggregator(_ExactProjectionMixin):
         provider_name = "fake"
 
         def chat(
