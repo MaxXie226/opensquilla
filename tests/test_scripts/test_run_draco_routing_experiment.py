@@ -15251,6 +15251,40 @@ def test_formal_runtime_accepts_frozen_proposer_recovery_overrides(module) -> No
     ) == ""
 
 
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_formal_runtime_accepts_effective_proposer_backup_shortfall(module) -> None:
+    policy = module.formal_proposer_recovery_policy(2)
+    policy["effective_backup_count"] = 1
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "ranking_parameters": {"proposer_count": {"backup_count": 2}},
+        "selected_P": ["openrouter:model-a", "openrouter:model-b"],
+        "proposer_models": ["model-a", "model-b"],
+        "proposer_sample_count": 2,
+        "backup_P": ["openrouter:model-c"],
+        "selected_A": "openrouter:model-d",
+        "aggregator_candidates": ["openrouter:model-d"],
+        "configured_proposer_backup_count": 2,
+        "effective_proposer_backup_count": 1,
+        "effective_min_successful_proposers": 2,
+        "proposer_recovery_policy": policy,
+    }
+
+    assert module.formal_proposer_recovery_policy_for_plan(plan) == policy
+    assert module.g1_provider_native_recovery_policy_reason(plan) == ""
+
+    plan["proposer_recovery_policy"] = {
+        **policy,
+        "effective_backup_count": 3,
+    }
+    assert module.formal_proposer_recovery_policy_for_plan(plan) is None
+    assert (
+        module.g1_provider_native_recovery_policy_reason(plan)
+        == "invalid_g1_proposer_recovery_policy"
+    )
+
+
 def test_gateway_ranking_override_effective_snapshot_is_detached() -> None:
     original = {"penalties": {"task_cost_weights": {"medium": 0.17}}}
     config = GatewayConfig(

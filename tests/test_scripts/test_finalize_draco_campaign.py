@@ -1836,6 +1836,30 @@ def test_provider_native_proposer_recovery_uses_authenticated_dynamic_policy(
     assert reasons == []
 
 
+def test_provider_native_proposer_recovery_accepts_effective_backup_shortfall(
+    module,
+) -> None:
+    call, plan = _provider_native_recovery_call(module)
+    plan["backup_P"] = plan["backup_P"][:1]
+    plan["effective_proposer_backup_count"] = 1
+    plan["proposer_recovery_policy"] = {
+        **plan["proposer_recovery_policy"],
+        "effective_backup_count": 1,
+    }
+
+    from opensquilla.provider.protocol import provider_retry_roster_fingerprint
+
+    call["proposer_recovery"]["selection_plan_fingerprint"] = (
+        provider_retry_roster_fingerprint(plan)
+    )
+    _, _, reasons = module.proposer_recovery_execution_reasons(
+        call,
+        executed_plan=plan,
+    )
+
+    assert reasons == []
+
+
 def test_provider_shaped_dynamic_partial_quorum_separates_strict_and_usable(
     module,
 ) -> None:
@@ -5073,6 +5097,38 @@ def test_g1_plan_uses_authenticated_dynamic_proposer_recovery_policy(
     )
 
     assert "wrong_g1_proposer_recovery_policy" in reasons
+
+
+def test_g1_plan_accepts_effective_proposer_backup_shortfall(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "FORMAL_G1_RANKING_CONFIG_SHA256",
+        module.canonical_sha256(_test_ranking_config(module)),
+    )
+    plan = _g1_plan(
+        module,
+        [
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen3.7-max",
+            "z-ai/glm-5.2",
+        ],
+        "z-ai/glm-5.2",
+    )
+    plan["backup_P"] = plan["backup_P"][:1]
+    plan["effective_proposer_backup_count"] = 1
+    plan["proposer_recovery_policy"] = {
+        **plan["proposer_recovery_policy"],
+        "effective_backup_count": 1,
+    }
+    contract = _contract(module, "G1", "a" * 64)["g1_registry_contract"]
+
+    reasons, _, _ = module.g1_registry_plan_reasons(plan, contract=contract)
+
+    assert "wrong_g1_proposer_recovery_policy" not in reasons
+    assert "wrong_g1_proposer_recovery_roster" not in reasons
 
 
 def test_g1_route_gate_reuses_one_provider_lifecycle_plan_and_analyzer(

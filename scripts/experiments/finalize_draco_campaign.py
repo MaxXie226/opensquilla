@@ -5299,8 +5299,30 @@ def proposer_recovery_execution_reasons(
 
     policy = executed_plan.get("proposer_recovery_policy")
     receipt = call.get("proposer_recovery")
-    expected_backup_count = nonnegative_int(
-        expected_policy.get("effective_backup_count")
+    expected_configured_backup_count = expected_policy.get(
+        "configured_backup_count"
+    )
+    actual_effective_backup_count = (
+        policy.get("effective_backup_count")
+        if isinstance(policy, Mapping)
+        else None
+    )
+    effective_backup_count_valid = bool(
+        isinstance(expected_configured_backup_count, int)
+        and not isinstance(expected_configured_backup_count, bool)
+        and isinstance(actual_effective_backup_count, int)
+        and not isinstance(actual_effective_backup_count, bool)
+        and 0
+        <= actual_effective_backup_count
+        <= expected_configured_backup_count
+    )
+    expected_plan_policy = dict(expected_policy)
+    if effective_backup_count_valid:
+        expected_plan_policy["effective_backup_count"] = (
+            actual_effective_backup_count
+        )
+    expected_backup_count = (
+        actual_effective_backup_count if effective_backup_count_valid else -1
     )
     expected_max_additional_requests = nonnegative_int(
         expected_policy.get("max_additional_physical_requests")
@@ -5314,7 +5336,7 @@ def proposer_recovery_execution_reasons(
         )
 
     reasons: list[str] = []
-    if not isinstance(policy, Mapping) or dict(policy) != dict(expected_policy):
+    if not isinstance(policy, Mapping) or dict(policy) != expected_plan_policy:
         reasons.append("invalid_proposer_recovery_policy")
     selected = executed_plan.get("selected_P")
     backups = executed_plan.get("backup_P")
@@ -6937,19 +6959,31 @@ def g1_registry_plan_reasons(
         expected_proposer_recovery_policy = {
             **proposer_recovery_policy,
             "configured_backup_count": configured_backup_count,
-            "effective_backup_count": configured_backup_count,
         }
+        effective_backup_count = plan_proposer_recovery_policy.get(
+            "effective_backup_count"
+        )
+        effective_backup_count_valid = bool(
+            isinstance(effective_backup_count, int)
+            and not isinstance(effective_backup_count, bool)
+            and 0 <= effective_backup_count <= configured_backup_count
+        )
+        if effective_backup_count_valid:
+            expected_proposer_recovery_policy["effective_backup_count"] = (
+                effective_backup_count
+            )
         if dict(plan_proposer_recovery_policy) != expected_proposer_recovery_policy:
             reasons.append("wrong_g1_proposer_recovery_policy")
         if (
-            not isinstance(backup_p, list)
-            or len(normalized_backups) != configured_backup_count
-            or len(set(normalized_backups)) != configured_backup_count
+            not effective_backup_count_valid
+            or not isinstance(backup_p, list)
+            or len(normalized_backups) != effective_backup_count
+            or len(set(normalized_backups)) != effective_backup_count
             or any(identity not in expected_identities for identity in normalized_backups)
             or bool(set(normalized_backups).intersection(str(value) for value in selected_p or []))
             or bool(set(normalized_backups).intersection(normalized_aggregators))
             or plan.get("configured_proposer_backup_count") != configured_backup_count
-            or plan.get("effective_proposer_backup_count") != configured_backup_count
+            or plan.get("effective_proposer_backup_count") != effective_backup_count
             or plan.get("effective_min_successful_proposers") != 2
         ):
             reasons.append("wrong_g1_proposer_recovery_roster")

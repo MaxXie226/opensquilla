@@ -384,7 +384,7 @@ def formal_proposer_recovery_policy_for_plan(
         # the exact formal schema below.
         backup_count = policy.get("configured_backup_count")
     try:
-        return formal_proposer_recovery_policy(
+        expected = formal_proposer_recovery_policy(
             backup_count,
             max_additional_physical_requests=policy.get(
                 "max_additional_physical_requests"
@@ -396,6 +396,15 @@ def formal_proposer_recovery_policy_for_plan(
         )
     except ValueError:
         return None
+    effective_backup_count = policy.get("effective_backup_count")
+    if (
+        isinstance(effective_backup_count, bool)
+        or not isinstance(effective_backup_count, int)
+        or not 0 <= effective_backup_count <= expected["configured_backup_count"]
+    ):
+        return None
+    expected["effective_backup_count"] = effective_backup_count
+    return expected
 
 
 REPAIR_ONLY_SOURCE_DRIFT_SCHEMA = "opensquilla.draco.repair-only-source-drift/v1"
@@ -4321,9 +4330,26 @@ async def build_experiment_provider(
                 expected_proposer_policy = proposer_recovery_plan_policy(
                     proposer_policy
                 )
+                actual_proposer_policy = dry_provider.selection_plan.get(
+                    "proposer_recovery_policy"
+                )
+                if isinstance(actual_proposer_policy, Mapping):
+                    effective_backup_count = actual_proposer_policy.get(
+                        "effective_backup_count"
+                    )
+                    configured_backup_count = expected_proposer_policy[
+                        "configured_backup_count"
+                    ]
+                    if (
+                        isinstance(effective_backup_count, int)
+                        and not isinstance(effective_backup_count, bool)
+                        and 0 <= effective_backup_count <= configured_backup_count
+                    ):
+                        expected_proposer_policy["effective_backup_count"] = (
+                            effective_backup_count
+                        )
                 if (
-                    dry_provider.selection_plan.get("proposer_recovery_policy")
-                    != expected_proposer_policy
+                    actual_proposer_policy != expected_proposer_policy
                 ):
                     raise ValueError(
                         "dry G1 proposer recovery policy differs from the "
@@ -10220,13 +10246,14 @@ def g1_provider_native_recovery_policy_reason(
     expected_policy = formal_proposer_recovery_policy_for_plan(plan)
     if expected_policy is None or dict(policy) != expected_policy:
         return "invalid_g1_proposer_recovery_policy"
-    expected_backup_count = expected_policy["configured_backup_count"]
+    configured_backup_count = expected_policy["configured_backup_count"]
+    effective_backup_count = expected_policy["effective_backup_count"]
     backups = plan.get("backup_P")
     selected = plan.get("selected_P")
     aggregator_candidates = plan.get("aggregator_candidates")
     if (
         not isinstance(backups, list)
-        or len(backups) != expected_backup_count
+        or len(backups) != effective_backup_count
         or not isinstance(selected, list)
         or not selected
         or not isinstance(aggregator_candidates, list)
@@ -10246,8 +10273,8 @@ def g1_provider_native_recovery_policy_reason(
         or len(set(backups)) != len(backups)
         or bool(set(backups).intersection(selected))
         or bool(set(backups).intersection(aggregator_candidates))
-        or plan.get("configured_proposer_backup_count") != expected_backup_count
-        or plan.get("effective_proposer_backup_count") != expected_backup_count
+        or plan.get("configured_proposer_backup_count") != configured_backup_count
+        or plan.get("effective_proposer_backup_count") != effective_backup_count
         or plan.get("effective_min_successful_proposers") != 2
     ):
         return "invalid_g1_proposer_recovery_roster"
