@@ -126,8 +126,8 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
   const ribbons = ref<Map<string, MetaRibbonState>>(new Map())
   const preflights = ref<Map<string, MetaPreflightEntry>>(new Map())
   const ribbonOrder = ref<string[]>([])
-  let subscribed = false
   let recoveryRequestVersion = 0
+  let recoveryFlight: { sessionKey: string; promise: Promise<void> } | null = null
 
   function noteRunId(runId: string) {
     if (!runId) return
@@ -201,37 +201,46 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
    * hydration has to use this dedicated read model instead of model-visible
    * transcript content.
    */
-  async function hydrateRecovery() {
+  function hydrateRecovery(): Promise<void> {
     const targetSessionKey = sessionKey.value.trim()
-    const requestVersion = ++recoveryRequestVersion
-    if (!targetSessionKey) return
-    try {
-      const payload = await rpc.call<{ recovery?: MetaRunRecoveryPayload | null }>(
-        'meta.runs.recovery',
-        { sessionKey: targetSessionKey },
-      )
-      if (
-        requestVersion !== recoveryRequestVersion
-        || sessionKey.value !== targetSessionKey
-      ) return
-      const recovery = payload?.recovery
-      const announced = recovery?.announced
-      if (!announced?.run_id) return
+    if (!targetSessionKey) return Promise.resolve()
+    if (recoveryFlight?.sessionKey === targetSessionKey) return recoveryFlight.promise
 
-      const ribbon = reactive(createRibbon(announced)) as MetaRibbonState
-      for (const stepState of recovery?.step_states || []) updateStep(ribbon, stepState)
-      if (recovery?.completed) completeRun(ribbon, recovery.completed)
-      noteRunId(ribbon.runId)
-      const next = new Map(ribbons.value)
-      // A same-run live ribbon can be partial when the socket drops just
-      // before its terminal events. The durable failed snapshot is newer
-      // truth after reconnect, so replace that stale in-memory state.
-      next.set(ribbon.runId, ribbon)
-      ribbons.value = next
-    } catch {
-      // Recovery hydration is an optional reconnect affordance. Older
-      // gateways do not expose this RPC; live event handling remains intact.
+    const requestVersion = ++recoveryRequestVersion
+    const run = async () => {
+      try {
+        const payload = await rpc.call<{ recovery?: MetaRunRecoveryPayload | null }>(
+          'meta.runs.recovery',
+          { sessionKey: targetSessionKey },
+        )
+        if (
+          requestVersion !== recoveryRequestVersion
+          || sessionKey.value !== targetSessionKey
+        ) return
+        const recovery = payload?.recovery
+        const announced = recovery?.announced
+        if (!announced?.run_id) return
+
+        const ribbon = reactive(createRibbon(announced)) as MetaRibbonState
+        for (const stepState of recovery?.step_states || []) updateStep(ribbon, stepState)
+        if (recovery?.completed) completeRun(ribbon, recovery.completed)
+        noteRunId(ribbon.runId)
+        const next = new Map(ribbons.value)
+        // A same-run live ribbon can be partial when the socket drops just
+        // before its terminal events. The durable failed snapshot is newer
+        // truth after reconnect, so replace that stale in-memory state.
+        next.set(ribbon.runId, ribbon)
+        ribbons.value = next
+      } catch {
+        // Recovery hydration is an optional reconnect affordance. Older
+        // gateways do not expose this RPC; live event handling remains intact.
+      }
     }
+    const promise = run().finally(() => {
+      if (recoveryFlight?.promise === promise) recoveryFlight = null
+    })
+    recoveryFlight = { sessionKey: targetSessionKey, promise }
+    return promise
   }
 
   /* ── Phase helpers ───────────────────────────────────────────────── */
@@ -464,24 +473,16 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     options.scrollToStepCard(`meta_step_${payload.stepId}`)
   }
 
-  function onConnectionState(state: unknown) {
-    if (subscribed && state === 'connected') void hydrateRecovery()
-  }
-
   /* ── Subscription lifecycle ──────────────────────────────────────── */
 
   function subscribe(): () => void {
-    subscribed = true
     const unsubs = [
       rpc.on('session.event.meta_preflight', onPreflight as RpcEventHandler),
       rpc.on('session.event.meta_run_announced', onRunAnnounced as RpcEventHandler),
       rpc.on('session.event.meta_step_state', onStepState as RpcEventHandler),
       rpc.on('session.event.meta_run_completed', onRunCompleted as RpcEventHandler),
-      rpc.on('_state', onConnectionState as RpcEventHandler),
     ]
-    void hydrateRecovery()
     return () => {
-      subscribed = false
       unsubs.forEach((unsub) => unsub())
     }
   }
@@ -493,16 +494,12 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     ribbonOrder.value = []
   }
 
-  // Session switches clear all per-run state, then hydrate only the newly
-  // selected session. Request-version gating drops late results from the old
-  // session so recovery controls can never cross conversation boundaries.
-  watch(sessionKey, () => {
-    reset()
-    if (subscribed) void hydrateRecovery()
-  })
+  // Session switches clear all per-run state. ChatView starts optional durable
+  // recovery only after the new session subscription is authoritative, so this
+  // read can never overtake subscribe/snapshot/history during bootstrap.
+  watch(sessionKey, reset)
 
   function cleanup() {
-    subscribed = false
     reset()
   }
 

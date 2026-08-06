@@ -2253,7 +2253,10 @@ async function handleAuthoritativeSessionSubscription(
   // Ordinary Sessions Hub handoffs must never wait behind optional Meta
   // recovery. Durable controls remain persisted for the next reconnect.
   if (flushPendingAutoSend(targetSessionKey)) return
-  await restoreDurableMetaControls(targetSessionKey, prefetchedServerDrafts, isCurrent)
+  await Promise.all([
+    metaRuns.hydrateRecovery(),
+    restoreDurableMetaControls(targetSessionKey, prefetchedServerDrafts, isCurrent),
+  ])
 }
 
 function isPristineDraftForRecovery(expectedSessionKey: string, agentId: string): boolean {
@@ -4030,7 +4033,10 @@ onMounted(async () => {
       && sessionKey.value === initialMetaSessionKey
     ) {
       if (initialSession.draft) metaDraftRecovery.retry(draftAgentId())
-      return restoreDurableMetaControls(initialMetaSessionKey)
+      return Promise.all([
+        metaRuns.hydrateRecovery(),
+        restoreDurableMetaControls(initialMetaSessionKey),
+      ])
     }
   }).catch((error: unknown) => {
     console.warn(

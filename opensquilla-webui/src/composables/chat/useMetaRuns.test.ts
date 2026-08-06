@@ -458,17 +458,37 @@ describe('useMetaRuns persisted recovery hydration', () => {
     expect(ribbon && counterText(ribbon, ribbonCopy('en'))).toBe('Step 30 of 36')
   })
 
-  it('hydrates on subscribe and rehydrates after the same session reconnects', async () => {
+  it('waits for explicit authoritative hydration instead of overtaking bootstrap', async () => {
     const call = vi.fn(async () => recoveryPayload('persisted-paper-run'))
     const { api, handlers } = makeOptions(call)
 
     const unsubscribe = api.subscribe()
-    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    await nextTick()
+    expect(call).not.toHaveBeenCalled()
+    expect(handlers.has('_state')).toBe(false)
+
+    await api.hydrateRecovery()
+    expect(call).toHaveBeenCalledTimes(1)
     await vi.waitFor(() => expect(api.ribbons.value.has('persisted-paper-run')).toBe(true))
 
-    handlers.get('_state')?.('connected')
-    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(2))
+    await api.hydrateRecovery()
+    expect(call).toHaveBeenCalledTimes(2)
     unsubscribe()
+  })
+
+  it('coalesces concurrent recovery reads for the same session', async () => {
+    let resolveRecovery: ((value: unknown) => void) | undefined
+    const call = vi.fn(() => new Promise(resolve => { resolveRecovery = resolve }))
+    const { api } = makeOptions(call)
+
+    const first = api.hydrateRecovery()
+    const second = api.hydrateRecovery()
+    expect(call).toHaveBeenCalledTimes(1)
+    expect(second).toBe(first)
+
+    resolveRecovery?.(recoveryPayload('persisted-paper-run'))
+    await Promise.all([first, second])
+    expect(api.ribbons.value.has('persisted-paper-run')).toBe(true)
   })
 
   it('replaces a partial same-run ribbon with the durable terminal snapshot', async () => {
@@ -479,7 +499,8 @@ describe('useMetaRuns persisted recovery hydration', () => {
     })
     const { api, handlers } = makeOptions(call)
     const unsubscribe = api.subscribe()
-    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    await api.hydrateRecovery()
+    expect(call).toHaveBeenCalledTimes(1)
 
     handlers.get('session.event.meta_run_announced')?.({
       run_id: 'persisted-paper-run',
@@ -497,10 +518,8 @@ describe('useMetaRuns persisted recovery hydration', () => {
     })
     expect(api.ribbons.value.get('persisted-paper-run')?.runOutcome).toBeNull()
 
-    handlers.get('_state')?.('connected')
-    await vi.waitFor(() => {
-      expect(api.ribbons.value.get('persisted-paper-run')?.runOutcome).toBe('failed')
-    })
+    await api.hydrateRecovery()
+    expect(api.ribbons.value.get('persisted-paper-run')?.runOutcome).toBe('failed')
     expect(
       api.ribbons.value.get('persisted-paper-run')?.steps[1]?.state,
     ).toBe('failed')
