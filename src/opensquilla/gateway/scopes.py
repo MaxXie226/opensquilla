@@ -129,6 +129,8 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.hydrate": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
+    "artifacts.list": READ_SCOPE,
+    "artifacts.get": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
     "last-heartbeat": READ_SCOPE,
     "system-presence": READ_SCOPE,

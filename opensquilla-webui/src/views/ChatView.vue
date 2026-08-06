@@ -715,6 +715,7 @@ import {
 import { useChatStream } from '@/composables/chat/useChatStream'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
+import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
 import { navigateMetaSetupProviderSettings } from '@/composables/chat/metaSetupProviderNavigation'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -1601,6 +1602,23 @@ const {
 } = chatHistory
 planMutationAccepted = () => scheduleHistorySync()
 
+// The durable artifact index fills gaps left by the bounded/compacted message
+// history. History and the in-flight ArtifactEvent stream remain live fallback
+// sources for mixed-version gateways and list-refresh races.
+const chatSessionArtifacts = useSessionArtifacts({
+  rpc,
+  sessionKey,
+  messages,
+  streamArtifacts,
+})
+const {
+  artifacts: sessionArtifacts,
+  load: loadSessionArtifacts,
+  loadAfterReconnect: loadSessionArtifactsAfterReconnect,
+  reset: resetSessionArtifacts,
+  cleanup: cleanupSessionArtifacts,
+} = chatSessionArtifacts
+
 const voiceInput = useVoiceInput()
 const {
   voiceBusy,
@@ -2001,6 +2019,7 @@ const chatSlashCommands = useChatSlashCommands({
   },
   resetCurrentSession: () => {
     resetCurrentSessionAfterSlash()
+    resetSessionArtifacts()
     chatPlans.reset()
   },
   setCompactInFlight,
@@ -3250,38 +3269,11 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   }
 }
 
-/**
- * Every deliverable the current session has produced, deduped by identity.
- * Artifacts arrive on completed/replayed assistant turns (`message.artifacts`,
- * filled from chat.history and from the streamed turn that just ended) and on
- * the in-flight turn (`streamArtifacts`); both feed the per-session drawer.
- */
-const sessionArtifacts = computed<ArtifactPayload[]>(() => {
-  const seen = new Set<string>()
-  const collected: ArtifactPayload[] = []
-  const consider = (artifact: ArtifactPayload | undefined | null) => {
-    if (!artifact) return
-    const id = String(artifact.id || artifact.download_url || artifact.name || '')
-    if (!id || seen.has(id)) return
-    seen.add(id)
-    collected.push(artifact)
-  }
-  for (const message of messages.value) {
-    message.artifacts?.forEach(consider)
-  }
-  streamArtifacts.value.forEach(consider)
-  return collected
-})
-
 const sessionWorkbenchArtifacts = computed(() =>
   sessionArtifacts.value.filter(artifactUsesWorkbenchPreview),
 )
 
-const headerDeliverableCount = computed(() =>
-  workbenchEnabled.value
-    ? sessionWorkbenchArtifacts.value.length
-    : sessionArtifacts.value.length,
-)
+const headerDeliverableCount = computed(() => sessionArtifacts.value.length)
 
 const deliverablesOpen = ref(false)
 
@@ -3293,7 +3285,9 @@ function focusHeaderAction(
 
 function openDeliverables() {
   if (sessionArtifacts.value.length === 0) return
-  if (workbenchEnabled.value) {
+  const allArtifactsUseWorkbench = sessionWorkbenchArtifacts.value.length
+    === sessionArtifacts.value.length
+  if (workbenchEnabled.value && allArtifactsUseWorkbench) {
     const recentPreview = workbenchStore.findMostRecentItem(item => {
       if (
         item.kind !== 'artifact-preview'
@@ -3316,14 +3310,6 @@ function openDeliverables() {
       openArtifact(artifact)
       return
     }
-
-    const latestArtifact = sessionArtifacts.value[sessionArtifacts.value.length - 1]
-    if (latestArtifact && artifactCategory(latestArtifact) === 'visual') {
-      openArtifact(latestArtifact)
-      return
-    }
-    if (latestArtifact) focusInlineDeliverable(latestArtifact)
-    return
   }
   deliverablesOpen.value = true
 }
@@ -4121,6 +4107,7 @@ onUnmounted(() => {
   unsubs = []
   cleanupPendingQueue()
   cleanupHistory()
+  cleanupSessionArtifacts()
   cleanupStream()
   cleanupCompaction()
   cleanupVoiceInput()
@@ -4228,9 +4215,26 @@ watch(() => [route.query.newChat, route.query.new], () => {
 
 watch(sessionKey, () => {
   pendingForkBeforeMessageId.value = null
+  // Retire any in-flight page walk and clear the old Session before starting
+  // the new one, so a late response cannot leak deliverables across tabs/routes.
+  resetSessionArtifacts()
   if (workbenchEnabled.value) workbenchStore.setSessionScope(sessionKey.value || null)
   if (shareMode.value) endShareMode()
   deliverablesOpen.value = false
+  if (sessionKey.value && pendingSessionIntent.value !== 'new_chat') void loadSessionArtifacts()
+})
+
+// Hello refreshes method capabilities on reconnect. Retry the durable index
+// for the current Session then; older gateways simply remain on history/live.
+watch(() => rpc.state, (state, previous) => {
+  if (
+    state === 'connected'
+    && previous !== 'connected'
+    && sessionKey.value
+    && pendingSessionIntent.value !== 'new_chat'
+  ) {
+    void loadSessionArtifactsAfterReconnect()
+  }
 })
 
 watch(shareableMessageCount, (count) => {
