@@ -5,7 +5,6 @@ import type {
   MetaSetupInstallResponse,
   MetaSetupJob,
   MetaSetupPlanResponse,
-  MetaSetupProviderHandoff,
   MetaSetupReadiness,
   MetaSetupRunResponse,
   MetaSetupState,
@@ -19,15 +18,39 @@ import {
   removePendingMetaDiscard,
 } from '@/utils/chat/metaDiscardOutbox'
 
+import {
+  availableMetaSetupProviderIds as availableProviderIds,
+  createMetaSetupConfirmationState as confirmState,
+  failMetaSetupState as failedState,
+  isBusyMetaSetupState as isBusyPhase,
+  isMissingMetaSetupJobError as isMissingJobError,
+  metaSetupErrorMessage as errorMessage,
+  metaSetupResumeRequestId as setupResumeRequestId,
+  normalizeMetaLaunchText,
+  normalizeMetaSetupClientRequestId as normalizeClientRequestId,
+  normalizeMetaSetupProviderId as normalizeProviderId,
+  projectMetaSetupJob,
+  transitionMetaSetupState,
+  validMetaSetupProviderHandoff as validProviderHandoff,
+} from './metaSetupMachine'
+import {
+  createMetaSetupRepository,
+  defaultMetaSetupDiscardStorage,
+  defaultMetaSetupStorage,
+  type MetaSetupStorage,
+} from './metaSetupRepository'
+
+export { META_SETUP_PROVIDER_HANDOFF_TTL_MS } from './metaSetupMachine'
+export {
+  metaSetupLaunchStorageKey,
+  metaSetupManualStorageKey,
+  metaSetupStorageKey,
+} from './metaSetupRepository'
+export type { MetaSetupStorage } from './metaSetupRepository'
+
 type RpcClient = {
   call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   waitForConnection?: (timeoutMs?: number) => Promise<void>
-}
-
-export interface MetaSetupStorage {
-  getItem: (key: string) => string | null
-  setItem: (key: string, value: string) => void
-  removeItem: (key: string) => void
 }
 
 export type MetaDraftDiscardOutcome = 'discarded' | 'accepted' | 'unconfirmed'
@@ -66,59 +89,7 @@ export interface UseMetaSkillSetupOptions {
   forgetHiddenControl?: (sessionKey: string, clientRequestId: string) => void
 }
 
-const STORAGE_PREFIX = 'opensquilla.chat.metaSetupJob:'
-const LAUNCH_STORAGE_PREFIX = 'opensquilla.chat.metaSetupLaunch:'
-const MANUAL_STORAGE_PREFIX = 'opensquilla.chat.metaSetupManual:'
 const DEFAULT_POLL_INTERVAL_MS = 850
-const PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
-const CLIENT_REQUEST_ID_PATTERN = /^\S{1,256}$/
-
-export const META_SETUP_PROVIDER_HANDOFF_TTL_MS = 15 * 60 * 1000
-
-export function metaSetupStorageKey(sessionKey: string): string {
-  return `${STORAGE_PREFIX}${encodeURIComponent(sessionKey)}`
-}
-
-export function metaSetupLaunchStorageKey(sessionKey: string): string {
-  return `${LAUNCH_STORAGE_PREFIX}${encodeURIComponent(sessionKey)}`
-}
-
-export function metaSetupManualStorageKey(sessionKey: string): string {
-  return `${MANUAL_STORAGE_PREFIX}${encodeURIComponent(sessionKey)}`
-}
-
-function normalizeMetaLaunchText(name: string, candidate?: string): string {
-  const legacy = `/meta ${name}`
-  const launchText = String(candidate || '').trim()
-  if (launchText === legacy) return launchText
-  const suffix = launchText.startsWith(legacy) ? launchText.slice(legacy.length) : ''
-  if (/^\s+--(?:\s+[\s\S]*)?$/.test(suffix)) return launchText
-  return legacy
-}
-
-function availableActionIds(readiness: MetaSetupReadiness): string[] {
-  return (readiness.setup_actions || [])
-    .filter(action => action.available !== false && Boolean(action.id))
-    .map(action => action.id)
-}
-
-function normalizeProviderId(candidate: unknown): string {
-  const providerId = typeof candidate === 'string' ? candidate.trim().toLowerCase() : ''
-  return PROVIDER_ID_PATTERN.test(providerId) ? providerId : ''
-}
-
-function availableProviderIds(readiness: MetaSetupReadiness): string[] {
-  const providerIds = (readiness.manual_setup_actions || [])
-    .filter(action => action.kind === 'provider_connection' && action.available !== false)
-    .map(action => normalizeProviderId(action.provider_id))
-    .filter(Boolean)
-  return [...new Set(providerIds)]
-}
-
-function normalizeClientRequestId(candidate: unknown): string {
-  const clientRequestId = typeof candidate === 'string' ? candidate.trim() : ''
-  return CLIENT_REQUEST_ID_PATTERN.test(clientRequestId) ? clientRequestId : ''
-}
 
 function normalizeDiscardOutcome(candidate: unknown): MetaDraftDiscardOutcome {
   if (candidate === true || candidate === 'discarded') return 'discarded'
@@ -126,70 +97,26 @@ function normalizeDiscardOutcome(candidate: unknown): MetaDraftDiscardOutcome {
   return 'unconfirmed'
 }
 
-function validProviderHandoff(
-  candidate: unknown,
-  readiness: MetaSetupReadiness,
-  nowMs = Date.now(),
-): MetaSetupProviderHandoff | undefined {
-  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined
-  const value = candidate as Partial<MetaSetupProviderHandoff>
-  const providerId = normalizeProviderId(value.providerId)
-  const clientRequestId = normalizeClientRequestId(value.clientRequestId)
-  const startedAtMs = value.startedAtMs
-  if (typeof startedAtMs !== 'number') return undefined
-  const ageMs = nowMs - startedAtMs
-  if (
-    value.kind !== 'provider_settings'
-    || !providerId
-    || !clientRequestId
-    || !availableProviderIds(readiness).includes(providerId)
-    || !Number.isFinite(startedAtMs)
-    || ageMs < 0
-    || ageMs > META_SETUP_PROVIDER_HANDOFF_TTL_MS
-  ) {
-    return undefined
-  }
-  return { kind: 'provider_settings', providerId, startedAtMs, clientRequestId }
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error || 'Unknown setup error')
-}
-
-function isMissingJobError(error: unknown): boolean {
-  return /(?:not found|404|unknown (?:meta )?setup job|setup job (?:is )?unknown)/i
-    .test(errorMessage(error))
-}
-
-function isBusyPhase(state: MetaSetupState): boolean {
-  return state.phase === 'installing' || state.phase === 'verifying'
-}
-
-function defaultStorage(): MetaSetupStorage | null {
-  if (typeof window === 'undefined') return null
-  try {
-    return window.sessionStorage
-  } catch {
-    return null
-  }
-}
-
-function defaultDiscardStorage(): MetaSetupStorage | null {
-  if (typeof window === 'undefined') return null
-  try {
-    return window.localStorage
-  } catch {
-    return null
-  }
-}
-
 export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
   const setupState = ref<MetaSetupState | null>(null)
   const pollIntervalMs = Math.max(750, Math.min(1000, options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS))
-  const storage = options.storage === undefined ? defaultStorage() : options.storage
+  const storage = options.storage === undefined ? defaultMetaSetupStorage() : options.storage
   const discardStorage = options.discardStorage === undefined
-    ? defaultDiscardStorage()
+    ? defaultMetaSetupDiscardStorage()
     : options.discardStorage
+  const repository = createMetaSetupRepository(storage)
+  const {
+    clearCheckpoint: clearPersistedManualSetup,
+    clearJob: clearPersistedJobMarker,
+    clearLaunch: clearPersistedLaunch,
+    persistCheckpoint: persistSetupCheckpoint,
+    persistJob,
+    persistLaunch,
+    readCheckpoint: readPersistedSetupCheckpoint,
+    readJob: readPersistedJob,
+    readLaunch: readPersistedLaunch,
+    recoverFromMissingJob,
+  } = repository
 
   let operationToken = 0
   let pollTimer: ReturnType<typeof setTimeout> | null = null
@@ -217,273 +144,6 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
 
   function isCurrent(token: number): boolean {
     return !disposed && token === operationToken
-  }
-
-  function readPersistedJob(sessionKey: string): string {
-    if (!storage || !sessionKey) return ''
-    try {
-      return String(storage.getItem(metaSetupStorageKey(sessionKey)) || '')
-    } catch {
-      return ''
-    }
-  }
-
-  function persistJob(sessionKey: string, jobId: string): void {
-    if (!storage || !sessionKey || !jobId) return
-    try {
-      storage.setItem(metaSetupStorageKey(sessionKey), jobId)
-    } catch {
-      // A blocked sessionStorage must not prevent setup from completing.
-    }
-  }
-
-  function readPersistedLaunch(sessionKey: string): string {
-    if (!storage || !sessionKey) return ''
-    try {
-      return String(storage.getItem(metaSetupLaunchStorageKey(sessionKey)) || '')
-    } catch {
-      return ''
-    }
-  }
-
-  function persistLaunch(sessionKey: string, launchText: string): void {
-    if (!storage || !sessionKey || !launchText) return
-    try {
-      storage.setItem(metaSetupLaunchStorageKey(sessionKey), launchText)
-    } catch {
-      // A blocked sessionStorage must not prevent setup from completing.
-    }
-  }
-
-  function clearPersistedJobMarker(sessionKey: string): void {
-    if (!storage || !sessionKey) return
-    try {
-      storage.removeItem(metaSetupStorageKey(sessionKey))
-    } catch {
-      // Best-effort cleanup only.
-    }
-  }
-
-  function clearPersistedLaunch(sessionKey: string): void {
-    if (!storage || !sessionKey) return
-    try {
-      storage.removeItem(metaSetupLaunchStorageKey(sessionKey))
-    } catch {
-      // Best-effort cleanup only.
-    }
-  }
-
-  function clearPersistedManualSetup(sessionKey: string): void {
-    if (!storage || !sessionKey) return
-    try {
-      storage.removeItem(metaSetupManualStorageKey(sessionKey))
-    } catch {
-      // Best-effort cleanup only.
-    }
-  }
-
-  function confirmState(
-    name: string,
-    readiness: MetaSetupReadiness,
-    sessionKey: string,
-    launchText: string,
-  ): MetaSetupState {
-    const actionIds = availableActionIds(readiness)
-    const providerIds = availableProviderIds(readiness)
-    if (actionIds.length === 0 && providerIds.length === 0) {
-      return {
-        name,
-        sessionKey,
-        launchText: normalizeMetaLaunchText(name, launchText),
-        phase: 'blocked',
-        readiness,
-        actionIds,
-        completedActions: [],
-        error: readiness.reasons?.join('; ') || '',
-        blockedReason: 'no_actions',
-        retryMode: 'readiness',
-      }
-    }
-    return {
-      name,
-      sessionKey,
-      launchText: normalizeMetaLaunchText(name, launchText),
-      phase: 'confirm',
-      readiness,
-      actionIds,
-      completedActions: [],
-      retryMode: actionIds.length === 0 ? 'readiness' : undefined,
-    }
-  }
-
-  function persistSetupCheckpoint(current: MetaSetupState): boolean {
-    // Persist only stable recovery inputs, never server-owned progress. Keeping
-    // this checkpoint while a job is active lets the UI recover the original
-    // readiness and launch after a Gateway restart invalidates the job id.
-    if (!storage || !current.sessionKey) return false
-    try {
-      const providerHandoff = validProviderHandoff(
-        current.providerHandoff,
-        current.readiness,
-      )
-      const resumeRequestId = normalizeClientRequestId(
-        current.resumeRequestId || providerHandoff?.clientRequestId,
-      )
-      storage.setItem(metaSetupManualStorageKey(current.sessionKey), JSON.stringify({
-        name: current.name,
-        launchText: normalizeMetaLaunchText(current.name, current.launchText),
-        readiness: current.readiness,
-        ...(providerHandoff ? { providerHandoff } : {}),
-        ...(resumeRequestId ? { resumeRequestId } : {}),
-        ...(current.suppressAutoResume ? { suppressAutoResume: true } : {}),
-      }))
-      return true
-    } catch {
-      // The card still works for the current route when sessionStorage is unavailable.
-      return false
-    }
-  }
-
-  function readPersistedSetupCheckpoint(sessionKey: string): MetaSetupState | null {
-    if (!storage || !sessionKey) return null
-    try {
-      const raw = storage.getItem(metaSetupManualStorageKey(sessionKey))
-      if (!raw) return null
-      const parsed = JSON.parse(raw) as {
-        name?: unknown
-        launchText?: unknown
-        readiness?: unknown
-        providerHandoff?: unknown
-        resumeRequestId?: unknown
-        suppressAutoResume?: unknown
-      }
-      if (
-        typeof parsed.name !== 'string'
-        || !parsed.name
-        || typeof parsed.readiness !== 'object'
-        || parsed.readiness === null
-        || Array.isArray(parsed.readiness)
-      ) {
-        clearPersistedManualSetup(sessionKey)
-        return null
-      }
-      const restored = confirmState(
-        parsed.name,
-        parsed.readiness as MetaSetupReadiness,
-        sessionKey,
-        typeof parsed.launchText === 'string' ? parsed.launchText : `/meta ${parsed.name}`,
-      )
-      const providerHandoff = validProviderHandoff(
-        parsed.providerHandoff,
-        restored.readiness,
-      )
-      const resumeRequestId = normalizeClientRequestId(parsed.resumeRequestId)
-      const providerMatchesResume = Boolean(
-        providerHandoff
-        && (!resumeRequestId || providerHandoff.clientRequestId === resumeRequestId),
-      )
-      if (providerHandoff && providerMatchesResume) {
-        restored.providerHandoff = providerHandoff
-        restored.resumeRequestId = resumeRequestId || providerHandoff.clientRequestId
-      } else if (resumeRequestId) {
-        restored.resumeRequestId = resumeRequestId
-        restored.suppressAutoResume = Boolean(
-          parsed.suppressAutoResume === true || parsed.providerHandoff !== undefined,
-        )
-      }
-      if (
-        (parsed.providerHandoff !== undefined && !providerMatchesResume)
-        || (
-          parsed.suppressAutoResume !== undefined
-          && parsed.suppressAutoResume !== restored.suppressAutoResume
-        )
-        || (parsed.resumeRequestId !== undefined && !resumeRequestId)
-      ) {
-        persistSetupCheckpoint(restored)
-      }
-      return restored
-    } catch {
-      clearPersistedManualSetup(sessionKey)
-      return null
-    }
-  }
-
-  function readLegacySetupCheckpoint(sessionKey: string): MetaSetupState | null {
-    const launchText = readPersistedLaunch(sessionKey)
-    const match = /^\/meta\s+([^\s]+)(?:\s|$)/.exec(launchText)
-    const name = match?.[1] || ''
-    if (!name) return null
-    const checkpoint = confirmState(name, {}, sessionKey, launchText)
-    persistSetupCheckpoint(checkpoint)
-    return checkpoint
-  }
-
-  function recoverFromMissingJob(
-    sessionKey: string,
-    fallback?: MetaSetupState,
-  ): MetaSetupState | null {
-    // The Gateway owns setup jobs in memory, so a restart legitimately makes
-    // a previously accepted id unknown. Drop only that short-lived pointer;
-    // the stable checkpoint remains the source of truth for user recovery.
-    clearPersistedJobMarker(sessionKey)
-    const persisted = readPersistedSetupCheckpoint(sessionKey)
-    if (persisted) {
-      const fallbackRequestId = setupResumeRequestId(fallback)
-      const persistedRequestId = setupResumeRequestId(persisted)
-      if (
-        fallback
-        && fallbackRequestId
-        && persisted.name === fallback.name
-        && normalizeMetaLaunchText(persisted.name, persisted.launchText)
-          === normalizeMetaLaunchText(fallback.name, fallback.launchText)
-        && (!persistedRequestId || persistedRequestId === fallbackRequestId)
-      ) {
-        const merged = {
-          ...persisted,
-          resumeRequestId: fallbackRequestId,
-          providerHandoff: fallback.providerHandoff || persisted.providerHandoff,
-        }
-        persistSetupCheckpoint(merged)
-        return merged
-      }
-      return persisted
-    }
-
-    if (fallback && fallback.name && fallback.name !== 'MetaSkill') {
-      const checkpoint = confirmState(
-        fallback.name,
-        fallback.readiness,
-        sessionKey,
-        fallback.launchText || readPersistedLaunch(sessionKey),
-      )
-      checkpoint.resumeRequestId = fallback.resumeRequestId
-      checkpoint.providerHandoff = fallback.providerHandoff
-      persistSetupCheckpoint(checkpoint)
-      return checkpoint
-    }
-
-    // Older clients persisted only a job id plus launch text. Preserve that
-    // upgrade path as a readiness-recheck card when the old job disappeared.
-    return readLegacySetupCheckpoint(sessionKey)
-  }
-
-  function failedState(
-    current: MetaSetupState,
-    error: string,
-    retryMode: 'install' | 'status' | 'launch' | 'readiness' | 'discard',
-  ): MetaSetupState {
-    return {
-      ...current,
-      phase: 'failed',
-      error,
-      retryMode,
-    }
-  }
-
-  function setupResumeRequestId(current: MetaSetupState | null | undefined): string {
-    return normalizeClientRequestId(
-      current?.resumeRequestId || current?.providerHandoff?.clientRequestId,
-    )
   }
 
   function dispatchFailureMessage(result: HiddenControlDispatchResult): string {
@@ -533,13 +193,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
 
     if (!currentMatches || !current) return
     if (result.status === 'queued') {
-      setupState.value = {
-        ...current,
-        phase: 'verifying',
-        message: '',
-        error: '',
-        retryMode: undefined,
-      }
+      setupState.value = transitionMetaSetupState(current, { type: 'launch_queued' })
       return
     }
     setupState.value = failedState(current, dispatchFailureMessage(result), 'launch')
@@ -604,21 +258,16 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     persistSetupCheckpoint(identifiedCurrent)
 
     stopPolling()
-    setupState.value = {
-      ...identifiedCurrent,
-      phase: 'verifying',
+    setupState.value = transitionMetaSetupState(identifiedCurrent, {
+      type: 'verification_started',
       readiness,
-      message: '',
-      error: '',
-      retryMode: undefined,
-    }
+    })
 
     if (options.currentSessionKey.value !== sessionKey) {
-      setupState.value = {
-        ...setupState.value,
-        phase: 'blocked',
-        blockedReason: 'session_changed',
-      }
+      setupState.value = transitionMetaSetupState(
+        setupState.value,
+        { type: 'session_changed' },
+      )
       return
     }
 
@@ -632,11 +281,10 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       if (!isCurrent(token)) return
 
       if (options.currentSessionKey.value !== sessionKey) {
-        setupState.value = {
-          ...setupState.value!,
-          phase: 'blocked',
-          blockedReason: 'session_changed',
-        }
+        setupState.value = transitionMetaSetupState(
+          setupState.value!,
+          { type: 'session_changed' },
+        )
         return
       }
 
@@ -717,9 +365,6 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     const restoredSetup = Boolean(current.jobId && current.jobId === job.job_id)
     if (!sameSetup && !restoredSetup) return
 
-    const completedActions = [...(job.completed_actions || [])]
-    const remainingActionIds = (job.action_ids || current.actionIds)
-      .filter(actionId => !completedActions.includes(actionId))
     const readiness = job.readiness || current.readiness
     const launchText = normalizeMetaLaunchText(
       job.name,
@@ -737,89 +382,24 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       })
     }
 
-    if (job.status === 'completed' || job.phase === 'completed') {
-      setupState.value = {
-        ...current,
-        name: job.name,
-        launchText,
-        phase: 'verifying',
-        readiness,
-        jobId: job.job_id,
-        jobStatus: job.status,
-        message: job.message || '',
-        currentAction: '',
-        downloadedBytes: job.downloaded_bytes || 0,
-        downloadTotalBytes: job.download_total_bytes || 0,
-        completedActions,
-        error: '',
-      }
+    const projection = projectMetaSetupJob(current, job, launchText)
+    setupState.value = projection.state
+
+    if (projection.kind === 'completed') {
       await resumeAfterSetup(job.name, job.sessionKey, readiness, token)
       return
     }
 
-    if (job.status === 'blocked' || job.phase === 'blocked') {
+    if (projection.kind === 'blocked') {
       clearPersistedJobMarker(job.sessionKey)
-      const next = confirmState(job.name, readiness, job.sessionKey, launchText)
-      setupState.value = {
-        ...next,
-        jobId: job.job_id,
-        jobStatus: job.status,
-        message: job.message || '',
-        currentAction: '',
-        downloadedBytes: job.downloaded_bytes || 0,
-        downloadTotalBytes: job.download_total_bytes || 0,
-        completedActions,
-        error: job.error || next.error || '',
-        blockedReason: next.phase === 'blocked' ? 'requirements_remaining' : undefined,
-        // The setup job may complete its automatic actions while a provider
-        // requirement remains. Keep the original launch identity across that
-        // transition so provider settings resumes the already-drafted request
-        // instead of allocating a second, independently chargeable launch.
-        providerHandoff: current.providerHandoff,
-        resumeRequestId: setupResumeRequestId(current) || undefined,
-      }
+      // The pure projection keeps the original request identity when automatic
+      // actions finish but provider requirements remain.
       persistSetupCheckpoint(setupState.value!)
       return
     }
 
-    if (job.status === 'failed' || job.phase === 'failed') {
-      setupState.value = {
-        ...current,
-        name: job.name,
-        launchText,
-        phase: 'failed',
-        actionIds: remainingActionIds,
-        jobId: job.job_id,
-        jobStatus: job.status,
-        message: job.message || '',
-        currentAction: '',
-        downloadedBytes: job.downloaded_bytes || 0,
-        downloadTotalBytes: job.download_total_bytes || 0,
-        completedActions,
-        error: job.error || job.message || 'Setup failed',
-        retryMode: remainingActionIds.length ? 'install' : 'status',
-      }
-      return
-    }
+    if (projection.kind === 'failed') return
 
-    const phase = job.phase === 'verifying' ? 'verifying' : 'installing'
-    setupState.value = {
-      ...current,
-      name: job.name,
-      launchText,
-      phase,
-      readiness,
-      actionIds: job.action_ids || current.actionIds,
-      jobId: job.job_id,
-      jobStatus: job.status,
-      message: job.message || '',
-      currentAction: job.current_action || '',
-      downloadedBytes: job.downloaded_bytes || 0,
-      downloadTotalBytes: job.download_total_bytes || 0,
-      completedActions,
-      error: '',
-      retryMode: undefined,
-    }
     persistJob(job.sessionKey, job.job_id)
     schedulePoll(job.job_id, job.sessionKey, token)
   }
@@ -847,24 +427,14 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
   async function startInstall(current: MetaSetupState): Promise<void> {
     if (installInFlight || current.actionIds.length === 0) return
     if (options.currentSessionKey.value !== current.sessionKey) {
-      setupState.value = {
-        ...current,
-        phase: 'blocked',
-        blockedReason: 'session_changed',
-      }
+      setupState.value = transitionMetaSetupState(current, { type: 'session_changed' })
       return
     }
 
     const token = beginOperation()
     installInFlight = true
     persistSetupCheckpoint(current)
-    setupState.value = {
-      ...current,
-      phase: 'installing',
-      message: '',
-      error: '',
-      retryMode: undefined,
-    }
+    setupState.value = transitionMetaSetupState(current, { type: 'install_started' })
     try {
       const result = await rpcCall<MetaSetupInstallResponse>('meta.setup.install', {
         name: current.name,
@@ -1041,17 +611,15 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     }
 
     const clientRequestId = setupResumeRequestId(current) || createClientRequestId()
-    const { suppressAutoResume: _suppressAutoResume, ...resumableCurrent } = current
-    const next: MetaSetupState = {
-      ...resumableCurrent,
-      resumeRequestId: clientRequestId,
-      providerHandoff: {
+    const next = transitionMetaSetupState(current, {
+      type: 'provider_handoff_started',
+      handoff: {
         kind: 'provider_settings',
         providerId: normalizedProviderId,
         startedAtMs: Date.now(),
         clientRequestId,
       },
-    }
+    })
     // A handoff necessarily unmounts ChatView. Do not leave the page unless its
     // original intent and idempotency identity are durably recoverable.
     if (!persistSetupCheckpoint(next)) return ''
@@ -1074,7 +642,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     // The handoff marker is one-shot navigation state. The resume identity is
     // the durable server draft identity and must survive a cancelled/failed
     // route so a later dismissal can atomically discard that exact request.
-    const { providerHandoff: _providerHandoff, ...next } = current
+    const next = transitionMetaSetupState(current, { type: 'provider_handoff_cancelled' })
     setupState.value = next
     persistSetupCheckpoint(next)
   }
@@ -1102,24 +670,18 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     clientRequestId = '',
   ): Promise<void> {
     if (options.currentSessionKey.value !== current.sessionKey) {
-      setupState.value = {
-        ...current,
-        phase: 'blocked',
-        blockedReason: 'session_changed',
-        retryMode: undefined,
-      }
+      setupState.value = transitionMetaSetupState(current, {
+        type: 'session_changed',
+        clearRetryMode: true,
+      })
       return
     }
 
     const token = beginOperation()
-    setupState.value = {
-      ...current,
-      suppressAutoResume: undefined,
-      phase: 'verifying',
-      message: '',
-      error: '',
-      retryMode: undefined,
-    }
+    setupState.value = transitionMetaSetupState(current, {
+      type: 'verification_started',
+      clearSuppressAutoResume: true,
+    })
     const stableClientRequestId = normalizeClientRequestId(
       clientRequestId || setupResumeRequestId(current),
     )
