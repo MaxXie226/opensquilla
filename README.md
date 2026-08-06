@@ -565,6 +565,13 @@ opensquilla chat                       # interactive REPL
 opensquilla agent -m "your prompt"     # one-shot, automation-friendly
 ```
 
+For subprocess progress, add `--event-stream-stderr`. The final result keeps
+its existing stdout format, while stderr receives incrementally flushed,
+privacy-bounded v1 JSONL events. Consumers must drain stderr continuously and
+only treat objects with `"_event": true` as events because ordinary diagnostics
+can share the stream. See [docs/cli.md](docs/cli.md#agent-progress-event-stream)
+for the versioned schema and compatibility contract.
+
 > **Development-only OpenTUI terminal UI.** Release installs continue to use
 > the Python-native chat. The richer full-screen frontend currently runs only
 > from a [Develop from source](#develop-from-source) checkout; no companion host

@@ -107,7 +107,44 @@ Useful automation flags:
 | `--permissions` | Select restricted, bypass, or full permission posture. |
 | `--transcript-path` | Write a JSONL transcript for automation. |
 | `--usage-path` | Write usage JSON. |
+| `--event-stream-stderr` | Stream stable v1 progress-event JSONL on stderr. |
 | `--session-db-path` | Persist session replay across invocations. |
+
+### Agent Progress Event Stream
+
+`--event-stream-stderr` is opt-in. It does not change the final stdout payload
+or exit status. Each supported event is flushed to stderr as one compact JSON
+object with this envelope:
+
+```json
+{"_event":true,"schema_version":1,"kind":"thinking"}
+```
+
+stderr can also contain ordinary diagnostics. Subprocess consumers must drain
+it continuously, parse it line by line, and accept only objects whose `_event`
+value is `true`. A closed or unwritable stderr disables further progress events
+without failing an otherwise successful agent run.
+
+The v1 event fields are intentionally smaller and more stable than the engine's
+internal event dataclasses:
+
+| `kind` | Additional fields |
+| --- | --- |
+| `router_decision` | `tier`, `model`, `source` |
+| `thinking` | None |
+| `text_delta` | `presentation` |
+| `run_heartbeat` | `phase`, `elapsed_ms`, `idle_ms` |
+| `tool_use_start` | `tool_use_id`, `tool_name`, `started_at` |
+| `tool_result` | `tool_use_id`, `tool_name`, `is_error` |
+| `warning`, `error` | `code`, redacted and bounded `message` |
+| `artifact` | `id`, `name`, `mime`, `size` |
+| `done` | None; read the final result from stdout |
+
+The stream does not expose reasoning text, answer text, tool arguments, tool
+results, internal routing probabilities, session paths, or fields added to
+future engine events. Unsupported internal events are skipped. Consumers may
+use the stable top-level fields above and must ignore additional fields that a
+future compatible v1 producer may add.
 
 ## Coding Mode and Code-Task
 
