@@ -52,7 +52,10 @@ describe('PromptCacheKeepaliveDialog', () => {
     expect(document.body.textContent).toContain('Provider cache lifetime')
     expect(document.body.textContent).toContain('Idle keepalive duration')
     expect(document.body.textContent).toContain('About every 4 min')
-    expect(document.body.textContent).toContain('about 14 requests in 60 min')
+    expect(document.body.textContent).toContain('up to about 14 requests')
+    expect(document.body.textContent).toContain('Scheduled')
+    expect(document.body.textContent).not.toContain('Keepalive plan')
+    expect(document.body.querySelector('.keepalive-dialog__plan')).toBeNull()
 
     const save = document.body.querySelector<HTMLButtonElement>('.btn--primary')
     save?.click()
@@ -115,7 +118,6 @@ describe('PromptCacheKeepaliveDialog', () => {
     expect(document.body.textContent).toContain(
       'must be longer than the roughly 48-minute probe interval',
     )
-    expect(document.body.textContent).not.toContain('Keepalive plan')
     expect(document.body.textContent).not.toContain('about 0 requests')
     app.unmount()
   })
