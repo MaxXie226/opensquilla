@@ -146,6 +146,27 @@ future engine events. Unsupported internal events are skipped. Consumers may
 use the stable top-level fields above and must ignore additional fields that a
 future compatible v1 producer may add.
 
+### Concurrent Agent Subprocesses
+
+Each write-capable agent holds a profile-wide writer lease. Calls that share an
+`OPENSQUILLA_STATE_DIR` therefore conflict instead of writing the same profile
+concurrently. An orchestrator that needs parallel agents must give every child
+both a distinct profile home and a distinct gateway state root:
+
+```sh
+OPENSQUILLA_STATE_DIR=/tmp/agent-a \
+OPENSQUILLA_GATEWAY_STATE_DIR=/tmp/agent-a/state \
+  opensquilla agent -m "task A" --json &
+```
+
+`OPENSQUILLA_STATE_DIR` alone does not override a `state_dir` from a
+current-directory `opensquilla.toml`, an explicit gateway config, or a copied
+profile. When copying `config.toml` or `.env`, remove or rewrite `state_dir` and
+`OPENSQUILLA_GATEWAY_STATE_DIR`. Also choose distinct `--session-db-path`,
+workspace, scratch, transcript, and usage paths when those outputs must be
+isolated. On Windows, pass both environment variables in each child process
+rather than relying on POSIX inline assignment syntax.
+
 ## Coding Mode and Code-Task
 
 Coding mode routes code modification work through the `code-task` workflow. It
