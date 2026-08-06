@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  effectiveCnyPerUsd,
   formatUsageCost,
   nativeBillingDisplay,
   serializeNativeBilling,
 } from './nativeBilling'
+import type { UsageSnapshot, UsageTotals } from '@/types/usage'
 
 function receipt(
   currency: string,
@@ -56,7 +58,7 @@ describe('native billing display contract', () => {
       exactCny: null,
       useCanonicalUsd: true,
     })
-    expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('$1.0000')
+    expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('¥7.2500')
   })
 
   it('requires one confirmed CNY receipt for every billed physical request', () => {
@@ -68,7 +70,7 @@ describe('native billing display contract', () => {
       exactCny: null,
       useCanonicalUsd: true,
     })
-    expect(formatUsageCost(0, 'CNY', 7.25, 4, source)).toBe('$0.0000')
+    expect(formatUsageCost(0, 'CNY', 7.25, 4, source)).toBe('¥0.0000')
   })
 
   it('accepts multiple physical B5 receipts for one billed envelope', () => {
@@ -90,10 +92,10 @@ describe('native billing display contract', () => {
     delete source.nativeBillingMissingConfirmedReceiptCount
 
     expect(nativeBillingDisplay(source, 1).exactCny).toBeNull()
-    expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('$1.0000')
+    expect(formatUsageCost(1, 'CNY', 7.25, 4, source)).toBe('¥7.2500')
   })
 
-  it('keeps pending and mixed-currency totals in canonical USD', () => {
+  it('converts pending and mixed-currency totals from canonical USD for CNY display', () => {
     const pending = {
       costSource: 'opensquilla_estimate',
       pendingBillingReceiptCount: 1,
@@ -118,13 +120,13 @@ describe('native billing display contract', () => {
       },
     }
 
-    expect(formatUsageCost(0.5, 'CNY', 7.25, 4, pending)).toBe('$0.5000')
+    expect(formatUsageCost(0.5, 'CNY', 7.25, 4, pending)).toBe('¥3.6250')
     expect(nativeBillingDisplay(mixed, 3)).toMatchObject({
       exactCny: null,
       useCanonicalUsd: true,
       subtotalText: '¥6.975 · $2',
     })
-    expect(formatUsageCost(3, 'CNY', 7.25, 4, mixed)).toBe('$3.0000')
+    expect(formatUsageCost(3, 'CNY', 7.25, 4, mixed)).toBe('¥21.7500')
   })
 
   it('retains the legacy approximate conversion when no receipt exists', () => {
@@ -138,5 +140,58 @@ describe('native billing display contract', () => {
     const serialized = serializeNativeBilling(source)
 
     expect(JSON.parse(serialized).CNY.usdEquivalentNanos).toBe('9007199254740993123')
+  })
+})
+
+function snapshot(overrides: {
+  fxRatesNativePerUsd?: Record<string, string>
+  cnyReceiptRates?: string[]
+}): UsageSnapshot {
+  const totals = {
+    nativeBilledByCurrency: overrides.cnyReceiptRates
+      ? {
+        CNY: {
+          amountNanos: '6975000000',
+          amount: '6.975',
+          usdEquivalentNanos: '1000000000',
+          receiptCount: 1,
+          normalizationRatesNativePerUsd: overrides.cnyReceiptRates,
+        },
+      }
+      : {},
+  } as unknown as UsageTotals
+  return {
+    totals,
+    ...(overrides.fxRatesNativePerUsd
+      ? { fxRatesNativePerUsd: overrides.fxRatesNativePerUsd }
+      : {}),
+  } as UsageSnapshot
+}
+
+describe('effective CNY-per-USD rate', () => {
+  it('prefers the gateway-served canonical rate', () => {
+    expect(effectiveCnyPerUsd(snapshot({
+      fxRatesNativePerUsd: { CNY: '6.975' },
+      cnyReceiptRates: ['7.1'],
+    }))).toBe(6.975)
+  })
+
+  it('falls back to a unanimous receipt-recorded rate on older gateways', () => {
+    expect(effectiveCnyPerUsd(snapshot({ cnyReceiptRates: ['6.975'] }))).toBe(6.975)
+  })
+
+  it('declines to guess when receipts disagree or nothing is recorded', () => {
+    expect(effectiveCnyPerUsd(snapshot({ cnyReceiptRates: ['6.975', '7.1'] }))).toBeNull()
+    expect(effectiveCnyPerUsd(snapshot({}))).toBeNull()
+    expect(effectiveCnyPerUsd(null)).toBeNull()
+  })
+
+  it('rejects non-positive or malformed served rates', () => {
+    expect(effectiveCnyPerUsd(snapshot({
+      fxRatesNativePerUsd: { CNY: 'not-a-rate' },
+    }))).toBeNull()
+    expect(effectiveCnyPerUsd(snapshot({
+      fxRatesNativePerUsd: { CNY: '0' },
+    }))).toBeNull()
   })
 })

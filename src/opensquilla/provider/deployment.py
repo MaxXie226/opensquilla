@@ -21,6 +21,7 @@ import structlog
 
 from opensquilla.endpoint_identity import base_url_allows_credential_reuse
 
+from .credentials import credential_provider_hint, endpoint_provider_hint
 from .environment import environment_value
 from .registry import UnknownProviderError, get_provider_spec
 from .selector import ProviderConfig
@@ -222,8 +223,14 @@ def resolve_provider_deployment(
             credential_source = "profile_env"
             credential_env = profile_env
             credential_endpoint = profile_base_url or _text(spec.default_base_url)
-    registry_env_matches_profile_endpoint = not profile_base_url or (
-        base_url_allows_credential_reuse(spec.default_base_url, profile_base_url)
+    # The registry env key follows the registry-default endpoint origin. A
+    # provider spec without a default base URL (azure-style: the endpoint is
+    # operator-supplied by design) binds its env key to whatever endpoint the
+    # operator configured, so the profile base URL does not gate it there.
+    registry_env_matches_profile_endpoint = (
+        not profile_base_url
+        or not _text(spec.default_base_url)
+        or base_url_allows_credential_reuse(spec.default_base_url, profile_base_url)
     )
     if (
         not api_key
@@ -236,11 +243,22 @@ def resolve_provider_deployment(
         if api_key:
             credential_source = "registry_env"
             credential_env = spec.env_key
-            credential_endpoint = _text(spec.default_base_url)
+            credential_endpoint = _text(spec.default_base_url) or profile_base_url
     if spec.requires_api_key() and not api_key and not blocked_reason:
         blocked_reason = "missing_credential"
     if not spec.requires_api_key() and not api_key:
         credential_source = "keyless"
+    credential_hint = credential_provider_hint(api_key)
+    if api_key and credential_hint and credential_hint != provider:
+        # Keep a known cross-provider credential out of every downstream
+        # ProviderConfig, including status/readiness callers that might
+        # otherwise accidentally reuse an unready resolution.
+        api_key = ""
+        credential_source = "none"
+        credential_env = ""
+        blocked_reason = "credential_provider_mismatch"
+        if turn_metadata is not None:
+            turn_metadata.pop("credential_pool", None)
 
     base_url = member_base_url
     endpoint_source = "member" if base_url else "none"
@@ -256,6 +274,19 @@ def resolve_provider_deployment(
         base_url = _text(spec.default_base_url)
         if base_url:
             endpoint_source = "registry"
+    endpoint_hint = endpoint_provider_hint(base_url)
+    if (
+        api_key
+        and credential_hint
+        and endpoint_hint
+        and credential_hint != endpoint_hint
+    ):
+        api_key = ""
+        credential_source = "none"
+        credential_env = ""
+        blocked_reason = "credential_endpoint_provider_mismatch"
+        if turn_metadata is not None:
+            turn_metadata.pop("credential_pool", None)
     if not base_url and spec.requires_base_url() and not blocked_reason:
         blocked_reason = "missing_base_url"
     if (

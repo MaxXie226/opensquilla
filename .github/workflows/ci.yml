@@ -210,6 +210,66 @@ jobs:
           retention-days: 31
           overwrite: true
 
+  webui-chat-recovery:
+    name: WebUI chat recovery
+    needs: [classify-changes, frontend-check]
+    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
+      OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download verified frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-webui-dist
+          path: src/opensquilla/gateway/static/dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: 'npm'
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install Gateway dependencies
+        run: uv sync --frozen
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: opensquilla-webui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run production-dist chat recovery browser contract
+        working-directory: opensquilla-webui
+        run: npm run test:e2e -- history-hydration.spec.ts --project=chromium --workers=1
+
+      - name: Upload chat recovery traces
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-chat-recovery-attempt-${{ github.run_attempt }}
+          path: opensquilla-webui/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
   tui-check:
     name: OpenTUI package tests
     needs: classify-changes
@@ -241,7 +301,20 @@ jobs:
 
       - name: Run OpenTUI Bun tests
         working-directory: src/opensquilla/cli/tui/opentui/package
-        run: bun run test:bun
+        shell: bash
+        run: |
+          set +e
+          for attempt in 1 2; do
+            bun run test:bun
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$status" -ne 132 ] || [ "$attempt" -eq 2 ]; then
+              exit "$status"
+            fi
+            echo "::warning::Bun exited with SIGILL (132); retrying once."
+          done
 
   desktop-check:
     name: Desktop Electron unit tests
@@ -280,11 +353,17 @@ jobs:
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
           node scripts/test-desktop-locale.mjs
+          node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
-          node scripts/test-desktop-profile-context.mjs
+          node scripts/test-desktop-profile-consolidation.mjs
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
+          node scripts/test-desktop-window-lifecycle.mjs
+          node scripts/test-bundled-runtimes.mjs
           node scripts/test-desktop-cleanup-contract.mjs
+          node scripts/test-artifact-preview-lease-broker.mjs
+          node scripts/test-native-workbench-surface.mjs
+          node ../../.github/scripts/verify-sandbox-package.mjs --source
 
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
@@ -678,6 +757,7 @@ jobs:
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
+            --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
             -- \
             -q \
             -m "${markers}" \
@@ -848,7 +928,9 @@ jobs:
         with:
           node-version: '22.12.0'
           cache: 'npm'
-          cache-dependency-path: desktop/electron/package-lock.json
+          cache-dependency-path: |
+            desktop/electron/package-lock.json
+            opensquilla-webui/package-lock.json
 
       - name: Verify downloaded frontend artifact on consumer OS
         shell: bash
@@ -862,6 +944,36 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         run: npm ci
+
+      - name: Install WebUI recovery dependencies
+        working-directory: opensquilla-webui
+        shell: bash
+        run: npm ci
+
+      - name: Install WebUI recovery browser
+        working-directory: opensquilla-webui
+        shell: bash
+        run: |
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            npx playwright install --with-deps chromium
+          else
+            npx playwright install chromium
+          fi
+
+      - name: Run cross-platform production-dist browser session hang contract
+        working-directory: opensquilla-webui
+        shell: bash
+        env:
+          OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
+          OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+        run: |
+          set -euo pipefail
+          npm run test:e2e -- \
+            history-hydration.spec.ts \
+            --project=chromium \
+            --workers=1 \
+            --grep "terminates stalled" \
+            2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
 
       - name: Record Desktop recovery tool versions
         shell: bash
@@ -883,7 +995,7 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         env:
-          OPENSQUILLA_DESKTOP_RECOVERY_SCREENSHOT: ${{ runner.temp }}/desktop-recovery-e2e/recovery-page.png
+          OPENSQUILLA_DESKTOP_CONSOLIDATION_SCREENSHOT: ${{ runner.temp }}/desktop-recovery-e2e/consolidated-primary.png
           OPENSQUILLA_DESKTOP_IMPORT_SCREENSHOT_DIR: ${{ runner.temp }}/desktop-recovery-e2e/profile-import-screenshots
         run: |
           set -euo pipefail
@@ -899,11 +1011,17 @@ jobs:
           }
 
           for entry in \
-            'profile-recovery-flow:scripts/test-profile-recovery-flow.mjs' \
-            'profile-recovery-accessibility:scripts/test-profile-recovery-accessibility.mjs' \
+            'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs' \
+            'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs' \
             'profile-import-flow:scripts/test-profile-import-flow.mjs' \
+            'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs' \
+            'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs' \
             'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
-            'unsafe-profile-no-write:scripts/test-unsafe-profile-no-write.mjs'
+            'window-background-flow:scripts/test-desktop-window-background-flow.mjs' \
+            'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs' \
+            'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs' \
+            'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs' \
+            'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
           do
             name="${entry%%:*}"
             script="${entry#*:}"
@@ -964,6 +1082,7 @@ jobs:
             tests/test_root_start_scripts.py \
             tests/test_release_consistency.py \
             tests/test_public_release_hygiene.py \
+            tests/test_sandbox/test_release_contract.py \
             -q
 
   readme-locale-check:
@@ -996,6 +1115,7 @@ jobs:
       - workflow-lint
       - readme-locale-check
       - frontend-check
+      - webui-chat-recovery
       - tui-check
       - desktop-check
       - ubuntu-quality
@@ -1017,6 +1137,24 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Check WebUI chat recovery result
+        env:
+          RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
+          FLAG_FRONTEND_CHANGED: ${{ needs.classify-changes.outputs.frontend_changed }}
+          FLAG_PLATFORM_SENSITIVE_CHANGED: ${{ needs.classify-changes.outputs.platform_sensitive_changed }}
+          FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
+        shell: bash
+        run: |
+          if [[ "${FLAG_FRONTEND_CHANGED}" == "true" || "${FLAG_PLATFORM_SENSITIVE_CHANGED}" == "true" || "${FLAG_FULL_REQUIRED}" == "true" ]]; then
+            if [[ "${RESULT_WEBUI_CHAT_RECOVERY}" != "success" ]]; then
+              echo "ERROR: WebUI chat recovery must succeed; got ${RESULT_WEBUI_CHAT_RECOVERY:-missing}." >&2
+              exit 1
+            fi
+          elif [[ "${RESULT_WEBUI_CHAT_RECOVERY}" != "success" && "${RESULT_WEBUI_CHAT_RECOVERY}" != "skipped" ]]; then
+            echo "ERROR: WebUI chat recovery must be successful or intentionally skipped; got ${RESULT_WEBUI_CHAT_RECOVERY:-missing}." >&2
+            exit 1
+          fi
 
       - name: Check required CI results
         env:

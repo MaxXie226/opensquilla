@@ -5,6 +5,7 @@ import type {
   ChatStreamTimelineItem,
 } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
+import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
@@ -17,6 +18,21 @@ export interface UseChatMessageActionsOptions {
   focusComposer: () => void
   pendingForkBeforeMessageId: Ref<string | null>
   aiGeneratedLabel?: () => string
+  canDeliver?: () => boolean
+  notifyDeliveryBlocked?: () => void
+  /**
+   * User-visible feedback when regenerate/edit cannot run because the anchor
+   * user message has no durable server id yet (chat.send ack lost, or an
+   * older gateway omitted the id). Without it the buttons look dead: the
+   * only trace of the refusal would be a console warning.
+   */
+  notifyMessagePending?: () => void
+  /**
+   * User-visible feedback when edit is clicked while the assistant is still
+   * streaming. The edit button is disabled in that state, but other entry
+   * points (keyboard, future surfaces) must not fail silently either.
+   */
+  notifyEditBlocked?: () => void
 }
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
@@ -26,6 +42,24 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     // text (e.g. "<details>") that is visible on screen.
     if ((message.displayRole || message.role) === 'user') {
       return options.stripTimePrefix(message.text || '').trim()
+    }
+    const answer = resolveAssistantAnswer(
+      message,
+      message.timelineItems ?? [],
+      message.interrupted || message.terminalFailure
+        ? 'interrupted'
+        : message.isStreaming
+          ? 'working'
+          : 'settled',
+    )
+    // The same structurally proven PlanRun answer shown outside the collapsed
+    // activity must also be what Copy returns. Otherwise the compact completed
+    // state would silently copy the entire execution narration.
+    if (
+      answer.source === 'terminal-control-boundary'
+      || answer.source === 'terminal-timeline-boundary'
+    ) {
+      return options.sanitizeCopyText(answer.text)
     }
     // Tool-bearing turns render text as separate timeline segments; the raw
     // message text concatenates them without separators, so rebuild from the
@@ -74,6 +108,13 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       console.warn('Wait for the current response to finish')
       return
     }
+    // Regenerate is a send action that also truncates local history and
+    // replaces the composer. Fail closed before any of those mutations when
+    // live delivery cannot receive the resulting turn.
+    if (options.canDeliver && !options.canDeliver()) {
+      options.notifyDeliveryBlocked?.()
+      return
+    }
     const assistantIndex = sourceMessageIndex(message)
     const userMsgIndex = previousUserMessageIndex(assistantIndex)
     if (userMsgIndex < 0) {
@@ -85,6 +126,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     const forkBeforeMessageId = userMessage?.messageId || ''
     if (!forkBeforeMessageId) {
       console.warn('Wait for the message to finish saving before regenerating')
+      options.notifyMessagePending?.()
       return
     }
     const userText = userMessage?.text || ''
@@ -98,6 +140,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   function editMessage(message: ChatRenderedMessage) {
     if (options.isStreaming.value) {
       console.warn('Wait for the current response to finish')
+      options.notifyEditBlocked?.()
       return
     }
     const msgIndex = sourceMessageIndex(message)
@@ -107,6 +150,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     const forkBeforeMessageId = sourceMessage?.messageId || ''
     if (!forkBeforeMessageId) {
       console.warn('Wait for the message to finish saving before editing')
+      options.notifyMessagePending?.()
       return
     }
     const text = sourceMessage.text || ''

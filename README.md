@@ -43,7 +43,7 @@ TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini,
 Qwen/DashScope, and 20+ other LLM providers with no change to your code or config
 schema.
 
-OpenSquilla 0.5.0 Preview 4 is the current preview release.
+OpenSquilla 0.5.2 is the current stable release.
 
 For task-oriented product documentation, start with the
 [OpenSquilla Product Guide](README.product.md) or the
@@ -65,9 +65,9 @@ contain that console, so their users do **not** need Node.js or npm.
 Release install commands use published GitHub release assets. Python wheel installs use versioned wheel filenames because installers validate the version
 embedded in the wheel filename.
 
-For 0.5.0 Preview 4 desktop use, prefer the packaged desktop installers from
-the GitHub Release: `OpenSquilla-0.5.0-rc4-mac-arm64.dmg` on macOS and
-`OpenSquilla-0.5.0-rc4-win-x64.exe` on Windows.
+For 0.5.2 desktop use, prefer the packaged desktop installers from
+the GitHub Release: `OpenSquilla-0.5.2-mac-arm64.dmg` on macOS and
+`OpenSquilla-0.5.2-win-x64.exe` on Windows.
 
 | Path | Audience | When to use |
 | --- | --- | --- |
@@ -113,11 +113,11 @@ Install links: [Git](https://git-scm.com/downloads) ·
 
 ### Desktop installers
 
-The 0.5.0 Preview 4 desktop installers package the Vue control console and
+The 0.5.2 desktop installers package the Vue control console and
 gateway runtime in an Electron shell.
 
-- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/OpenSquilla-0.5.0-rc4-mac-arm64.dmg>
-- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/OpenSquilla-0.5.0-rc4-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-mac-arm64.dmg>
+- Windows x64: <https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/OpenSquilla-0.5.2-win-x64.exe>
 
 For faster Mainland China downloads, use the OSS direct-download aliases:
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -175,7 +175,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Install OpenSquilla** — the same command on every platform.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
 ```
 
 This installs the OpenSquilla wheel from the release URL, then lets
@@ -199,7 +199,7 @@ opensquilla gateway run
 > a new terminal, or re-run the PATH line from step 1.
 
 For a fully pinned install, use the versioned wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl`.
+`https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl`.
 
 ### Install from source
 
@@ -387,9 +387,9 @@ full reference.
 
 ## Installation Privacy
 
-OpenSquilla uses anonymous installation telemetry to estimate install counts,
-version adoption, and runtime compatibility. Data is sent on first gateway
-startup and once per OpenSquilla version. It also records content-free daily
+OpenSquilla uses pseudonymous installation telemetry to estimate install
+counts, version adoption, and runtime compatibility. Data is sent on first
+gateway startup and once per OpenSquilla version. It also records content-free daily
 aggregates of completed top-level conversations and token usage by UTC date,
 and attempts to upload pending cumulative UTC-day snapshots to the telemetry
 service at startup and once per hour. OpenSquilla may also make
@@ -418,6 +418,15 @@ The `install_id` is a local one-way SHA-256 digest derived from usable MAC
 addresses, then local IP addresses when no MAC is available, with a random
 persisted fallback. Raw MAC/IP values are not uploaded.
 
+By default, requests sent directly to the official TokenRhythm HTTPS API may
+also carry the same pseudonymous, cross-session installation identifier in the
+optional `X-OpenSquilla-Install-Id` header. Only the exact official
+`tokenrhythm.studio` and `api.tokenrhythm.studio` HTTPS hosts on port 443 are
+eligible; custom proxies, OpenRouter, other providers, browser pages,
+redirected nonofficial targets, and returned image/CDN downloads are excluded.
+The raw MAC/IP values are never sent. The header is omitted if its background
+resolution is not ready or fails, so requests continue normally.
+
 What is not sent: usernames, hostnames, paths, API keys, provider config,
 chat/session/memory/agent content, file names, or file contents. Source IP may
 be visible to HTTP servers at the transport layer, but is not part of the
@@ -437,12 +446,14 @@ disable_network_observability = true
 ```
 
 That unified switch covers automatic install telemetry, daily aggregate usage
-telemetry, passive update checks,
-and automatic desktop update checks at startup and during long-running app
-sessions. Explicit update-availability checks remain disabled while the unified
-or legacy opt-out is active. Other user-initiated actions may still contact
-network services after user intent, including release downloads and configured
-providers, search, or channels.
+telemetry, passive update checks, and automatic desktop update checks at
+startup and during long-running app sessions, as well as the TokenRhythm
+installation header. Explicit update-availability checks remain disabled while
+the unified or legacy opt-out is active. CI and test environments also
+suppress the installation header and installation telemetry automatically.
+Other user-initiated actions may still
+contact network services after user intent, including release downloads and
+configured providers, search, or channels.
 
 Legacy opt-out environment variables remain honored:
 
@@ -450,6 +461,13 @@ Legacy opt-out environment variables remain honored:
 OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
+
+The legacy telemetry opt-out suppresses the TokenRhythm installation header;
+the update-check opt-out by itself does not. TokenRhythm must treat the header
+as optional and untrusted, and must not use it for authentication,
+authorization, billing, rate limiting, or anti-abuse decisions. See
+[`PRIVACY.md`](PRIVACY.md#tokenrhythm-installation-identifier) for the complete
+target and data-handling rules.
 
 Advanced deployments can use their own installation telemetry endpoint:
 
@@ -621,8 +639,8 @@ to allow inbound TCP on that port. Do not expose the gateway with
 **Docker**
 
 Prebuilt multi-arch images (`amd64`/`arm64`) are published to
-`ghcr.io/opensquilla/opensquilla` on release tags. Preview 4 is published as
-both `v0.5.0rc4` and the moving `latest` tag —
+`ghcr.io/opensquilla/opensquilla` on release tags. 0.5.2 is published as
+both `v0.5.2` and the moving `latest` tag —
 [`docs/docker.md`](docs/docker.md) is the full container guide
 (home servers and NAS, LAN exposure with token auth, upgrades):
 
@@ -651,29 +669,27 @@ settings live in `opensquilla.toml.example`.
 
 ---
 
-## What's New in 0.5.0 Preview 4
+## What's New in 0.5.0
 
-OpenSquilla 0.5.0 Preview 4 focuses on safe upgrades and existing user data:
+OpenSquilla 0.5.0 is the first stable release of the 0.5 line, collecting
+Previews 1-4 and the fixes since:
 
-- **Profile recovery** - validates the active workspace before any empty
-  workspace or chat database can be created, preserving identity, memory,
-  settings, and chats when upgrading RC2 or RC3 Desktop to RC4.
-- **Windows Portable transfer** - a fresh Windows Desktop can explicitly copy
-  an old Portable profile without modifying its source. Normal upgrades do not
-  show the transfer flow, and separate profiles are never silently merged.
-- **Desktop data protection** - normal uninstall now preserves profile data;
-  cleanup actions state exactly what they remove, and provider key changes
-  remain effective after restart.
-- **Updates and reliability** - long-running Desktop sessions can discover
-  later previews, while Model Ensemble progress, provider limits, WeCom
-  connectivity, SQLite, process, and checkpoint handling are more robust.
-- **Download options** - versioned GitHub assets,
-  multi-architecture GHCR images, and
-  an Alibaba Cloud OSS mirror provide release download options. Windows
-  Portable archives remain retired.
+- **Model Ensemble and multi-provider routing** - one turn can run across
+  several models with preset or custom lineups, provider management keeps
+  verified provider state across restarts, and on-device routing keeps
+  classification local.
+- **Safe upgrades and profile protection** - guarded migration previews,
+  profile recovery, and Windows profile-data preservation on uninstall.
+- **Desktop maturity** - signed and notarized macOS builds with in-app
+  updates, gateway boot recovery, and fail-closed restarts.
+- **Usage and cost reporting** - daily usage summaries on a durable ledger
+  with exact billing arithmetic.
+- **Download options** - versioned GitHub assets, multi-architecture GHCR
+  images, and an Alibaba Cloud OSS mirror with stable download aliases.
+  Windows Portable archives remain retired.
 
 Full notes: [`CHANGELOG.md`](CHANGELOG.md) ·
-[`docs/releases/0.5.0rc4.md`](docs/releases/0.5.0rc4.md).
+[`docs/releases/0.5.0.md`](docs/releases/0.5.0.md).
 
 ## What's New in 0.2.1
 

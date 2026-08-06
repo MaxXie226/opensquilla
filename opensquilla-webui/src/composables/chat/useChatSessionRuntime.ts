@@ -4,11 +4,8 @@ import type {
   ChatRunStatusSource,
 } from '@/types/chat'
 import type { PersistSessionOptions } from '@/composables/chat/useChatSessionRoute'
-import {
-  isAuthoritativeSessionSubscription,
-  type SessionSubscriptionOutcome,
-  type SessionSubscriptionResult,
-} from '@/composables/chat/useChatSessionSubscription'
+import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
+import type { SessionSubscriptionResult } from '@/composables/chat/useChatSessionSubscription'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -21,6 +18,7 @@ export interface ChatUsageAccumulator {
 }
 
 export interface ResponseSessionAdoptionResult {
+  authoritative: boolean
   authoritativeIdle: boolean
   backgroundOnly: boolean
 }
@@ -40,22 +38,23 @@ export interface UseChatSessionRuntimeOptions {
   usageModel: Ref<string>
   createSessionKey: (agentId?: string) => string
   persistSession: (key: string, options?: PersistSessionOptions) => void
-  unsubscribeSession: () => void | Promise<void>
-  subscribeSession: () => SessionSubscriptionResult | Promise<SessionSubscriptionResult>
-  loadHistory: () => void | Promise<void>
+  cancelSessionBootstrap: () => void
+  startSessionBootstrap: (options?: {
+    includeHistory?: boolean
+    force?: boolean
+  }) => SessionBootstrapRun
   loadCurrentSessionUsage: () => void | Promise<void>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   setCompactInFlight: (active: boolean, key?: string) => void
   hideCompactStatus: () => void
   clearPendingQueue: () => void
-  switchPendingQueue?: (targetSessionKey: string) => void
-  adoptPendingQueue?: (targetSessionKey: string, ownerRequestId: string) => void
+  switchPendingQueue: (targetSessionKey: string) => void
+  adoptPendingQueue: (targetSessionKey: string, ownerRequestId: string) => void
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
+  resetDraftComposer?: () => void
 }
-
-export type DraftSessionRebindGuard = (sourceSessionKey: string) => boolean
 
 const EMPTY_USAGE: ChatUsageAccumulator = {
   input: 0,
@@ -106,31 +105,20 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     resetSessionViewState()
   }
 
-  function switchSession(
-    key: string,
-    pendingQueuePolicy: { kind: 'navigate' },
-  ): Promise<boolean>
-  function switchSession(
-    key: string,
-    pendingQueuePolicy: { kind: 'response_handoff'; ownerRequestId: string },
-  ): Promise<ResponseSessionAdoptionResult | undefined>
   async function switchSession(
     key: string,
     pendingQueuePolicy:
       | { kind: 'navigate' }
       | { kind: 'response_handoff'; ownerRequestId: string },
-  ): Promise<boolean | ResponseSessionAdoptionResult | undefined> {
-    if (!key || key === options.sessionKey.value) {
-      return pendingQueuePolicy.kind === 'navigate' ? false : undefined
-    }
+  ): Promise<ResponseSessionAdoptionResult | undefined> {
+    if (!key || key === options.sessionKey.value) return
 
-    options.unsubscribeSession()
+    options.cancelSessionBootstrap()
     resetCompactState()
     if (pendingQueuePolicy.kind === 'response_handoff') {
-      options.adoptPendingQueue?.(key, pendingQueuePolicy.ownerRequestId)
+      options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
     } else {
-      if (options.switchPendingQueue) options.switchPendingQueue(key)
-      else options.clearPendingQueue()
+      options.switchPendingQueue(key)
     }
     options.persistSession(key, { source: 'runtime.switchToSession' })
     resetSessionRuntimeState()
@@ -138,30 +126,21 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.applySessionRunState({ run_status: 'idle' })
     resetSessionViewState()
     options.restoreWidgetState()
-    options.loadCurrentSessionUsage()
-    if (pendingQueuePolicy.kind === 'navigate') {
-      let subscription: Promise<SessionSubscriptionResult>
-      try {
-        subscription = Promise.resolve(options.subscribeSession()).catch(() => false)
-      } catch {
-        subscription = Promise.resolve(false)
-      }
-      const history = Promise.resolve(options.loadHistory())
-      const [subscriptionOutcome] = await Promise.all([subscription, history])
-      return options.sessionKey.value === key
-        && isAuthoritativeSessionSubscription(subscriptionOutcome)
-    }
-
-    const [subscriptionOutcome] = await Promise.all([
-      options.subscribeSession(),
-      options.loadHistory(),
-    ])
+    // History and live are launched together by the coordinator but remain
+    // orthogonal. Response hand-off only waits for the authoritative live
+    // snapshot; history can recover independently without blocking adoption.
+    const bootstrap = options.startSessionBootstrap({ includeHistory: true })
+    // Usage is optional metadata. Start it once the critical request frames are
+    // queued; a slow history response must not withhold the rest of the UI.
+    void bootstrap.criticalRequestsQueued.then(() => {
+      if (options.sessionKey.value === key) void options.loadCurrentSessionUsage()
+    })
+    const subscriptionOutcome = await bootstrap.live
     return {
-      authoritativeIdle: isSubscriptionOutcome(subscriptionOutcome)
-        && subscriptionOutcome.authoritative === true
+      authoritative: subscriptionOutcome?.authoritative === true,
+      authoritativeIdle: subscriptionOutcome?.authoritative === true
         && subscriptionOutcome.live === false,
-      backgroundOnly: isSubscriptionOutcome(subscriptionOutcome)
-        && subscriptionOutcome.authoritative === true
+      backgroundOnly: subscriptionOutcome?.authoritative === true
         && subscriptionOutcome.backgroundOnly === true,
     }
   }
@@ -181,21 +160,14 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     const sourceSessionKey = options.sessionKey.value
     if (!key || key === sourceSessionKey || !guard(sourceSessionKey)) return false
 
-    await options.unsubscribeSession()
+    options.cancelSessionBootstrap()
     if (options.sessionKey.value !== sourceSessionKey) return false
     if (!guard(sourceSessionKey)) {
-      try {
-        await options.subscribeSession()
-      } catch {
-        // Re-establishing the source subscription is best-effort. The caller
-        // still treats this stale recovery attempt as non-authoritative.
-      }
-      return false
+      return options.startSessionBootstrap({ includeHistory: false, force: true }).live
     }
 
     resetCompactState()
-    if (options.switchPendingQueue) options.switchPendingQueue(key)
-    else options.clearPendingQueue()
+    options.switchPendingQueue(key)
     // A recovered provisional draft remains a draft: do not write it to the URL
     // or active-session storage before the first accepted send.
     options.sessionKey.value = key
@@ -204,22 +176,22 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.applySessionRunState({ run_status: 'idle' })
     resetSessionViewState()
     options.restoreWidgetState()
-    return options.subscribeSession()
+    return options.startSessionBootstrap({ includeHistory: false }).live
   }
 
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
   function startDraftSession(agentId?: string) {
-    options.unsubscribeSession()
+    options.cancelSessionBootstrap()
     const key = options.createSessionKey(agentId)
     resetCompactState()
-    if (options.switchPendingQueue) options.switchPendingQueue(key)
-    else options.clearPendingQueue()
+    options.switchPendingQueue(key)
     options.sessionKey.value = key
     resetSessionRuntimeState()
     options.pendingSessionIntent.value = 'new_chat'
+    options.resetDraftComposer?.()
     resetSessionViewState()
-    options.subscribeSession()
+    options.startSessionBootstrap({ includeHistory: false })
   }
 
   return {
@@ -231,8 +203,4 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   }
 }
 
-function isSubscriptionOutcome(
-  value: boolean | void | SessionSubscriptionOutcome,
-): value is SessionSubscriptionOutcome {
-  return typeof value === 'object' && value !== null
-}
+export type DraftSessionRebindGuard = (sourceSessionKey: string) => boolean

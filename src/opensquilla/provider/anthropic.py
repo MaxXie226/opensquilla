@@ -12,12 +12,15 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import derive_is_error
 
+from .candidate_artifact import CandidateArtifactBuilder, CandidateArtifactLimitError
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
 from .failures import retry_after_from_headers
 from .model_catalog import shared_catalog
 from .registry import AuthHeaderStyle
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    protected_tool_result_indexes,
     prove_provider_payload_from_env,
 )
 from .stream_assembly import (
@@ -32,6 +35,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -113,6 +117,7 @@ def _build_message_payload(
     model: str | None = None,
     *,
     replay_provider_state: bool = True,
+    record_unsupported_document: bool = True,
 ) -> dict[str, Any]:
     if isinstance(msg.content, str):
         return {"role": msg.role, "content": msg.content}
@@ -152,7 +157,8 @@ def _build_message_payload(
                         "text": _document_unsupported_fallback_text(block.title),
                     }
                 )
-                _increment_document_block_unsupported()
+                if record_unsupported_document:
+                    _increment_document_block_unsupported()
                 continue
             doc_block: dict[str, Any] = {
                 "type": "document",
@@ -282,6 +288,7 @@ def _anthropic_iteration_token_counts(usage: dict[str, Any]) -> tuple[int, int]:
 class AnthropicProvider:
     """Streams from Anthropic Messages API with SSE parsing."""
 
+    final_request_admission_guaranteed = True
     provider_name = "anthropic"
 
     def __init__(
@@ -293,6 +300,9 @@ class AnthropicProvider:
         replay_provider_state: bool = True,
         auth_header_style: AuthHeaderStyle = "x-api-key",
         provider_id: str | None = None,
+        listing_model_ids: tuple[str, ...] | None = None,
+        temperature_floor_model_ids: frozenset[str] = frozenset(),
+        temperature_floor: float = 0.0,
     ) -> None:
         # The default auth style matches Anthropic proper so direct
         # construction (tests, embedding) against the default host behaves
@@ -308,6 +318,9 @@ class AnthropicProvider:
         # profiles such as MiniMax carry their own configured identity for
         # response attribution without changing Anthropic-shaped behavior.
         self.provider_id = (provider_id or self.provider_name).strip()
+        self._listing_model_ids = listing_model_ids
+        self._temperature_floor_model_ids = temperature_floor_model_ids
+        self._temperature_floor = temperature_floor
 
     @property
     def model(self) -> str:
@@ -329,21 +342,14 @@ class AnthropicProvider:
             return f"{self._base_url}{path[3:]}"
         return f"{self._base_url}{path}"
 
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[ToolDefinition] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        cfg = config or ChatConfig()
-        return self._stream(messages, tools, cfg)
-
-    async def _stream(
+    def _build_payload(
         self,
         messages: list[Message],
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
-    ) -> AsyncIterator[StreamEvent]:
+        *,
+        record_diagnostics: bool,
+    ) -> tuple[dict[str, Any], bool]:
         max_tokens = max(1, cfg.max_tokens)
         thinking_payload: dict[str, Any] | None = None
         if cfg.thinking:
@@ -360,16 +366,20 @@ class AnthropicProvider:
 
         built_messages = [
             _build_message_payload(
-                m,
+                message,
                 model=self._model,
                 replay_provider_state=self._replay_provider_state,
+                record_unsupported_document=record_diagnostics,
             )
-            for m in messages
+            for message in messages
         ]
         request_has_document = any(
-            isinstance(m.get("content"), list)
-            and any(isinstance(p, dict) and p.get("type") == "document" for p in m["content"])
-            for m in built_messages
+            isinstance(message.get("content"), list)
+            and any(
+                isinstance(part, dict) and part.get("type") == "document"
+                for part in message["content"]
+            )
+            for message in built_messages
         )
         payload: dict[str, Any] = {
             "model": self._model,
@@ -381,13 +391,71 @@ class AnthropicProvider:
         if system_payload:
             payload["system"] = system_payload
         if cfg.temperature is not None and not cfg.thinking:
-            payload["temperature"] = cfg.temperature
+            temperature = cfg.temperature
+            if (
+                self._model.rsplit("/", 1)[-1].strip().lower()
+                in self._temperature_floor_model_ids
+            ):
+                temperature = max(temperature, self._temperature_floor)
+            payload["temperature"] = temperature
         if cfg.stop_sequences:
             payload["stop_sequences"] = cfg.stop_sequences
         if tools:
-            payload["tools"] = [_build_tool_payload(t) for t in tools]
+            payload["tools"] = [_build_tool_payload(tool) for tool in tools]
         if thinking_payload:
             payload["thinking"] = thinking_payload
+        return payload, request_has_document
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Messages payload without transport or shaping."""
+
+        cfg = config or ChatConfig()
+        payload, _ = self._build_payload(
+            messages,
+            tools,
+            cfg,
+            record_diagnostics=False,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        return project_final_request_payload(
+            payload,
+            projection_adapter="anthropic",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="native_is_error",
+            active_user_message_index=cfg.active_user_message_index,
+            message_limit=message_limit,
+            protected_tool_result_indexes=protected_result_indexes,
+        )
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        cfg = config or ChatConfig()
+        return self._stream(messages, tools, cfg)
+
+    async def _stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        payload, request_has_document = self._build_payload(
+            messages,
+            tools,
+            cfg,
+            record_diagnostics=True,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
 
         from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
@@ -396,6 +464,8 @@ class AnthropicProvider:
             projection_adapter="anthropic",
             proof_budget=cfg.provider_request_max_chars,
             status_projection_mode="native_is_error",
+            active_user_message_index=cfg.active_user_message_index,
+            protected_tool_result_indexes=protected_result_indexes,
         )
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
@@ -403,6 +473,13 @@ class AnthropicProvider:
             yield ErrorEvent(
                 message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
                 code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
             )
             return
         payload = budget_decision.payload or payload
@@ -413,6 +490,8 @@ class AnthropicProvider:
                 payload,
                 projection_adapter="anthropic",
                 status_projection_mode="native_is_error",
+                active_user_message_index=cfg.active_user_message_index,
+                protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
             log.warning("provider.request_budget_exhausted", **exc.proof)
@@ -427,10 +506,11 @@ class AnthropicProvider:
             "content-type": "application/json",
             "accept": "text/event-stream",
         }
-        if self._auth_header_style == "bearer":
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        else:
-            headers["x-api-key"] = self._api_key
+        if self._api_key:
+            if self._auth_header_style == "bearer":
+                headers["Authorization"] = f"Bearer {self._api_key}"
+            else:
+                headers["x-api-key"] = self._api_key
         endpoint = self._api_url("/v1/messages")
         trace = LLMTraceRecorder(
             provider="anthropic",
@@ -450,7 +530,14 @@ class AnthropicProvider:
             },
         )
 
-        # Tool calls keyed by Anthropic's global content-block index.
+        # Tool calls keyed by Anthropic's global content-block index. Proposer
+        # calls are retained as inert evidence instead of entering the
+        # executable ToolUse lifecycle.
+        candidate_artifact = (
+            CandidateArtifactBuilder()
+            if cfg.candidate_output_mode == "inert_artifact"
+            else None
+        )
         tools_acc = ToolStreamAccumulator()
         text_parts: list[str] = []
         trace_tool_calls: list[dict[str, Any]] = []
@@ -489,6 +576,15 @@ class AnthropicProvider:
         message_terminal_seen = False
         deferred_tool_ends: list[tuple[ToolUseEndEvent, str]] = []
         invalid_tool_call_ids: set[str] = set()
+        candidate_open_blocks: set[Any] = set()
+        candidate_closed_blocks: set[Any] = set()
+        candidate_argument_content_blocks: set[Any] = set()
+        candidate_lifecycle_invalid = False
+        # Content-block indices opened with a non-client-tool type (text,
+        # thinking, server-side tool blocks). Their input_json_delta frames
+        # are tolerated diagnostics, never client tool calls; only deltas for
+        # indices that were never opened at all remain protocol errors.
+        non_tool_block_indices: set[Any] = set()
 
         try:
             async with httpx.AsyncClient(
@@ -582,6 +678,7 @@ class AnthropicProvider:
                             trace.record_chunk(event)
 
                         if message_terminal_seen and etype not in {
+                            "message_delta",
                             "message_stop",
                             "ping",
                             "error",
@@ -623,11 +720,41 @@ class AnthropicProvider:
                             index = event.get("index", -1)
                             block = event.get("content_block", {})
                             btype = block.get("type")
-                            if btype == "tool_use":
+                            if candidate_artifact is not None:
+                                if (
+                                    index in candidate_open_blocks
+                                    or index in candidate_closed_blocks
+                                ):
+                                    candidate_lifecycle_invalid = True
+                                    continue
+                                # Track every native content block so an
+                                # unmatched/duplicate stop cannot be laundered
+                                # into a successful candidate terminal.
+                                candidate_open_blocks.add(index)
+                            if btype != "tool_use":
+                                non_tool_block_indices.add(index)
+                            else:
+                                # An index reopened as a client tool block is
+                                # a tool block from here on.
+                                non_tool_block_indices.discard(index)
                                 raw_tool_name = block.get("name")
                                 tool_name = (
                                     raw_tool_name if isinstance(raw_tool_name, str) else ""
                                 )
+                                if candidate_artifact is not None:
+                                    candidate_artifact.start(
+                                        index,
+                                        name_text=raw_tool_name,
+                                    )
+                                    if "input" in block:
+                                        initial_input = block.get("input")
+                                        if initial_input not in (None, {}, ""):
+                                            candidate_artifact.append_arguments(
+                                                index,
+                                                initial_input,
+                                            )
+                                            candidate_argument_content_blocks.add(index)
+                                    continue
                                 try:
                                     tool_events = tools_acc.start(
                                         index,
@@ -656,7 +783,26 @@ class AnthropicProvider:
                                 yield TextDeltaEvent(text=text)
                             elif dtype == "input_json_delta":
                                 index = event.get("index", 0)
+                                if index in non_tool_block_indices:
+                                    # Not a client tool block at this index
+                                    # (e.g. a server-side tool call) — never
+                                    # a client tool call.
+                                    log.debug(
+                                        "anthropic.non_tool_block_delta", index=index
+                                    )
+                                    continue
                                 fragment = delta.get("partial_json", "")
+                                if candidate_artifact is not None:
+                                    if (
+                                        index not in candidate_open_blocks
+                                        or index in candidate_closed_blocks
+                                    ):
+                                        candidate_lifecycle_invalid = True
+                                        continue
+                                    if fragment not in (None, ""):
+                                        candidate_argument_content_blocks.add(index)
+                                    candidate_artifact.append_arguments(index, fragment)
+                                    continue
                                 try:
                                     tool_events = tools_acc.append(index, fragment)
                                 except ToolStreamProtocolError as exc:
@@ -670,8 +816,8 @@ class AnthropicProvider:
                                     )
                                     continue
                                 if not tool_events:
-                                    # Not a tool block at this index (e.g. a
-                                    # server-tool result) — never a tool call.
+                                    # Identity still incomplete at this index —
+                                    # the delta is retained, not yet emitted.
                                     log.debug("anthropic.unknown_delta_index", index=index)
                                 for tool_event in tool_events:
                                     yield tool_event
@@ -684,6 +830,20 @@ class AnthropicProvider:
 
                         elif etype == "content_block_stop":
                             index = event.get("index", -1)
+                            if candidate_artifact is not None:
+                                if (
+                                    index not in candidate_open_blocks
+                                    or index in candidate_closed_blocks
+                                ):
+                                    candidate_lifecycle_invalid = True
+                                    continue
+                                candidate_open_blocks.discard(index)
+                                candidate_closed_blocks.add(index)
+                                if index not in non_tool_block_indices:
+                                    if index not in candidate_argument_content_blocks:
+                                        candidate_artifact.append_arguments(index, "{}")
+                                    candidate_artifact.finish(index)
+                                continue
                             pending_call = next(
                                 (
                                     (tool_use_id, tool_name, text)
@@ -740,12 +900,23 @@ class AnthropicProvider:
                                 invalid_tool_call_ids.add(tool_use_id)
 
                         elif etype == "message_delta":
-                            usage = event.get("usage", {})
+                            # The Messages stream may carry more than one
+                            # message_delta (usage and stop_reason can arrive
+                            # split across frames on Anthropic-compatible
+                            # endpoints). Merge each field only when the frame
+                            # actually provides it so a sparse epilogue frame
+                            # cannot regress an earlier frame's data; content
+                            # mutation stays rejected by the post-terminal
+                            # frame-order guard above.
+                            usage = event.get("usage") or {}
                             (
                                 iteration_input_tokens,
                                 iteration_output_tokens,
                             ) = _anthropic_iteration_token_counts(usage)
-                            output_tokens = iteration_output_tokens
+                            if "output_tokens" in usage or isinstance(
+                                usage.get("iterations"), list
+                            ):
+                                output_tokens = iteration_output_tokens
                             cached_tokens = max(
                                 cached_tokens,
                                 usage.get("cache_read_input_tokens", 0),
@@ -762,7 +933,11 @@ class AnthropicProvider:
                                 input_tokens = (
                                     base_input_tokens + cached_tokens + cache_creation_tokens
                                 )
-                            stop_reason = event.get("delta", {}).get("stop_reason", "end_turn")
+                            delta_body = event.get("delta") or {}
+                            if not message_terminal_seen:
+                                stop_reason = delta_body.get("stop_reason", "end_turn")
+                            elif "stop_reason" in delta_body:
+                                stop_reason = delta_body["stop_reason"]
                             message_terminal_seen = True
 
                         elif etype == "message_stop":
@@ -806,7 +981,13 @@ class AnthropicProvider:
                         return
 
                     pending_tool_calls = tools_acc.pending_raw_arguments()
-                    if pending_tool_calls or invalid_tool_call_ids:
+                    if (
+                        candidate_artifact is not None
+                        and (candidate_open_blocks or candidate_lifecycle_invalid)
+                    ) or (
+                        candidate_artifact is None
+                        and (pending_tool_calls or invalid_tool_call_ids)
+                    ):
                         message = "Anthropic response ended with an incomplete tool call"
                         trace.record_error(code="incomplete_tool_call", message=message)
                         yield ErrorEvent(message=message, code="incomplete_tool_call")
@@ -818,6 +999,21 @@ class AnthropicProvider:
                     for tool_event, raw in deferred_tool_ends:
                         _trace_tool_call(tool_event, raw)
                         yield tool_event
+                    if candidate_artifact is not None and candidate_artifact.has_calls:
+                        artifact_text = candidate_artifact.render_text()
+                        if artifact_text:
+                            text_parts.append(artifact_text)
+                            yield TextDeltaEvent(text=artifact_text)
+                        log.info(
+                            "provider.candidate_artifact",
+                            provider=self.provider_name,
+                            model=self._model,
+                            call_count=candidate_artifact.call_count,
+                            event_count=candidate_artifact.event_count,
+                            char_count=candidate_artifact.char_count,
+                            issue_codes=list(candidate_artifact.issue_codes),
+                            truncated=False,
+                        )
                     reasoning_content = reasoning.finalize()
                     trace.record_response(
                         usage={
@@ -846,6 +1042,28 @@ class AnthropicProvider:
                         provider=self.provider_id,
                     )
 
+        except CandidateArtifactLimitError as exc:
+            message = "Anthropic candidate artifact exceeded safety limits"
+            trace.record_error(
+                code="candidate_artifact_limit_exceeded",
+                message=message,
+                metadata={
+                    "operation": exc.operation,
+                    "reason": exc.reason,
+                    "limit": exc.limit,
+                    "observed": exc.observed,
+                },
+            )
+            log.warning(
+                "provider.candidate_artifact_limit",
+                provider=self.provider_name,
+                model=self._model,
+                operation=exc.operation,
+                reason=exc.reason,
+                limit=exc.limit,
+                observed=exc.observed,
+            )
+            yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
         except httpx.TimeoutException as exc:
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
@@ -885,20 +1103,27 @@ class AnthropicProvider:
             )
 
     async def list_models(self) -> list[ModelInfo]:
-        """Build listing rows for the adapter's SKUs from the shared catalog.
+        """Build listing rows for this provider identity from the shared catalog.
 
         The catalog's canonical costs are USD per million tokens; the
         ``ModelInfo`` wire contract carries per-1k floats (rpc_models
         renders per-1k), so entry costs are converted back (÷1000).
         Capability flags stay at ``ModelInfo`` defaults — the listing has
-        only ever advertised identity, windows, and pricing.
+        only ever advertised identity, windows, and pricing. Native Anthropic
+        uses its built-in SKU list; compatibility endpoints receive an exact
+        registry list or the configured model from the selector.
         """
         rows: list[ModelInfo] = []
-        for model_id in _LISTING_MODEL_IDS:
-            entry = shared_catalog().resolve_entry(model_id, provider=self.provider_name)
+        model_ids = (
+            _LISTING_MODEL_IDS
+            if self._listing_model_ids is None
+            else self._listing_model_ids
+        )
+        for model_id in model_ids:
+            entry = shared_catalog().resolve_entry(model_id, provider=self.provider_id)
             rows.append(
                 ModelInfo(
-                    provider=self.provider_name,
+                    provider=self.provider_id,
                     model_id=model_id,
                     display_name=entry.display_name or model_id,
                     context_window=entry.context_window,

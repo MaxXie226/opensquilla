@@ -21,6 +21,7 @@ from opensquilla.engine.steps.meta_command import (
     pending_meta_launch_put,
     pending_meta_launch_state,
 )
+from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
@@ -851,6 +852,70 @@ async def test_sessions_send_atomically_accepts_message_task_and_receipt(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_atomic_direct_send_enters_registry_admission_before_accept_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        stack.context.task_runtime = None
+        registry = get_agent_task_registry()
+        admission_attempted = asyncio.Event()
+        accept_called = asyncio.Event()
+        original_admission = registry.admission
+        original_accept = stack.storage.accept_turn
+
+        @asynccontextmanager
+        async def observed_admission(session_key: str) -> AsyncIterator[None]:
+            admission_attempted.set()
+            async with original_admission(session_key):
+                yield
+
+        async def observed_accept(*args: Any, **kwargs: Any) -> Any:
+            accept_called.set()
+            return await original_accept(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "admission", observed_admission)
+        monkeypatch.setattr(stack.storage, "accept_turn", observed_accept)
+        admission_lock = registry._admission_locks.setdefault(
+            SESSION_KEY,
+            asyncio.Lock(),
+        )
+
+        async with admission_lock:
+            sending = asyncio.create_task(
+                get_dispatcher().dispatch(
+                    "rpc-direct-admission",
+                    "sessions.send",
+                    {
+                        "key": SESSION_KEY,
+                        "message": "direct accepted turn",
+                        "clientRequestId": "direct-admission-request",
+                    },
+                    stack.context,
+                )
+            )
+            admission_wait = asyncio.create_task(admission_attempted.wait())
+            accept_wait = asyncio.create_task(accept_called.wait())
+            done, _pending = await asyncio.wait(
+                {admission_wait, accept_wait},
+                timeout=2.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert admission_wait in done
+            assert accept_wait not in done
+            assert sending.done() is False
+
+        response = await asyncio.wait_for(sending, timeout=2.0)
+        task = registry.get(SESSION_KEY)
+        if task is not None:
+            await task
+        admission_wait.cancel()
+        accept_wait.cancel()
+
+        assert response.ok is True
+
+
+@pytest.mark.asyncio
 async def test_sessions_send_replays_same_request_without_duplicate_side_effects(
     tmp_path: Path,
 ) -> None:
@@ -890,6 +955,41 @@ async def test_sessions_send_replays_same_request_without_duplicate_side_effects
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_sessions_send_fast_replay_consumes_legacy_meta_launch_draft(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        params = {
+            "key": SESSION_KEY,
+            "message": "accepted before the legacy Meta outbox was repaired",
+            "clientRequestId": CLIENT_REQUEST_ID,
+            "clientMessageId": "meta-control-message",
+        }
+        first = await get_dispatcher().dispatch(
+            "rpc-meta-draft-first", "sessions.send", params, stack.context
+        )
+        assert first.ok is True
+
+        # Reproduce an older build's crash window: ingress is committed, but a
+        # browser-recovery draft with the same coordinates remains durable.
+        await stack.storage.stage_meta_launch_draft(
+            session_key=SESSION_KEY,
+            client_request_id=CLIENT_REQUEST_ID,
+            meta_skill_name="meta-paper-write",
+            launch_text="/meta meta-paper-write -- keep the original request",
+        )
+        assert await stack.storage.list_meta_launch_drafts(session_key=SESSION_KEY)
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-meta-draft-replay", "sessions.send", params, stack.context
+        )
+
+        assert replay.ok is True
+        assert replay.payload["replayed"] is True
+        assert await stack.storage.list_meta_launch_drafts(session_key=SESSION_KEY) == []
 
 
 @pytest.mark.asyncio
@@ -1265,6 +1365,12 @@ async def test_collect_mode_atomically_merges_message_and_receipt_into_queued_ta
             "intent": "send",
             "disposition": "queued",
             "revision": 1,
+            "sandbox_mode_resolution": {
+                "desiredMode": "full",
+                "effectiveMode": "full",
+                "fallbackReason": None,
+                "confirmationRequired": False,
+            },
         }
         assert entries[-1].turn_context == {
             "turn_id": first.payload["task_id"],
@@ -1275,6 +1381,12 @@ async def test_collect_mode_atomically_merges_message_and_receipt_into_queued_ta
             "disposition": "queued",
             "target_turn_id": first.payload["task_id"],
             "revision": 2,
+            "sandbox_mode_resolution": {
+                "desiredMode": "full",
+                "effectiveMode": "full",
+                "fallbackReason": None,
+                "confirmationRequired": False,
+            },
         }
         assert _table_counts(stack.db_path) == {
             "transcript_entries": 3,

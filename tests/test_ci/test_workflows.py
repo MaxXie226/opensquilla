@@ -454,13 +454,13 @@ def test_toolchain_validator_platform_assertion_never_overrides_detection(
     assert not (root / "packages").exists()
 
 
-def test_desktop_ci_runs_profile_substrate_unit_tests() -> None:
+def test_desktop_ci_runs_primary_profile_substrate_unit_tests() -> None:
     data = _workflow("ci.yml")
     desktop_steps = data["jobs"]["desktop-check"]["steps"]
     unit_step = next(step for step in desktop_steps if step.get("name") == "Run desktop unit tests")
 
     assert "node scripts/test-desktop-profile-substrate.mjs" in unit_step["run"]
-    assert "node scripts/test-desktop-profile-context.mjs" in unit_step["run"]
+    assert "node scripts/test-desktop-profile-consolidation.mjs" in unit_step["run"]
 
 
 def test_pr_target_validator_allows_main_pull_requests(tmp_path: Path) -> None:
@@ -1245,8 +1245,10 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "frontend_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "desktop_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
+    assert "platform_sensitive_changed == 'true'" in jobs["webui-chat-recovery"]["if"]
     assert "release_changed == 'true'" in jobs["release-packaging"]["if"]
     assert "tui-check" in jobs["ci-result"]["needs"]
+    assert "webui-chat-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-check" in jobs["ci-result"]["needs"]
     assert "ubuntu-full" in jobs["ci-result"]["needs"]
     assert "macos-recovery" in jobs["ci-result"]["needs"]
@@ -1273,6 +1275,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "workflow-lint",
         "readme-locale-check",
         "frontend-check",
+        "webui-chat-recovery",
         "tui-check",
         "desktop-check",
         "ubuntu-quality",
@@ -1334,6 +1337,12 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         if step.get("name") == "Verify downloaded frontend artifact on consumer OS"
     )
     build = next(step for step in steps if step.get("name") == "Build Desktop TypeScript")
+    session_recovery = next(
+        step
+        for step in steps
+        if step.get("name")
+        == "Run cross-platform production-dist browser session hang contract"
+    )
     run = next(
         step for step in steps if step.get("name") == "Run compiled Desktop recovery flows"
     )
@@ -1348,14 +1357,46 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "src/opensquilla/gateway/static/dist"
     )
     assert build["run"] == "npm run build"
+    assert session_recovery["working-directory"] == "opensquilla-webui"
+    assert session_recovery["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
+    assert session_recovery["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
+    assert "history-hydration.spec.ts" in session_recovery["run"]
+    assert '--grep "terminates stalled"' in session_recovery["run"]
     assert "xvfb-run -a node" in run["run"]
-    assert "test-profile-recovery-flow.mjs" in run["run"]
-    assert "test-profile-recovery-accessibility.mjs" in run["run"]
+    assert "test-profile-consolidation-flow.mjs" in run["run"]
+    assert "test-primary-repair-accessibility.mjs" in run["run"]
     assert "test-profile-import-flow.mjs" in run["run"]
-    assert "test-unsafe-profile-no-write.mjs" in run["run"]
+    assert "test-desktop-cleanup-flow.mjs" in run["run"]
+    assert "test-desktop-gateway-ownership.mjs" in run["run"]
+    assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
     assert "github.run_attempt" in upload["with"]["name"]
+
+
+def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
+    job = _workflow("ci.yml")["jobs"]["webui-chat-recovery"]
+    steps = job["steps"]
+    download = next(
+        step for step in steps if step.get("name") == "Download verified frontend artifact"
+    )
+    install_gateway = next(
+        step for step in steps if step.get("name") == "Install Gateway dependencies"
+    )
+    run = next(
+        step
+        for step in steps
+        if step.get("name") == "Run production-dist chat recovery browser contract"
+    )
+
+    assert job["needs"] == ["classify-changes", "frontend-check"]
+    assert download["with"]["name"] == "opensquilla-webui-dist"
+    assert download["with"]["path"] == "src/opensquilla/gateway/static/dist/"
+    assert steps.index(download) < steps.index(install_gateway) < steps.index(run)
+    assert install_gateway["run"] == "uv sync --frozen"
+    assert job["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
+    assert job["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
+    assert "history-hydration.spec.ts" in run["run"]
 
 
 def test_windows_smoke_does_not_install_bun_by_default() -> None:
@@ -1370,6 +1411,12 @@ def test_windows_smoke_does_not_install_bun_by_default() -> None:
     tui_steps = jobs["tui-check"]["steps"]
     assert any(step.get("uses") == "oven-sh/setup-bun@v2" for step in tui_steps)
     assert any("bun run test:bun" in step.get("run", "") for step in tui_steps)
+
+    bun_test = next(step for step in tui_steps if step.get("name") == "Run OpenTUI Bun tests")
+    bun_run = bun_test["run"]
+    assert "for attempt in 1 2" in bun_run
+    assert 'status" -ne 132' in bun_run
+    assert "retrying once" in bun_run
 
 
 def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
@@ -1762,3 +1809,37 @@ def test_wheelhouse_release_hydrates_current_router_bundle() -> None:
     assert 'root / "router.runtime.yaml"' in text
     assert "intent_head.joblib" not in text
     assert "router_model.onnx" not in text
+
+
+def test_linux_desktop_recovery_e2e_scripts_preserve_x11_authority() -> None:
+    """The xvfb display needs ``DISPLAY`` and ``XAUTHORITY`` to survive scrubbing.
+
+    These harnesses strip credential-shaped variables from the Electron child
+    environment, and ``XAUTHORITY`` matches that pattern.  Dropping it makes the
+    ubuntu Desktop recovery E2E job fail with ``Missing X server or $DISPLAY``,
+    so every harness that scrubs must exempt the X11 variables.
+    """
+
+    data = _workflow("ci.yml")
+    steps = data["jobs"]["desktop-recovery-e2e"]["steps"]
+    step = next(
+        item for item in steps if item.get("name") == "Run compiled Desktop recovery flows"
+    )
+    run = step["run"]
+    assert "xvfb-run" in run, "the Linux branch must provide a virtual display"
+
+    scripts = re.findall(r"'[a-z0-9-]+:(scripts/[A-Za-z0-9_./-]+\.mjs)'", run)
+    assert scripts, "no Desktop recovery E2E scripts were found in ci.yml"
+
+    exemption = "name === 'DISPLAY' || name === 'XAUTHORITY'"
+    for relative in scripts:
+        path = Path("desktop/electron") / relative
+        assert path.is_file(), f"missing Desktop recovery E2E script: {path}"
+        source = path.read_text(encoding="utf-8")
+        if "CREDENTIAL|AUTH" not in source:
+            continue
+        assert exemption in source, (
+            f"{path} scrubs credential-shaped environment variables without exempting "
+            "DISPLAY/XAUTHORITY, so the ubuntu Desktop recovery E2E job will fail with "
+            "'Missing X server or $DISPLAY'"
+        )

@@ -22,7 +22,7 @@ future prompt-failure early-yield branch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.protocol import configured_provider_id
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
+    from opensquilla.provider.types import ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,10 @@ class RunPipelineRequest:
     input_provenance: dict[str, Any] | str | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -106,6 +111,7 @@ class PromptAssemblerPort(Protocol):
         prompt_metadata: dict[str, Any],
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
+        workspace_dir: str | None = None,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -246,6 +252,10 @@ class PromptAssemblerStageInput:
     input_provenance: dict[str, Any] | str | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -369,6 +379,7 @@ class PromptAssemblerStage:
             prompt_metadata=prompt_metadata,
             bootstrap_context_mode=inp.bootstrap_context_mode,
             fresh_user_session=inp.fresh_user_session,
+            workspace_dir=getattr(inp.effective_tool_context, "workspace_dir", None),
         )
 
         # 2. Fetch router context (transcript-driven)
@@ -440,6 +451,7 @@ class PromptAssemblerStage:
             input_provenance=inp.input_provenance,
             skill_catalog=inp.skill_catalog,
             usage_execution_context=inp.usage_execution_context,
+            provider_request_correlation=inp.provider_request_correlation,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 

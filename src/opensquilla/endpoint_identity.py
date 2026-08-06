@@ -44,4 +44,73 @@ def base_url_allows_credential_reuse(
     return stored_origin is not None and candidate_origin == stored_origin
 
 
-__all__ = ["base_url_allows_credential_reuse"]
+def base_url_matches_official_api(
+    official_base_url: str,
+    candidate_base_url: str | None,
+) -> bool:
+    """Return whether ``candidate_base_url`` names the same provider API root.
+
+    Credential reuse is intentionally origin-scoped, but capability defaults
+    also depend on the provider's canonical API path.  This stricter identity
+    allows a trailing slash and rejects query/fragment/user-info variations.
+    """
+
+    official = str(official_base_url or "").strip()
+    candidate = str(candidate_base_url or "").strip() or official
+    if not official or not candidate:
+        return False
+    try:
+        official_parts = urlsplit(official)
+        candidate_parts = urlsplit(candidate)
+    except (UnicodeError, ValueError):
+        return False
+    if (
+        official_parts.username is not None
+        or official_parts.password is not None
+        or candidate_parts.username is not None
+        or candidate_parts.password is not None
+        or official_parts.query
+        or official_parts.fragment
+        or candidate_parts.query
+        or candidate_parts.fragment
+    ):
+        return False
+    official_path = official_parts.path.rstrip("/") or "/"
+    candidate_path = candidate_parts.path.rstrip("/") or "/"
+    return (
+        _http_origin(official) is not None
+        and _http_origin(official) == _http_origin(candidate)
+        and official_path == candidate_path
+    )
+
+
+def credential_env_for_endpoint(
+    *,
+    configured_env: str,
+    configured_explicitly: bool,
+    default_env: str,
+    default_base_url: str,
+    effective_base_url: str,
+) -> str:
+    """Resolve an env reference without moving an implicit default across origins.
+
+    A non-default env name is necessarily operator-authored. A configured name
+    equal to the registry default is operator-authored only when the config
+    model says that field was explicitly set. Otherwise the registry env name
+    belongs to the registry endpoint and is available only on that origin.
+    """
+
+    configured = str(configured_env or "").strip()
+    default = str(default_env or "").strip()
+    if configured and (configured != default or configured_explicitly):
+        return configured
+    if default and base_url_allows_credential_reuse(default_base_url, effective_base_url):
+        return default
+    return ""
+
+
+__all__ = [
+    "base_url_allows_credential_reuse",
+    "base_url_matches_official_api",
+    "credential_env_for_endpoint",
+]

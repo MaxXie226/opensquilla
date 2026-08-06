@@ -53,7 +53,7 @@ from opensquilla.skills.meta.templating import _JINJA_ENV, render_with_args
 from opensquilla.skills.meta.types import MetaStep
 from opensquilla.skills.runtime_env import MEDIA_FONTS_DIR_ENV, managed_skill_env
 from opensquilla.skills.types import SkillLayer
-from opensquilla.subprocess_encoding import apply_utf8_child_env
+from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
 
 log = structlog.get_logger(__name__)
 
@@ -803,8 +803,8 @@ async def run_skill_exec_step(
     returncode = completed.returncode
     stdout_bytes = completed.stdout
     stderr_bytes = completed.stderr
-    stdout_text = (stdout_bytes or b"").decode("utf-8", errors="replace")
-    stderr_text = (stderr_bytes or b"").decode("utf-8", errors="replace")
+    stdout_text = decode_subprocess_output(stdout_bytes)
+    stderr_text = decode_subprocess_output(stderr_bytes)
     receipt_proof = (
         _current_paid_receipt_proof(
             effective_skill=effective_skill,

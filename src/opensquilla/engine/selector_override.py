@@ -218,15 +218,29 @@ def cross_provider_tier_config(
         return None
     router_cfg = getattr(config, "squilla_router", None)
     if not bool(getattr(router_cfg, "cross_provider_tiers", False)):
-        # A historical mixed-provider tier may still be present while the
-        # additive execution flag is off.  Preserve the routed decision for
-        # observability, but mark it blocked so apply_model_override keeps the
-        # primary provider *and its model*.  A foreign model id must never be
-        # sent with the primary provider's credentials.
-        turn_metadata["routed_provider_blocked"] = "cross_provider_tiers_disabled"
-        turn_metadata["routed_provider_fallback_reason"] = (
-            "cross_provider_tiers_disabled"
+        mismatch_policy = (
+            str(getattr(router_cfg, "tier_provider_mismatch", "route") or "route")
+            .strip()
+            .lower()
         )
+        if mismatch_policy == "veto":
+            # Veto operators opted out of the historical misroute entirely.
+            # Reaching this point means the upstream tier rebind abstained
+            # (no same-provider rebind target), so fail closed: the blocked
+            # marker makes apply_model_override keep the primary provider
+            # *and its model* — a foreign model id is never sent with the
+            # primary provider's credentials in veto mode.
+            turn_metadata["routed_provider_blocked"] = "cross_provider_tiers_disabled"
+            turn_metadata["routed_provider_fallback_reason"] = (
+                "cross_provider_tiers_disabled"
+            )
+            return None
+        # Default 'route' policy: the documented (and loudly flagged)
+        # historical contract runs the tier's model id on the active
+        # provider's deployment — aggregator-style endpoints serve foreign
+        # model ids and hand-authored ladders depend on it.  Returning None
+        # without the blocked marker lets apply_model_override apply the
+        # routed model to the primary provider.
         return None
     if decision == "discard_provider_state":
         log.warning(
@@ -272,6 +286,26 @@ def _resolve_and_record_execution(
     turn_metadata["executed_model"] = str(
         getattr(current_config, "model", "") or ""
     )
+    remaining_chain = getattr(selector, "remaining_chain", None)
+    if callable(remaining_chain):
+        candidates: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in remaining_chain():
+            candidate_provider = str(
+                getattr(candidate, "provider", "") or ""
+            ).strip()
+            candidate_model = str(getattr(candidate, "model", "") or "").strip()
+            identity = (candidate_provider, candidate_model)
+            if not candidate_provider or not candidate_model or identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append(
+                {
+                    "provider": candidate_provider,
+                    "model": candidate_model,
+                }
+            )
+        turn_metadata["selector_execution_chain"] = candidates
     return provider
 
 

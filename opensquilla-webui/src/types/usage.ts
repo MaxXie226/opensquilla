@@ -2,6 +2,14 @@ export interface SessionRow {
   session?: string
   sessionKey?: string
   key?: string
+  taskName?: string
+  task_name?: string
+  title?: string
+  displayName?: string
+  display_name?: string
+  subject?: string
+  derivedTitle?: string
+  derived_title?: string
   updated_at?: number | string
   updatedAt?: number | string
   endedAt?: number | string
@@ -193,6 +201,9 @@ export interface UsageQueryResponse extends Record<string, unknown> {
   schemaVersion?: number
   source?: string
   asOfMs?: number | string
+  /** Canonical native-per-USD display rates served by newer gateways. */
+  fxRatesNativePerUsd?: Record<string, string>
+  fx_rates_native_per_usd?: Record<string, string>
   range?: {
     preset?: string | null
     timezone?: string
@@ -255,6 +266,11 @@ export interface UsageSnapshot {
   models: ModelCard[]
   days: UsageDay[]
   coverage: UsageCoverage
+  /**
+   * Canonical native-per-USD rates from the gateway (absent when the backend
+   * predates them or the snapshot came from the legacy usage.status fallback).
+   */
+  fxRatesNativePerUsd?: Record<string, string>
 }
 
 export interface TableColumn {

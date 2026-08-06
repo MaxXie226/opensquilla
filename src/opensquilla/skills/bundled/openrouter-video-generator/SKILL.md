@@ -1,6 +1,7 @@
 ---
 name: openrouter-video-generator
 description: "Generate or declare an OpenRouter video asset for AwesomeWebpageMetaSkill using a parent-leased Provider Settings connection and configured non-secret model/output values."
+description_zh: "使用父级租用的 Provider Settings 连接及已配置的非敏感模型/输出参数，为 AwesomeWebpageMetaSkill 生成或声明 OpenRouter 视频资产。"
 homepage: ""
 user-invocable: false
 disable-model-invocation: true

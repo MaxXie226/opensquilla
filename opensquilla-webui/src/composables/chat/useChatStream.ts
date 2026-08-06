@@ -2,6 +2,7 @@ import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type {
   ChatMessage,
+  ChatRunStatus,
   ChatRunStatusSource,
   ChatStreamSegment,
   ChatStreamTimelineItem,
@@ -11,6 +12,7 @@ import type {
 } from '@/types/chat'
 import type {
   ArtifactPayload,
+  CompactionPayload,
   ToolDeltaPayload,
   ToolResultPayload,
   ToolUsePayload,
@@ -84,6 +86,7 @@ export interface UseChatStreamOptions {
   lastHeaderRole: Ref<string>
   aborted: Ref<boolean>
   autoScroll: Ref<boolean>
+  runStatus?: Ref<ChatRunStatus>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   renderMarkdown: (text: string, opts?: { highlight?: boolean }) => string
   stripDirectiveTags: (text: string) => string
@@ -113,6 +116,9 @@ export function useChatStream(options: UseChatStreamOptions) {
   const openToolGroups = ref<Set<string>>(new Set())
   const openToolItems = ref<Set<string>>(new Set())
   let streamToolGroupSeq = 0
+  let checkpointedRaw = ''
+  let checkpointedAcrossToolBoundary = false
+  let activeStreamTurnId = ''
   const streamBubble = ref(false)
   const streamShowHeader = ref(false)
 
@@ -139,14 +145,16 @@ export function useChatStream(options: UseChatStreamOptions) {
     return lastSignalAt.value > 0 && Date.now() - lastSignalAt.value > STALE_SIGNAL_MS
   })
 
-  // Phase narration on its own, used by the work-card head where elapsed and
+  // Phase narration on its own, used by the activity head where elapsed and
   // the step chip render as separate elements rather than one packed string.
   const streamPhaseLabel = computed(() => {
     streamActivityTick.value
     const now = Date.now()
     if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
-      const silent = Math.floor((now - lastSignalAt.value) / 1000)
-      return i18n.global.t('chat.stream.stillWorking', { seconds: silent })
+      // Static on purpose: this feeds a polite live region, so a ticking
+      // seconds value here would be re-announced every second for the whole
+      // stall. The aria-hidden elapsed chip carries the seconds instead.
+      return i18n.global.t('chat.activity.stale')
     }
     const startedAt = streamActivity.value.startedAt || now
     const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
@@ -159,7 +167,11 @@ export function useChatStream(options: UseChatStreamOptions) {
   const streamPhaseElapsed = computed(() => {
     streamActivityTick.value
     const now = Date.now()
-    if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) return ''
+    if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
+      // During a stall the phase label is static for screen readers, so the
+      // silence duration ticks here, out of the announced sentence.
+      return `${Math.floor((now - lastSignalAt.value) / 1000)}s`
+    }
     const startedAt = streamActivity.value.startedAt || now
     const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
     return `${seconds}s`
@@ -172,16 +184,22 @@ export function useChatStream(options: UseChatStreamOptions) {
     return segmentsToTimelineItems(streamSegments.value, streamToolCalls.value, 'stream')
   })
 
-  // append-only turn log. In OFF mode (prod default) nothing below ever
-  // appends, so the live turn is byte-identical to legacy; in SHADOW (DEV) the
-  // mutators also append frames and the fold is parity-checked against the
-  // legacy refs. The fold never drives render in this PR (still 100% legacy).
+  // Append-only turn log. ON is the production default and drives the live
+  // activity surface; SHADOW is the development default and parity-checks the fold
+  // while legacy refs render; only the explicit OFF kill switch skips frames
+  // and restores the legacy render path.
   const turnLog = useChatTurnLog({
     renderMarkdown: options.renderMarkdown,
     toolCallGroups,
     interruptState: options.interruptState,
   })
-  const { appendFrame, resetLog, useReducer, foldedTurn } = turnLog
+  const {
+    appendFrame,
+    checkpointText,
+    resetLog,
+    useReducer,
+    foldedTurn,
+  } = turnLog
 
   // Bound shadow-parity check: assembles this composable's legacy live surface,
   // injecting the live thinking text (owned by the event handlers) so the fold's
@@ -227,9 +245,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamArtifacts.value = []
     toolTimes.value = new Map()
     // Clear the live-turn log alongside the legacy refs so the next turn's fold
-    // starts empty. Every reset path (start/end/router-replay/live-turn) funnels
-    // through here, so this single call covers them all. Steer never calls
-    // a reset, so an in-flight steered turn's log is preserved.
+    // starts empty. A steer checkpoint deliberately resets only the current
+    // visible segment; checkpointedRaw remains available to de-duplicate an
+    // authoritative whole-turn final snapshot.
     resetLog()
   }
 
@@ -268,6 +286,37 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
+  function recordCompactionActivity(payload: CompactionPayload) {
+    noteStreamSignal()
+    if (!useReducer.value) return
+    const rawStatus = String(payload.status || '').toLowerCase()
+    const state = rawStatus === 'skipped'
+      ? 'skipped'
+      : rawStatus === 'stale'
+        ? 'stale'
+        : rawStatus === 'cancelled'
+          ? 'cancelled'
+          : ['completed', 'emergency_ephemeral'].includes(rawStatus)
+            ? 'completed'
+            : ['failed', 'error', 'timed_out'].includes(rawStatus)
+              ? 'failed'
+              : 'running'
+    const id = String(payload.compaction_id || payload.compactionId || 'current')
+    appendFrame({
+      kind: 'status',
+      action: 'context_compaction',
+      label: '',
+      at: Number(payload.emitted_at || payload.started_at || Date.now()),
+      id,
+      category: 'maintenance',
+      state,
+      source: String(payload.source || 'automatic'),
+      durability: String(payload.durability || ''),
+      detail: String(payload.detail || payload.phase || ''),
+    })
+    scheduleRender()
+  }
+
   function toolNarrationLabel(tc: ChatToolCall): string {
     const verb = TOOL_PROGRESS_VERBS[toolOperationKey(tc.name)]
       || `Running ${tc.name.replace(/[_-]+/g, ' ')}`
@@ -289,8 +338,21 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function startStreaming() {
+    checkpointedRaw = ''
+    checkpointedAcrossToolBoundary = false
+    activeStreamTurnId = ''
     isStreaming.value = true
-    options.applySessionRunState({ run_status: 'running', active_task: { status: 'running' } })
+    const currentRunStatus = options.runStatus?.value
+    const activeTask = currentRunStatus
+      && ['queued', 'running', 'approval_pending'].includes(currentRunStatus.status)
+      ? currentRunStatus.task
+      : null
+    options.applySessionRunState({
+      run_status: 'running',
+      active_task: activeTask
+        ? { ...activeTask, status: 'running' }
+        : { status: 'running' },
+    })
     resetStreamState()
     openToolGroups.value = new Set()
     openToolItems.value = new Set()
@@ -325,11 +387,21 @@ export function useChatStream(options: UseChatStreamOptions) {
       const sentinelOnly = !wasAborted && ['NO_REPLY', 'HEARTBEAT_OK'].includes(cleanedText)
       // After Stop, partial streamed output (text, tool rows, artifacts) is
       // kept; only a bubble with nothing visible at all is dropped.
-      const emptyStream = !cleanedText && streamArtifacts.value.length === 0 && streamToolCalls.value.length === 0
+      const foldedInterrupts = foldedTurn.value.parts.filter(
+        (part): part is Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }> =>
+          part.type === 'interrupt',
+      )
+      const emptyStream = !cleanedText
+        && streamArtifacts.value.length === 0
+        && streamToolCalls.value.length === 0
+        && foldedInterrupts.length === 0
       if (sentinelOnly || emptyStream) {
         streamBubble.value = false
         isStreaming.value = false
         resetStreamState()
+        checkpointedRaw = ''
+        checkpointedAcrossToolBoundary = false
+        activeStreamTurnId = ''
         return
       }
 
@@ -337,9 +409,13 @@ export function useChatStream(options: UseChatStreamOptions) {
         role: 'assistant',
         text: cleanedText,
         ts: new Date().toISOString(),
+        turnId: activeStreamTurnId || undefined,
         artifacts: streamArtifacts.value.slice(),
         tool_calls: streamToolCalls.value.map(streamToolCallToHistoryCall),
-        timeline: streamTimelineSnapshot(cleanedText),
+        timeline: useReducer.value
+          ? foldedTurn.value.timelineSegments.slice()
+          : streamTimelineSnapshot(cleanedText),
+        interrupts: foldedInterrupts.map(part => ({ ...part })),
         // Detach the fold's activity history from the about-to-be-reset log. In
         // OFF mode this is [], so the field is harmless. The empty/sentinel drop
         // path above returns before this push, so a status-only ghost turn never
@@ -352,6 +428,44 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamBubble.value = false
     isStreaming.value = false
     resetStreamState()
+    checkpointedRaw = ''
+    checkpointedAcrossToolBoundary = false
+    activeStreamTurnId = ''
+  }
+
+  function checkpointForUserMessage(turnId: string) {
+    if (!isStreaming.value || !streamBubble.value) return
+    activeStreamTurnId = turnId || activeStreamTurnId
+
+    clearRenderTimer()
+    const cleanedText = options.stripDirectiveTags(
+      options.stripGeneratedArtifactMarkers(streamRaw.value),
+    ).trim()
+    if (cleanedText) {
+      options.messages.value.push({
+        role: 'assistant',
+        text: cleanedText,
+        ts: new Date().toISOString(),
+        turnId,
+        timeline: [{ type: 'text', raw: cleanedText }],
+      })
+    }
+
+    checkpointedAcrossToolBoundary = checkpointedAcrossToolBoundary || Boolean(
+      streamToolCalls.value.length
+      || streamSegments.value.some(segment => segment.type === 'tool-group'),
+    )
+    checkpointedRaw += streamRaw.value
+    // A steer is another user message inside the same turn. Split only the
+    // answer text so it stays chronologically above that message; the running
+    // tools, artifacts, interrupts, reasoning and status history continue to
+    // belong to the one live activity disclosure below it.
+    streamRaw.value = ''
+    streamSegments.value = streamSegments.value.filter(
+      segment => segment.type !== 'text',
+    )
+    checkpointText()
+    resetStreamIdleTimer()
   }
 
   function resetStreamForRouterReplay() {
@@ -371,10 +485,20 @@ export function useChatStream(options: UseChatStreamOptions) {
     isStreaming.value = false
     resetStreamState()
     streamBubble.value = false
+    checkpointedRaw = ''
+    checkpointedAcrossToolBoundary = false
+    activeStreamTurnId = ''
   }
 
   function normalizeIncomingTextDelta(text: string): string {
-    const raw = typeof text === 'string' ? text : ''
+    let raw = typeof text === 'string' ? text : ''
+    if (
+      checkpointedAcrossToolBoundary
+      && checkpointedRaw
+      && raw.startsWith(checkpointedRaw)
+    ) {
+      raw = raw.slice(checkpointedRaw.length)
+    }
     if (!raw || !streamRaw.value) return raw
 
     const sawToolBoundary =
@@ -387,7 +511,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     return raw
   }
 
-  function appendDelta(text: string) {
+  function appendDelta(
+    text: string,
+    presentation: 'intermediate' | 'answer' = 'answer',
+  ) {
     if (options.aborted.value) return
     const deltaText = normalizeIncomingTextDelta(text)
     if (!deltaText) return
@@ -396,14 +523,24 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamRaw.value += deltaText
 
     const lastSegment = streamSegments.value[streamSegments.value.length - 1]
-    if (!lastSegment || lastSegment.type !== 'text') {
-      streamSegments.value.push({ type: 'text', raw: deltaText, html: '', dirty: true })
+    if (
+      !lastSegment
+      || lastSegment.type !== 'text'
+      || lastSegment.presentation !== presentation
+    ) {
+      streamSegments.value.push({
+        type: 'text',
+        raw: deltaText,
+        html: '',
+        dirty: true,
+        presentation,
+      })
     } else {
       lastSegment.raw = (lastSegment.raw || '') + deltaText
       lastSegment.dirty = true
     }
 
-    if (useReducer.value) appendFrame({ kind: 'text', text: deltaText })
+    if (useReducer.value) appendFrame({ kind: 'text', text: deltaText, presentation })
     scheduleRender()
   }
 
@@ -771,7 +908,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   // approval). This is deliberately lighter than startStreaming(): it does NOT
   // reset the log or the activity refs, so an interrupt frame appended right
   // after it survives. The turn stays open because an unresolved approval pauses
-  // the idle timer, so the fold-driven work-card keeps rendering the part.
+  // the idle timer, so the fold-driven activity surface keeps rendering the part.
   function ensureInterruptBubble() {
     if (streamBubble.value) return
     streamBubble.value = true
@@ -785,17 +922,20 @@ export function useChatStream(options: UseChatStreamOptions) {
     // it intentionally clears stale text while preserving tool history.
     if (finalText == null) return
 
+    const segmentFinalText = checkpointedRaw && finalText.startsWith(checkpointedRaw)
+      ? finalText.slice(checkpointedRaw.length)
+      : finalText
     const reconciled = reconcileTextSnapshot(
       streamSegments.value,
       streamRaw.value,
-      finalText,
+      segmentFinalText,
     )
     if (reconciled.changed) {
       streamRaw.value = reconciled.rawText
       streamSegments.value = reconciled.segments
       scheduleRender()
     }
-    if (useReducer.value) appendFrame({ kind: 'final-text', text: finalText })
+    if (useReducer.value) appendFrame({ kind: 'final-text', text: segmentFinalText })
   }
 
   function isToolGroupOpen(groupId: string): boolean {
@@ -854,6 +994,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     thinkingText,
     startStreaming,
     endStreaming,
+    checkpointForUserMessage,
     resetStreamForRouterReplay,
     resetLiveTurnState,
     appendDelta,
@@ -868,6 +1009,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     resetStreamIdleTimer,
     clearStreamIdleTimer,
     setStreamActivity,
+    recordCompactionActivity,
     showThinkingIndicator,
     hideThinkingIndicator,
     isToolGroupOpen,

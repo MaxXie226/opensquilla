@@ -164,7 +164,7 @@ async def run_agent_once(
     from opensquilla.gateway.routing import build_cli_route_envelope, tool_context_from_envelope
     from opensquilla.paths import media_root_from_config
     from opensquilla.permissions import configured_default_run_mode
-    from opensquilla.sandbox.run_mode import normalize_run_mode
+    from opensquilla.run_mode import normalize_run_mode
     from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
     from opensquilla.tools.types import InteractionMode
 
@@ -177,14 +177,23 @@ async def run_agent_once(
     permissions_override = (
         permissions is not None or os.environ.get("OPENSQUILLA_AGENT_PERMISSIONS") is not None
     )
-    sandbox_settings = getattr(cfg, "sandbox", None)
-    explicit_run_mode = getattr(sandbox_settings, "run_mode", None)
-    run_mode = None
-    if not permissions_override:
-        if explicit_run_mode:
-            run_mode = normalize_run_mode(explicit_run_mode).value
-        elif permissions_profile == "restricted":
-            run_mode = configured_default_run_mode(cfg).value
+    run_mode = configured_default_run_mode(cfg).value
+    accepted_run_mode_override = None
+    if permissions_override:
+        from opensquilla.gateway.project_workspace_runtime import (
+            AcceptedRunModeOverride,
+        )
+
+        run_mode = (
+            "full"
+            if permissions_profile in {"bypass", "full"}
+            else "safe"
+        )
+        accepted_run_mode_override = AcceptedRunModeOverride(
+            run_mode=normalize_run_mode(run_mode),
+            run_mode_source="user",
+            source="request",
+        )
     run_attachments: list[dict[str, Any]] = list(attachments or [])
     if attachment_paths:
         run_attachments.extend(attachments_from_paths(tuple(attachment_paths)))
@@ -304,12 +313,50 @@ async def run_agent_once(
             elevated=elevated,
             run_mode=run_mode,
         )
+        from opensquilla.gateway.project_workspace_runtime import (
+            apply_accepted_run_mode_override,
+            authoritative_project_run_context,
+        )
+        from opensquilla.gateway.session_services import get_session_storage
+
+        storage = get_session_storage(svc.session_manager)
+        if storage is not None:
+            session = await storage.get_session(session_key)
+            if session is None:
+                raise KeyError(f"Session not found: {session_key}")
+            run_context, workspace_guard = await authoritative_project_run_context(
+                storage=storage,
+                session_manager=svc.session_manager,
+                session=session,
+                config=service_cfg,
+                default_workspace=tool_workspace_dir,
+            )
+            run_context = apply_accepted_run_mode_override(
+                run_context,
+                accepted_run_mode_override,
+            )
+            from opensquilla.gateway.rpc_sessions import (
+                _apply_run_context_route_metadata,
+            )
+
+            _apply_run_context_route_metadata(
+                route_envelope,
+                run_context,
+                principal_is_owner=True,
+            )
+            if run_context.workspace is not None:
+                tool_workspace_dir = run_context.workspace
+            if workspace_guard is not None and not isinstance(workspace_strict, bool):
+                effective_workspace_strict = True
         tool_ctx = tool_context_from_envelope(
             route_envelope,
             is_owner=True,
             workspace_dir=tool_workspace_dir,
             workspace_strict=effective_workspace_strict,
         )
+        from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+        pin_sandbox_policy(tool_ctx, service_cfg)
         tool_ctx.scratch_dir = effective_scratch_dir
         tool_ctx.workspace_lockdown = workspace_lockdown
         tool_ctx.workspace_write_deny_globs = list(effective_workspace_write_deny_globs)
@@ -363,9 +410,7 @@ async def run_agent_once(
     if usage_path:
         _write_json(usage_path, usage)
 
-    done_text_present, done_text = (
-        done_text_snapshot(done) if done is not None else (False, "")
-    )
+    done_text_present, done_text = done_text_snapshot(done) if done is not None else (False, "")
     return AgentRunResult(
         status="error" if errors else "ok",
         agent_id=agent_id,
@@ -720,11 +765,11 @@ def _print_no_provider_error() -> None:
             "  opensquilla onboard\n\n"
             "Option 2 — set an environment variable for your provider:\n"
             "  export OPENROUTER_API_KEY=sk-or-...        # POSIX / macOS / Linux\n"
-            "  setx OPENROUTER_API_KEY \"sk-or-...\"  "
+            '  setx OPENROUTER_API_KEY "sk-or-..."  '
             "# Windows cmd: set OPENROUTER_API_KEY=...\n\n"
             "Option 3 — edit ~/.opensquilla/config.toml and add:\n"
             "  [llm]\n"
-            "  api_key = \"your-key-here\"\n"
+            '  api_key = "your-key-here"\n'
         ),
     )
     console.print(Panel(body, title="No Provider Configured", border_style="red"))
@@ -885,9 +930,7 @@ def run_agent_command(
     stateless_keep_project_rules = _unwrap_typer_default(stateless_keep_project_rules)
     permissions = _unwrap_typer_default(permissions)
     json_output = _unwrap_typer_default(json_output)
-    workspace_write_deny_globs = _parse_workspace_write_deny_globs(
-        workspace_lockdown_deny_paths
-    )
+    workspace_write_deny_globs = _parse_workspace_write_deny_globs(workspace_lockdown_deny_paths)
 
     result = asyncio.run(
         run_agent_once(

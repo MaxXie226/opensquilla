@@ -14,7 +14,7 @@ import hashlib
 import hmac
 import logging
 import os
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
 from opensquilla import __version__
@@ -98,28 +98,43 @@ async def upload_pending_daily_usage(
     config: Any,
     today: date | None = None,
 ) -> int:
-    """Upload pending aggregates through today; failures remain retryable."""
+    """Upload pending aggregates for completed UTC days; failures stay retryable.
+
+    The current (still-accumulating) day is deliberately excluded: the
+    event ID — sent as the ``Idempotency-Key`` — is stable per (install,
+    day), so an intraday snapshot would freeze the day at its first upload
+    on any endpoint that honors idempotency semantics. Waiting until the
+    UTC day has closed means each day is uploaded exactly once with its
+    final totals, and retries legitimately replay the same content.
+    """
     if install_telemetry._telemetry_skip_reason(config=config) is not None:
         return 0
     endpoint = _endpoint()
     if not endpoint:
         return 0
     current_day = today or datetime.now(UTC).date()
-    exclusive_cutoff = current_day + timedelta(days=1)
-    rows = await storage.list_pending_daily_usage(before_day=exclusive_cutoff.isoformat())
+    rows = await storage.list_pending_daily_usage(before_day=current_day.isoformat())
     if not rows:
         return 0
 
-    state_path = install_telemetry._state_path(config=config, explicit=None)
-    state = install_telemetry._load_or_create_state(state_path)
-    install_telemetry._write_state(state_path, state)
+    install_id = await asyncio.to_thread(
+        install_telemetry.ensure_install_telemetry_id,
+        config=config,
+    )
+    if install_telemetry._telemetry_skip_reason(config=config) is not None:
+        return 0
+
     uploaded = 0
     for row in rows:
         payload = _daily_payload(
             row,
-            install_id=state["install_id"],
+            install_id=install_id,
             sent_at=_utc_now(),
         )
+        # The privacy flag is hot-reloadable. Do not start another request
+        # after an operator opts out while a multi-day batch is in flight.
+        if install_telemetry._telemetry_skip_reason(config=config) is not None:
+            break
         ok, error = await _post_payload(endpoint, payload)
         if not ok:
             log.debug("Daily usage telemetry upload failed: %s", error)

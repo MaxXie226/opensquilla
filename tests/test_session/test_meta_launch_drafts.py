@@ -559,6 +559,48 @@ async def test_legacy_manual_staging_respects_shared_session_capacity(
 
 
 @pytest.mark.asyncio
+async def test_global_accepted_selector_is_ranked_and_bounded_in_sql(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    statements: list[str] = []
+    try:
+        intent, _ = await storage.stage_meta_control_intent(
+            session_key=SESSION_KEY,
+            control_kind="manual",
+            correlation_id="request:accepted-query-bound",
+            meta_skill_name="meta-paper-write",
+        )
+        await storage.conn.execute(
+            "UPDATE meta_control_intents SET status = 'accepted' WHERE intent_id = ?",
+            (intent.intent_id,),
+        )
+        await storage.conn.commit()
+        await storage.conn.set_trace_callback(statements.append)
+
+        coordinates = await storage._select_live_meta_launch_coordinates(
+            storage.conn,
+            now_ms=storage_module._now_ms(),
+            include_drafts=False,
+            include_tombstones=False,
+            include_staged=False,
+        )
+
+        assert (SESSION_KEY, "accepted-query-bound") in coordinates
+        accepted_queries = [
+            statement
+            for statement in statements
+            if "status = 'accepted'" in statement
+        ]
+        assert accepted_queries
+        assert "ROW_NUMBER() OVER" in accepted_queries[-1]
+        assert "LIMIT" in accepted_queries[-1]
+    finally:
+        await storage.conn.set_trace_callback(None)
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_delete_succeeds_after_more_accepted_controls_than_tombstone_capacity(
     tmp_path: Path,
 ) -> None:

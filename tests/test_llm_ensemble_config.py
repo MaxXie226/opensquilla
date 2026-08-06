@@ -6,6 +6,7 @@ from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
 from opensquilla.provider.openai import _build_openai_wire_messages
+from opensquilla.provider.request_proof import project_final_request_payload
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ChatConfig, Message, ModelCapabilities
 
@@ -53,7 +54,7 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 5.0
+    assert provider.quorum_grace_seconds == 10.0
 
 
 def test_static_openrouter_b5_does_not_need_model_options() -> None:
@@ -122,7 +123,7 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 5.0
+    assert provider.quorum_grace_seconds == 10.0
 
 
 def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
@@ -454,13 +455,13 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "effective_aggregator_timeout_seconds": 480.0,
             "configured_shuffle_candidates": False,
             "effective_shuffle_candidates": False,
-            "quorum_grace_seconds": 5.0,
+            "quorum_grace_seconds": 10.0,
         }
         assert provider.min_successful_proposers == 4
         assert provider.proposer_timeout_seconds == 300.0
         assert provider.aggregator_timeout_seconds == 480.0
         assert provider.shuffle_candidates is False
-        assert provider.quorum_grace_seconds == 5.0
+        assert provider.quorum_grace_seconds == 10.0
         members = [*provider.proposers, provider.aggregator]
         assert all(member.provider_config.provider == "openrouter" for member in members)
         assert all(member.provider_config.api_key == "fake" for member in members)
@@ -501,7 +502,7 @@ def test_static_openrouter_b5_ensemble_uses_profile_effective_defaults() -> None
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 5.0
+    assert provider.quorum_grace_seconds == 10.0
 
 
 def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> None:
@@ -593,7 +594,7 @@ def test_custom_b5_uses_fixed_lineup_effective_defaults_with_auto_quorum() -> No
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 5.0
+    assert provider.quorum_grace_seconds == 10.0
 
 
 def test_custom_b5_preserves_explicit_quorum_and_timeouts() -> None:
@@ -956,6 +957,33 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
                 return
             yield TextDeltaEvent(text="candidate")
             yield DoneEvent(model=self.model, input_tokens=1, output_tokens=1)
+
+        def project_final_request(
+            self,
+            messages,
+            tools=None,
+            config=None,
+            *,
+            message_limit=None,
+        ):
+            cfg = config or ChatConfig()
+            payload = {
+                "model": self.model,
+                "messages": [
+                    message.model_dump(mode="json", exclude_none=True)
+                    for message in messages
+                ],
+                "tools": [
+                    tool.model_dump(mode="json", exclude_none=True)
+                    for tool in (tools or [])
+                ],
+            }
+            return project_final_request_payload(
+                payload,
+                projection_adapter="synthetic_ensemble_member",
+                proof_budget=cfg.provider_request_max_chars or 1_000_000,
+                message_limit=message_limit,
+            )
 
     monkeypatch.setattr(
         "opensquilla.provider.ensemble._build_provider",

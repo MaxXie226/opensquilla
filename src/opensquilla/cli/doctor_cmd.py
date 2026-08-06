@@ -357,6 +357,93 @@ def _local_config_findings(config_path: str | Path | None = None) -> list[Health
     return _local_onboarding_findings(config, config_path=config_path)
 
 
+def _local_tui_findings() -> list[HealthFinding]:
+    """Explain which chat surface `--ui auto` selects on THIS terminal.
+
+    The gateway report cannot cover this: renderer availability (companion,
+    bun, terminal capabilities) is a property of the CLI process's machine, so
+    the finding is appended locally to both the online and offline reports. A
+    healthy full-screen selection reports nothing.
+    """
+    from opensquilla.cli.tui.backend.render_summary import sanitize_terminal_text
+    from opensquilla.cli.tui.renderers.selection import select_chat_ui_backend
+
+    try:
+        selection = select_chat_ui_backend("auto")
+    except Exception as exc:  # noqa: BLE001 - a UI probe must never crash doctor.
+        # Exception text can wrap host/subprocess output: same trust level and
+        # scrubbing as the fallback detail below.
+        crash_detail = (
+            sanitize_terminal_text(f"{type(exc).__name__}: {exc}")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+        return [
+            HealthFinding(
+                id="tui.selection_failed",
+                severity="warn",
+                readiness_impact="optional",
+                surface="cli",
+                title="Terminal UI selection failed",
+                detail=crash_detail,
+            )
+        ]
+    fallback = selection.fallback
+    if fallback is None:
+        return []
+    fix_steps: list[FixStep] = []
+    from opensquilla.cli.tui.source_checkout import resolve_tui_source_checkout_hint
+
+    hint = resolve_tui_source_checkout_hint()
+    if hint is not None:
+        fix_steps = [
+            FixStep(label="Install the TUI host dependencies", command=hint.install_command),
+            FixStep(label="Launch the full-screen TUI", command=hint.launch_command),
+        ]
+    detail = sanitize_terminal_text(fallback.detail).replace("\r", " ").replace("\n", " ")
+    return [
+        HealthFinding(
+            id="tui.opentui_unavailable",
+            severity="info",
+            readiness_impact="optional",
+            surface="cli",
+            title="Full-screen terminal UI not active — chat uses plain mode",
+            detail=detail,
+            evidence={
+                "reasonCode": fallback.code.value,
+                "selectedBackend": selection.backend.backend_id,
+            },
+            fix_steps=fix_steps,
+        )
+    ]
+
+
+def _append_local_tui_findings(report: dict[str, Any]) -> None:
+    """Merge the CLI-local terminal-UI findings into a finished report.
+
+    The whole report is re-derived through ``_refresh_report_readiness`` so
+    counts, impact counts, ordering, and the summary stay mutually consistent.
+    An offline report keeps its "unavailable" sentinel status/ready/summary —
+    those describe the failed gateway probe, which an optional UI capability
+    note must not rewrite.
+    """
+    findings = _local_tui_findings()
+    if not findings:
+        return
+    report_findings = report.setdefault("findings", [])
+    if not isinstance(report_findings, list):
+        return
+    report_findings.extend(finding.to_dict() for finding in findings)
+    offline_sentinel = (
+        (report.get("status"), report.get("ready"), report.get("summary"))
+        if report.get("status") == "unavailable"
+        else None
+    )
+    _refresh_report_readiness(report)
+    if offline_sentinel is not None:
+        report["status"], report["ready"], report["summary"] = offline_sentinel
+
+
 def _offline_report(
     error: BaseException,
     *,
@@ -394,13 +481,21 @@ async def _fetch_report(
     gateway_url: str,
     agent_id: str,
     deep: bool,
+    probe_providers: bool = False,
 ) -> dict[str, Any]:
     from opensquilla.cli import gateway_client as gateway_client_module
 
     client = gateway_client_module.GatewayClient()
     try:
         await client.connect(gateway_url)
-        payload = await client.call("doctor.status", {"agentId": agent_id, "deep": deep})
+        payload = await client.call(
+            "doctor.status",
+            {
+                "agentId": agent_id,
+                "deep": deep,
+                "probeProviders": probe_providers,
+            },
+        )
         return dict(payload)
     finally:
         await client.close()
@@ -652,6 +747,11 @@ def doctor_command(
         "--deep/--quick",
         help="Include deeper memory diagnostics; use --quick for shallow checks.",
     ),
+    probe_providers: bool = typer.Option(
+        False,
+        "--probe-providers",
+        help="Opt in to live provider model-list probes.",
+    ),
     gateway_url: str | None = typer.Option(None, "--gateway", envvar="OPENSQUILLA_GATEWAY_URL"),
     config_path: Path | None = typer.Option(
         None,
@@ -677,7 +777,14 @@ def doctor_command(
             gateway_url=gateway_url,
             config_path=config_path,
         )
-        report = asyncio.run(_fetch_report(gateway_url=target_url, agent_id=agent_id, deep=deep))
+        report = asyncio.run(
+            _fetch_report(
+                gateway_url=target_url,
+                agent_id=agent_id,
+                deep=deep,
+                probe_providers=probe_providers,
+            )
+        )
     except SystemExit as exc:
         report = _offline_report(
             exc,
@@ -693,6 +800,7 @@ def doctor_command(
             config_owns_target=config_owns_gateway_target,
         )
     report = copy.deepcopy(report)
+    _append_local_tui_findings(report)
     report.setdefault("gatewayUrl", target_url)
     report.setdefault("agentId", agent_id)
     if requested_config_path:

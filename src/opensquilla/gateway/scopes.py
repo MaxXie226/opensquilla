@@ -38,6 +38,30 @@ NODE_SCOPE = "node"
 
 OPERATOR_SCOPE_NAMESPACE = "operator."
 
+# Execution capabilities are intentionally separate from RPC scopes.
+GUEST_SAFE_CAPABILITY = "guest.safe"
+HOST_EXECUTE_CAPABILITY = "host.execute"
+HOST_READ_CAPABILITY = "host.read"
+TASK_READ_CAPABILITY = "task.read"
+TASK_SUBMIT_CAPABILITY = "task.submit"
+LOCAL_OWNER_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        HOST_EXECUTE_CAPABILITY,
+        HOST_READ_CAPABILITY,
+        TASK_READ_CAPABILITY,
+        TASK_SUBMIT_CAPABILITY,
+    }
+)
+HUMAN_TOKEN_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        HOST_EXECUTE_CAPABILITY,
+        HOST_READ_CAPABILITY,
+        TASK_READ_CAPABILITY,
+        TASK_SUBMIT_CAPABILITY,
+    }
+)
+GUEST_SAFE_CAPABILITIES: frozenset[str] = frozenset({GUEST_SAFE_CAPABILITY})
+
 # Default scope set for a locally-proven operator: same machine, loopback
 # transport. Mirrors what the desktop CLI declares on connect.
 CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(
@@ -56,7 +80,7 @@ CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(
 # not get destructive privileges. Pairing and proposals are also excluded:
 # proposal mutation promotes generated SKILL.md files into the managed skill
 # layer, so remote callers need an authenticated/admin path for that surface.
-REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset({READ_SCOPE, WRITE_SCOPE, APPROVALS_SCOPE})
+REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset({READ_SCOPE, WRITE_SCOPE})
 
 # Default scopes for the node role (separate scope namespace).
 NODE_DEFAULT_SCOPES: frozenset[str] = frozenset({NODE_SCOPE})
@@ -100,7 +124,10 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.bootstrap": READ_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
+    "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
+    "sessions.messages.snapshot": READ_SCOPE,
     "sessions.messages.subscribe": READ_SCOPE,
+    "sessions.messages.hydrate": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
     "last-heartbeat": READ_SCOPE,
@@ -121,13 +148,19 @@ METHOD_SCOPES: dict[str, str] = {
     "memory.list": READ_SCOPE,
     "memory.search": READ_SCOPE,
     "memory.show": READ_SCOPE,
+    "memory.import.info": READ_SCOPE,
     "tools.catalog": READ_SCOPE,
     "tools.effective": READ_SCOPE,
     "tools.search_provider": READ_SCOPE,  # OpenSquilla-only; classified read.
     "sandbox.status": READ_SCOPE,  # OpenSquilla-only; sandbox posture summary.
     "sandbox.setup.status": READ_SCOPE,  # OpenSquilla-only; setup readiness.
+    "sandbox.capability.status": READ_SCOPE,  # OpenSquilla-only; real Safe capability.
+    "sandbox.policy.get": READ_SCOPE,  # OpenSquilla-only; versioned Safe settings.
+    "sandbox.policy.defaults": READ_SCOPE,  # OpenSquilla-only; immutable Safe rules.
+    "sandbox.tokens.list": READ_SCOPE,  # OpenSquilla-only; owner token metadata.
     "sandbox.explain": READ_SCOPE,  # OpenSquilla-only; deterministic sandbox explanation.
     "sandbox.run_context.get": READ_SCOPE,  # OpenSquilla-only; session sandbox mode.
+    "sandbox.run_mode.preference.get": READ_SCOPE,  # OpenSquilla-only; global picker default.
     "sandbox.path.list": READ_SCOPE,  # OpenSquilla-only; inline path browser listing.
     "channels.status": READ_SCOPE,
     "commands.list_for_surface": READ_SCOPE,  # OpenSquilla-only.
@@ -178,12 +211,23 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.create": WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
+    "plans.capabilities": READ_SCOPE,
+    "plans.setMode": WRITE_SCOPE,
+    "plans.implement": WRITE_SCOPE,
+    "plans.revise": WRITE_SCOPE,
+    "plans.cancelRun": WRITE_SCOPE,
     "sessions.steer": WRITE_SCOPE,
+    "sessions.steer.v2": WRITE_SCOPE,
     "sessions.abort": WRITE_SCOPE,
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,
     "sessions.compact": WRITE_SCOPE,
     "sessions.truncate": WRITE_SCOPE,
+    "workspaces.open": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded project lifecycle.
+    "workspaces.update": WRITE_SCOPE,
+    "workspaces.pin": WRITE_SCOPE,
+    "workspaces.remove": WRITE_SCOPE,
+    "workspaces.history.delete": WRITE_SCOPE,
     "models.routing.set": WRITE_SCOPE,
     # Deleting a session is a routine, per-user write op like reset/truncate above,
     # so it is write-scoped rather than admin-gated. Admin-gating it broke deletion
@@ -200,9 +244,14 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.bundle.enable": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.bundle.disable": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.setup.ensure": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded setup.
+    "sandbox.policy.update": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded settings.
+    "sandbox.tokens.create": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded token issue.
+    "sandbox.tokens.revoke": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded token revoke.
     "sandbox.resume": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded denial-pause clear.
     "sandbox.run_context.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
+    "sandbox.run_mode.preference.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded default.
     "sandbox.path.pick": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded host directory picker.
+    "sandbox.path.create-directory": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded path creation.
     # OpenSquilla-only; explicit override of `config.` admin prefix.
     "config.patch.safe": WRITE_SCOPE,
     # OpenSquilla-only; manual ``/meta`` command launch stamp.
@@ -307,6 +356,14 @@ METHOD_SCOPES: dict[str, str] = {
     "routing.hold.set": ADMIN_SCOPE,
     "routing.hold.clear": ADMIN_SCOPE,
     "memory.index": ADMIN_SCOPE,
+    "memory.import.preview": ADMIN_SCOPE,
+    "memory.import.start": ADMIN_SCOPE,
+    "memory.import.status": ADMIN_SCOPE,
+    "memory.import.cancel": ADMIN_SCOPE,
+    "memory.import.retry": ADMIN_SCOPE,
+    "memory.import.apply": ADMIN_SCOPE,
+    "memory.import.undo": ADMIN_SCOPE,
+    "memory.import.discard": ADMIN_SCOPE,
     "memory.raw_fallbacks.list": ADMIN_SCOPE,
     "memory.raw_fallbacks.show": ADMIN_SCOPE,
     "memory.repair.list": ADMIN_SCOPE,
@@ -323,6 +380,7 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.llmProfile.upsert": ADMIN_SCOPE,
     "onboarding.llmProfile.credential.clear": ADMIN_SCOPE,
     "onboarding.llmProfile.remove": ADMIN_SCOPE,
+    "onboarding.llmProfile.active.remove": ADMIN_SCOPE,
     "onboarding.llmProfile.activate": ADMIN_SCOPE,
     "onboarding.llmProfile.probe": ADMIN_SCOPE,
     "onboarding.llmProfile.models.discover": ADMIN_SCOPE,
@@ -337,7 +395,9 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.memory_embedding.configure": ADMIN_SCOPE,
     "onboarding.search.configure": ADMIN_SCOPE,
     "onboarding.imageGeneration.configure": ADMIN_SCOPE,
+    "onboarding.imageGeneration.models.discover": ADMIN_SCOPE,
     "onboarding.audio.configure": ADMIN_SCOPE,
+    "onboarding.capability.reset": ADMIN_SCOPE,
     "onboarding.channel.probe": ADMIN_SCOPE,
     "onboarding.channel.upsert": ADMIN_SCOPE,
     "onboarding.channel.remove": ADMIN_SCOPE,

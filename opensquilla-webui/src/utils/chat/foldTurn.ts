@@ -2,6 +2,7 @@ import type {
   ChatRenderedMessage,
   ChatStreamSegment,
   ChatStreamTimelineItem,
+  ChatTimelineSegment,
   ChatToolCall,
   ChatToolCallGroup,
 } from '@/types/chat'
@@ -40,6 +41,7 @@ export interface FoldedTurn {
   // Accepted activity-phase transitions, in arrival order, for the finished
   // turn's activity timeline. Empty when no status frames were appended.
   statusHistory: StatusPart[]
+  timelineSegments: ChatTimelineSegment[]
 }
 
 // Live ownerKey: the legacy `streamTimelineItems` computed groups with the
@@ -85,13 +87,15 @@ export function reconcileTextSnapshot(
         dirty: true,
       }
     } else {
-      next.push({ type: 'text', raw: suffix, html: '', dirty: true })
+      next.push({ type: 'text', raw: suffix, html: '', dirty: true, presentation: 'answer' })
     }
     return { rawText: snapshot, segments: next, changed: true }
   }
 
-  const next = segments.filter(segment => segment.type === 'tool-group')
-  if (snapshot) next.push({ type: 'text', raw: snapshot, html: '', dirty: true })
+  const next = segments.filter(segment => segment.type !== 'text')
+  if (snapshot) {
+    next.push({ type: 'text', raw: snapshot, html: '', dirty: true, presentation: 'answer' })
+  }
   return { rawText: snapshot, segments: next, changed: true }
 }
 
@@ -162,6 +166,7 @@ export function foldTurn(
   const interrupts: FoldedInterrupt[] = []
   const interruptIndex = new Map<string, number>()
   const statusHistory: StatusPart[] = []
+  const maintenanceIndex = new Map<string, number>()
   let rawText = ''
   let finalText: string | null = null
   let thinkingText = ''
@@ -215,8 +220,18 @@ export function foldTurn(
       case 'text': {
         rawText += frame.text
         const lastSegment = segments[segments.length - 1]
-        if (!lastSegment || lastSegment.type !== 'text') {
-          segments.push({ type: 'text', raw: frame.text, html: '', dirty: true })
+        if (
+          !lastSegment
+          || lastSegment.type !== 'text'
+          || lastSegment.presentation !== frame.presentation
+        ) {
+          segments.push({
+            type: 'text',
+            raw: frame.text,
+            html: '',
+            dirty: true,
+            presentation: frame.presentation,
+          })
         } else {
           lastSegment.raw = (lastSegment.raw || '') + frame.text
           lastSegment.dirty = true
@@ -272,6 +287,7 @@ export function foldTurn(
         if (i === undefined) {
           interruptIndex.set(frame.approvalId, interrupts.length)
           interrupts.push({ kind: frame.interruptKind, approvalId: frame.approvalId, data: frame.data })
+          segments.push({ type: 'interrupt', approvalId: frame.approvalId })
         } else {
           // A later requested-frame for the same id (re-broadcast / hydration
           // backfill) merges richer data without reordering.
@@ -285,9 +301,36 @@ export function foldTurn(
         break
       }
       case 'status': {
-        // Append-only, already in accept order: setStreamActivity emits a frame
-        // only on a real phase change, so each entry is a distinct transition.
-        statusHistory.push({ action: frame.action, label: frame.label, at: frame.at })
+        const entry: StatusPart = {
+          action: frame.action,
+          label: frame.label,
+          at: frame.at,
+          ...(frame.id ? { id: frame.id } : {}),
+          ...(frame.category ? { category: frame.category } : {}),
+          ...(frame.state ? { state: frame.state } : {}),
+          ...(frame.source ? { source: frame.source } : {}),
+          ...(frame.durability ? { durability: frame.durability } : {}),
+          ...(frame.detail ? { detail: frame.detail } : {}),
+        }
+        // Context maintenance emits started/observed/completed lifecycle
+        // frames. Keep its first chronological position and update that row in
+        // place so one compaction never looks like multiple task steps.
+        if (entry.category === 'maintenance' && entry.id) {
+          const index = maintenanceIndex.get(entry.id)
+          if (index === undefined) {
+            maintenanceIndex.set(entry.id, statusHistory.length)
+            statusHistory.push(entry)
+          } else {
+            statusHistory[index] = {
+              ...statusHistory[index],
+              ...entry,
+              at: statusHistory[index]!.at,
+            }
+          }
+        } else {
+          // Phase rows remain append-only and in accepted order.
+          statusHistory.push(entry)
+        }
         break
       }
     }
@@ -308,7 +351,48 @@ export function foldTurn(
     }
   }
 
-  const timelineItems = segmentsToTimelineItems(segments, toolCalls, ownerKey)
+  const interruptParts = new Map<
+    string,
+    Extract<ChatPart, { type: 'interrupt' }>
+  >()
+  for (const interrupt of interrupts) {
+    const state = interruptState.get(interrupt.approvalId)
+    interruptParts.set(interrupt.approvalId, {
+      type: 'interrupt',
+      interruptKind: interrupt.kind,
+      approval: interrupt.kind === 'approval'
+        ? interrupt.data as InterruptApprovalData
+        : undefined,
+      clarify: interrupt.kind === 'clarify'
+        ? interrupt.data as InterruptClarifyData
+        : undefined,
+      resolution: state?.resolution ?? interrupt.resolution ?? null,
+      busy: state?.busy ?? false,
+      error: state?.error ?? '',
+      key: `${ownerKey}:interrupt:${interrupt.approvalId}`,
+    })
+  }
+  const timelineItems = segmentsToTimelineItems(
+    segments,
+    toolCalls,
+    ownerKey,
+    interruptParts,
+  )
+  const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
+    if (segment.type === 'text') {
+      const raw = String(segment.raw || '')
+      return raw ? [{ type: 'text', raw }] : []
+    }
+    if (segment.type === 'interrupt') {
+      const approvalId = String(segment.approvalId || '')
+      return approvalId ? [{ type: 'interrupt', approvalId }] : []
+    }
+    return [{
+      type: 'tool-group',
+      groupId: segment.groupId,
+      operationKey: segment.operationKey,
+    }]
+  })
   const base = { timelineItems, toolCalls, artifacts, rawText }
   const rendered = asRenderedMessage(base)
 
@@ -317,6 +401,7 @@ export function foldTurn(
     thinkingText,
     toolTimes,
     statusHistory,
+    timelineSegments,
     parts: toParts(rendered, renderMarkdown, toolCallGroups, ownerKey, interrupts, interruptState),
     sources: toSources(rendered),
   }

@@ -26,6 +26,8 @@ No ``TurnHook`` is fired from inside the stream loop today.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
@@ -33,11 +35,14 @@ from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 import structlog
 
 from opensquilla.engine.hooks.types import CompactionState
+from opensquilla.engine.route_plan import route_plan_snapshot
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
+from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
 
 if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent
     from opensquilla.engine.agent_injection import PendingInputProvider
+    from opensquilla.engine.artifact_delivery import OmittedArtifactPublishResult
     from opensquilla.engine.hooks.types import CompactionHook
     from opensquilla.engine.types import (
         AgentEvent,
@@ -45,7 +50,6 @@ if TYPE_CHECKING:
         CompactionEvent,
         DoneEvent,
         ErrorEvent,
-        RouterDecisionEvent,
         TextDeltaEvent,
         ToolResultEvent,
         ToolUseStartEvent,
@@ -107,8 +111,20 @@ class CompactionPersistPort(Protocol):
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
-    ) -> None: ...
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int = 0,
+        source_entries: tuple[Any, ...] | None = None,
+        source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+    ) -> bool | None: ...
 
 @runtime_checkable
 class MemorySnapshotRefreshPort(Protocol):
@@ -262,6 +278,15 @@ class StreamConsumerStageInput:
     input_provenance: dict[str, Any] | None = None
     # In-process pending submitted-line provider for mid-turn injection.
     pending_input_provider: PendingInputProvider | None = None
+    # Live delivery-ready authorization resolved on the event loop before the
+    # blocking omitted-artifact publish enters its worker thread.
+    attached_plan_run_ready: bool | None = None
+    # Frozen durable prefix used by in-turn compaction persistence. The storage
+    # adapter compares it atomically and preserves later append-only queue rows.
+    compaction_source_entries: tuple[Any, ...] | None = None
+    compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+    compaction_source_boundary_message_id: str | None = None
+    compaction_source_boundary_entry_id: int | None = None
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -337,6 +362,37 @@ def _clear_artifact_delivery_failure(state: _StreamState, target_key: str) -> No
         pass
 
 
+def _user_input_payload(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or value.get("kind") != "user_input":
+        return None
+    return dict(value)
+
+
+def _pending_user_input_request(value: Any) -> dict[str, Any] | None:
+    payload = _user_input_payload(value)
+    if (
+        payload is None
+        or payload.get("status") != "input_required"
+        or payload.get("paused") is not True
+    ):
+        return None
+    return payload
+
+
+def _is_terminal_user_input_outcome(value: Any) -> bool:
+    payload = _user_input_payload(value)
+    return bool(
+        payload is not None
+        and payload.get("status") in {"answered", "cancelled", "expired"}
+        and payload.get("paused") is False
+    )
+
+
 class _ToolResultHandler:
     """Capture artifact-delivery failures and append the tool_result segment."""
 
@@ -391,6 +447,16 @@ class _ToolResultHandler:
                 segment.get("type") == "tool_result"
                 and segment.get("tool_use_id") == event.tool_use_id
             ):
+                initial_user_input_request = segment.get("user_input_request")
+                if initial_user_input_request is None:
+                    initial_user_input_request = _pending_user_input_request(
+                        segment.get("result")
+                    )
+                if (
+                    initial_user_input_request is not None
+                    and _is_terminal_user_input_outcome(result_segment.get("result"))
+                ):
+                    result_segment["user_input_request"] = initial_user_input_request
                 state.turn_segments[index] = result_segment
                 break
         else:
@@ -455,7 +521,10 @@ class _WarningHandler:
         self._transformer = transformer
 
     def handle(self, event: WarningEvent, state: _StreamState) -> WarningEvent:
-        if event.code == "workspace_diff_recovery":
+        if event.code in {
+            "workspace_diff_recovery",
+            "plan_run_reconciliation",
+        }:
             self._discard_superseded_current_text(state)
         return self._transformer(event)
 
@@ -469,15 +538,36 @@ class _WarningHandler:
             state.final_text_parts[:] = [accumulated_text[: -len(current_text)]]
         state.current_text_parts[:] = []
 
+@dataclass
+class _DonePrePublish:
+    """Carrier between the done handler's on-loop pre/post-publish phases.
+
+    Holds the transformed ``DoneEvent``, the pre-publish ``extra_yields`` and
+    the accumulated final text so the blocking artifact publish can run in a
+    worker thread BETWEEN two on-loop phases -- without ever carrying a
+    ``_StreamState`` mutation into that thread.
+    """
+
+    event: DoneEvent
+    extra_yields: list[AgentEvent]
+    accumulated_text: str
+
+
 class _DoneHandler:
     """Apply routing-tier metadata, savings, normalize text, emit notices.
 
     Largest single handler. Returns ``(transformed_done_event,
     extra_yields)`` where ``extra_yields`` is the (possibly empty) list
     of events the outer stage must yield BEFORE the DoneEvent itself --
-    the corrective fallback RouterDecisionEvent (when the selector
-    hopped mid-turn), the artifact-delivery-failure notice TextDelta
-    and/or the hallucination Warning yield, in the original order.
+    the artifact-delivery-failure notice TextDelta and/or the
+    hallucination Warning yield, in the original order.
+
+    Split into three phases so the live stage can keep every
+    ``_StreamState`` mutation on the event loop while offloading ONLY the
+    blocking artifact publish to a worker thread: ``pre_publish`` (on loop)
+    -> ``run_publish`` (offloadable, self-contained) -> ``post_publish`` (on
+    loop, applied only after the publish completes). ``handle`` composes all
+    three synchronously for callers that do not need the offload.
     """
 
     def handle(
@@ -486,20 +576,36 @@ class _DoneHandler:
         inp: StreamConsumerStageInput,
         state: _StreamState,
     ) -> tuple[DoneEvent, list[AgentEvent]]:
-        from opensquilla.engine.artifact_delivery import (
-            auto_publish_omitted_workspace_artifacts,
-        )
+        """Run all three phases synchronously on the calling thread.
+
+        Convenience composition for callers that do not need to keep the
+        blocking publish off a live event loop (focused unit tests). The
+        live stage runs the phases separately -- see ``StreamConsumerStage``.
+        """
+
+        pre = self.pre_publish(event, inp, state)
+        publish_result = self.run_publish(inp, pre.accumulated_text)
+        return self.post_publish(pre, publish_result, inp, state)
+
+    def pre_publish(
+        self,
+        event: DoneEvent,
+        inp: StreamConsumerStageInput,
+        state: _StreamState,
+    ) -> _DonePrePublish:
+        """Metadata, savings, text reconciliation and pre-publish notices.
+
+        Every ``_StreamState`` mutation here runs on the caller's thread. The
+        live stage calls this on the event loop so the shared, by-reference
+        accumulators the CancelledError finalizer reads are never mutated
+        concurrently with cancellation.
+        """
+
         from opensquilla.engine.runtime import (
-            _artifact_delivery_failure_notice,
-            _claims_image_without_tool_use,
             _compute_comprehensive_turn_savings,
             _compute_route_input_savings_usd,
             _normalize_heartbeat_text,
-            _should_add_artifact_delivery_failure_notice,
             _turn_used_ensemble,
-        )
-        from opensquilla.engine.types import (
-            WarningEvent as _WarningEvent,
         )
         from opensquilla.engine.types import (
             done_text_snapshot,
@@ -593,6 +699,12 @@ class _DoneHandler:
             vision_followup_gate_model=metadata.get("router_vision_followup_gate_model"),
             vision_followup_needs_image=metadata.get("router_vision_followup_needs_image"),
             vision_followup_fallback=metadata.get("router_vision_followup_fallback"),
+            route_plan=route_plan_snapshot(turn),
+            execution_legs=[
+                dict(leg)
+                for leg in metadata.get("execution_legs", [])
+                if isinstance(leg, dict)
+            ],
         )
 
         accumulated_text = "".join(state.final_text_parts)
@@ -606,9 +718,6 @@ class _DoneHandler:
         event = replace(event, text=canonical_text)
         state.done_event = event
         extra_yields: list[AgentEvent] = []
-        corrective_router_event = _fallback_router_decision_event(turn)
-        if corrective_router_event is not None:
-            extra_yields.append(corrective_router_event)
         if done_suffix_event is not None:
             extra_yields.append(done_suffix_event)
         if not accumulated_text.strip() and state.completed_meta_skill_without_text:
@@ -622,21 +731,103 @@ class _DoneHandler:
             )
             extra_yields.append(fallback_event)
             accumulated_text = "".join(state.final_text_parts)
-        from opensquilla.engine.types import ArtifactEvent as _ArtifactEvent
 
-        omitted_publish_result = auto_publish_omitted_workspace_artifacts(
+        return _DonePrePublish(
+            event=event,
+            extra_yields=extra_yields,
+            accumulated_text=accumulated_text,
+        )
+
+    def run_publish(
+        self,
+        inp: StreamConsumerStageInput,
+        accumulated_text: str,
+    ) -> OmittedArtifactPublishResult:
+        """Publish deliverables the model wrote but forgot to publish.
+
+        The blocking phase: re-reads workspace files, validates, hashes and
+        writes them through the ``ArtifactStore``. Self-contained -- it reads
+        ``inp.tool_context`` and returns a result, and never touches
+        ``_StreamState``. This is the ONLY phase the live stage offloads to a
+        worker thread, so a cancelled turn cannot leave a store write racing
+        the finalizer's reads of the shared stream accumulators.
+        """
+
+        from opensquilla.engine.artifact_delivery import (
+            auto_publish_omitted_workspace_artifacts,
+        )
+
+        return auto_publish_omitted_workspace_artifacts(
             inp.tool_context,
             final_text=accumulated_text,
+            attached_plan_run_ready=inp.attached_plan_run_ready,
         )
-        for artifact in omitted_publish_result.artifacts:
+
+    def record_publish_result(
+        self,
+        publish_result: OmittedArtifactPublishResult,
+        state: _StreamState,
+    ) -> list[AgentEvent]:
+        """Record a completed publish's side effects into shared turn state.
+
+        The artifact-recording half of ``post_publish``: append published
+        artifacts to ``state.turn_artifacts`` (the by-reference accumulator
+        every finalizer -- including the CancelledError finalizer -- persists
+        the transcript from), clear resolved delivery failures, and record
+        new failure summaries. Runs on the event loop. Returns the
+        ``ArtifactEvent``s for the outer stage to yield; the cancel path
+        discards them because the stream is already unwinding, but the
+        recording itself must still happen -- the store write and the
+        ``ctx.published_artifacts`` append already took effect in the worker,
+        so skipping it would orphan an artifact that exists on disk (and
+        counts against the disk budget) without any transcript record.
+        """
+
+        from opensquilla.engine.types import ArtifactEvent as _ArtifactEvent
+
+        artifact_events: list[AgentEvent] = []
+        for artifact in publish_result.artifacts:
             artifact_event = _ArtifactEvent(**artifact)
             state.turn_artifacts.append(artifact)
-            extra_yields.append(artifact_event)
-        for target_key in omitted_publish_result.resolved_target_keys:
+            artifact_events.append(artifact_event)
+        for target_key in publish_result.resolved_target_keys:
             _clear_artifact_delivery_failure(state, target_key)
         state.artifact_delivery_failures.extend(
-            omitted_publish_result.failure_summaries
+            publish_result.failure_summaries
         )
+        return artifact_events
+
+    def post_publish(
+        self,
+        pre: _DonePrePublish,
+        publish_result: OmittedArtifactPublishResult,
+        inp: StreamConsumerStageInput,
+        state: _StreamState,
+    ) -> tuple[DoneEvent, list[AgentEvent]]:
+        """Apply the publish result and post-publish notices to state.
+
+        Runs on the caller's thread (the event loop in the live stage) and
+        only AFTER ``run_publish`` has fully completed, so a cancelled turn
+        never observes a half-applied result: on cancellation the stage
+        records a completed publish through ``record_publish_result`` and
+        re-raises before the notice phases run.
+        """
+
+        from opensquilla.engine.runtime import (
+            _artifact_delivery_failure_notice,
+            _claims_image_without_tool_use,
+            _should_add_artifact_delivery_failure_notice,
+        )
+        from opensquilla.engine.types import (
+            WarningEvent as _WarningEvent,
+        )
+
+        event = pre.event
+        extra_yields = pre.extra_yields
+        accumulated_text = pre.accumulated_text
+        turn = inp.turn
+
+        extra_yields.extend(self.record_publish_result(publish_result, state))
 
         if _should_add_artifact_delivery_failure_notice(
             failure_summaries=state.artifact_delivery_failures,
@@ -743,49 +934,6 @@ def _append_done_notice_delta(
     event = replace(event, text=final_text, text_snapshot=final_text)
     state.done_event = event
     return event, _TextDeltaEvent(text=notice_delta)
-
-
-def _fallback_router_decision_event(turn: Any) -> RouterDecisionEvent | None:
-    """Corrective router-decision event after a mid-turn selector failover.
-
-    The turn's one-shot RouterDecisionEvent is emitted before the first
-    provider call, so a pre-content failover leaves every router HUD
-    showing a decision for a model that never answered. When the turn
-    metadata records at least one selector fallback hop, rebuild the
-    event from the realigned metadata (``routed_model`` already names
-    the model that ran, and route savings were zeroed alongside it) and
-    mark it as a fallback so HUDs settle before the DoneEvent receipt
-    renders. Returns ``None`` when no hop occurred, keeping non-fallback
-    turns at exactly one RouterDecisionEvent.
-    """
-    # Late imports keep the module import-cycle-free.
-    from opensquilla.engine.router_decision import build_router_decision_event
-    from opensquilla.engine.steps.router_decision_record import (
-        FALLBACK_HOPS_METADATA_KEY,
-    )
-
-    metadata = turn.metadata
-    try:
-        fallback_hops = int(metadata.get(FALLBACK_HOPS_METADATA_KEY) or 0)
-    except (TypeError, ValueError):
-        fallback_hops = 0
-    if fallback_hops <= 0:
-        return None
-
-    corrective = build_router_decision_event(turn)
-    if corrective is None:
-        return None
-    # Source is passed explicitly instead of mutating turn metadata: the
-    # staged decision record and the DoneEvent keep reporting the original
-    # routing source, while the corrective HUD event reports the failover.
-    # ``savings_pct`` mirrors the realigned metadata value directly so the
-    # builder cannot resurrect stale tier savings for the abandoned model.
-    return replace(
-        corrective,
-        source="fallback",
-        fallback=True,
-        savings_pct=float(metadata.get("savings_pct") or 0.0),
-    )
 
 
 def _is_completed_meta_invoke(event: ToolResultEvent) -> bool:
@@ -930,12 +1078,101 @@ class _CompactionHandler:
         await self._fire_before_compact(state)
         if inp.session_manager_present:
             try:
-                await self._persist.persist_and_notify(
-                    session_key=inp.session_key,
-                    summary=event.summary,
-                    kept_entries=event.kept_entries,
-                    compaction_id=event.compaction_id,
+                persist_kwargs: dict[str, Any] = {
+                    "session_key": inp.session_key,
+                    "summary": event.summary,
+                    "kept_entries": event.kept_entries,
+                    "summary_payload": event.summary_payload,
+                    "summary_format": event.summary_format,
+                    "coverage_status": event.coverage_status,
+                    "missing_obligations": event.missing_obligations,
+                    "critical_carry_forward": event.critical_carry_forward,
+                    "compaction_id": event.compaction_id,
+                    "removed_count": event.removed_count,
+                    "source_entries": inp.compaction_source_entries,
+                    "source_preimage": inp.compaction_source_preimage,
+                    "source_boundary_message_id": (
+                        inp.compaction_source_boundary_message_id
+                    ),
+                    "source_boundary_entry_id": (
+                        inp.compaction_source_boundary_entry_id
+                    ),
+                }
+                if event.compaction_deadline_at_monotonic is not None:
+                    persist_kwargs["compaction_deadline_at_monotonic"] = (
+                        event.compaction_deadline_at_monotonic
+                    )
+                if event.compaction_timeout_seconds is not None:
+                    persist_kwargs["compaction_timeout_seconds"] = (
+                        event.compaction_timeout_seconds
+                    )
+                installed = await self._persist.persist_and_notify(**persist_kwargs)
+                if installed is False:
+                    await self._fire_after_compact(
+                        state,
+                        {
+                            "status": "skipped",
+                            "reason": "stale_preimage",
+                        },
+                    )
+                    return
+            except asyncio.CancelledError:
+                from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_effect_payload,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
                 )
+
+                compaction_id = event.compaction_id or new_compaction_id()
+                notify_compaction(
+                    inp.session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="cancelled",
+                    reason="cancelled",
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                await self._fire_after_compact(
+                    state,
+                    {"status": "cancelled", "reason": "cancelled"},
+                )
+                raise
+            except CompactionTimeoutError as exc:
+                from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_effect_payload,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
+                )
+
+                compaction_id = event.compaction_id or new_compaction_id()
+                notify_compaction(
+                    inp.session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason="compaction_deadline_exceeded",
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                await self._fire_after_compact(
+                    state,
+                    {
+                        "status": "timed_out",
+                        "reason": "compaction_deadline_exceeded",
+                    },
+                )
+                return
             except Exception as exc:  # noqa: BLE001 - preserve turn recoverability
                 log.warning("compaction_persist_failed", error=str(exc))
                 from opensquilla.engine.cache_break_monitor import notify_compaction
@@ -1128,8 +1365,67 @@ class StreamConsumerStage:
             elif isinstance(event, WarningEvent):
                 transformed = self._warning_handler.handle(event, state)
             elif isinstance(event, DoneEvent):
-                transformed, extra_yields = self._done_handler.handle(
-                    event, inp, state
+                # The done handler may auto-publish forgotten workspace
+                # deliverables, which re-reads and fully validates them
+                # (PPTX inflation plus deck parse). Keep every _StreamState
+                # mutation on the event loop (pre/post-publish) and offload
+                # ONLY that blocking publish to a worker thread. The worker
+                # cannot be cancelled, so on cancellation we wait for it to
+                # finish before unwinding: otherwise a steered follow-up turn
+                # could start finalizing (reading the shared, by-reference
+                # stream accumulators) while the worker was still writing to
+                # the ArtifactStore -- yielding a torn transcript or an
+                # artifact persisted without a transcript record.
+                pre = self._done_handler.pre_publish(event, inp, state)
+                from opensquilla.engine.artifact_delivery import (
+                    attached_plan_run_ready_for_auto_publish,
+                )
+
+                publish_inp = replace(
+                    inp,
+                    attached_plan_run_ready=(
+                        await attached_plan_run_ready_for_auto_publish(inp.tool_context)
+                    ),
+                )
+                publish_task = asyncio.ensure_future(
+                    asyncio.to_thread(
+                        self._done_handler.run_publish,
+                        publish_inp,
+                        pre.accumulated_text,
+                    )
+                )
+                try:
+                    publish_result = await asyncio.shield(publish_task)
+                except asyncio.CancelledError:
+                    # Let the in-flight store write drain before the
+                    # CancelledError finalizer runs. The worker thread cannot
+                    # be interrupted, so absorb REPEATED cancels too: a second
+                    # cancel arriving during the drain must not unwind the
+                    # coroutine while the worker is still writing to the
+                    # ArtifactStore, or the finalizer would race that write.
+                    while not publish_task.done():
+                        try:
+                            await asyncio.shield(asyncio.wait({publish_task}))
+                        except asyncio.CancelledError:
+                            continue
+                    if (
+                        not publish_task.cancelled()
+                        and publish_task.exception() is None
+                    ):
+                        # The publish COMPLETED: its bytes are already in the
+                        # ArtifactStore and in ctx.published_artifacts, so
+                        # record the result into the shared turn state the
+                        # cancel finalizer persists from. Recording is the
+                        # loss-free choice -- dropping it would orphan a file
+                        # that exists on disk (and counts against the disk
+                        # budget) with no transcript record. The notice
+                        # phases of post_publish stay skipped.
+                        self._done_handler.record_publish_result(
+                            publish_task.result(), state
+                        )
+                    raise
+                transformed, extra_yields = self._done_handler.post_publish(
+                    pre, publish_result, inp, state
                 )
             elif isinstance(event, CompactionEvent):
                 await self._compaction_handler.handle(event, inp)

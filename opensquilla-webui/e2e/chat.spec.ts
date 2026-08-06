@@ -20,32 +20,111 @@ test.describe('Chat Page', () => {
     // Chat stays the dedicated New-chat action. Long-lived Agent management and
     // the old Build disclosure are intentionally absent from the primary rail.
     await expect(core.getByText('Chat', { exact: true })).toHaveCount(0)
+    // Sessions is routed but off the nav; New task leads the index as an action
+    // row (its own class) rather than a destination.
+    await expect(core.locator('> .sidebar-new-session')).toHaveText(/New task/)
     await expect(core.locator('> .sidebar-fn-item .sidebar-fn-label')).toHaveText(
-      ['Sessions', 'Overview', 'Skills', 'Cron'],
+      ['Overview', 'Skills & Channels', 'Cron'],
     )
+    await expect(core.getByText('Sessions', { exact: true })).toHaveCount(0)
     await expect(core.getByText('Agents', { exact: true })).toHaveCount(0)
     await expect(core.locator('.sidebar-nav-group-toggle')).toHaveCount(0)
   })
 
-  test('command palette keeps Skills and Cron in Work without an Agents or Build entry', async ({ page }) => {
+  test('command palette opens on recent tasks, not on a list of destinations', async ({ page }) => {
     await page.locator('.sidebar-cmd-btn').click()
     const palette = page.getByRole('dialog', { name: 'Search and go to' })
     await expect(palette).toBeVisible()
 
-    for (const name of ['Sessions', 'Overview', 'Skills', 'Cron']) {
-      await expect(palette.getByRole('option', { name, exact: true })).toBeVisible()
+    // Untyped state answers "which task?" — the button promises task search, so
+    // destinations must not be the resting content.
+    await expect(palette.locator('.cmdp-group-label')).toHaveText(['Recent tasks'])
+    for (const name of ['Overview', 'Skills & Channels', 'Cron']) {
+      await expect(palette.getByRole('option', { name, exact: true })).toHaveCount(0)
     }
-    await expect(palette.getByRole('option', { name: 'Agents', exact: true })).toHaveCount(0)
-    await expect(palette.locator('.cmdp-group-label', { hasText: /^Build$/ })).toHaveCount(0)
   })
 
-  test('Overview stays active on every route hosted by the monitor hub', async ({ page }) => {
+  test('command palette keeps the Skills & Channels hub together in Work', async ({ page }) => {
+    await page.locator('.sidebar-cmd-btn').click()
+    const palette = page.getByRole('dialog', { name: 'Search and go to' })
+    await expect(palette).toBeVisible()
+
+    // Destinations surface by name rather than by default, so the grouping
+    // contract is asserted against a query that matches the whole hub.
+    await palette.getByRole('combobox').fill('channels')
+    for (const name of ['Skills & Channels', 'Channels']) {
+      await expect(palette.getByRole('option', { name, exact: true })).toBeVisible()
+    }
+    const labels = await palette.locator('.cmdp-option__label').allTextContents()
+    expect(labels.indexOf('Channels')).toBe(labels.indexOf('Skills & Channels') + 1)
+    await expect(palette.getByRole('option', { name: 'Agents', exact: true })).toHaveCount(0)
+    await expect(palette.locator('.cmdp-group-label', { hasText: /^Build$/ })).toHaveCount(0)
+
+    // Usage and Logs stay reachable from their own band despite being off the rail.
+    await palette.getByRole('combobox').fill('usage')
+    await expect(palette.locator('.cmdp-group-label', { hasText: /^Overview$/ })).toBeVisible()
+    await expect(palette.getByRole('option', { name: 'Usage', exact: true })).toBeVisible()
+  })
+
+  test('Overview and Skills & Channels own disjoint route families', async ({ page }) => {
     const overview = page.locator('.sidebar-core').getByRole('link', { name: 'Overview' })
-    for (const path of ['overview', 'channels', 'usage', 'logs']) {
+    const skillsChannels = page.locator('.sidebar-core').getByRole('link', { name: 'Skills & Channels' })
+    for (const path of ['overview', 'usage', 'logs']) {
       await page.goto(CONTROL_URL + path)
       await expect(overview).toHaveClass(/is-active/)
       await expect(overview).toHaveAttribute('aria-current', 'page')
+      await expect(skillsChannels).not.toHaveClass(/is-active/)
     }
+    for (const path of ['skills', 'channels']) {
+      await page.goto(CONTROL_URL + path)
+      await expect(skillsChannels).toHaveClass(/is-active/)
+      await expect(skillsChannels).toHaveAttribute('aria-current', 'page')
+      await expect(overview).not.toHaveClass(/is-active/)
+    }
+  })
+
+  test('Skills and Channels use canonical route links through history and reload', async ({ page }) => {
+    await page.goto(CONTROL_URL + 'skills')
+    let hub = page.getByRole('navigation', { name: 'Skills & Channels' })
+    const skills = hub.getByRole('link', { name: 'Skills', exact: true })
+    const channels = hub.getByRole('link', { name: 'Channels', exact: true })
+
+    await expect(skills).toHaveAttribute('aria-current', 'page')
+    await expect(channels).not.toHaveAttribute('aria-current', 'page')
+    await channels.click()
+    await expect(page).toHaveURL(/\/channels$/)
+    await expect(channels).toHaveAttribute('aria-current', 'page')
+
+    await page.goBack()
+    await expect(page).toHaveURL(/\/skills$/)
+    await expect(skills).toHaveAttribute('aria-current', 'page')
+
+    await page.reload()
+    hub = page.getByRole('navigation', { name: 'Skills & Channels' })
+    await expect(hub.getByRole('link', { name: 'Skills', exact: true }))
+      .toHaveAttribute('aria-current', 'page')
+  })
+
+  test('Overview exposes only Status and Usage while keeping Logs directly reachable', async ({ page }) => {
+    await page.goto(CONTROL_URL + 'overview')
+    const hub = page.getByRole('navigation', { name: 'Overview' })
+    const status = hub.getByRole('link', { name: 'Status', exact: true })
+    const usage = hub.getByRole('link', { name: 'Usage', exact: true })
+
+    await expect(hub.getByRole('link')).toHaveCount(2)
+    await expect(status).toHaveAttribute('aria-current', 'page')
+    await expect(hub.getByRole('link', { name: 'Logs', exact: true })).toHaveCount(0)
+    await usage.click()
+    await expect(page).toHaveURL(/\/usage$/)
+    await expect(usage).toHaveAttribute('aria-current', 'page')
+
+    await page.goBack()
+    await expect(page).toHaveURL(/\/overview$/)
+    await expect(status).toHaveAttribute('aria-current', 'page')
+
+    await page.goto(CONTROL_URL + 'logs')
+    await expect(page).toHaveURL(/\/logs$/)
+    await expect(page.getByRole('heading', { name: 'Logs', level: 1 })).toBeVisible()
   })
 
   test('can navigate between views', async ({ page }) => {
@@ -54,18 +133,15 @@ test.describe('Chat Page', () => {
     await core.getByText('Overview', { exact: true }).click()
     await expect(page).toHaveURL(/\/overview/)
 
-    await core.getByText('Skills', { exact: true }).click()
+    await core.getByText('Skills & Channels', { exact: true }).click()
     await expect(page).toHaveURL(/\/skills/)
 
     await core.getByText('Cron', { exact: true }).click()
     await expect(page).toHaveURL(/\/cron/)
 
-    await core.getByText('Sessions', { exact: true }).click()
-    await expect(page).toHaveURL(/\/sessions/)
-
-    // New chat is instant (no modal): the primary button drops straight to a
-    // draft. `exact` matches the New-chat button precisely.
-    await page.getByRole('button', { name: 'New chat', exact: true }).click()
+    // New task is instant (no modal): the primary row drops straight to a
+    // draft. `exact` matches the New-task button precisely.
+    await page.getByRole('button', { name: 'New task', exact: true }).click()
     await expect(page.getByRole('dialog', { name: 'New chat' })).toHaveCount(0)
     await expect(page).toHaveURL(/\/chat\/new\?agent=[a-z0-9_-]+$/i)
   })

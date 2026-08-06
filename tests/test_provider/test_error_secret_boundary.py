@@ -24,6 +24,7 @@ from opensquilla.provider.types import ChatConfig, ErrorEvent, Message
 # provider-boundary replacement must protect it solely because it is the active
 # credential; the prefix also exercises Google-style API key shapes.
 _API_KEY = "AIza"
+_SHORT_INSTALL_ID = "i7"
 
 
 def test_tiny_synthetic_key_does_not_corrupt_unrelated_error_words() -> None:
@@ -33,6 +34,130 @@ def test_tiny_synthetic_key_does_not_corrupt_unrelated_error_words() -> None:
         redact_upstream_error_text("document block malformed", api_key="k")
         == "document block malformed"
     )
+
+
+def test_install_id_is_redacted_from_upstream_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.error_redaction import redact_upstream_error_code
+
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(_SHORT_INSTALL_ID, "***"),
+    )
+
+    assert (
+        redact_upstream_error_code(
+            f"install-{_SHORT_INSTALL_ID}-rejected",
+            api_key="synthetic-key",
+        )
+        == "install-***-rejected"
+    )
+
+
+async def test_short_install_id_is_redacted_from_openai_chat_and_model_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(_SHORT_INSTALL_ID, "***"),
+    )
+    monkeypatch.setattr(
+        openai_module,
+        "tokenrhythm_install_id_headers",
+        lambda *_args, **_kwargs: {
+            "X-OpenSquilla-Install-Id": _SHORT_INSTALL_ID
+        },
+    )
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        model="deepseek-v4-flash",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            raise httpx.ConnectError(
+                f"model discovery echoed {_SHORT_INSTALL_ID}",
+                request=request,
+            )
+        return httpx.Response(
+            401,
+            request=request,
+            json={"error": {"message": f"request echoed {_SHORT_INSTALL_ID}"}},
+        )
+
+    _patch_transport(monkeypatch, handler)
+
+    events = await _events(provider)
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    assert _SHORT_INSTALL_ID not in errors[0].message
+    assert "***" in errors[0].message
+
+    with pytest.raises(httpx.ConnectError) as raised:
+        await provider.list_models(raise_on_error=True)
+    assert _SHORT_INSTALL_ID not in str(raised.value)
+    assert "model discovery echoed ***" in str(raised.value)
+    assert raised.value.request.headers["X-OpenSquilla-Install-Id"] == "[PRESENT]"
+    assert _SHORT_INSTALL_ID not in repr(raised.value.request.headers)
+    assert _SHORT_INSTALL_ID not in repr(raised.value.__context__)
+
+
+def test_http_status_error_clone_redacts_retained_request_and_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.error_redaction import redacted_httpx_error
+
+    monkeypatch.setattr(
+        "opensquilla.provider.error_redaction.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(_SHORT_INSTALL_ID, "***"),
+    )
+    request = httpx.Request(
+        "POST",
+        f"https://tokenrhythm.studio/v1/models?echo={_SHORT_INSTALL_ID}",
+        headers={
+            "Authorization": f"Bearer {_API_KEY}",
+            "X-OpenSquilla-Install-Id": _SHORT_INSTALL_ID,
+            "X-Upstream-Echo": _SHORT_INSTALL_ID,
+        },
+        content=f'{{"echo":"{_SHORT_INSTALL_ID}"}}',
+    )
+    response = httpx.Response(
+        500,
+        request=request,
+        headers={
+            "X-Upstream-Echo": _SHORT_INSTALL_ID,
+            f"X-Echo-{_SHORT_INSTALL_ID}": "present",
+        },
+        text=f"upstream echoed {_SHORT_INSTALL_ID} and {_API_KEY}",
+    )
+    original = httpx.HTTPStatusError(
+        f"request failed for {_SHORT_INSTALL_ID} and {_API_KEY}",
+        request=request,
+        response=response,
+    )
+
+    safe = redacted_httpx_error(original, api_key=_API_KEY)
+
+    assert isinstance(safe, httpx.HTTPStatusError)
+    assert safe.response.request is safe.request
+    assert safe.request.headers["X-OpenSquilla-Install-Id"] == "[PRESENT]"
+    retained = " ".join(
+        (
+            str(safe),
+            repr(safe),
+            str(safe.request.url),
+            repr(safe.request.headers),
+            safe.request.content.decode("latin-1"),
+            repr(safe.response.headers),
+            safe.response.text,
+            repr(original.__dict__),
+        )
+    )
+    assert _SHORT_INSTALL_ID not in retained
+    assert _API_KEY not in retained
 
 
 class _CapturedLog:
@@ -343,3 +468,142 @@ async def test_model_discovery_transport_error_preserves_type_but_redacts_key(
 
     assert _API_KEY not in str(raised.value)
     assert "discovery transport echoed" in str(raised.value)
+
+
+# The Codex adapter authenticates with an OAuth access token instead of an
+# API key; upstream error frames that echo it must pass the same boundary.
+_ACCESS_TOKEN = "synthetic-codex-access-token"
+
+
+def _codex_provider(tmp_path: Path) -> Any:
+    from opensquilla.provider.openai_codex import OpenAICodexProvider
+
+    auth_path = tmp_path / "codex-auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": _ACCESS_TOKEN,
+                    "refresh_token": "synthetic-refresh",
+                    "account_id": "synthetic-account",
+                    "id_token": "",
+                },
+            }
+        )
+    )
+    return OpenAICodexProvider(auth_path=str(auth_path))
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected_code"),
+    [
+        pytest.param(
+            {
+                "type": "error",
+                "error": {
+                    "code": f"auth_error-{_ACCESS_TOKEN}",
+                    "message": f"upstream diagnostic echoed Bearer {_ACCESS_TOKEN}",
+                },
+            },
+            "auth_error-***",
+            id="error-frame",
+        ),
+        pytest.param(
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "server_error",
+                        "message": f"request rejected for token {_ACCESS_TOKEN}",
+                    }
+                },
+            },
+            "server_error",
+            id="response-failed",
+        ),
+        pytest.param(
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "incomplete_details": {
+                        "reason": f"interrupted while validating {_ACCESS_TOKEN}"
+                    }
+                },
+            },
+            "response_incomplete",
+            id="response-incomplete",
+        ),
+    ],
+)
+async def test_codex_stream_error_frames_redact_the_access_token(
+    frame: dict[str, Any],
+    expected_code: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = _codex_provider(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = "data: " + json.dumps(frame) + "\n\n"
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            text=content,
+        )
+
+    _patch_transport(monkeypatch, handler)
+    events = await _events(provider)
+
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    error = errors[0]
+    assert error.code == expected_code
+    assert _ACCESS_TOKEN not in error.message
+    assert "***" in error.message
+
+
+async def test_codex_http_error_body_redacts_the_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = _codex_provider(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            request=request,
+            json={"error": {"message": f"denied for credential {_ACCESS_TOKEN}"}},
+        )
+
+    _patch_transport(monkeypatch, handler)
+    events = await _events(provider)
+
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    error = errors[0]
+    assert error.code == "403"
+    assert _ACCESS_TOKEN not in error.message
+    assert "denied for credential" in error.message
+
+
+async def test_codex_transport_error_redacts_the_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = _codex_provider(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            f"synthetic transport echoed {_ACCESS_TOKEN}",
+            request=request,
+        )
+
+    _patch_transport(monkeypatch, handler)
+    events = await _events(provider)
+
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    assert errors[0].code == "request_error"
+    assert _ACCESS_TOKEN not in errors[0].message

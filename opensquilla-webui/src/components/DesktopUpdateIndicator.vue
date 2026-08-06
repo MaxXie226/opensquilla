@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from './Icon.vue'
 import { useDesktopUpdate } from '@/composables/useDesktopUpdate'
+import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 
 const { t } = useI18n()
@@ -10,6 +11,7 @@ const update = useDesktopUpdate()
 const open = ref(false)
 const triggerRef = ref<HTMLButtonElement | null>(null)
 const popoverStyle = ref<Record<string, string>>({})
+useDialogLayer(computed(() => open.value))
 
 onMounted(update.init)
 
@@ -71,16 +73,16 @@ const iconName = computed(() => {
 function positionPopover() {
   const trigger = triggerRef.value
   if (!trigger) return
+  const rect = trigger.getBoundingClientRect()
   if (window.innerWidth <= 768) {
     popoverStyle.value = {
       position: 'fixed',
       left: 'var(--sp-3)',
       right: 'var(--sp-3)',
-      top: '56px',
+      top: `${rect.bottom + 8}px`,
     }
     return
   }
-  const rect = trigger.getBoundingClientRect()
   popoverStyle.value = {
     position: 'fixed',
     right: `${Math.max(12, window.innerWidth - rect.right)}px`,

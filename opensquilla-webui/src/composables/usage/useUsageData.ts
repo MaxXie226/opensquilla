@@ -10,8 +10,17 @@ import { useUsageTotals } from '@/composables/usage/useUsageTotals'
 import { useUsageChartRows } from '@/composables/usage/useUsageChartRows'
 import { useUsageModelCards } from '@/composables/usage/useUsageModelCards'
 import { useUsageSessionRows } from '@/composables/usage/useUsageSessionRows'
-import { formatUsageCost } from '@/composables/usage/nativeBilling'
+import {
+  isUsableTaskName,
+  usageTaskDisplayName,
+} from '@/composables/usage/taskDisplayName'
+import { formatUsageCost, effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { buildUsageCsv } from '@/composables/usage/usageCsv'
+import {
+  SESSION_LIST_VIEW,
+  itemKey,
+  normalizeSessionItem,
+} from '@/composables/useSessions'
 import { useRpcStore } from '@/stores/rpc'
 import { downloadText } from '@/utils/browser'
 import i18n from '@/i18n'
@@ -25,6 +34,7 @@ import type {
   UsageSnapshot,
   UsageStatusData,
 } from '@/types/usage'
+import type { RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
 
 const t = i18n.global.t
 
@@ -32,7 +42,9 @@ const t = i18n.global.t
 // Constants
 // ---------------------------------------------------------------------------
 
-const CNY_RATE = 7.25
+// Display fallback only — used when neither the gateway nor the snapshot's
+// receipts provide the canonical CNY-per-USD rate (see `cnyRate` below).
+const FALLBACK_CNY_RATE = 7.25
 
 type CostFormatOptions = {
   decimals?: number
@@ -79,6 +91,7 @@ const chartMode = ref<'tokens' | 'cost'>('tokens')
 const expandedSessions = ref<Set<string>>(new Set())
 
 const usageSnapshot = ref<UsageSnapshot | null>(null)
+const taskTitles = ref<Map<string, string>>(new Map())
 const usageLoading = ref(false)
 const usageError = ref<string | null>(null)
 const sessions = computed<SessionRow[]>(() => usageSnapshot.value?.sessions || [])
@@ -95,6 +108,11 @@ const lastStatus = computed<UsageStatusData | null>(() => {
 
 let autoRefreshId: ReturnType<typeof setInterval> | null = null
 let loadGeneration = 0
+
+// The rate the ledger normalized CNY receipts with, so every derived CNY
+// figure (totals hint, CSV export, per-row conversions) agrees with
+// receipt-exact amounts instead of drifting on a hardcoded display rate.
+const cnyRate = computed(() => effectiveCnyPerUsd(usageSnapshot.value) ?? FALLBACK_CNY_RATE)
 
 // ---------------------------------------------------------------------------
 // Computed
@@ -123,7 +141,7 @@ const rangeHiddenHint = computed(() => {
       effective: snapshot.timezoneFallback.effectiveTimezone,
     }))
   }
-  if (snapshot.mode === 'session_approximation') {
+  if (snapshot.mode === 'session_approximation' && range.value !== 'all') {
     notices.push(t('usageLogs.coverage.approximate'))
   } else if (snapshot.mode === 'ledger_partial') {
     notices.push(t('usageLogs.coverage.partial'))
@@ -157,6 +175,11 @@ const serverModels = computed(() =>
   usageSnapshot.value?.source === 'usage_ledger' ? usageSnapshot.value.models : null)
 const serverDays = computed(() =>
   usageSnapshot.value?.source === 'usage_ledger' ? usageSnapshot.value.days : null)
+const taskName = (row: SessionRow) => usageTaskDisplayName(
+  row,
+  taskTitles.value,
+  t('usageLogs.tasks.unnamed'),
+)
 
 const {
   usageTotals,
@@ -171,7 +194,7 @@ const {
   visibleSessions,
   serverTotals,
   currency,
-  cnyRate: CNY_RATE,
+  cnyRate,
   rowVal,
   fmtCost,
   sourceCompositionHint,
@@ -184,6 +207,7 @@ const { chartCaption, chartRows } = useUsageChartRows({
   rowVal,
   fmtCost,
   fmtNum,
+  taskName,
 })
 
 const { modelCards, modelsMeta } = useUsageModelCards({
@@ -202,6 +226,7 @@ const { sortedRows, sessionsMeta } = useUsageSessionRows({
   sessionTimestamp,
   relTime,
   sortVal,
+  taskName,
 })
 
 // ---------------------------------------------------------------------------
@@ -266,22 +291,31 @@ function toggleModelExpand(row: { raw: SessionRow; rowIdentity: string }) {
   }
 }
 
-async function loadData(): Promise<boolean> {
-  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return false
+// 'superseded' means a newer load took over (auto-refresh tick, visibility
+// refresh); that newer load fetches with the freshest range selection, so the
+// superseded caller must neither report failure nor roll anything back.
+type LoadOutcome = 'loaded' | 'superseded' | 'failed' | 'hidden'
+
+async function requestLoad(): Promise<LoadOutcome> {
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return 'hidden'
   const generation = ++loadGeneration
   usageLoading.value = true
   usageError.value = null
   try {
-    const snapshot = await requestUsageSnapshot(
-      rpc,
-      range.value as UsageRangeSelection,
-      { cachedSnapshot: usageSnapshot.value },
-    )
-    if (generation !== loadGeneration) return false
+    const [snapshot, nextTaskTitles] = await Promise.all([
+      requestUsageSnapshot(
+        rpc,
+        range.value as UsageRangeSelection,
+        { cachedSnapshot: usageSnapshot.value },
+      ),
+      requestTaskTitles(),
+    ])
+    if (generation !== loadGeneration) return 'superseded'
     usageSnapshot.value = snapshot
-    return true
+    taskTitles.value = nextTaskTitles
+    return 'loaded'
   } catch (error) {
-    if (generation !== loadGeneration) return false
+    if (generation !== loadGeneration) return 'superseded'
     // A refresh or range request must never replace already-rendered,
     // trustworthy data with a page-level error.  The caller that changed the
     // range restores the previous selection below, keeping the cached
@@ -289,17 +323,29 @@ async function loadData(): Promise<boolean> {
     if (!usageSnapshot.value) {
       usageError.value = error instanceof Error ? error.message : String(error)
     }
-    return false
+    return 'failed'
   } finally {
     if (generation === loadGeneration) usageLoading.value = false
   }
 }
 
+async function loadData(): Promise<boolean> {
+  return (await requestLoad()) === 'loaded'
+}
+
 function setRange(nextRange: string) {
   const previousRange = range.value
   persistRange(nextRange)
-  void loadData().then(loaded => {
-    if (!loaded && range.value === nextRange && usageSnapshot.value) {
+  void requestLoad().then(outcome => {
+    // Only this call's own failure (or a hidden-document no-op) may revert:
+    // a superseded request means a concurrent refresh already fetched the
+    // new range and published its snapshot, so rolling the selection back
+    // would mislabel that fresher data and persist the wrong preference.
+    if (
+      (outcome === 'failed' || outcome === 'hidden')
+      && range.value === nextRange
+      && usageSnapshot.value
+    ) {
       persistRange(previousRange)
     }
   })
@@ -307,12 +353,13 @@ function setRange(nextRange: string) {
 
 function exportCsv() {
   const snapshot = usageSnapshot.value
-  const csv = buildUsageCsv(snapshot, visibleSessions.value, CNY_RATE)
+  const rate = cnyRate.value
+  const csv = buildUsageCsv(snapshot, visibleSessions.value, rate)
   const suffix = range.value === 'all' ? 'all' : `${range.value}d`
   const coverageSuffix = snapshot?.mode === 'session_approximation'
     ? '-approximate'
     : snapshot?.mode === 'ledger_partial' ? '-partial' : ''
-  download(`opensquilla-usage-${suffix}${coverageSuffix}-cny${CNY_RATE}.csv`, 'text/csv', csv)
+  download(`opensquilla-usage-${suffix}${coverageSuffix}-cny${rate}.csv`, 'text/csv', csv)
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +375,7 @@ function fmtCost(usd: number | null | undefined, opts?: CostFormatOptions): stri
   return formatUsageCost(
     usd,
     currency.value,
-    CNY_RATE,
+    cnyRate.value,
     decimals,
     opts?.source as Record<string, unknown> | undefined,
   )
@@ -367,7 +414,7 @@ function sessionTimestamp(row: SessionRow): number | null {
 function sortVal(row: SessionRow, key: string): string | number {
   switch (key) {
     case 'session':
-      return (rowVal(row, 'session', 'sessionKey', 'key') || '') as string
+      return taskName(row)
     case 'updated_at':
       return sessionTimestamp(row) || 0
     case 'input_tokens':
@@ -382,6 +429,29 @@ function sortVal(row: SessionRow, key: string): string | number {
       return Number(rowVal(row, 'cost_usd', 'costUsd') || 0)
     default:
       return (rowVal(row, key) || '') as string
+  }
+}
+
+async function requestTaskTitles(): Promise<Map<string, string>> {
+  if (typeof rpc.call !== 'function') return taskTitles.value
+  try {
+    if (typeof rpc.waitForConnection === 'function') await rpc.waitForConnection()
+    const data = await rpc.call<SessionsListResponse>(
+      'sessions.list',
+      { limit: 200, view: SESSION_LIST_VIEW },
+    )
+    const rawItems: RawSessionListEntry[] = data?.sessions || data?.keys || []
+    const titles = new Map<string, string>()
+    rawItems.forEach(raw => {
+      const key = itemKey(raw)
+      const item = normalizeSessionItem(raw)
+      if (key && item && isUsableTaskName(item.title, key)) titles.set(key, item.title)
+    })
+    return titles
+  } catch {
+    // Task names enrich the presentation only. Usage data remains available
+    // when an older gateway cannot provide the task directory.
+    return taskTitles.value
   }
 }
 
@@ -554,6 +624,7 @@ function download(filename: string, mime: string, content: string) {
 
   return {
     currency,
+    cnyRate,
     sessions,
     sortCol,
     sortAsc,

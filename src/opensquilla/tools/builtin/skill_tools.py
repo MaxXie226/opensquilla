@@ -22,7 +22,7 @@ from opensquilla.skills.hub.defaults import (
 )
 from opensquilla.skills.types import SkillInstallSpec, SkillLayer, SkillSpec
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
 
 if TYPE_CHECKING:
     from opensquilla.skills.loader import SkillLoader
@@ -33,6 +33,14 @@ logger = structlog.get_logger(__name__)
 _loader: SkillLoader | None = None
 # Layers that user may mutate — workspace only
 _MUTABLE_LAYERS = frozenset({SkillLayer.WORKSPACE})
+
+
+def _reject_guest_skill_tool(tool_name: str) -> None:
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.guest_safe:
+        raise ToolError(
+            f"GUEST_TOOL_UNAVAILABLE: {tool_name} is unavailable to anonymous guests"
+        )
 
 
 class _NoCatalogMutationError(Exception):
@@ -260,8 +268,10 @@ def create_skill_tools(
     @tool(
         name="skill_list",
         description="List all available skills with name, description, and eligibility.",
+        plan_access=PlanAccess.READ_ONLY,
     )
     async def skill_list() -> str:
+        _reject_guest_skill_tool("skill_list")
         if _loader is None:
             return "No skill loader available."
         skills = _active_skills()
@@ -319,8 +329,10 @@ def create_skill_tools(
             },
         },
         required=["name"],
+        plan_access=PlanAccess.READ_ONLY,
     )
     async def skill_view(name: str, file_path: str | None = None) -> str:
+        _reject_guest_skill_tool("skill_view")
         if _loader is None:
             return "No skill loader available."
         # Gate operator-disabled / coding-mode skills here too: removing them
@@ -382,6 +394,7 @@ def create_skill_tools(
             },
         },
         required=["query"],
+        plan_access=PlanAccess.READ_ONLY,
     )
     async def skill_search_community(
         query: str,
@@ -585,6 +598,7 @@ def create_skill_tools(
         content: str,
         triggers: list[str] | None = None,
     ) -> str:
+        _reject_guest_skill_tool("skill_create")
         if _loader is None:
             raise ToolError("Skill loader not available")
 
@@ -659,6 +673,7 @@ def create_skill_tools(
         description: str | None = None,
         triggers: list[str] | None = None,
     ) -> str:
+        _reject_guest_skill_tool("skill_edit")
         if _loader is None:
             raise ToolError("Skill loader not available")
 
@@ -709,6 +724,7 @@ def create_skill_tools(
     async def skill_delete(name: str) -> str:
         import shutil
 
+        _reject_guest_skill_tool("skill_delete")
         if _loader is None:
             raise ToolError("Skill loader not available")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import types
 from io import StringIO
 
+import pytest
 from rich.console import Console
 
 
@@ -637,6 +638,28 @@ def test_interactive_onboard_imported_provider_prefers_inline_key_over_env(
     assert data["llm"]["model"] == "deepseek/deepseek-v4-pro"
 
 
+def test_imported_openrouter_router_defaults_respect_image_skip():
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.onboarding import flow
+
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.5",
+            "api_key": "synthetic-imported-key",
+        }
+    )
+
+    updated = flow._use_imported_provider_credentials_with_router_defaults(
+        None,
+        cfg,
+        requested_mode="",
+        skip_image_generation=True,
+    )
+
+    assert updated.image_generation.enabled is False
+
+
 def test_interactive_onboard_imported_provider_finalize_error_continues_setup(
     tmp_path, monkeypatch
 ):
@@ -1065,7 +1088,16 @@ def test_interactive_onboard_migration_prompts_for_missing_imported_provider_key
     assert data["llm"]["model"] == "deepseek/deepseek-v4-pro"
 
 
-def test_interactive_onboard_can_enable_image_generation(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("skip_image_generation", "expected_enabled"),
+    [(False, True), (True, False)],
+)
+def test_interactive_openrouter_onboard_applies_image_default_unless_skipped(
+    tmp_path,
+    monkeypatch,
+    skip_image_generation,
+    expected_enabled,
+):
     import sys
     import tomllib
     import types
@@ -1146,15 +1178,21 @@ def test_interactive_onboard_can_enable_image_generation(tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "questionary", _Questionary())
 
-    flow.run_interactive_onboard(flow.OnboardOptions())
-
-    assert calls.index("Enable image generation now?") > calls.index("Configure web search now?")
-    data = tomllib.loads(target.read_text())
-    assert data["image_generation"]["enabled"] is True
-    assert (
-        data["image_generation"]["primary"]
-        == "openrouter/google/gemini-3.1-flash-image-preview"
+    flow.run_interactive_onboard(
+        flow.OnboardOptions(skip_image_generation=skip_image_generation)
     )
+
+    assert "Configure web search now?" in calls
+    assert "Enable image generation now?" not in calls
+    saved = flow.load_config(target)
+    assert saved.image_generation.enabled is expected_enabled
+    if expected_enabled:
+        data = tomllib.loads(target.read_text())
+        assert data["image_generation"]["binding"] == "follow_llm"
+        assert (
+            data["image_generation"]["primary"]
+            == "openrouter/google/gemini-3.1-flash-image-preview"
+        )
 
 
 def test_onboard_if_needed_core_ready_repairs_memory_embedding_without_provider_setup(
@@ -1490,7 +1528,7 @@ def test_interactive_feishu_websocket_prompts_only_core_fields(tmp_path, monkeyp
     assert "uv tool install --python 3.12 --force" in normalized_out
     assert "opensquilla[recommended]" in normalized_out
     assert "https://github.com/opensquilla/opensquilla/releases/download/" in out
-    assert "v0.5.0rc4" in out
+    assert "v0.5.2" in out
     assert "opensquilla.ai/install." not in normalized_out
     assert "uv sync --extra recommended" in normalized_out
     assert "--extra feishu" not in normalized_out
@@ -2624,3 +2662,52 @@ def test_declared_questionary_floor_supports_use_search_filter():
         "questionary 2.0.x lacks use_search_filter; the floor must be >=2.1"
     )
     assert requirement.specifier.contains("2.1.0")
+
+
+def test_installed_reinstall_command_pins_the_running_release_wheel(monkeypatch):
+    from opensquilla.onboarding import flow
+
+    monkeypatch.setattr("opensquilla.__version__", "0.6.0")
+
+    lines = flow._installed_reinstall_command_lines()
+
+    assert (
+        "https://github.com/opensquilla/opensquilla/releases/download/"
+        "v0.6.0/opensquilla-0.6.0-py3-none-any.whl" in lines
+    )
+    assert "opensquilla[recommended]" in lines
+    assert "0.5.0rc4" not in lines
+
+
+def test_installed_reinstall_command_supports_prerelease_versions(monkeypatch):
+    from opensquilla.onboarding import flow
+
+    monkeypatch.setattr("opensquilla.__version__", "1.2.3rc1")
+
+    lines = flow._installed_reinstall_command_lines()
+
+    assert "v1.2.3rc1/opensquilla-1.2.3rc1-py3-none-any.whl" in lines
+
+
+def test_installed_reinstall_command_never_guesses_a_wheel_for_dev_builds(monkeypatch):
+    from opensquilla.onboarding import flow
+
+    monkeypatch.setattr("opensquilla.__version__", "0.0.0+unknown")
+
+    lines = flow._installed_reinstall_command_lines()
+
+    assert "releases/download" not in lines
+    assert "releases/latest" in lines
+
+
+def test_channel_dependency_warning_has_no_hardcoded_release_tag():
+    """The wizard's upgrade hint must be derived from the running version, so
+    a stale pinned wheel can never instruct users to downgrade after a newer
+    release ships."""
+    import inspect
+
+    from opensquilla.onboarding import flow
+
+    source = inspect.getsource(flow._warn_channel_dependency_gaps)
+    assert "releases/download" not in source
+    assert "_installed_reinstall_command_lines" in source

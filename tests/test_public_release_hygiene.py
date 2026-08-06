@@ -54,6 +54,8 @@ PATH_POLICY_FIXTURE_FILES = {
     "tests/test_migration/fixtures/homes/desktop-0.5rc/config.toml",
     "tests/test_provider_image_generation.py",
     "tests/test_sandbox/test_operation_profile.py",
+    "tests/test_sandbox/test_file_policy.py",
+    "tests/test_sandbox/test_path_access.py",
     "tests/test_sandbox/test_permission_profiles.py",
     "tests/test_sandbox/test_platform_permissions.py",
     "tests/test_sandbox/test_windows_default_cache.py",
@@ -65,6 +67,8 @@ PATH_POLICY_FIXTURE_FILES = {
     "tests/test_tools/test_web_http_request.py",
     "tests/test_observability/test_decision_log_contract.py",
     "opensquilla-webui/src/components/SupportDiagnosticsMenu.test.ts",
+    "opensquilla-webui/src/composables/chat/useChatShareExport.test.ts",
+    "opensquilla-webui/src/utils/chat/activityToolDetails.test.ts",
     "opensquilla-webui/src/utils/overviewDiagnostics.test.ts",
     "opensquilla-webui/src/views/OverviewView.diagnostics.test.ts",
 }
@@ -210,7 +214,7 @@ def test_release_sop_documents_github_only_validation_boundary() -> None:
 
     required_phrases = [
         "GitHub-only release checks",
-        "0.5.x preview releases publish Electron desktop installers",
+        "0.5.x releases (previews and the stable) publish Electron desktop installers",
         "must not be marked as Latest",
         "do not publish Windows portable zips",
         "portable latest aliases",

@@ -1,4 +1,4 @@
-import type { NativeBilledByCurrency } from '@/types/usage'
+import type { NativeBilledByCurrency, UsageSnapshot } from '@/types/usage'
 
 const NANOS_PER_USD = 1_000_000_000
 
@@ -136,6 +136,37 @@ export function serializeNativeBilling(source: NativeBillingSource): string {
   return Object.keys(native).length > 0 ? JSON.stringify(native) : ''
 }
 
+function positiveRate(value: unknown): number | null {
+  if (value == null || value === '') return null
+  const rate = Number(value)
+  return Number.isFinite(rate) && rate > 0 ? rate : null
+}
+
+/**
+ * The CNY-per-USD rate the ledger actually normalized receipts with.
+ *
+ * Prefers the gateway-served canonical rate; when talking to an older gateway
+ * that predates it, falls back to the receipt-recorded normalization rate if
+ * the snapshot's receipts agree on exactly one. Returns null when neither is
+ * available (legacy usage.status fallback), letting callers keep their
+ * historical default rate.
+ */
+export function effectiveCnyPerUsd(snapshot: UsageSnapshot | null | undefined): number | null {
+  if (!snapshot) return null
+  const served = positiveRate(snapshot.fxRatesNativePerUsd?.CNY)
+  if (served != null) return served
+  const receiptRates = snapshot.totals?.nativeBilledByCurrency?.CNY?.normalizationRatesNativePerUsd
+  if (Array.isArray(receiptRates)) {
+    const unique = new Set<number>()
+    for (const rate of receiptRates) {
+      const parsed = positiveRate(rate)
+      if (parsed != null) unique.add(parsed)
+    }
+    if (unique.size === 1) return [...unique][0]
+  }
+  return null
+}
+
 export function formatUsageCost(
   usd: number | null | undefined,
   currency: string,
@@ -148,6 +179,9 @@ export function formatUsageCost(
   if (currency !== 'CNY') return '$' + canonicalUsd.toFixed(decimals)
   const native = nativeBillingDisplay(source, canonicalUsd)
   if (native.exactCny != null) return '¥' + native.exactCny.toFixed(decimals)
-  if (native.useCanonicalUsd) return '$' + canonicalUsd.toFixed(decimals)
+  // Native receipt coverage determines whether CNY can be shown as an exact
+  // provider-billed amount, but it must not override the user's display
+  // currency. Mixed, pending, and older rows still have a canonical USD total
+  // that can be converted with the snapshot's effective display rate.
   return '¥' + (canonicalUsd * cnyRate).toFixed(decimals)
 }

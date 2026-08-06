@@ -110,7 +110,12 @@ const DEFAULT_ALL_FAILED_POLICY = 'fallback_single'
 const STATIC_B5_EFFECTIVE_QUORUM = 3
 const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 300
 const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 480
-const STATIC_B5_QUORUM_GRACE_SECONDS = 5
+const STATIC_B5_QUORUM_GRACE_SECONDS = 10
+// The gateway builder substitutes the static-B5 timeout defaults above ONLY
+// when the stored value still equals this legacy default; an explicit
+// operator override (e.g. proposer_timeout_seconds = 600 in TOML) runs as
+// configured and must be surfaced as such.
+const LEGACY_ENSEMBLE_TIMEOUT_SECONDS = 3600
 
 export type EnsembleScheme = 'preset' | 'custom' | 'legacy'
 
@@ -181,10 +186,20 @@ export interface EnsembleCustomLineupView {
 export interface EnsembleConfigSlice {
   enabled?: boolean
   selection_mode?: string
+  selection_configured?: boolean
+  activation_preview?: {
+    selection_mode?: string
+    candidates?: EnsembleCandidateConfig[]
+    blocked_reason?: string | null
+  }
   model_options?: string[]
   candidates?: EnsembleCandidateConfig[]
   min_successful_proposers?: number
   all_failed_policy?: string
+  // Read-only in this form (no editor yet): consumed so effectiveFacts can
+  // report an explicit operator override instead of the static default.
+  proposer_timeout_seconds?: number
+  aggregator_timeout_seconds?: number
 }
 
 interface EnsembleTierCandidate {
@@ -218,6 +233,11 @@ function normalizeAllFailedPolicy(value: unknown): string {
 function normalizeMinSuccessful(value: unknown): number {
   const num = Math.trunc(Number(value))
   return Number.isFinite(num) && num >= 1 ? num : DEFAULT_MIN_SUCCESSFUL_PROPOSERS
+}
+
+function normalizeStoredTimeoutSeconds(value: unknown): number {
+  const num = Number(value)
+  return Number.isFinite(num) && num > 0 ? num : LEGACY_ENSEMBLE_TIMEOUT_SECONDS
 }
 
 function normalizeModelOptions(value: unknown): string[] {
@@ -393,6 +413,11 @@ export function useSetupEnsembleForm() {
   const candidates = ref<EnsembleCandidateConfig[]>([])
   const minSuccessfulProposers = ref(DEFAULT_MIN_SUCCESSFUL_PROPOSERS)
   const allFailedPolicy = ref(DEFAULT_ALL_FAILED_POLICY)
+  // Stored timeout values mirrored from config (read-only here — the panel
+  // has no editor for them, but effectiveFacts must reflect explicit
+  // operator overrides instead of always claiming the static defaults).
+  const storedProposerTimeoutSeconds = ref(LEGACY_ENSEMBLE_TIMEOUT_SECONDS)
+  const storedAggregatorTimeoutSeconds = ref(LEGACY_ENSEMBLE_TIMEOUT_SECONDS)
 
   // Per-key baselines: partial payloads need to know WHICH keys changed, not
   // just that something did. Seeded from the initial state so the pristine
@@ -445,13 +470,33 @@ export function useSetupEnsembleForm() {
 
   function initFromConfig(config: EnsembleConfigSlice) {
     enabled.value = config.enabled === true
-    selectionMode.value = normalizeSelectionMode(config.selection_mode)
+    const usePlannedActivation = (
+      config.enabled !== true && config.selection_configured === false
+    )
+    const plannedActivation = usePlannedActivation
+      ? config.activation_preview
+      : undefined
+    selectionMode.value = (
+      usePlannedActivation
+        ? normalizeSelectionMode(
+            plannedActivation?.selection_mode ?? CUSTOM_B5_SELECTION_MODE,
+          )
+        : normalizeSelectionMode(config.selection_mode)
+    )
     modelOptions.value = normalizeModelOptions(config.model_options)
-    candidates.value = normalizeCandidates(config.candidates)
+    candidates.value = normalizeCandidates(
+      plannedActivation?.candidates ?? config.candidates,
+    )
     minSuccessfulProposers.value = normalizeMinSuccessful(
       config.min_successful_proposers ?? DEFAULT_MIN_SUCCESSFUL_PROPOSERS,
     )
     allFailedPolicy.value = normalizeAllFailedPolicy(config.all_failed_policy)
+    storedProposerTimeoutSeconds.value = normalizeStoredTimeoutSeconds(
+      config.proposer_timeout_seconds,
+    )
+    storedAggregatorTimeoutSeconds.value = normalizeStoredTimeoutSeconds(
+      config.aggregator_timeout_seconds,
+    )
     snapshotBaseline()
   }
 
@@ -729,20 +774,20 @@ export function useSetupEnsembleForm() {
     }
   }
 
-  // Default activation when the ensemble strategy is switched on: providers
-  // with an official preset land on it; every other provider gets an explicit
-  // custom lineup seeded from the router tiers (the models the user already
-  // configured), never the hidden legacy dynamic mode.
+  // Default activation when the ensemble strategy is switched on: every
+  // provider lands on the single editable custom path. Providers with a
+  // curated static profile use that profile only as the initial seed; other
+  // providers seed from the router tiers the user already configured.
   function activateForProvider(provider: unknown, tierCandidates: readonly EnsembleTierCandidate[] = []) {
     const presetMode = staticB5ModeForProvider(provider)
-    if (presetMode) {
-      selectionMode.value = presetMode
+    selectionMode.value = CUSTOM_B5_SELECTION_MODE
+    if (candidates.value.some(candidate => candidate.enabled !== false)) return
+    const profile = presetMode ? STATIC_B5_PROFILES[presetMode] : null
+    if (profile) {
+      candidates.value = customSeedFromProfile(profile)
       return
     }
-    selectionMode.value = CUSTOM_B5_SELECTION_MODE
-    if (!candidates.value.some(candidate => candidate.enabled !== false)) {
-      importTierCandidates(tierCandidates)
-    }
+    importTierCandidates(tierCandidates)
   }
 
   // One-click migration off the hidden legacy router_dynamic mode: fold the
@@ -837,13 +882,28 @@ export function useSetupEnsembleForm() {
       configuredQuorum === DEFAULT_MIN_SUCCESSFUL_PROPOSERS ? autoQuorum : configuredQuorum,
       Math.max(1, proposerCount),
     )
+    // Mirrors the gateway builder: static presets and custom_b5 lineups get
+    // the static defaults only while the stored value still equals the legacy
+    // default; an explicit override runs (and reads) as configured. The
+    // hidden legacy router_dynamic mode runs the stored values untouched and
+    // has no quorum grace.
+    const staticDefaultsApply = isPreset || selectionMode.value !== 'router_dynamic'
+    const substituteLegacy = (stored: number, staticDefault: number): number => (
+      staticDefaultsApply && stored === LEGACY_ENSEMBLE_TIMEOUT_SECONDS ? staticDefault : stored
+    )
     return {
       perTurnCalls: proposerCount + 1,
       quorum,
       proposerCount,
-      proposerTimeoutSeconds: STATIC_B5_PROPOSER_TIMEOUT_SECONDS,
-      aggregatorTimeoutSeconds: STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,
-      quorumGraceSeconds: STATIC_B5_QUORUM_GRACE_SECONDS,
+      proposerTimeoutSeconds: substituteLegacy(
+        storedProposerTimeoutSeconds.value,
+        STATIC_B5_PROPOSER_TIMEOUT_SECONDS,
+      ),
+      aggregatorTimeoutSeconds: substituteLegacy(
+        storedAggregatorTimeoutSeconds.value,
+        STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,
+      ),
+      quorumGraceSeconds: staticDefaultsApply ? STATIC_B5_QUORUM_GRACE_SECONDS : 0,
     }
   }
 
@@ -853,6 +913,13 @@ export function useSetupEnsembleForm() {
       const activeProvider = normalizeProvider(context.activeProvider.value)
       const activeModel = normalizeModel(context.activeModel?.value ?? '')
       const providerStaticMode = staticB5ModeForProvider(activeProvider)
+      // The STORED selection mode is what the runtime builder keys off: a
+      // static preset saved for one provider keeps running its own lineup
+      // even after the active provider changes (its members resolve
+      // credentials through the profile provider's env key).
+      const storedStaticMode = selectionMode.value in STATIC_B5_PROFILES
+        ? selectionMode.value
+        : null
 
       const scheme: EnsembleScheme = (
         selectionMode.value === 'router_dynamic'
@@ -888,10 +955,14 @@ export function useSetupEnsembleForm() {
         })
       const customCandidates = uniqueCandidateViews([...structuredCandidates, ...legacyCandidates])
 
+      // Render the preset card from the STORED profile, not the active
+      // provider's own preset: when they disagree, the stored lineup is the
+      // one that runs (and bills), so showing the active provider's lineup
+      // would misreport every turn's members.
       const activeStaticProfile = (
-        scheme === 'preset' && providerStaticMode !== null
+        scheme === 'preset' && storedStaticMode !== null
       )
-        ? STATIC_B5_PROFILES[providerStaticMode]
+        ? STATIC_B5_PROFILES[storedStaticMode]
         : null
       const fixedProfile: EnsembleFixedProfileView | null = activeStaticProfile
         ? {
@@ -946,6 +1017,15 @@ export function useSetupEnsembleForm() {
         customCandidates,
         custom: customLineup,
         fixedProfile,
+        // True when the stored preset belongs to a different provider than
+        // the active one (both have static profiles): the stored lineup
+        // still runs, so the panel flags the divergence instead of quietly
+        // relabelling it.
+        presetProviderMismatch: (
+          scheme === 'preset'
+          && storedStaticMode !== null
+          && storedStaticMode !== providerStaticMode
+        ),
         presetFacts: effectiveFacts(
           activeStaticProfile ? activeStaticProfile.proposers.length : 4,
           true,

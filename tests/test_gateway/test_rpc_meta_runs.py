@@ -39,18 +39,20 @@ from opensquilla.skills.meta.inputs import make_meta_inputs
 from opensquilla.skills.meta.scheduler import _preflight_missing_fields
 from opensquilla.skills.meta.types import MetaPlan, MetaResult, MetaStep
 
-MIGRATIONS_DIR = Path(__file__).resolve().parents[1].parent / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
 
 def _seed_writer(
-    tmp_path: Path,
+    migrated_db: Path,
     *,
     final_status: str = "ok",
     final_result: MetaResult | None = None,
 ):
-    db = str(tmp_path / "runs.db")
-    apply_pending(db, MIGRATIONS_DIR)
-    writer = open_meta_run_writer(db)
+    db_path = migrated_db
+    if migrated_db.is_dir():
+        db_path = migrated_db / "runs.db"
+        apply_pending(str(db_path), MIGRATIONS_DIR)
+    writer = open_meta_run_writer(str(db_path))
     plan = MetaPlan(
         name="alpha-skill",
         triggers=("alpha request",),
@@ -179,9 +181,9 @@ def test_meta_runs_list_rpc_returns_summary(tmp_path: Path) -> None:
     }
 
 
-def test_meta_runs_failures_rpc_returns_summary_only(tmp_path: Path) -> None:
+def test_meta_runs_failures_rpc_returns_summary_only(migrated_db: Path) -> None:
     writer, run_id = _seed_writer(
-        tmp_path,
+        migrated_db,
         final_status="failed",
         final_result=MetaResult(
             ok=False,
@@ -689,8 +691,8 @@ def test_meta_runs_show_rpc_returns_steps(tmp_path: Path) -> None:
     assert run["summary"]["steps"][0]["output_chars"] == 4
 
 
-def test_meta_runs_draft_rpc_returns_author_seed(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+def test_meta_runs_draft_rpc_returns_author_seed(migrated_db: Path) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     try:
         ctx = RpcContext(conn_id="test", meta_run_writer=writer)
         payload = asyncio.run(_handle_meta_runs_draft({"runId": run_id}, ctx))
@@ -704,8 +706,8 @@ def test_meta_runs_draft_rpc_returns_author_seed(tmp_path: Path) -> None:
     assert draft["eval_prompts"][0]["name"] == "brief"
 
 
-def test_meta_runs_confirm_preflight_requires_template_fields(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+def test_meta_runs_confirm_preflight_requires_template_fields(migrated_db: Path) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     try:
         ctx = RpcContext(conn_id="test", meta_run_writer=writer)
         payload = asyncio.run(_handle_meta_runs_confirm_preflight({
@@ -740,8 +742,8 @@ def test_meta_runs_confirm_preflight_requires_template_fields(tmp_path: Path) ->
     ) == []
 
 
-def test_meta_runs_confirm_preflight_rejects_missing_fields(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+def test_meta_runs_confirm_preflight_rejects_missing_fields(migrated_db: Path) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     try:
         ctx = RpcContext(conn_id="test", meta_run_writer=writer)
         with pytest.raises(Exception) as exc_info:
@@ -755,9 +757,9 @@ def test_meta_runs_confirm_preflight_rejects_missing_fields(tmp_path: Path) -> N
     assert "language" in str(exc_info.value)
 
 
-def test_meta_runs_replay_rpc_returns_bounded_replay_message(tmp_path: Path) -> None:
+def test_meta_runs_replay_rpc_returns_bounded_replay_message(migrated_db: Path) -> None:
     writer, run_id = _seed_writer(
-        tmp_path,
+        migrated_db,
         final_status="failed",
         final_result=MetaResult(ok=False, error="failed at writer", failed_step_id="s1"),
     )
@@ -779,9 +781,11 @@ def test_meta_runs_replay_rpc_returns_bounded_replay_message(tmp_path: Path) -> 
     assert replay["request"]["user_message"] == "Write an alpha brief"
 
 
-def test_meta_runs_replay_keeps_original_request_before_large_outputs(tmp_path: Path) -> None:
+def test_meta_runs_replay_keeps_original_request_before_large_outputs(
+    migrated_db: Path,
+) -> None:
     writer, run_id = _seed_writer(
-        tmp_path,
+        migrated_db,
         final_status="failed",
         final_result=MetaResult(ok=False, error="failed late", failed_step_id="s1"),
     )
@@ -1136,8 +1140,8 @@ def test_meta_runs_diff_rpc_compares_runs(tmp_path: Path) -> None:
     assert diff["steps"][0]["step_id"] == "s1"
 
 
-def test_meta_runs_cost_rpc_aggregates_persisted_step_usage(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+def test_meta_runs_cost_rpc_aggregates_persisted_step_usage(migrated_db: Path) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     writer.finish_step_sync(
         run_id=run_id,
         step_id="s1",
@@ -1170,8 +1174,8 @@ def test_meta_runs_cost_rpc_aggregates_persisted_step_usage(tmp_path: Path) -> N
     assert payload["runs"][0]["steps"][0]["usage"]["model"] == "gpt-test"
 
 
-def test_meta_runs_validate_rpc_exposes_spec_metadata(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+def test_meta_runs_validate_rpc_exposes_spec_metadata(migrated_db: Path) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     try:
         ctx = RpcContext(conn_id="test", meta_run_writer=writer)
         payload = asyncio.run(_handle_meta_runs_validate({"runId": run_id}, ctx))
@@ -1185,8 +1189,10 @@ def test_meta_runs_validate_rpc_exposes_spec_metadata(tmp_path: Path) -> None:
     assert validation["eval_prompts"][0]["name"] == "brief"
 
 
-def test_meta_runs_eval_baseline_rpc_returns_deterministic_rubric(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+def test_meta_runs_eval_baseline_rpc_returns_deterministic_rubric(
+    migrated_db: Path,
+) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     try:
         ctx = RpcContext(conn_id="test", meta_run_writer=writer)
         payload = asyncio.run(_handle_meta_runs_eval_baseline({"runId": run_id}, ctx))
@@ -1215,8 +1221,10 @@ def test_meta_runs_rpc_scope_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_meta_runs_show_and_draft_deny_read_only_dispatch(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+async def test_meta_runs_show_and_draft_deny_read_only_dispatch(
+    migrated_db: Path,
+) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     read_only = Principal(
         role="operator",
         scopes=frozenset({READ_SCOPE}),
@@ -1239,8 +1247,10 @@ async def test_meta_runs_show_and_draft_deny_read_only_dispatch(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_meta_runs_read_only_requires_session_key_for_history(tmp_path: Path) -> None:
-    writer, _run_id = _seed_writer(tmp_path)
+async def test_meta_runs_read_only_requires_session_key_for_history(
+    migrated_db: Path,
+) -> None:
+    writer, _run_id = _seed_writer(migrated_db)
     read_only = Principal(
         role="operator",
         scopes=frozenset({READ_SCOPE}),
@@ -1259,8 +1269,10 @@ async def test_meta_runs_read_only_requires_session_key_for_history(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_meta_runs_read_only_allows_session_scoped_history(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+async def test_meta_runs_read_only_allows_session_scoped_history(
+    migrated_db: Path,
+) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     other_plan = MetaPlan(
         name="beta-skill",
         triggers=("beta request",),
@@ -1303,10 +1315,10 @@ async def test_meta_runs_read_only_allows_session_scoped_history(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_meta_runs_failures_read_only_allows_session_scoped_history(
-    tmp_path: Path,
+    migrated_db: Path,
 ) -> None:
     writer, run_id = _seed_writer(
-        tmp_path,
+        migrated_db,
         final_status="failed",
         final_result=MetaResult(ok=False, error="failed", failed_step_id="s1"),
     )
@@ -1351,8 +1363,10 @@ async def test_meta_runs_failures_read_only_allows_session_scoped_history(
 
 
 @pytest.mark.asyncio
-async def test_meta_runs_owner_read_scope_allows_session_history(tmp_path: Path) -> None:
-    writer, run_id = _seed_writer(tmp_path)
+async def test_meta_runs_owner_read_scope_allows_session_history(
+    migrated_db: Path,
+) -> None:
+    writer, run_id = _seed_writer(migrated_db)
     owner_read = Principal(
         role="operator",
         scopes=frozenset({READ_SCOPE}),
@@ -1399,6 +1413,6 @@ def test_meta_runs_rpc_does_not_import_cli_private_helpers() -> None:
 
 
 def test_meta_runs_cli_uses_neutral_report_helpers() -> None:
-    source = Path("src/opensquilla/cli/skills_meta_cmd.py").read_text()
+    source = Path("src/opensquilla/cli/skills_meta_cmd.py").read_text(encoding="utf-8")
     assert "opensquilla.gateway.rpc_meta_runs" not in source
     assert "opensquilla.skills.meta.run_reports" in source

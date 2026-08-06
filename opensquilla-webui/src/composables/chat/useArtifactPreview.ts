@@ -19,7 +19,7 @@ import { onUnmounted, ref, shallowRef } from 'vue'
  */
 
 export type ArtifactPreviewState = 'idle' | 'loading' | 'loaded' | 'timeout' | 'error'
-export type ArtifactPreviewErrorCode = 'network' | 'too_large' | null
+export type ArtifactPreviewErrorCode = 'network' | 'too_large' | 'unsupported' | null
 
 export interface ArtifactPreviewOptions {
   /** Loader resolving the URL to fetch (thumbnail for grids, full for lightbox). */
@@ -36,6 +36,10 @@ export interface ArtifactPreviewOptions {
   maxRetries?: number
   /** Maximum response bytes retained for a preview. Omit for no size cap. */
   maxBytes?: number
+  /** Reject cross-origin URLs before any unauthenticated preview request. */
+  requireSameOrigin?: boolean
+  /** Validate response bytes before allocating an object URL. */
+  acceptBlob?: (blob: Blob) => boolean
 }
 
 const CONCURRENCY = 3
@@ -185,11 +189,15 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
 
     try {
       const isSame = sameOriginFn(url)
+      if (options.requireSameOrigin && !isSame) {
+        throw new ArtifactPreviewLoadError('network', 'Cross-origin preview is not allowed')
+      }
       const response = await fetch(url, {
         method: 'GET',
         headers: isSame && options.headers ? options.headers() : {},
         credentials: isSame ? 'same-origin' : 'omit',
         signal: controller.signal,
+        redirect: 'error',
       })
       if (!response.ok) throw new Error(`status ${response.status}`)
 
@@ -197,6 +205,9 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
         if (seq === runSeq) progress.value = p
       }, maxBytes)
       if (disposed || seq !== runSeq) return
+      if (options.acceptBlob && !options.acceptBlob(blob)) {
+        throw new ArtifactPreviewLoadError('unsupported', 'Preview media type is unsupported')
+      }
 
       const nextUrl = URL.createObjectURL(blob)
       setObjectUrl(nextUrl)

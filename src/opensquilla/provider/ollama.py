@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import httpx
@@ -12,10 +12,21 @@ import structlog
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.secrets import clean_header_secret
 
+from .candidate_artifact import (
+    CandidateArtifactBuilder,
+    CandidateArtifactLimitError,
+    strip_candidate_tool_identity,
+)
 from .error_redaction import (
     redact_upstream_error_code,
     redact_upstream_error_text,
     redacted_httpx_error,
+)
+from .request_proof import (
+    ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    protected_tool_result_indexes,
+    prove_provider_payload_from_env,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
 from .trace_recorder import LLMTraceRecorder
@@ -25,6 +36,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -54,6 +66,45 @@ def _build_ollama_tool(tool: ToolDefinition) -> dict[str, Any]:
 def _tool_result_content(block: Any) -> str:
     content = block.content
     return content if isinstance(content, str) else json.dumps(content)
+
+
+def _candidate_wrapper_has_substantive_content(value: object) -> bool:
+    """Return whether a sanitized malformed wrapper carries advisory content."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            key_text = str(key).casefold()
+            if key_text == "index":
+                continue
+            # A bare native wrapper marker does not make an otherwise empty
+            # action useful to the aggregator.
+            if (
+                key_text == "type"
+                and isinstance(nested, str)
+                and nested.strip().casefold() == "function"
+            ):
+                continue
+            if _candidate_wrapper_has_substantive_content(nested):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_candidate_wrapper_has_substantive_content(item) for item in value)
+    # Numeric and boolean values are explicit provider-authored evidence.
+    return True
+
+
+def _candidate_field_has_content(value: object) -> bool:
+    """Cheaply classify a native name/arguments field without walking it."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (Mapping, list, tuple)):
+        return bool(value)
+    return True
 
 
 def _build_ollama_messages(
@@ -107,7 +158,12 @@ def _build_ollama_messages(
     return out
 
 
-def _convert_messages(messages: list[Message], system: str | None) -> list[dict[str, Any]]:
+def _convert_messages(
+    messages: list[Message],
+    system: str | None,
+    *,
+    logical_index_map: dict[int, int] | None = None,
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if system:
         out.append({"role": "system", "content": system})
@@ -120,7 +176,9 @@ def _convert_messages(messages: list[Message], system: str | None) -> list[dict[
                 if block.type == "tool_use":
                     tool_names[block.id] = block.name
 
-    for msg in messages:
+    for index, msg in enumerate(messages):
+        if logical_index_map is not None:
+            logical_index_map[index] = len(out)
         out.extend(_build_ollama_messages(msg, tool_names))
     return out
 
@@ -128,6 +186,7 @@ def _convert_messages(messages: list[Message], system: str | None) -> list[dict[
 class OllamaProvider:
     """Streams from an Ollama instance (local or cloud) using /api/chat."""
 
+    final_request_admission_guaranteed = True
     provider_name = "ollama"
 
     def __init__(
@@ -160,6 +219,61 @@ class OllamaProvider:
             return {"Authorization": f"Bearer {self._api_key}"}
         return {}
 
+    def _build_payload(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> tuple[dict[str, Any], int | None]:
+        logical_index_map: dict[int, int] = {}
+        ollama_messages = _convert_messages(
+            messages,
+            cfg.system,
+            logical_index_map=logical_index_map,
+        )
+        wire_active_user_index = (
+            logical_index_map.get(cfg.active_user_message_index)
+            if cfg.active_user_message_index is not None
+            else None
+        )
+        options: dict[str, Any] = {
+            "num_predict": cfg.max_tokens,
+            "num_ctx": self._num_ctx,
+        }
+        if cfg.temperature is not None:
+            options["temperature"] = cfg.temperature
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": ollama_messages,
+            "stream": True,
+            "options": options,
+        }
+        if tools:
+            payload["tools"] = [_build_ollama_tool(tool) for tool in tools]
+        return payload, wire_active_user_index
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Ollama payload without transport or shaping."""
+
+        cfg = config or ChatConfig()
+        payload, wire_active_user_index = self._build_payload(messages, tools, cfg)
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        return project_final_request_payload(
+            payload,
+            projection_adapter="ollama",
+            proof_budget=cfg.provider_request_max_chars,
+            active_user_message_index=wire_active_user_index,
+            message_limit=message_limit,
+            protected_tool_result_indexes=protected_result_indexes,
+        )
+
     def chat(
         self,
         messages: list[Message],
@@ -175,23 +289,51 @@ class OllamaProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
-        ollama_messages = _convert_messages(messages, cfg.system)
+        payload, wire_active_user_index = self._build_payload(messages, tools, cfg)
+        protected_result_indexes = protected_tool_result_indexes(messages)
 
-        options: dict[str, Any] = {
-            "num_predict": cfg.max_tokens,
-            "num_ctx": self._num_ctx,
-        }
-        if cfg.temperature is not None:
-            options["temperature"] = cfg.temperature
+        from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": ollama_messages,
-            "stream": True,
-            "options": options,
-        }
-        if tools:
-            payload["tools"] = [_build_ollama_tool(t) for t in tools]
+        budget_decision = coordinate_provider_context_budget(
+            payload,
+            projection_adapter="ollama",
+            proof_budget=cfg.provider_request_max_chars,
+            active_user_message_index=wire_active_user_index,
+            protected_tool_result_indexes=protected_result_indexes,
+        )
+        if budget_decision.action == "budget_limited":
+            proof = budget_decision.proof or {}
+            log.warning("provider.request_budget_exhausted", **proof)
+            yield ErrorEvent(
+                message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
+            )
+            return
+        payload = budget_decision.payload or payload
+        if budget_decision.proof is not None:
+            log.info("provider.request_proof", **budget_decision.proof)
+        try:
+            prove_provider_payload_from_env(
+                payload,
+                projection_adapter="ollama",
+                active_user_message_index=wire_active_user_index,
+                protected_tool_result_indexes=protected_result_indexes,
+            )
+        except ProviderRequestBudgetExceededError as exc:
+            log.warning("provider.request_budget_exhausted", **exc.proof)
+            yield ErrorEvent(
+                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
+
         endpoint = f"{self._base_url}/api/chat"
         trace = LLMTraceRecorder(
             provider="ollama",
@@ -202,7 +344,11 @@ class OllamaProvider:
         )
         trace.record_request(
             payload=payload,
-            metadata={"timeout_seconds": cfg.timeout, "tools_count": len(tools or [])},
+            metadata={
+                "timeout_seconds": cfg.timeout,
+                "tools_count": len(tools or []),
+                "request_proof": budget_decision.proof,
+            },
         )
 
         input_tokens = 0
@@ -213,9 +359,15 @@ class OllamaProvider:
         # until done=true supplies successful terminal evidence. This applies
         # response-local call/identity/argument limits before retaining an
         # attacker-controlled number of calls or bytes.
+        candidate_artifact = (
+            CandidateArtifactBuilder()
+            if cfg.candidate_output_mode == "inert_artifact"
+            else None
+        )
         tools_acc = ToolStreamAccumulator()
         prepared_tool_events: list[StreamEvent] = []
         prepared_tool_calls: list[dict[str, Any]] = []
+        candidate_call_key = 0
         saw_done = False
 
         try:
@@ -316,26 +468,90 @@ class OllamaProvider:
                         # Ollama delivers tool_calls in a single chunk (non-streaming)
                         raw_tool_calls = msg_chunk.get("tool_calls", [])
                         if not isinstance(raw_tool_calls, list):
-                            message = "Ollama stream contained malformed tool calls"
-                            trace.record_error(code="incomplete_tool_call", message=message)
-                            yield ErrorEvent(message=message, code="incomplete_tool_call")
-                            return
+                            if candidate_artifact is not None:
+                                sanitized_calls = strip_candidate_tool_identity(
+                                    raw_tool_calls
+                                )
+                                if _candidate_wrapper_has_substantive_content(
+                                    sanitized_calls
+                                ):
+                                    candidate_artifact.observe_call(
+                                        candidate_call_key,
+                                        arguments={
+                                            "malformed_tool_calls": sanitized_calls
+                                        },
+                                    )
+                                    candidate_call_key += 1
+                                raw_tool_calls = []
+                            else:
+                                message = "Ollama stream contained malformed tool calls"
+                                trace.record_error(code="incomplete_tool_call", message=message)
+                                yield ErrorEvent(message=message, code="incomplete_tool_call")
+                                return
                         for tc in raw_tool_calls:
                             if not isinstance(tc, dict):
+                                if candidate_artifact is not None:
+                                    sanitized_call = strip_candidate_tool_identity(tc)
+                                    if _candidate_wrapper_has_substantive_content(
+                                        sanitized_call
+                                    ):
+                                        candidate_artifact.observe_call(
+                                            candidate_call_key,
+                                            arguments={
+                                                "malformed_tool_call": sanitized_call
+                                            },
+                                        )
+                                        candidate_call_key += 1
+                                    continue
                                 message = "Ollama stream contained a malformed tool call"
                                 trace.record_error(code="incomplete_tool_call", message=message)
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             fn = tc.get("function", {})
                             if not isinstance(fn, dict):
+                                if candidate_artifact is not None:
+                                    sanitized_call = strip_candidate_tool_identity(tc)
+                                    if _candidate_wrapper_has_substantive_content(
+                                        sanitized_call
+                                    ):
+                                        candidate_artifact.observe_call(
+                                            candidate_call_key,
+                                            arguments={
+                                                "malformed_tool_call": sanitized_call
+                                            },
+                                        )
+                                        candidate_call_key += 1
+                                    continue
                                 message = "Ollama stream contained a malformed tool function"
                                 trace.record_error(code="incomplete_tool_call", message=message)
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             raw_tool_id = tc.get("id")
+                            if candidate_artifact is not None:
+                                candidate_name = fn.get("name")
+                                candidate_arguments = fn.get("arguments")
+                                if not _candidate_field_has_content(
+                                    candidate_name
+                                ) and not _candidate_field_has_content(
+                                    candidate_arguments
+                                ):
+                                    sanitized_call = strip_candidate_tool_identity(tc)
+                                    if not _candidate_wrapper_has_substantive_content(
+                                        sanitized_call
+                                    ):
+                                        continue
+                                    candidate_arguments = {
+                                        "malformed_tool_call": sanitized_call,
+                                    }
+                                candidate_artifact.observe_call(
+                                    candidate_call_key,
+                                    name_text=candidate_name,
+                                    arguments=candidate_arguments,
+                                )
+                                candidate_call_key += 1
+                                continue
                             if "id" in tc and (
-                                not isinstance(raw_tool_id, str)
-                                or not raw_tool_id.strip()
+                                not isinstance(raw_tool_id, str) or not raw_tool_id.strip()
                             ):
                                 message = "Ollama stream contained an invalid tool call id"
                                 trace.record_error(code="incomplete_tool_call", message=message)
@@ -415,6 +631,21 @@ class OllamaProvider:
                     # response's explicit done=true terminal.
                     for tool_event in prepared_tool_events:
                         yield tool_event
+                    if candidate_artifact is not None and candidate_artifact.has_calls:
+                        artifact_text = candidate_artifact.render_text()
+                        if artifact_text:
+                            assistant_text_parts.append(artifact_text)
+                            yield TextDeltaEvent(text=artifact_text)
+                        log.info(
+                            "provider.candidate_artifact",
+                            provider=self.provider_name,
+                            model=self._model,
+                            call_count=candidate_artifact.call_count,
+                            event_count=candidate_artifact.event_count,
+                            char_count=candidate_artifact.char_count,
+                            issue_codes=list(candidate_artifact.issue_codes),
+                            truncated=False,
+                        )
 
                     trace.record_response(
                         usage={
@@ -442,6 +673,28 @@ class OllamaProvider:
                         provider=self.provider_id,
                     )
 
+        except CandidateArtifactLimitError as exc:
+            message = "Ollama candidate artifact exceeded safety limits"
+            trace.record_error(
+                code="candidate_artifact_limit_exceeded",
+                message=message,
+                metadata={
+                    "operation": exc.operation,
+                    "reason": exc.reason,
+                    "limit": exc.limit,
+                    "observed": exc.observed,
+                },
+            )
+            log.warning(
+                "provider.candidate_artifact_limit",
+                provider=self.provider_name,
+                model=self._model,
+                operation=exc.operation,
+                reason=exc.reason,
+                limit=exc.limit,
+                observed=exc.observed,
+            )
+            yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
         except httpx.TimeoutException as exc:
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",

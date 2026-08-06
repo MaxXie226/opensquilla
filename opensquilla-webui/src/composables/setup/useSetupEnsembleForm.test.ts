@@ -67,6 +67,29 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
+  it('uses the backend activation preview instead of the dormant legacy default', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      enabled: false,
+      selection_mode: 'static_openrouter_b5',
+      selection_configured: false,
+      activation_preview: {
+        selection_mode: CUSTOM_B5_SELECTION_MODE,
+        candidates: [
+          { provider: 'tokenrhythm', model: 'deepseek-v4-pro', role: 'primary' },
+          { provider: 'tokenrhythm', model: 'glm-5.2', role: 'aggregator' },
+        ],
+      },
+    })
+
+    expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.candidates.value.map((candidate) => candidate.provider)).toEqual([
+      'tokenrhythm',
+      'tokenrhythm',
+    ])
+    expect(f.isDirty.value).toBe(false)
+  })
+
   it('falls back to the shipped defaults for an empty or invalid config slice', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({ selection_mode: 'bogus', all_failed_policy: 'bogus', min_successful_proposers: -3 })
@@ -221,11 +244,15 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
-  it('activateForProvider lands on the preset for preset providers', () => {
+  it('activateForProvider seeds preset providers into the custom editing path', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({})
     f.activateForProvider('tokenrhythm')
-    expect(f.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.candidates.value.filter(c => c.role !== 'aggregator').map(c => c.model))
+      .toEqual([...TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS])
+    expect(f.candidates.value.find(c => c.role === 'aggregator')?.model)
+      .toBe(TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR)
   })
 
   it('activateForProvider gives other providers an explicit custom lineup seeded from tiers', () => {
@@ -793,6 +820,30 @@ describe('useSetupEnsembleForm — panel contract', () => {
     expect(panel.value.fixedProfile!.proposers.map(c => c.model))
       .toEqual([...TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS])
     expect(panel.value.fixedProfile!.aggregator.model).toBe(TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR)
+    expect(panel.value.presetProviderMismatch).toBe(false)
+  })
+
+  it('renders the stored preset lineup with a mismatch flag when it differs from the active provider', () => {
+    const f = useSetupEnsembleForm()
+    // Stored TokenRhythm preset; the user later switched the active provider
+    // to OpenRouter. The runtime builder keys off the stored mode, so the
+    // TokenRhythm lineup still runs (and bills) — the card must show it.
+    f.initFromConfig({ enabled: true, selection_mode: 'static_tokenrhythm_b5' })
+    const panel = makePanel(f, 'openrouter')
+    expect(panel.value.scheme).toBe('preset')
+    expect(panel.value.fixedProfile!.providerLabel).toBe('TokenRhythm')
+    expect(panel.value.fixedProfile!.proposers.map(c => c.model))
+      .toEqual([...TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS])
+    expect(panel.value.fixedProfile!.aggregator.model).toBe(TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR)
+    expect(panel.value.presetProviderMismatch).toBe(true)
+  })
+
+  it('reports no preset mismatch when the stored preset belongs to the active provider', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    const panel = makePanel(f, 'openrouter')
+    expect(panel.value.presetProviderMismatch).toBe(false)
+    expect(panel.value.fixedProfile!.providerLabel).toBe('OpenRouter')
   })
 
   it('reports the custom scheme (no preset cards) for non-preset providers even with a stored static mode', () => {
@@ -870,7 +921,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
     expect(makePanel(f, 'volcengine').value.custom.canAddProposer).toBe(false)
   })
 
-  it('surfaces the effective preset facts (quorum 3/4, 300/480s, 5s grace)', () => {
+  it('surfaces the effective preset facts (quorum 3/4, 300/480s, 10s grace)', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
     const facts = makePanel(f, 'openrouter').value.presetFacts
@@ -880,7 +931,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
       proposerCount: 4,
       proposerTimeoutSeconds: 300,
       aggregatorTimeoutSeconds: 480,
-      quorumGraceSeconds: 5,
+      quorumGraceSeconds: 10,
     })
   })
 
@@ -923,6 +974,75 @@ describe('useSetupEnsembleForm — panel contract', () => {
     })
     const panel = makePanel(f, 'deepseek')
     expect(panel.value.customCandidates).toEqual([])
+  })
+})
+
+describe('useSetupEnsembleForm — effective timeout facts', () => {
+  it('surfaces explicit operator timeout overrides instead of the static defaults', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      enabled: true,
+      selection_mode: 'static_openrouter_b5',
+      proposer_timeout_seconds: 600,
+      aggregator_timeout_seconds: 900,
+    })
+    const facts = makePanel(f, 'openrouter').value.presetFacts
+    expect(facts.proposerTimeoutSeconds).toBe(600)
+    expect(facts.aggregatorTimeoutSeconds).toBe(900)
+    expect(facts.quorumGraceSeconds).toBe(10)
+    // The stored timeouts are read-only facts, never a pending edit.
+    expect(f.isDirty.value).toBe(false)
+    expect(f.payload()).toEqual({})
+  })
+
+  it('keeps the static defaults for legacy-default and absent stored values', () => {
+    const explicitLegacy = useSetupEnsembleForm()
+    explicitLegacy.initFromConfig({
+      enabled: true,
+      selection_mode: 'static_openrouter_b5',
+      proposer_timeout_seconds: 3600,
+      aggregator_timeout_seconds: 3600,
+    })
+    const legacyFacts = makePanel(explicitLegacy, 'openrouter').value.presetFacts
+    expect(legacyFacts.proposerTimeoutSeconds).toBe(300)
+    expect(legacyFacts.aggregatorTimeoutSeconds).toBe(480)
+
+    // Older gateways may omit the keys from the config slice entirely.
+    const absent = useSetupEnsembleForm()
+    absent.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    const absentFacts = makePanel(absent, 'openrouter').value.presetFacts
+    expect(absentFacts.proposerTimeoutSeconds).toBe(300)
+    expect(absentFacts.aggregatorTimeoutSeconds).toBe(480)
+  })
+
+  it('applies a partial override to the custom lineup facts', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      enabled: true,
+      selection_mode: CUSTOM_B5_SELECTION_MODE,
+      candidates: [
+        { provider: 'deepseek', model: 'a' },
+        { provider: 'deepseek', model: 'b' },
+      ],
+      proposer_timeout_seconds: 720,
+    })
+    const facts = makePanel(f, 'deepseek').value.custom.facts
+    expect(facts.proposerTimeoutSeconds).toBe(720)
+    expect(facts.aggregatorTimeoutSeconds).toBe(480)
+    expect(facts.quorumGraceSeconds).toBe(10)
+  })
+
+  it('reports raw stored timeouts and no grace for the legacy router_dynamic mode', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      enabled: true,
+      selection_mode: 'router_dynamic',
+      candidates: [{ provider: 'deepseek', model: 'a' }],
+    })
+    const facts = makePanel(f, 'deepseek').value.custom.facts
+    expect(facts.proposerTimeoutSeconds).toBe(3600)
+    expect(facts.aggregatorTimeoutSeconds).toBe(3600)
+    expect(facts.quorumGraceSeconds).toBe(0)
   })
 })
 

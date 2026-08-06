@@ -8,6 +8,7 @@ import re
 import time
 from pathlib import Path, PurePosixPath
 
+import structlog
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 from starlette.routing import Mount, Route
@@ -15,6 +16,8 @@ from starlette.staticfiles import StaticFiles
 
 from opensquilla import __version__
 from opensquilla.gateway.config import GatewayConfig
+
+log = structlog.get_logger(__name__)
 
 # Conservative max-age for static assets. 30 days is long enough that hot
 # clients save roundtrips but short enough that any deploy without a version
@@ -198,6 +201,7 @@ def _build_bootstrap_context(config: GatewayConfig, request: Request) -> dict:
         "ws_url": _request_ws_url(request, config),
         "auth_mode": config.auth.mode,
         "base_path": config.control_ui.base_path,
+        "asset_base_path": config.control_ui.base_path.rstrip("/"),
         "config_path": config.config_path or "",
         "locale": _resolve_locale(config, request),
         "update": _update_payload(config),
@@ -267,7 +271,25 @@ def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
     if not config.control_ui.enabled:
         return []
 
+    if not (_DIST_DIR / "index.html").exists():
+        # The served page already shows an actionable notice, but headless
+        # operators only watch logs — surface the same guidance at startup.
+        log.warning(
+            "control_ui.webui_assets_missing",
+            detail=(
+                "The built Vue console was not found, so the Control UI will "
+                "serve an 'assets are unavailable' notice instead of the "
+                "console. From a source checkout, build it with "
+                "`cd opensquilla-webui && npm ci && npm run build` "
+                "(Node.js 22.12+ with npm) and restart or reload the page. "
+                "Release-wheel and Desktop installs should reinstall an "
+                "official package."
+            ),
+            dist_dir=str(_DIST_DIR),
+        )
+
     base = config.control_ui.base_path
+    route_base = "" if base == "/" else base
     template = _get_jinja_env().get_template("index.html")
 
     async def serve_index(request: Request) -> HTMLResponse:
@@ -289,11 +311,11 @@ def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
 
     routes: list[Route | Mount] = [
         Mount(
-            f"{base}/static",
+            f"{route_base}/static",
             app=_CachedStaticFiles(directory=str(_STATIC_DIR)),
             name="control_ui_static",
         ),
-        Route(f"{base}/{{path:path}}", serve_index, methods=["GET"]),
-        Route(f"{base}/", serve_index, methods=["GET"]),
+        Route(f"{route_base}/{{path:path}}", serve_index, methods=["GET"]),
+        Route(f"{route_base}/", serve_index, methods=["GET"]),
     ]
     return routes

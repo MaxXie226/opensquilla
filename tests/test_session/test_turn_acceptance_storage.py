@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceGuard,
+    ProjectWorkspaceStateError,
+)
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
@@ -18,6 +24,7 @@ from opensquilla.session.storage import (
     MetaLaunchDraftDiscardedError,
     SessionStorage,
     StorageBusyError,
+    TurnIngressConflictError,
 )
 
 SESSION_KEY = "agent:main:webchat:durable-acceptance"
@@ -643,6 +650,150 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
 
 
 @pytest.mark.asyncio
+async def test_accept_turn_can_bind_receipt_to_existing_task_without_mutating_it(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "steer-receipt.db"))
+    try:
+        await storage.upsert_session(_session())
+        running = _task("turn-running")
+        running.status = AgentTaskStatus.RUNNING
+        await storage.create_agent_task(running)
+
+        accepted = await storage.accept_turn(
+            _entry("message-steer", content="change direction"),
+            expected_epoch=0,
+            updated_at=250,
+            task_record=None,
+            receipt_task_id=running.task_id,
+            source_scope="webui:steer.v2",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-steer",
+            request_fingerprint="sha256:request-steer",
+        )
+        replayed = await storage.accept_turn(
+            _entry("unused-replay-entry", content="change direction"),
+            expected_epoch=0,
+            updated_at=251,
+            task_record=None,
+            receipt_task_id=running.task_id,
+            source_scope="webui:steer.v2",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-steer",
+            request_fingerprint="sha256:request-steer",
+        )
+
+        task = await storage.get_agent_task(running.task_id)
+        transcript = await storage.get_transcript(SESSION_ID)
+        assert task is not None
+        assert task.status == AgentTaskStatus.RUNNING
+        assert accepted.receipt.task_id == running.task_id
+        assert accepted.replayed is False
+        assert replayed.receipt.message_id == "message-steer"
+        assert replayed.replayed is True
+        assert [entry.message_id for entry in transcript] == ["message-steer"]
+        looked_up = await storage.get_canonical_transcript_entry(
+            SESSION_ID,
+            "message-steer",
+        )
+        assert looked_up is not None
+        assert looked_up.content == "change direction"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_updates_session_origin_in_same_transaction(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        session = _session()
+        session.origin = {
+            "surface": "webchat",
+            "sandbox_run_context": {
+                "run_mode": "trusted",
+                "run_mode_source": "operator_default",
+            },
+        }
+        await storage.upsert_session(session)
+        selected_origin = {
+            "surface": "webchat",
+            "sandbox_run_context": {
+                "run_mode": "standard",
+                "run_mode_source": "user",
+            },
+        }
+
+        await storage.accept_turn(
+            _entry("message-mode"),
+            expected_epoch=0,
+            updated_at=200,
+            task_record=_task("task-mode"),
+            source_scope="webui",
+            request_session_key=SESSION_KEY,
+            client_request_id="request-mode",
+            request_fingerprint="sha256:request-mode",
+            session_updates={"origin": selected_origin},
+        )
+
+        persisted = await storage.get_session(SESSION_KEY)
+        assert persisted is not None
+        assert persisted.origin == selected_origin
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rolls_back_session_origin_with_failed_task_insert(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        original_origin = {
+            "sandbox_run_context": {
+                "run_mode": "trusted",
+                "run_mode_source": "operator_default",
+            }
+        }
+        session = _session()
+        session.origin = original_origin
+        await storage.upsert_session(session)
+        await storage.conn.execute(
+            """
+            CREATE TRIGGER fail_mode_task_insert
+            BEFORE INSERT ON agent_tasks
+            BEGIN
+                SELECT RAISE(ABORT, 'injected mode acceptance failure');
+            END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected mode acceptance failure"):
+            await storage.accept_turn(
+                _entry("message-mode-failed"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=_task("task-mode-failed"),
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-mode-failed",
+                request_fingerprint="sha256:request-mode-failed",
+                session_updates={
+                    "origin": {
+                        "sandbox_run_context": {
+                            "run_mode": "full",
+                            "run_mode_source": "user",
+                        }
+                    }
+                },
+            )
+
+        persisted = await storage.get_session(SESSION_KEY)
+        assert persisted is not None
+        assert persisted.origin == original_origin
+        assert await storage.count_transcript_entries(SESSION_ID) == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failing_table", ["agent_tasks", "turn_ingress_receipts"])
 async def test_accept_turn_rolls_back_every_write_when_an_insert_fails(
     tmp_path,
@@ -859,6 +1010,257 @@ async def test_accept_turn_rejects_request_id_reuse_with_a_different_fingerprint
 
 
 @pytest.mark.asyncio
+async def test_accept_turn_rechecks_project_guard_in_transaction(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = project.workspace_id
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+        await storage.remove_project_workspace(project.workspace_id)
+
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await storage.accept_turn(
+                _entry("guarded-message"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="req-guarded",
+                request_fingerprint="sha256:guarded",
+                session_node=node,
+                workspace_guard=guard,
+            )
+        assert raised.value.reason == "removed"
+        assert await storage.get_session(node.session_key) is None
+        assert await storage.get_turn_ingress_receipt(
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-guarded",
+        ) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rejects_project_binding_mismatch(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        first_path = tmp_path / "first"
+        second_path = tmp_path / "second"
+        first_path.mkdir()
+        second_path.mkdir()
+        first = await storage.create_or_restore_project_workspace(
+            path=str(first_path.resolve()),
+            path_key=str(first_path.resolve()),
+            display_name="first",
+            trusted_at=1,
+        )
+        second = await storage.create_or_restore_project_workspace(
+            path=str(second_path.resolve()),
+            path_key=str(second_path.resolve()),
+            display_name="second",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = first.workspace_id
+        guard = ProjectWorkspaceGuard(
+            second.workspace_id,
+            second.path,
+            second.path_key,
+        )
+
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await storage.accept_turn(
+                _entry("binding-mismatch"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="req-binding-mismatch",
+                request_fingerprint="sha256:binding-mismatch",
+                session_node=node,
+                workspace_guard=guard,
+            )
+
+        assert raised.value.reason == "binding_changed"
+        assert await storage.get_session(node.session_key) is None
+        assert await storage.get_turn_ingress_receipt(
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-binding-mismatch",
+        ) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_requires_guard_for_bound_session(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = project.workspace_id
+
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await storage.accept_turn(
+                _entry("missing-guard"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="req-missing-guard",
+                request_fingerprint="sha256:missing-guard",
+                session_node=node,
+            )
+
+        assert raised.value.reason == "guard_required"
+        assert await storage.get_session(node.session_key) is None
+        assert await storage.get_turn_ingress_receipt(
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-missing-guard",
+        ) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_without_task_persists_nullable_receipt(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = project.workspace_id
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+
+        accepted = await storage.accept_turn(
+            _entry("taskless-message"),
+            expected_epoch=0,
+            updated_at=200,
+            task_record=None,
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-taskless",
+            request_fingerprint="sha256:taskless",
+            session_node=node,
+            workspace_guard=guard,
+        )
+
+        assert accepted.replayed is False
+        assert accepted.receipt.task_id is None
+        assert [
+            item.message_id for item in await storage.get_transcript(node.session_id)
+        ] == ["taskless-message"]
+        receipt = await storage.get_turn_ingress_receipt(
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-taskless",
+        )
+        assert receipt is not None
+        assert receipt.receipt.task_id is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_replays_before_removed_project_guard(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = _session()
+        node.workspace_id = project.workspace_id
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+        first = await storage.accept_turn(
+            _entry("original-project-message"),
+            expected_epoch=0,
+            updated_at=200,
+            task_record=None,
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-project-replay",
+            request_fingerprint="sha256:project-replay",
+            session_node=node,
+            workspace_guard=guard,
+        )
+        await storage.remove_project_workspace(project.workspace_id)
+
+        replay = await storage.accept_turn(
+            _entry("prospective-replay"),
+            expected_epoch=0,
+            updated_at=300,
+            task_record=None,
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="req-project-replay",
+            request_fingerprint="sha256:project-replay",
+            session_node=node,
+            workspace_guard=guard,
+        )
+
+        assert replay.replayed is True
+        assert replay.receipt.receipt_id == first.receipt.receipt_id
+        with pytest.raises(TurnIngressConflictError):
+            await storage.accept_turn(
+                _entry("conflicting-replay"),
+                expected_epoch=0,
+                updated_at=300,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="req-project-replay",
+                request_fingerprint="sha256:changed",
+                session_node=node,
+                workspace_guard=guard,
+            )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_accept_turn_busy_timeout_has_no_partial_side_effects(tmp_path) -> None:
     db_path = tmp_path / "sessions.db"
     storage = await SessionStorage.open(str(db_path))
@@ -892,3 +1294,296 @@ async def test_accept_turn_busy_timeout_has_no_partial_side_effects(tmp_path) ->
             locker.execute("ROLLBACK")
             locker.close()
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_project_accept_after_history_delete_commit_remains_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    deleting_storage = await SessionStorage.open(str(db_path))
+    accepting_storage = await SessionStorage.open(str(db_path))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await deleting_storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        old = SessionNode(
+            session_key="agent:main:webchat:history-old",
+            workspace_id=project.workspace_id,
+            created_at=100,
+            updated_at=100,
+        )
+        await deleting_storage.upsert_session(old)
+        new = SessionNode(
+            session_key="agent:main:webchat:history-new",
+            workspace_id=project.workspace_id,
+            created_at=200,
+            updated_at=200,
+        )
+        entry = TranscriptEntry(
+            session_id=new.session_id,
+            session_key=new.session_key,
+            message_id="history-new-message",
+            role="user",
+            content="new history",
+            created_at=200,
+        )
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+        delete_entered = asyncio.Event()
+        release_delete = asyncio.Event()
+        accept_begin_attempted = asyncio.Event()
+        original_delete_rows = deleting_storage._delete_session_rows
+        original_begin = accepting_storage._begin_immediate
+
+        async def paused_delete_rows(
+            conn: Any,
+            session: SessionNode,
+        ) -> None:
+            delete_entered.set()
+            await release_delete.wait()
+            await original_delete_rows(conn, session)
+
+        async def observed_accept_begin(
+            conn: Any,
+            operation: str,
+            deadline: float,
+            started: float,
+        ) -> None:
+            if operation == "accept_turn":
+                accept_begin_attempted.set()
+            await original_begin(conn, operation, deadline, started)
+
+        monkeypatch.setattr(
+            deleting_storage,
+            "_delete_session_rows",
+            paused_delete_rows,
+        )
+        monkeypatch.setattr(
+            accepting_storage,
+            "_begin_immediate",
+            observed_accept_begin,
+        )
+        deleting = asyncio.create_task(
+            deleting_storage.delete_project_workspace_sessions(
+                project.workspace_id,
+                expected_session_keys=[old.session_key],
+            )
+        )
+        await asyncio.wait_for(delete_entered.wait(), timeout=2)
+        accepting = asyncio.create_task(
+            accepting_storage.accept_turn(
+                entry,
+                expected_epoch=0,
+                updated_at=200,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=new.session_key,
+                client_request_id="history-new-request",
+                request_fingerprint="sha256:history-new-request",
+                session_node=new,
+                workspace_guard=guard,
+            )
+        )
+        await asyncio.wait_for(accept_begin_attempted.wait(), timeout=2)
+        await asyncio.sleep(0)
+        assert accepting.done() is False
+        release_delete.set()
+
+        assert await deleting == [old.session_key]
+        await accepting
+        assert await accepting_storage.get_session(old.session_key) is None
+        assert await accepting_storage.get_session(new.session_key) is not None
+        assert [
+            item.message_id
+            for item in await accepting_storage.get_transcript(new.session_id)
+        ] == ["history-new-message"]
+    finally:
+        await accepting_storage.close()
+        await deleting_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_project_accept_committed_before_history_delete_is_in_deleted_snapshot(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = SessionNode(
+            session_key="agent:main:webchat:history-before-delete",
+            workspace_id=project.workspace_id,
+            created_at=100,
+            updated_at=100,
+        )
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+        await storage.accept_turn(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id="history-before-delete-message",
+                role="user",
+                content="old history",
+                created_at=100,
+            ),
+            expected_epoch=0,
+            updated_at=100,
+            task_record=None,
+            source_scope="web:test",
+            request_session_key=node.session_key,
+            client_request_id="history-before-delete-request",
+            request_fingerprint="sha256:history-before-delete-request",
+            session_node=node,
+            workspace_guard=guard,
+        )
+
+        snapshot = await storage.list_project_workspace_session_keys(
+            project.workspace_id
+        )
+        assert await storage.delete_project_workspace_sessions(
+            project.workspace_id,
+            expected_session_keys=snapshot,
+        ) == [node.session_key]
+
+        assert await storage.get_session(node.session_key) is None
+        assert await storage.get_transcript(node.session_id) == []
+        assert (
+            await storage.get_turn_ingress_receipt(
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="history-before-delete-request",
+            )
+            is None
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_project_remove_commit_serializes_before_accept_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    removing_storage = await SessionStorage.open(str(db_path))
+    accepting_storage = await SessionStorage.open(str(db_path))
+    try:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await removing_storage.create_or_restore_project_workspace(
+            path=str(project_path.resolve()),
+            path_key=str(project_path.resolve()),
+            display_name="project",
+            trusted_at=1,
+        )
+        node = SessionNode(
+            session_key="agent:main:webchat:removed-before-accept",
+            workspace_id=project.workspace_id,
+            created_at=100,
+            updated_at=100,
+        )
+        guard = ProjectWorkspaceGuard(
+            project.workspace_id,
+            project.path,
+            project.path_key,
+        )
+        commit_entered = asyncio.Event()
+        release_commit = asyncio.Event()
+        accept_begin_attempted = asyncio.Event()
+        original_commit = removing_storage._commit_transaction
+        original_begin = accepting_storage._begin_immediate
+
+        async def gated_commit(
+            conn: Any,
+            operation: str,
+            deadline: float,
+            started: float,
+        ) -> None:
+            if operation == "remove_project_workspace":
+                commit_entered.set()
+                await release_commit.wait()
+            await original_commit(conn, operation, deadline, started)
+
+        async def observed_accept_begin(
+            conn: Any,
+            operation: str,
+            deadline: float,
+            started: float,
+        ) -> None:
+            if operation == "accept_turn":
+                accept_begin_attempted.set()
+            await original_begin(conn, operation, deadline, started)
+
+        monkeypatch.setattr(removing_storage, "_commit_transaction", gated_commit)
+        monkeypatch.setattr(
+            accepting_storage,
+            "_begin_immediate",
+            observed_accept_begin,
+        )
+        removing = asyncio.create_task(
+            removing_storage.remove_project_workspace(project.workspace_id)
+        )
+        await asyncio.wait_for(commit_entered.wait(), timeout=2)
+        accepting = asyncio.create_task(
+            accepting_storage.accept_turn(
+                TranscriptEntry(
+                    session_id=node.session_id,
+                    session_key=node.session_key,
+                    message_id="removed-before-accept-message",
+                    role="user",
+                    content="must not persist",
+                    created_at=100,
+                ),
+                expected_epoch=0,
+                updated_at=100,
+                task_record=None,
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="removed-before-accept-request",
+                request_fingerprint="sha256:removed-before-accept-request",
+                session_node=node,
+                workspace_guard=guard,
+            )
+        )
+        await asyncio.wait_for(accept_begin_attempted.wait(), timeout=2)
+        await asyncio.sleep(0)
+        assert accepting.done() is False
+        release_commit.set()
+        await removing
+
+        with pytest.raises(ProjectWorkspaceStateError) as raised:
+            await accepting
+        assert raised.value.reason == "removed"
+        assert await accepting_storage.get_session(node.session_key) is None
+        assert await accepting_storage.get_transcript(node.session_id) == []
+        assert (
+            await accepting_storage.get_turn_ingress_receipt(
+                source_scope="web:test",
+                request_session_key=node.session_key,
+                client_request_id="removed-before-accept-request",
+            )
+            is None
+        )
+    finally:
+        await accepting_storage.close()
+        await removing_storage.close()

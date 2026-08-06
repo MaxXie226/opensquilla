@@ -1,12 +1,14 @@
 <template>
   <figure
     class="msg-video-card"
+    :data-state="cardState"
     :aria-label="t('chat.artifactTitleSubtitle', { title, subtitle })"
   >
-    <div class="msg-video-card__player">
+    <div class="msg-video-card__viewport">
       <video
         v-if="previewState === 'loaded' && previewUrl && !playbackFailed"
-        class="msg-video-card__video"
+        ref="videoElement"
+        class="msg-video-card__video msg-video-card__player"
         :src="previewUrl"
         :aria-label="t('chat.previewOf', { title })"
         controls
@@ -29,7 +31,7 @@
         <span class="msg-video-card__fallback-actions">
           <button
             type="button"
-            class="msg-video-card__retry"
+            class="msg-video-card__retry msg-video-card__action"
             :aria-label="t('chat.retryPreviewFor', { title })"
             @click="retryPreview"
           >
@@ -54,7 +56,7 @@
       >
         <button
           type="button"
-          class="msg-video-card__load"
+          class="msg-video-card__load msg-video-card__action"
           :aria-label="t('chat.loadVideoPreviewFor', { title })"
           @click="loadPreview"
         >
@@ -145,7 +147,7 @@ function retainVideoPreview(entry: RetainedVideoPreview): void {
 </script>
 
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
@@ -171,8 +173,19 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const playbackFailed = ref(false)
+const videoElement = ref<HTMLVideoElement | null>(null)
 const title = computed(() => artifactFileTitle(props.artifact))
 const subtitle = computed(() => artifactFileSubtitle(props.artifact))
+const artifactIdentity = computed(() => [
+  props.artifact.id,
+  props.artifact.key,
+  props.artifact.download_url,
+  props.artifact.name,
+  props.artifact.mime,
+  props.artifact.size,
+  props.sessionKey,
+  props.authToken,
+].map(value => String(value || '')).join('\u0000'))
 
 function sameOrigin(url: string): boolean {
   try {
@@ -186,6 +199,23 @@ function previewHeaders(url: string): Record<string, string> {
   if (props.sessionKey) headers['x-opensquilla-session-key'] = props.sessionKey
   if (props.authToken) headers.Authorization = `Bearer ${props.authToken}`
   return headers
+}
+
+function supportedByBrowser(blob: Blob): boolean {
+  const responseMime = String(blob.type || '').split(';', 1)[0].trim().toLowerCase()
+  const declaredMime = String(props.artifact.mime || '').split(';', 1)[0].trim().toLowerCase()
+  const mime = responseMime.startsWith('video/') ? responseMime : declaredMime
+  if (!mime.startsWith('video/')) return true
+  try {
+    const probe = document.createElement('video')
+    if (typeof probe.canPlayType !== 'function' || probe.canPlayType(mime) !== '') return true
+    // DOM test environments and some conservative browsers report an empty
+    // capability for standard containers before metadata is available. Keep
+    // those native formats loadable, while rejecting clearly unknown types.
+    return ['video/mp4', 'video/webm', 'video/ogg'].includes(mime)
+  } catch {
+    return true
+  }
 }
 
 // A video fetch starts only after an explicit preview request. Using a fetched
@@ -204,6 +234,8 @@ const controller = createArtifactPreview({
   fullSize: false,
   timeoutMs: VIDEO_PREVIEW_TIMEOUT_MS,
   maxBytes: VIDEO_PREVIEW_MAX_BYTES,
+  requireSameOrigin: true,
+  acceptBlob: supportedByBrowser,
 })
 
 const previewToken = `video-preview-${(nextVideoPreviewToken += 1)}`
@@ -211,8 +243,15 @@ const previewToken = `video-preview-${(nextVideoPreviewToken += 1)}`
 const previewState = computed(() => controller.state.value as ArtifactPreviewState)
 const previewProgress = computed(() => controller.progress.value ?? null)
 const previewUrl = computed(() => controller.objectUrl.value || '')
+const cardState = computed(() => {
+  if (playbackFailed.value || controller.errorCode.value === 'unsupported') return 'unsupported'
+  if (previewState.value === 'loaded') return 'ready'
+  return previewState.value
+})
 const fallbackMessage = computed(() => {
-  if (playbackFailed.value) return t('chat.videoUnsupported')
+  if (playbackFailed.value || controller.errorCode.value === 'unsupported') {
+    return t('chat.videoUnsupported')
+  }
   if (controller.errorCode.value === 'too_large') {
     const megabytes = new Intl.NumberFormat().format(VIDEO_PREVIEW_MAX_BYTES / (1024 * 1024))
     return t('chat.videoPreviewTooLarge', { size: `${megabytes} MB` })
@@ -232,7 +271,7 @@ function retryPreview() {
     // downloading a second copy. Network/load errors use the shared retry path.
     return
   }
-  controller.retry()
+  controller.load()
 }
 
 function unloadPreview() {
@@ -251,12 +290,22 @@ watch(
   state => {
     if (state === 'loaded') {
       retainVideoPreview({ token: previewToken, release: releaseRetainedPreview })
+      void nextTick(() => {
+        const playback = videoElement.value?.play()
+        if (playback && typeof playback.catch === 'function') {
+          void playback.catch(() => undefined)
+        }
+      })
     } else {
       forgetRetainedVideoPreview(previewToken)
     }
   },
   { flush: 'sync' },
 )
+
+watch(artifactIdentity, (_next, previous) => {
+  if (previous) unloadPreview()
+})
 
 onUnmounted(() => {
   forgetRetainedVideoPreview(previewToken)
@@ -276,7 +325,7 @@ onUnmounted(() => {
   background: var(--bg-elevated);
 }
 
-.msg-video-card__player {
+.msg-video-card__viewport {
   position: relative;
   display: flex;
   align-items: center;

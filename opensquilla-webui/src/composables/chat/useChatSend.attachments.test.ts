@@ -1,10 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 
 import { useChatSend, type UseChatSendOptions } from './useChatSend'
 import { useChatMessageActions } from './useChatMessageActions'
 import type { FoldLiveTurnMode } from './useChatTurnLog'
-import type { Attachment, ChatMessage, ChatRenderedMessage } from '@/types/chat'
+import type {
+  Attachment,
+  ChatMessage,
+  ChatPendingItem,
+  ChatRenderedMessage,
+} from '@/types/chat'
+import type { CollaborationMode } from '@/types/plans'
 import {
   useChatPendingQueue,
   type BusySendMode,
@@ -45,6 +51,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     streamHasVisibleOutput: ref(false),
     startStreaming: vi.fn(),
     endStreaming: vi.fn(),
+    checkpointForUserMessage: vi.fn(),
     appendDelta: vi.fn(),
     scheduleRender: vi.fn(),
     appendToolCall: vi.fn(),
@@ -70,9 +77,10 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     modelRoutingMode: ref<'off'>('off'),
     modelRoutingSettingsBusy: ref(false),
     elevatedMode: ref(''),
-    runMode: ref('trusted'),
+    runMode: ref('safe'),
     pendingAttachments: ref<Attachment[]>([]),
     pendingSessionIntent: ref(null),
+    initialCollaborationMode: ref<CollaborationMode>('default'),
     pendingForkBeforeMessageId: ref(null),
     aborted: ref(false),
     activeStreamTaskId: ref(''),
@@ -96,6 +104,20 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     ...overrides,
   }
   return { api: useChatSend(options), options, rpc, stream }
+}
+
+function sameTurnSteerOptions(
+  expectedTurnId = 'turn-current',
+): Partial<UseChatSendOptions> {
+  return {
+    supportsMethod: method => method === 'sessions.steer.v2',
+    activeSteerCapability: ref({
+      mode: 'same_turn',
+      expected_turn_id: expectedTurnId,
+      input_kinds: ['text'],
+    }),
+    activeStreamTaskId: ref(expectedTurnId),
+  }
 }
 
 describe('useChatSend attachment payloads', () => {
@@ -506,16 +528,792 @@ describe('useChatSend attachment payloads', () => {
     )).toEqual([])
   })
 
+  it('uses sessions.steer.v2 only when the active turn explicitly allows same-turn text', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        accepted: true,
+        replayed: false,
+        turn_id: 'turn-current',
+        user_message_id: 'user-steer-1',
+        disposition: 'steering',
+      }),
+    }
+    const { api, options, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      busySendMode: ref<BusySendMode>('steer'),
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('sessions.steer.v2', {
+      key: 'agent:main:webchat:test',
+      message: 'hello',
+      expected_turn_id: 'turn-current',
+      client_request_id: expect.any(String),
+      client_message_id: expect.any(String),
+      surface_id: 'webui',
+      _source: { runMode: 'safe' },
+    })
+    expect(rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
+    expect(rpc.call).not.toHaveBeenCalledWith('chat.abort', expect.anything())
+    expect(stream.checkpointForUserMessage).toHaveBeenCalledWith('turn-current')
+    expect(options.messages.value).toContainEqual(expect.objectContaining({
+      role: 'user',
+      text: 'hello',
+      messageId: 'user-steer-1',
+      turnId: 'turn-current',
+      inputDisposition: 'steering',
+    }))
+  })
+
+  it.each([
+    {
+      name: 'an old gateway',
+      supportsMethod: () => false,
+      capability: { mode: 'same_turn' as const, expected_turn_id: 'turn-current' },
+    },
+    {
+      name: 'a queue-only active mode',
+      supportsMethod: (method: string) => method === 'sessions.steer.v2',
+      capability: { mode: 'queue_only' as const, expected_turn_id: 'turn-current' },
+    },
+    {
+      name: 'an unsupported input-kind snapshot',
+      supportsMethod: (method: string) => method === 'sessions.steer.v2',
+      capability: {
+        mode: 'same_turn' as const,
+        expected_turn_id: 'turn-current',
+        input_kinds: ['attachment'],
+      },
+    },
+  ])('visibly queues instead of using legacy cancel-style steer for $name', async ({
+    supportsMethod,
+    capability,
+  }) => {
+    const enqueuePendingInput = vi.fn(() => true)
+    const { api, rpc, stream } = makeOptions({
+      supportsMethod,
+      activeSteerCapability: ref(capability),
+      busySendMode: ref<BusySendMode>('steer'),
+      enqueuePendingInput,
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(enqueuePendingInput).toHaveBeenCalledWith('hello', undefined)
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('does not expose a stale capability from a different active turn', () => {
+    const { api } = makeOptions({
+      ...sameTurnSteerOptions('turn-old'),
+      activeStreamTaskId: ref('turn-current'),
+    })
+
+    expect(api.supportsSameTurnSteer()).toBe(false)
+  })
+
+  it.each(['/status', '!pwd'])(
+    'queues busy control input %s without sending it as same-turn steer',
+    async input => {
+      const enqueuePendingInput = vi.fn(() => true)
+      const executeSlashCommand = vi.fn(async () => true)
+      const { api, rpc, stream } = makeOptions({
+        ...sameTurnSteerOptions(),
+        inputText: ref(input),
+        busySendMode: ref<BusySendMode>('steer'),
+        enqueuePendingInput,
+        executeSlashCommand,
+      })
+      stream.isStreaming.value = true
+
+      await api.onSend()
+
+      expect(enqueuePendingInput).toHaveBeenCalledWith(input, undefined)
+      expect(executeSlashCommand).not.toHaveBeenCalled()
+      expect(rpc.call).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['/status', '!pwd'])(
+    'rejects a direct queued-steer attempt for control input %s without RPC',
+    async input => {
+      const { api, rpc, stream } = makeOptions({
+        ...sameTurnSteerOptions(),
+        busySendMode: ref<BusySendMode>('steer'),
+      })
+      stream.isStreaming.value = true
+
+      await expect(api.sendQueuedSteer({
+        text: input,
+        attachments: [],
+        intent: null,
+      })).resolves.toBe('not_sent')
+
+      expect(rpc.call).not.toHaveBeenCalled()
+    },
+  )
+
+  it('falls back safely to the visible pending queue when v2 rejects before admission', async () => {
+    const enqueuePendingPayload = vi.fn(() => true)
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        accepted: false,
+        fallback_safe: true,
+        failure_code: 'turn_mismatch',
+      }),
+    }
+    const { api, options, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      busySendMode: ref<BusySendMode>('steer'),
+      enqueuePendingPayload,
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(enqueuePendingPayload).toHaveBeenCalledWith({
+      text: 'hello',
+      attachments: [],
+      intent: null,
+    }, undefined)
+    expect(options.messages.value).toEqual([])
+    expect(rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
+  })
+
+  it('preserves the draft and skips project preflight while live delivery is blocked', async () => {
+    const attachment: Attachment = {
+      kind: 'staged',
+      local_id: 1,
+      name: 'draft.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-draft',
+    }
+    const pendingAttachments = ref<Attachment[]>([attachment])
+    const validateActiveProjectBeforeSend = vi.fn(async () => null)
+    const { api, options, rpc } = makeOptions({
+      pendingAttachments,
+      sendBlockedReason: ref('Live updates are unavailable'),
+      validateActiveProjectBeforeSend,
+    })
+
+    await api.onSend()
+
+    expect(validateActiveProjectBeforeSend).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.pendingAttachments.value).toEqual([attachment])
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('preserves queued and hidden sends while live delivery is blocked', async () => {
+    const blocker = ref<string | null>('Live updates are unavailable')
+    const queued: ChatPendingItem = {
+      text: 'keep this queued',
+      attachments: [],
+      intent: null,
+    }
+    const { api, options, rpc } = makeOptions({ sendBlockedReason: blocker })
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('deferred')
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+    await api.dispatchHiddenSend('provider confirmation', 'Confirmed')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(queued).toEqual({
+      text: 'keep this queued',
+      attachments: [],
+      intent: null,
+    })
+    expect(options.inputText.value).toBe('hello')
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('queues an immutable hidden confirmation while live delivery is blocked', async () => {
+    const enqueueHiddenControl = vi.fn(() => true)
+    const { api, options, rpc } = makeOptions({
+      sendBlockedReason: ref('Live updates are unavailable'),
+      enqueueHiddenControl,
+    })
+
+    await expect(
+      api.dispatchHiddenSend('provider confirmation', 'Confirmed'),
+    ).resolves.toMatchObject({ status: 'queued', reason: 'queued' })
+
+    expect(enqueueHiddenControl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'provider confirmation',
+        displayText: 'Confirmed',
+        clientRequestId: expect.any(String),
+        sessionKey: 'agent:main:webchat:test',
+      }),
+    )
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('retries a hidden queue item with one stable request identity and bubble', async () => {
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-hidden',
+        }),
+    }
+    const queued: ChatPendingItem = {
+      text: 'provider confirmation',
+      displayTextOverride: 'Confirmed',
+      attachments: [],
+      intent: null,
+      hiddenControl: true,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api, options } = makeOptions({ rpc })
+
+    await expect(api.dispatchQueuedHiddenSend(
+      queued,
+      queued.ownerSessionKey!,
+    )).resolves.toBe('retryable_failure')
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(queued.hiddenClientRequestId).toBe(firstParams.clientRequestId)
+    expect(queued.hiddenClientMessageId).toBe(firstParams.clientMessageId)
+    expect(queued.hiddenVisibleCommitted).toBe(true)
+
+    await expect(api.dispatchQueuedHiddenSend(
+      queued,
+      queued.ownerSessionKey!,
+    )).resolves.toBe('accepted')
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(options.messages.value.filter(message => (
+      message.role === 'user' && message.text === 'Confirmed'
+    ))).toHaveLength(1)
+  })
+
+  it('keeps an unknown hidden acceptance in the durable outbox', async () => {
+    const enqueueHiddenControl = vi.fn(() => true)
+    const rpc = {
+      call: vi.fn().mockRejectedValue(Object.assign(new Error('response lost'), {
+        retryable: true,
+      })),
+    }
+    const { api, options } = makeOptions({
+      rpc,
+      enqueueHiddenControl,
+    })
+
+    await expect(
+      api.dispatchHiddenSend('provider confirmation', 'Confirmed'),
+    ).resolves.toMatchObject({ status: 'unknown', reason: 'response_unknown' })
+
+    expect(enqueueHiddenControl).not.toHaveBeenCalled()
+    expect(options.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+  })
+
+  it('rechecks live delivery after active-project validation resolves', async () => {
+    const blocker = ref<string | null>(null)
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, options, rpc } = makeOptions({
+      sendBlockedReason: blocker,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    blocker.value = 'Live updates are unavailable'
+    finishPreflight()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('sends the clicked snapshot without clearing edits made during project validation', async () => {
+    const originalAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 31,
+      name: 'original.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-original',
+    }
+    const laterAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 32,
+      name: 'later.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-later',
+    }
+    const inputText = ref('original prompt')
+    const pendingAttachments = ref<Attachment[]>([originalAttachment])
+    const composerRevision = ref(1)
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, options, rpc } = makeOptions({
+      inputText,
+      pendingAttachments,
+      composerRevision,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    inputText.value = 'new draft typed while validating'
+    pendingAttachments.value = [originalAttachment, laterAttachment]
+    composerRevision.value += 1
+    finishPreflight()
+    await send
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: 'original prompt',
+      attachments: [
+        expect.objectContaining({ file_uuid: 'file-original' }),
+      ],
+    }))
+    expect(options.messages.value).toContainEqual(expect.objectContaining({
+      role: 'user',
+      text: 'original prompt',
+    }))
+    expect(inputText.value).toBe('new draft typed while validating')
+    expect(pendingAttachments.value).toEqual([laterAttachment])
+  })
+
+  it('cancels an automatic send after any composer edit, even if text is restored', async () => {
+    const inputText = ref('automatic prompt')
+    const composerRevision = ref(4)
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, options, rpc } = makeOptions({
+      inputText,
+      composerRevision,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.onSend({ cancelIfComposerChanged: true })
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    inputText.value = 'operator takeover'
+    composerRevision.value += 1
+    inputText.value = 'automatic prompt'
+    composerRevision.value += 1
+    finishPreflight()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+    expect(inputText.value).toBe('automatic prompt')
+  })
+
+  it('rechecks live delivery after attachment preparation resolves', async () => {
+    const attachment: Attachment = {
+      kind: 'staged',
+      local_id: 2,
+      name: 'ready.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-ready',
+    }
+    const blocker = ref<string | null>(null)
+    const pendingAttachments = ref<Attachment[]>([attachment])
+    let finishPreparation!: () => void
+    const prepareAttachmentsForSend = vi.fn(() => new Promise<boolean>(
+      resolve => {
+        finishPreparation = () => resolve(true)
+      },
+    ))
+    const { api, options, rpc } = makeOptions({
+      pendingAttachments,
+      sendBlockedReason: blocker,
+      prepareAttachmentsForSend,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(prepareAttachmentsForSend).toHaveBeenCalledOnce())
+    blocker.value = 'Live updates are unavailable'
+    finishPreparation()
+    await send
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(options.pendingAttachments.value).toEqual([attachment])
+    expect(options.messages.value).toEqual([])
+  })
+
+  it.each(['resolving', 'unavailable', 'removed', 'unknown', 'error'])(
+    'does not mutate or call chat.send when project preflight returns %s',
+    async reason => {
+      const validateActiveProjectBeforeSend = vi.fn(async () => reason)
+      const { api, options, rpc } = makeOptions({
+        validateActiveProjectBeforeSend,
+      })
+
+      await api.onSend()
+
+      expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+      expect(rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
+      expect(options.inputText.value).toBe('hello')
+      expect(options.messages.value).toEqual([])
+    },
+  )
+
+  it('sends only after project preflight confirms ready', async () => {
+    const validateActiveProjectBeforeSend = vi.fn(async () => null)
+    const { api, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+    })
+
+    await api.onSend()
+
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.objectContaining({ message: 'hello' }),
+    )
+  })
+
+  it('blocks hidden control sends when the active project preflight fails', async () => {
+    const validateActiveProjectBeforeSend = vi.fn(async () => 'removed')
+    const { api, options, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+    })
+
+    await api.dispatchHiddenSend('provider confirmation', 'Confirmed')
+
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('keeps queued delivery owned when project validation blocks it', async () => {
+    const validateActiveProjectBeforeSend = vi.fn(async () => 'removed')
+    const queued: ChatPendingItem = {
+      text: 'keep queued',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api, options, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+    })
+
+    await expect(api.sendQueuedFollowup(
+      queued,
+      'agent:main:webchat:test',
+    )).resolves.toBe('deferred')
+    await expect(api.sendQueuedSteer(
+      queued,
+      'agent:main:webchat:test',
+    )).resolves.toBe('not_sent')
+
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+    expect(queued.text).toBe('keep queued')
+  })
+
+  it('rechecks live and session ownership after queued project validation', async () => {
+    const blocker = ref<string | null>(null)
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const queued: ChatPendingItem = {
+      text: 'queued follow-up',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+    }
+    const { api, options, rpc } = makeOptions({
+      sendBlockedReason: blocker,
+      validateActiveProjectBeforeSend,
+    })
+
+    const send = api.sendQueuedFollowup(queued, 'agent:main:webchat:test')
+    await vi.waitFor(() => expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce())
+    blocker.value = 'Live updates are unavailable'
+    finishPreflight()
+
+    await expect(send).resolves.toBe('deferred')
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.inputText.value).toBe('hello')
+
+    options.sessionKey.value = 'agent:main:webchat:other'
+    blocker.value = null
+    await expect(api.sendQueuedFollowup(
+      queued,
+      'agent:main:webchat:test',
+    )).resolves.toBe('not_sent')
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+  })
+
+  it('admits only one send while an active-project preflight is pending', async () => {
+    let finishPreflight!: () => void
+    const validateActiveProjectBeforeSend = vi.fn(() => new Promise<string | null>(
+      resolve => {
+        finishPreflight = () => resolve(null)
+      },
+    ))
+    const { api, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+    })
+
+    const first = api.onSend()
+    const second = api.onSend()
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledOnce()
+
+    finishPreflight()
+    await Promise.all([first, second])
+
+    expect(rpc.call).toHaveBeenCalledTimes(1)
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.objectContaining({ message: 'hello' }),
+    )
+  })
+
+  it('binds a new project task to its workspace and preserves that binding on retry', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('database busy'), { accepted: false }))
+        .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test' }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      pendingSessionIntent,
+      pendingWorkspaceId,
+    })
+
+    await api.onSend()
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(firstParams).toEqual(expect.objectContaining({
+      intent: 'new_chat',
+      workspaceId: 'project-a',
+    }))
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(pendingWorkspaceId.value).toBe('project-a')
+
+    await api.onSend()
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(expect.objectContaining({
+      clientRequestId: firstParams.clientRequestId,
+      intent: 'new_chat',
+      workspaceId: 'project-a',
+    }))
+    expect(pendingWorkspaceId.value).toBeNull()
+  })
+
+  it('does not materialize a project draft before chat.send accepts it', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const materializeDraftSession = vi.fn()
+    const intentTransitions: Array<string | null> = []
+    watch(pendingSessionIntent, value => intentTransitions.push(value))
+    let rejectSend!: (reason: unknown) => void
+    const rpc = {
+      call: vi.fn(() => new Promise((_, reject) => {
+        rejectSend = reject
+      })) as UseChatSendOptions['rpc']['call'],
+    }
+    const { api, options, stream } = makeOptions({
+      rpc,
+      pendingSessionIntent,
+      pendingWorkspaceId,
+      materializeDraftSession,
+    })
+    vi.mocked(stream.startStreaming).mockImplementation(() => {
+      stream.isStreaming.value = true
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    await nextTick()
+
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(intentTransitions).toEqual([])
+    expect(materializeDraftSession).not.toHaveBeenCalled()
+
+    options.inputText.value = 'follow-up while first send is pending'
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(options.enqueuePendingInput).toHaveBeenCalledWith(
+      'follow-up while first send is pending',
+      undefined,
+    )
+
+    rejectSend(Object.assign(new Error('database busy'), { accepted: false }))
+    await send
+    await nextTick()
+
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(pendingWorkspaceId.value).toBe('project-a')
+    expect(intentTransitions).toEqual([])
+    expect(materializeDraftSession).not.toHaveBeenCalled()
+  })
+
+  it('materializes a new project task only after chat.send accepts it', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const materializeDraftSession = vi.fn()
+    const { api, options } = makeOptions({
+      pendingSessionIntent,
+      pendingWorkspaceId,
+      materializeDraftSession,
+    })
+
+    await api.onSend()
+
+    expect(materializeDraftSession).toHaveBeenCalledWith(options.sessionKey.value)
+    expect(pendingSessionIntent.value).toBeNull()
+  })
+
+  it('queues a second draft while the first send has not announced steer capability', async () => {
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const busySendMode = ref<BusySendMode>('steer')
+    let rejectFirst!: (reason: unknown) => void
+    const rpc = {
+      call: vi.fn()
+        .mockImplementationOnce(() => new Promise((_, reject) => {
+          rejectFirst = reject
+        }))
+        .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test' }),
+    }
+    const { api, options, stream } = makeOptions({
+      rpc,
+      pendingSessionIntent,
+      pendingWorkspaceId,
+      busySendMode,
+    })
+    vi.mocked(stream.startStreaming).mockImplementation(() => {
+      stream.isStreaming.value = true
+    })
+
+    const firstSend = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    options.inputText.value = 'steer while first send is pending'
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(options.enqueuePendingInput).toHaveBeenCalledWith(
+      'steer while first send is pending',
+      undefined,
+    )
+    expect(pendingWorkspaceId.value).toBe('project-a')
+
+    rejectFirst(Object.assign(new Error('database busy'), { accepted: false }))
+    await firstSend
+    expect(pendingWorkspaceId.value).toBe('project-a')
+  })
+
+  it('reuses a v2 steer fingerprint while a project binding remains pending', async () => {
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test' }),
+    }
+    const { api, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      busySendMode: ref<BusySendMode>('steer'),
+      pendingSessionIntent: ref(null),
+      pendingWorkspaceId,
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    const retry = {
+      text: 'hello',
+      attachments: [],
+      intent: null,
+      steerClientRequestId: String(firstParams?.client_request_id || ''),
+      steerClientMessageId: String(firstParams?.client_message_id || ''),
+      steerExpectedTurnId: 'turn-current',
+      steerVisibleCommitted: true,
+      deliveryState: 'retryable' as const,
+    }
+    await api.sendQueuedSteer(retry)
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(firstParams).not.toHaveProperty('workspaceId')
+    expect(firstParams).not.toHaveProperty('queueMode')
+    expect(pendingWorkspaceId.value).toBe('project-a')
+  })
+
   it('sends the selected sandbox run mode as trusted source metadata', async () => {
     const { api, rpc } = makeOptions({
-      runMode: ref('standard'),
+      runMode: ref('safe'),
     } as Partial<UseChatSendOptions>)
 
     await api.onSend()
 
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-      _source: { runMode: 'standard' },
+      _source: { runMode: 'safe' },
     }))
+  })
+
+  it('sends the policy-default Full hint for a project task', async () => {
+    const { api, rpc } = makeOptions({
+      runMode: ref('full'),
+      pendingSessionIntent: ref('new_chat'),
+      pendingWorkspaceId: ref('project-a'),
+    })
+
+    await api.onSend()
+
+    const params = rpc.call.mock.calls[0]?.[1]
+    expect(params).toMatchObject({
+      workspaceId: 'project-a',
+      _source: { runMode: 'full' },
+    })
+  })
+
+  it('sends an explicitly selected Full hint for a project task', async () => {
+    const { api, rpc } = makeOptions({
+      runMode: ref('full'),
+      pendingSessionIntent: ref('new_chat'),
+      pendingWorkspaceId: ref('project-a'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.objectContaining({
+        workspaceId: 'project-a',
+        _source: { runMode: 'full' },
+      }),
+    )
   })
 
   it('serializes only sendable attachments and leaves failed attachments in the composer', async () => {
@@ -556,6 +1354,101 @@ describe('useChatSend attachment payloads', () => {
     expect(pendingAttachments.value).toEqual([failed])
   })
 
+  it('sends a slash-derived Plan prompt through the normal attachment path', async () => {
+    const ready: Attachment = {
+      kind: 'staged',
+      local_id: 7,
+      name: 'architecture.png',
+      mime: 'image/png',
+      file_uuid: 'file-plan-image',
+    }
+    const inputText = ref('/plan analyze this architecture')
+    const pendingAttachments = ref<Attachment[]>([ready])
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, options, rpc } = makeOptions({
+      executeSlashCommand,
+      inputText,
+      pendingAttachments,
+    })
+
+    await api.dispatchComposerPrompt(
+      'analyze this architecture',
+      '/plan analyze this architecture',
+    )
+
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: 'analyze this architecture',
+      displayText: 'analyze this architecture',
+      attachments: [
+        {
+          type: 'image/png',
+          file_uuid: 'file-plan-image',
+          mime: 'image/png',
+          name: 'architecture.png',
+        },
+      ],
+    }))
+    expect(options.messages.value[0]).toMatchObject({
+      role: 'user',
+      text: 'analyze this architecture',
+      attachments: [
+        {
+          kind: 'staged',
+          displayId: 'local:7',
+          renderKey: 'local:7',
+          name: 'architecture.png',
+          mime: 'image/png',
+        },
+      ],
+    })
+    expect(inputText.value).toBe('')
+    expect(pendingAttachments.value).toEqual([])
+  })
+
+  it('restores and idempotently retries a slash-derived Plan prompt with attachments', async () => {
+    const ready: Attachment = {
+      kind: 'staged',
+      local_id: 8,
+      name: 'diagram.png',
+      mime: 'image/png',
+      file_uuid: 'file-plan-retry',
+    }
+    const originalInput = '/plan analyze this diagram'
+    const inputText = ref(originalInput)
+    const pendingAttachments = ref<Attachment[]>([ready])
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('network down'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-plan-retry',
+        }),
+    }
+    const { api, options } = makeOptions({
+      inputText,
+      pendingAttachments,
+      rpc,
+    })
+
+    await api.dispatchComposerPrompt('analyze this diagram', originalInput)
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(inputText.value).toBe(originalInput)
+    expect(pendingAttachments.value).toEqual([ready])
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+
+    await api.dispatchComposerPrompt('analyze this diagram', originalInput)
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+    expect(inputText.value).toBe('')
+    expect(pendingAttachments.value).toEqual([])
+  })
+
   it('refreshes staged uploads before serializing chat.send attachments', async () => {
     const pendingAttachments = ref<Attachment[]>([
       {
@@ -568,18 +1461,20 @@ describe('useChatSend attachment payloads', () => {
         file: new File(['pdf'], 'ready.pdf', { type: 'application/pdf' }),
       },
     ])
-    const prepareAttachmentsForSend = vi.fn(async () => {
-      pendingAttachments.value = [
-        {
-          kind: 'staged',
-          local_id: 1,
-          name: 'ready.pdf',
-          mime: 'application/pdf',
-          file_uuid: 'file-fresh',
-          expires_at: Date.now() / 1000 + 600,
-          file: new File(['pdf'], 'ready.pdf', { type: 'application/pdf' }),
-        },
-      ]
+    const prepareAttachmentsForSend = vi.fn(async (context?: {
+      attachments?: Attachment[]
+    }) => {
+      const attachments = context?.attachments
+      if (!attachments) return false
+      attachments[0] = {
+        kind: 'staged',
+        local_id: 1,
+        name: 'ready.pdf',
+        mime: 'application/pdf',
+        file_uuid: 'file-fresh',
+        expires_at: Date.now() / 1000 + 600,
+        file: new File(['pdf'], 'ready.pdf', { type: 'application/pdf' }),
+      }
       return true
     })
     const { api, rpc } = makeOptions({ pendingAttachments, prepareAttachmentsForSend })
@@ -917,7 +1812,7 @@ describe('useChatSend attachment payloads', () => {
     const pendingSessionIntent = ref<string | null>('NEW')
     const pendingForkBeforeMessageId = ref<string | null>('msg-B')
     const elevatedMode = ref('enabled')
-    const runMode = ref<'standard' | 'trusted' | 'full'>('standard')
+    const runMode = ref<'safe' | 'full'>('safe')
     const rpc = {
       call: vi.fn()
         .mockRejectedValueOnce(Object.assign(new Error('database busy'), {
@@ -950,7 +1845,7 @@ describe('useChatSend attachment payloads', () => {
       sessionKey: 'agent:main:webchat:test',
       intent: 'NEW',
       forkBeforeMessageId: 'msg-B',
-      _source: { elevated: 'enabled', runMode: 'standard' },
+      _source: { elevated: 'enabled', runMode: 'safe' },
       attachments: [{ file_uuid: 'file-ready' }],
     })
 
@@ -969,37 +1864,421 @@ describe('useChatSend attachment payloads', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
   })
 
-  it('retries a recovered steer attempt unchanged after the active run becomes idle', async () => {
+  it('moves an ambiguous v2 steer into an exact-id retry instead of resending as follow-up', async () => {
     const inputText = ref('steer this exact turn')
+    let retryItem: ChatPendingItem | null = null
+    const enqueuePendingSteerRetry = vi.fn((item: {
+      text: string
+      clientRequestId: string
+      clientMessageId: string
+      expectedTurnId: string
+      visibleCommitted: boolean
+    }) => {
+      retryItem = {
+        text: item.text,
+        attachments: [],
+        intent: null,
+        deliveryState: 'retryable',
+        steerClientRequestId: item.clientRequestId,
+        steerClientMessageId: item.clientMessageId,
+        steerExpectedTurnId: item.expectedTurnId,
+        steerVisibleCommitted: item.visibleCommitted,
+      }
+      return true
+    })
     const rpc = {
       call: vi.fn()
         .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
           accepted: false,
           retryable: true,
         }))
-        .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test', task_id: 'task-steer' }),
+        .mockResolvedValueOnce({
+          accepted: true,
+          turn_id: 'turn-current',
+          disposition: 'steering',
+        }),
     }
     const { api, options, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
       rpc,
       inputText,
       busySendMode: ref<BusySendMode>('steer'),
+      enqueuePendingSteerRetry,
     })
     stream.isStreaming.value = true
 
     await api.onSend()
     const firstParams = rpc.call.mock.calls[0]?.[1]
     expect(firstParams).toMatchObject({
+      key: 'agent:main:webchat:test',
       message: 'steer this exact turn',
-      queueMode: 'steer',
-      clientRequestId: expect.any(String),
+      expected_turn_id: 'turn-current',
+      client_request_id: expect.any(String),
+      client_message_id: expect.any(String),
     })
-    expect(inputText.value).toBe('steer this exact turn')
+    expect(firstParams).not.toHaveProperty('queueMode')
+    expect(inputText.value).toBe('')
+    expect(enqueuePendingSteerRetry).toHaveBeenCalledOnce()
+
+    // Even if the active task settles before the retry, the original target
+    // and request id are replayed; this must never become chat.send follow-up.
+    stream.isStreaming.value = false
+    await api.sendQueuedSteer(retryItem!)
+
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
+    expect(rpc.call.mock.calls.map(call => call[0])).toEqual([
+      'sessions.steer.v2',
+      'sessions.steer.v2',
+    ])
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  it('re-homes a replayed promoted steer without waiting for its disposition event', async () => {
+    const messages = ref<ChatMessage[]>([
+      {
+        role: 'user',
+        text: 'original request',
+        ts: 1,
+        messageId: 'user-old',
+        turnId: 'turn-current',
+      },
+      {
+        role: 'user',
+        text: 'late adjustment',
+        ts: 2,
+        clientId: 'client-steer',
+        turnId: 'turn-current',
+        inputDisposition: 'steering',
+        inputDispositionRevision: 1,
+        steerClientRequestId: 'request-steer',
+        steerClientMessageId: 'client-steer',
+      },
+      {
+        role: 'assistant',
+        text: 'completed old-turn output',
+        ts: 3,
+        messageId: 'assistant-old',
+        turnId: 'turn-current',
+      },
+      {
+        role: 'router',
+        text: '',
+        ts: 4,
+        messageId: 'router-new',
+        turnId: 'turn-promoted',
+      },
+    ])
+    const queued: ChatPendingItem = {
+      text: 'late adjustment',
+      attachments: [],
+      intent: null,
+      deliveryState: 'retryable',
+      steerClientRequestId: 'request-steer',
+      steerClientMessageId: 'client-steer',
+      steerExpectedTurnId: 'turn-current',
+      steerVisibleCommitted: true,
+    }
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        accepted: true,
+        replayed: true,
+        turn_id: 'turn-promoted',
+        promoted_turn_id: 'turn-promoted',
+        promoted_from_turn_id: 'turn-current',
+        user_message_id: 'user-steer',
+        disposition: 'promoted',
+        revision: 2,
+      }),
+    }
+    const { api } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      messages,
+    })
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+
+    expect(messages.value.map(message => message.messageId || message.clientId)).toEqual([
+      'user-old',
+      'assistant-old',
+      'user-steer',
+      'router-new',
+    ])
+    expect(messages.value[2]).toMatchObject({
+      turnId: 'turn-promoted',
+      promotedFromTurnId: 'turn-current',
+      inputDisposition: 'promoted',
+      inputDispositionRevision: 2,
+    })
+  })
+
+  it('sends a pure-text queued steer without reading or mutating the live composer', async () => {
+    const draftAttachment: Attachment = {
+      kind: 'staged',
+      local_id: 20,
+      name: 'draft.pdf',
+      mime: 'application/pdf',
+      file_uuid: 'file-draft',
+    }
+    const laterDraftAttachment: Attachment = {
+      kind: 'inline',
+      local_id: 22,
+      name: 'later.txt',
+      mime: 'text/plain',
+      data: 'bGF0ZXI=',
+    }
+    const inputText = ref('keep this draft')
+    const pendingAttachments = ref<Attachment[]>([draftAttachment])
+    const pendingSessionIntent = ref<string | null>('DRAFT')
+    const pendingForkBeforeMessageId = ref<string | null>('msg-draft-parent')
+    let resolveSend!: (value: unknown) => void
+    const rpc = {
+      call: vi.fn().mockImplementation(() => new Promise(resolve => {
+        resolveSend = resolve
+      })),
+    }
+    const { api, options, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      pendingForkBeforeMessageId,
+    })
+    stream.isStreaming.value = true
+    const queued: ChatPendingItem = {
+      text: 'steer with the queued snapshot',
+      attachments: [],
+      intent: null,
+    }
+
+    const send = api.sendQueuedSteer(queued)
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+
+    expect(inputText.value).toBe('keep this draft')
+    expect(pendingAttachments.value).toEqual([draftAttachment])
+    expect(pendingSessionIntent.value).toBe('DRAFT')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-draft-parent')
+
+    // Edits made after dispatch belong to the live composer and must survive
+    // the queued RPC settling as well.
+    inputText.value = 'typed while steering'
+    pendingAttachments.value = [draftAttachment, laterDraftAttachment]
+    pendingSessionIntent.value = 'LATER'
+    pendingForkBeforeMessageId.value = 'msg-later-parent'
+    resolveSend({
+      accepted: true,
+      turn_id: 'turn-current',
+      disposition: 'steering',
+    })
+
+    await expect(send).resolves.toBe('accepted')
+    expect(inputText.value).toBe('typed while steering')
+    expect(pendingAttachments.value).toEqual([draftAttachment, laterDraftAttachment])
+    expect(pendingSessionIntent.value).toBe('LATER')
+    expect(pendingForkBeforeMessageId.value).toBe('msg-later-parent')
+    expect(options.closeSlashMenu).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledWith('sessions.steer.v2', expect.objectContaining({
+      message: 'steer with the queued snapshot',
+      expected_turn_id: 'turn-current',
+      client_request_id: expect.any(String),
+      client_message_id: expect.any(String),
+    }))
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('queueMode')
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('attachments')
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('intent')
+    expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
+  it('defers an automatic queued follow-up if another run became active', async () => {
+    const inputText = ref('new live draft')
+    const { api, rpc, stream } = makeOptions({ inputText })
+    const queued: ChatPendingItem = {
+      text: 'wait for the active run',
+      attachments: [],
+      intent: null,
+    }
+    stream.isStreaming.value = true
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('deferred')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('new live draft')
 
     stream.isStreaming.value = false
-    await api.onSend()
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+    expect(rpc.call.mock.calls[0]?.[1]).toHaveProperty('queueMode', 'followup')
+    expect(inputText.value).toBe('new live draft')
+  })
+
+  it('does not start a queued delivery while the composer is refreshing attachments', async () => {
+    let resolvePreparation!: (ready: boolean) => void
+    let preparing = false
+    const prepareAttachmentsForSend = vi.fn(() => {
+      preparing = true
+      return new Promise<boolean>(resolve => {
+        resolvePreparation = resolve
+      })
+    })
+    const { api, rpc } = makeOptions({
+      prepareAttachmentsForSend,
+      hasPendingAttachmentWork: () => preparing,
+    })
+    const queued: ChatPendingItem = {
+      text: 'wait for composer preparation',
+      attachments: [],
+      intent: null,
+    }
+
+    const composerSend = api.onSend()
+    await vi.waitFor(() => expect(prepareAttachmentsForSend).toHaveBeenCalledOnce())
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('deferred')
+    expect(rpc.call).not.toHaveBeenCalled()
+
+    preparing = false
+    resolvePreparation(false)
+    await composerSend
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('retries an ambiguous queued steer with the same request identity', async () => {
+    let compactInFlight = false
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-steer',
+        }),
+    }
+    const inputText = ref('unrelated draft')
+    const { api, options, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      inputText,
+      isCompactInFlightForCurrentSession: () => compactInFlight,
+    })
+    stream.isStreaming.value = true
+    const queued: ChatPendingItem = {
+      text: 'retry this queued steer',
+      attachments: [],
+      intent: null,
+    }
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    expect(firstParams).toMatchObject({
+      expected_turn_id: 'turn-current',
+      client_request_id: expect.any(String),
+      client_message_id: expect.any(String),
+    })
+    expect(firstParams).not.toHaveProperty('queueMode')
+    expect(inputText.value).toBe('unrelated draft')
+
+    compactInFlight = true
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('retryable_failure')
+    expect(rpc.call).toHaveBeenCalledOnce()
+
+    // The active run may have ended while the response was lost. The retry
+    // still carries the original steer semantics and idempotency fingerprint.
+    compactInFlight = false
+    stream.isStreaming.value = false
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
 
     expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
+    expect(inputText.value).toBe('unrelated draft')
+  })
+
+  it('does not send a queued steer when the gateway exposes no same-turn capability', async () => {
+    const { api, options, rpc, stream } = makeOptions()
+    const queued: ChatPendingItem = {
+      text: 'send after the prior turn',
+      attachments: [],
+      intent: null,
+    }
+
+    stream.isStreaming.value = false
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.messages.value).toEqual([])
+  })
+
+  it('does not consume a queued item that still contains an unsendable attachment', async () => {
+    const failed: Attachment = {
+      kind: 'failed',
+      local_id: 31,
+      name: 'failed.pdf',
+      mime: 'application/pdf',
+      error: 'upload failed',
+    }
+    const queued: ChatPendingItem = {
+      text: 'keep the failed attachment recoverable',
+      attachments: [failed],
+      intent: null,
+    }
+    const { api, rpc } = makeOptions()
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(queued.attachments).toEqual([failed])
+  })
+
+  it('keeps a queued image intact while Ensemble routing cannot send it', async () => {
+    const image: Attachment = {
+      kind: 'staged',
+      local_id: 32,
+      name: 'queued.png',
+      mime: 'image/png',
+      file_uuid: 'queued-image',
+    }
+    const inputText = ref('unrelated live draft')
+    const queued: ChatPendingItem = {
+      text: 'inspect the queued image',
+      attachments: [image],
+      intent: null,
+    }
+    const { api, rpc } = makeOptions({
+      inputText,
+      modelRoutingMode: ref<'llm_ensemble'>('llm_ensemble'),
+    })
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('not_sent')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(queued.attachments).toEqual([image])
+    expect(inputText.value).toBe('unrelated live draft')
+  })
+
+  it('defers an automatic queued image while routing settings are changing', async () => {
+    const image: Attachment = {
+      kind: 'staged',
+      local_id: 33,
+      name: 'queued.webp',
+      mime: 'image/webp',
+      file_uuid: 'queued-image-busy',
+    }
+    const queued: ChatPendingItem = {
+      text: 'wait for the routing update',
+      attachments: [image],
+      intent: null,
+    }
+    const { api, rpc } = makeOptions({
+      modelRoutingMode: ref<'off'>('off'),
+      modelRoutingSettingsBusy: ref(true),
+    })
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('deferred')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(queued.attachments).toEqual([image])
   })
 
   it('keeps a recovered fork gated while its canonical child response is pending', async () => {
@@ -1147,7 +2426,106 @@ describe('useChatSend attachment payloads', () => {
     const firstParams = rpc.call.mock.calls[0]?.[1]
     const secondParams = rpc.call.mock.calls[1]?.[1]
     expect(secondParams.clientRequestId).not.toBe(firstParams.clientRequestId)
-    expect(secondParams).toMatchObject({ message: 'edited', _source: { runMode: 'trusted' } })
+    expect(secondParams).toMatchObject({ message: 'edited', _source: { runMode: 'safe' } })
+  })
+
+  it('uses a new request when the recovered draft collaboration mode changes', async () => {
+    const inputText = ref('inspect and plan')
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const initialCollaborationMode = ref<CollaborationMode>('plan')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('database busy'), {
+          accepted: false,
+          retryable: true,
+        }))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-default',
+        }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      inputText,
+      pendingSessionIntent,
+      initialCollaborationMode,
+    })
+
+    await api.onSend()
+    initialCollaborationMode.value = 'default'
+    await api.onSend()
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    const secondParams = rpc.call.mock.calls[1]?.[1]
+    expect(firstParams).toMatchObject({
+      collaborationMode: 'plan',
+      intent: 'new_chat',
+    })
+    expect(secondParams.clientRequestId).not.toBe(firstParams.clientRequestId)
+    expect(secondParams).not.toHaveProperty('collaborationMode')
+  })
+
+  it('replays an unknown-acceptance draft with its original mode and request id', async () => {
+    const inputText = ref('inspect and plan')
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const initialCollaborationMode = ref<CollaborationMode>('plan')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new Error('response lost'))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-plan',
+        }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      inputText,
+      pendingSessionIntent,
+      initialCollaborationMode,
+    })
+
+    await api.onSend()
+    initialCollaborationMode.value = 'default'
+    await api.onSend()
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    const secondParams = rpc.call.mock.calls[1]?.[1]
+    expect(secondParams.clientRequestId).toBe(firstParams.clientRequestId)
+    expect(secondParams).toEqual(firstParams)
+    expect(secondParams).toMatchObject({
+      collaborationMode: 'plan',
+      intent: 'new_chat',
+    })
+  })
+
+  it('resolves unknown acceptance before sending an edited draft', async () => {
+    const inputText = ref('inspect and plan')
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const initialCollaborationMode = ref<CollaborationMode>('plan')
+    const rpc = {
+      call: vi.fn()
+        .mockRejectedValueOnce(new Error('response lost'))
+        .mockResolvedValueOnce({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-plan',
+        }),
+    }
+    const { api } = makeOptions({
+      rpc,
+      inputText,
+      pendingSessionIntent,
+      initialCollaborationMode,
+    })
+
+    await api.onSend()
+    inputText.value = 'a different follow-up'
+    initialCollaborationMode.value = 'default'
+    await api.onSend()
+
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+    const secondParams = rpc.call.mock.calls[1]?.[1]
+    expect(secondParams).toEqual(firstParams)
+    expect(inputText.value).toBe('a different follow-up')
   })
 
   it('does not restore an attempt explicitly reported as accepted', async () => {
@@ -1990,23 +3368,28 @@ describe('useChatSend attachment payloads', () => {
     }))
   })
 
-  it('surfaces a terminal steer failure without ending the existing stream', async () => {
+  it('restores a rejected v2 steer without ending the existing stream', async () => {
     const activeStreamTaskId = ref('task-current')
     const activeStreamSessionKey = ref('agent:main:webchat:test')
+    const restoreSteerIntoComposer = vi.fn()
     const rpc = {
       call: vi.fn().mockResolvedValue({
-        sessionKey: 'agent:main:webchat:test',
-        task_id: 'task-steer-failed',
-        task_status: 'failed',
-        terminal_reason: 'activation_failed',
-        terminal_message: 'The steer request could not be activated.',
+        accepted: false,
+        turn_id: 'task-current',
+        disposition: 'rejected',
+        failure_code: 'activation_failed',
+        retryable: false,
+        fallback_safe: false,
+        recovery: 'inspect_transcript_and_resend',
       }),
     }
     const { api, options, stream } = makeOptions({
+      ...sameTurnSteerOptions('task-current'),
       rpc,
       activeStreamTaskId,
       activeStreamSessionKey,
       busySendMode: ref<BusySendMode>('steer'),
+      restoreSteerIntoComposer,
     })
     stream.isStreaming.value = true
 
@@ -2016,12 +3399,13 @@ describe('useChatSend attachment payloads', () => {
     expect(activeStreamTaskId.value).toBe('task-current')
     expect(activeStreamSessionKey.value).toBe('agent:main:webchat:test')
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
-      role: 'error',
-      text: 'The steer request could not be activated.',
-      errorCode: 'activation_failed',
-      terminalNotice: true,
+      role: 'user',
+      text: 'hello',
+      inputDisposition: 'rejected',
+      turnId: 'task-current',
     })
-    expect(options.scheduleHistorySync).toHaveBeenCalledTimes(1)
+    expect(restoreSteerIntoComposer).toHaveBeenCalledWith('hello')
+    expect(options.scheduleHistorySync).not.toHaveBeenCalled()
   })
 
   it('does not materialize a stale steer terminal response in the newly selected session', async () => {
@@ -2033,6 +3417,7 @@ describe('useChatSend attachment payloads', () => {
     }
     const sessionKey = ref('agent:main:webchat:first')
     const { api, options, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
       rpc,
       sessionKey,
       busySendMode: ref<BusySendMode>('steer'),
@@ -2042,15 +3427,13 @@ describe('useChatSend attachment payloads', () => {
     const send = api.onSend()
     sessionKey.value = 'agent:main:webchat:second'
     resolveSend({
-      sessionKey: 'agent:main:webchat:first',
-      task_id: 'task-steer-failed',
-      task_status: 'failed',
-      terminal_reason: 'activation_failed',
-      terminal_message: 'This belongs to the previous session.',
+      accepted: true,
+      turn_id: 'turn-current',
+      disposition: 'steering',
     })
     await send
 
-    expect(options.messages.value.some(message => message.role === 'error')).toBe(false)
+    expect(options.messages.value.some(message => message.inputDisposition === 'rejected')).toBe(false)
     expect(options.scheduleHistorySync).not.toHaveBeenCalled()
     expect(stream.endStreaming).not.toHaveBeenCalled()
   })
@@ -2116,6 +3499,89 @@ describe('useChatSend attachment payloads', () => {
     await api.onSend()
 
     expect(bindActiveStreamTask).toHaveBeenCalledWith('task-new')
+  })
+
+  it('shows an empty-output Stop as typed state on the user turn, never a synthetic bubble', async () => {
+    let resolveSend!: (value: unknown) => void
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string) => {
+        if (method === 'chat.abort') {
+          return Promise.resolve({ aborted: true }) as Promise<T>
+        }
+        return new Promise<T>((resolve) => {
+          resolveSend = resolve as (value: unknown) => void
+        })
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const { api, options, stream } = makeOptions({ rpc })
+    stream.startStreaming = vi.fn(() => { stream.isStreaming.value = true })
+    stream.endStreaming = vi.fn(() => { stream.isStreaming.value = false })
+
+    const send = api.onSend()
+    const user = options.messages.value[0]
+    api.onStop()
+
+    expect(user).toMatchObject({
+      role: 'user',
+      turnOutcome: {
+        status: 'cancelled',
+        cancellationSource: 'webui_stop',
+      },
+    })
+    expect(options.messages.value).toHaveLength(1)
+    expect(options.messages.value.some(message => message.stopNotice)).toBe(false)
+
+    resolveSend({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'turn-stopped',
+      user_message_id: 'user-stopped',
+    })
+    await send
+
+    expect(options.messages.value[0]).toMatchObject({
+      messageId: 'user-stopped',
+      turnId: 'turn-stopped',
+      turnOutcome: {
+        turnId: 'turn-stopped',
+        taskId: 'turn-stopped',
+        cancellationSource: 'webui_stop',
+      },
+    })
+  })
+
+  it('does not guess pending steer dispositions or restore them before Stop is authoritative', () => {
+    const restoreSteerIntoComposer = vi.fn()
+    const messages = ref<ChatMessage[]>([
+      {
+        role: 'user',
+        text: 'first adjustment',
+        ts: 1,
+        turnId: 'turn-current',
+        inputDisposition: 'steering',
+      },
+      {
+        role: 'user',
+        text: 'second adjustment',
+        ts: 2,
+        turnId: 'turn-current',
+        inputDisposition: 'steering',
+      },
+    ])
+    const { api, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      messages,
+      restoreSteerIntoComposer,
+    })
+    stream.isStreaming.value = true
+
+    api.onStop()
+
+    expect(messages.value.map(message => message.inputDisposition)).toEqual([
+      'steering',
+      'steering',
+    ])
+    expect(messages.value.every(message => message.steerStopRequested)).toBe(true)
+    expect(restoreSteerIntoComposer).not.toHaveBeenCalled()
   })
 
   it('stops the whole session that owns the stream without trusting a stale task id', () => {
@@ -2259,7 +3725,7 @@ describe('useChatSend Ensemble image guard', () => {
   })
 
   it.each(['queue', 'steer'] as const)(
-    'does not consume an Ensemble image draft in %s mode',
+    'queues an Ensemble image draft in %s mode without pretending to steer',
     async (busySendMode) => {
       const image = readyAttachment('image/jpeg')
       const pendingAttachments = ref<Attachment[]>([image])
@@ -2275,7 +3741,7 @@ describe('useChatSend Ensemble image guard', () => {
       await api.onSend()
 
       expect(rpc.call).not.toHaveBeenCalled()
-      expect(enqueuePendingInput).not.toHaveBeenCalled()
+      expect(enqueuePendingInput).toHaveBeenCalledWith('hello', undefined)
       expect(options.messages.value).toEqual([])
       expect(options.inputText.value).toBe('hello')
       expect(pendingAttachments.value).toEqual([image])
@@ -2471,5 +3937,97 @@ describe('useChatSend Ensemble image guard', () => {
       errorCode: 'provider_custom_failure',
       text: 'Provider supplied this exact explanation.',
     })
+  })
+
+  it('sends the draft Plan mode atomically with intent=new_chat', async () => {
+    const { api, rpc } = makeOptions({
+      pendingSessionIntent: ref('new_chat'),
+      initialCollaborationMode: ref<CollaborationMode>('plan'),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      intent: 'new_chat',
+      collaborationMode: 'plan',
+    }))
+  })
+
+  it('keeps the default draft compatible with gateways that predate initial modes', async () => {
+    const { api, rpc } = makeOptions({
+      pendingSessionIntent: ref('new_chat'),
+      initialCollaborationMode: ref<CollaborationMode>('default'),
+    })
+
+    await api.onSend()
+
+    const params = rpc.call.mock.calls[0]?.[1]
+    expect(params).toEqual(expect.objectContaining({ intent: 'new_chat' }))
+    expect(params).not.toHaveProperty('collaborationMode')
+  })
+
+  it('materializes a draft intent only after durable acceptance', async () => {
+    let resolveSend!: (value: { sessionKey: string; task_id: string }) => void
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const rpc = {
+      call: vi.fn(() => new Promise<{ sessionKey: string; task_id: string }>(resolve => {
+        resolveSend = resolve
+      })),
+    }
+    const { api } = makeOptions({
+      rpc: rpc as UseChatSendOptions['rpc'],
+      pendingSessionIntent,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    expect(pendingSessionIntent.value).toBe('new_chat')
+
+    resolveSend({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'task-first',
+    })
+    await send
+
+    expect(pendingSessionIntent.value).toBeNull()
+  })
+
+  it('does not let a stale accepted response materialize a newer draft', async () => {
+    let resolveSend!: (value: { sessionKey: string; task_id: string }) => void
+    const firstKey = 'agent:main:webchat:first-draft'
+    const secondKey = 'agent:main:webchat:second-draft'
+    const sessionKey = ref(firstKey)
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const rpc = {
+      call: vi.fn(() => new Promise<{ sessionKey: string; task_id: string }>(resolve => {
+        resolveSend = resolve
+      })),
+    }
+    const { api } = makeOptions({
+      rpc: rpc as UseChatSendOptions['rpc'],
+      sessionKey,
+      pendingSessionIntent,
+    })
+
+    const send = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    sessionKey.value = secondKey
+
+    resolveSend({ sessionKey: firstKey, task_id: 'task-first' })
+    await send
+
+    expect(sessionKey.value).toBe(secondKey)
+    expect(pendingSessionIntent.value).toBe('new_chat')
+  })
+
+  it('does not attach an initial collaboration mode to an existing-session send', async () => {
+    const { api, rpc } = makeOptions({
+      initialCollaborationMode: ref<CollaborationMode>('plan'),
+    })
+
+    await api.onSend()
+
+    const params = rpc.call.mock.calls[0]?.[1]
+    expect(params).not.toHaveProperty('collaborationMode')
   })
 })

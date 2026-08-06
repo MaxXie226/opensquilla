@@ -22,11 +22,16 @@ export const SETTINGS_SECTIONS = [
   { id: 'provider', label: 'Model Service', icon: 'agents', client: false, desktopOnly: false, group: 'ai' },
   { id: 'modelStrategy', label: 'Model Routing', icon: 'router', client: false, desktopOnly: false, group: 'ai' },
   { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, desktopOnly: false, group: 'capabilities' },
-  // --- Delivery: where the assistant reaches users ---
-  { id: 'channels', label: 'Channels', icon: 'channels', client: false, desktopOnly: false, group: 'delivery' },
   // --- Preferences: assistant behaviour + local app settings ---
   { id: 'behavior', label: 'Behavior', icon: 'chat', client: false, desktopOnly: false, group: 'preferences' },
   { id: 'privacy', label: 'Privacy', icon: 'shield', client: false, desktopOnly: false, group: 'preferences' },
+  // Sandbox policy is versioned independently from the main config form and
+  // owns its own conflict-aware save controls.
+  { id: 'sandbox', label: 'Sandbox', icon: 'shield', client: true, desktopOnly: false, group: 'preferences' },
+  // Profile import is a gateway action surface, not a config form. Marking it
+  // client-like keeps it out of readiness and the global dirty/save bar; the
+  // panel owns its RPC feature gate, progress, confirmation, and recovery.
+  { id: 'memory', label: 'Memory & Profile', icon: 'user', client: true, desktopOnly: false, group: 'preferences' },
   // Client-only sections carry no readiness/RPC state: they edit local browser
   // preferences that apply instantly and never enter the dirty bar. The status
   // dot is suppressed for them in the rail.

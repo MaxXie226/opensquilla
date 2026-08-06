@@ -48,7 +48,19 @@ from opensquilla.engine.usage_accounting import (
     current_usage_accounting_scope,
     provider_accounts_physical_usage,
 )
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
+from opensquilla.provider.correlation_context import (
+    bind_provider_request_correlation,
+    current_provider_request_correlation,
+)
 from opensquilla.provider.protocol import LLMProvider
+from opensquilla.provider.types import (
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
+)
 from opensquilla.skills.meta.clarify_autofill import (
     autofill_required_clarify_fields,
     is_empty_clarify_submission,
@@ -187,9 +199,37 @@ async def _to_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     The writer commits SQLite transactions with ``busy_timeout=5000``; a
     contended commit executed on the loop would stall every surface for up
     to five seconds. Offloading keeps the module docstring's executor
-    contract honest for every async caller in this file.
+    contract honest for every async caller in this file. Cancellation is
+    deferred until the worker settles because cancelling ``to_thread`` does
+    not stop its underlying thread; returning early could otherwise let a
+    later cleanup race a still-running writer call.
     """
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    operation = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+    cancellation_requested = False
+
+    while True:
+        try:
+            result = await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if operation.cancelled() and (current is None or current.cancelling() == 0):
+                raise
+            cancellation_requested = True
+            if not operation.done():
+                continue
+            break
+        except BaseException:
+            if not cancellation_requested:
+                raise
+            break
+        else:
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            return result
+
+    if not operation.cancelled():
+        operation.exception()
+    raise asyncio.CancelledError
 
 
 def _preflight_confirmation_run_id(inputs: dict[str, Any]) -> str:
@@ -2019,6 +2059,7 @@ def make_agent_runner_from_parent(
     session_key: str | None = None,
     usage_event_sink: Any | None = None,
     usage_execution_context: Any | None = None,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> AgentRunner:
     """Build an :class:`AgentRunner` that mirrors the parent turn's surface.
 
@@ -2033,6 +2074,10 @@ def make_agent_runner_from_parent(
     sub-Agent both knows the path (system_prompt grounding) and resolves
     file tools against it (sub_config.workspace_dir).
     """
+
+    inherited_provider_request_correlation = (
+        provider_request_correlation or current_provider_request_correlation()
+    )
 
     # Diagnostic: log the workspace_dir this factory was constructed with
     # so we can verify the value flowing into sub-Agents matches the
@@ -2069,6 +2114,25 @@ def make_agent_runner_from_parent(
             )
 
     async def _runner(system_prompt: str, user_message: str) -> AsyncIterator[AgentEvent]:
+        child_provider_request_correlation = (
+            provider_request_correlation
+            or derive_provider_request_correlation(
+                current_provider_request_correlation()
+                or inherited_provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="subagent.chat",
+            )
+        )
+        child_tool_handler = tool_handler
+        if tool_handler is not None:
+
+            async def _child_tool_handler(call: Any) -> Any:
+                with bind_provider_request_correlation(
+                    child_provider_request_correlation
+                ):
+                    return await tool_handler(call)
+
+            child_tool_handler = _child_tool_handler
         # Per-call recovery: prefer the live tool_context's workspace_dir
         # over the (possibly stale or None) factory closure value. The
         # outer turn's tool_context is set by the gateway and is the
@@ -2203,11 +2267,12 @@ def make_agent_runner_from_parent(
             provider=provider,
             config=sub_config,
             tool_definitions=filtered_tool_definitions,
-            tool_handler=tool_handler,
+            tool_handler=child_tool_handler,
             usage_tracker=usage_tracker,
             session_key=session_key,
             usage_event_sink=usage_event_sink,
             usage_execution_context=child_usage_context,
+            provider_request_correlation=child_provider_request_correlation,
         )
         from opensquilla.engine.agent import _flatten_content_blocks
         from opensquilla.engine.types import TextDeltaEvent
@@ -2252,6 +2317,7 @@ def make_llm_chat_from_provider(
     session_key: str | None = None,
     usage_event_sink: UsageEventSink | None = None,
     usage_execution_context: UsageExecutionContext | None = None,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> LLMChat:
     """Build a single-turn LLM caller — no tools, no agent loop.
 
@@ -2277,16 +2343,53 @@ def make_llm_chat_from_provider(
     explicitly; callers that want LESS (classifiers) should also override.
     """
 
+    inherited_provider_request_correlation = (
+        provider_request_correlation or current_provider_request_correlation()
+    )
+
     from opensquilla.provider.types import ChatConfig, DoneEvent, Message
     from opensquilla.provider.types import TextDeltaEvent as ProviderTextDelta
 
+    request_budget = resolve_auxiliary_request_budget(
+        provider,
+        max_output_tokens=max_tokens,
+        provider_id=str(getattr(base_config, "provider_id", "") or ""),
+        model=str(getattr(base_config, "model_id", "") or ""),
+        context_window_tokens=int(
+            getattr(base_config, "context_window_tokens", 0) or 0
+        ),
+        provider_request_max_chars=int(
+            getattr(base_config, "provider_request_proof_max_chars", 0) or 0
+        ),
+        context_overflow_threshold=float(
+            getattr(base_config, "context_overflow_threshold", 0.85) or 0.85
+        ),
+    )
+
     async def _chat(system_prompt: str, user_message: str) -> str:
+        call_provider_request_correlation = (
+            provider_request_correlation
+            or derive_provider_request_correlation(
+                current_provider_request_correlation()
+                or inherited_provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.meta",
+            )
+        )
         config = ChatConfig(
             system=system_prompt,
-            max_tokens=max_tokens,
+            max_tokens=request_budget.max_output_tokens,
             temperature=0.0,
+            provider_request_max_chars=request_budget.provider_request_max_chars,
+            provider_request_correlation=call_provider_request_correlation,
         )
         messages = [Message(role="user", content=user_message)]
+        ensure_auxiliary_text_fits(
+            messages,
+            system=system_prompt,
+            max_chars=request_budget.provider_request_max_chars,
+            max_tokens=request_budget.max_input_tokens,
+        )
         parts: list[str] = []
         first_error: str = ""
         inherited_scope = current_usage_accounting_scope()
@@ -2323,7 +2426,10 @@ def make_llm_chat_from_provider(
             or ""
         )
         model_id = str(getattr(base_config, "model_id", "") or "")
-        with bind_usage_accounting_scope(scope):
+        with (
+            bind_provider_request_correlation(call_provider_request_correlation),
+            bind_usage_accounting_scope(scope),
+        ):
             stream = (
                 provider.chat(messages, tools=None, config=config)
                 if scope is not None and provider_accounts_physical_usage(provider)
@@ -2383,6 +2489,7 @@ def make_llm_chat_from_provider(
 def make_tool_invoker_from_handler(
     *,
     tool_handler: Any,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> ToolInvoker:
     """Build a direct tool caller that bypasses the LLM.
 
@@ -2396,14 +2503,28 @@ def make_tool_invoker_from_handler(
 
     from opensquilla.tool_boundary import ToolCall
 
+    inherited_provider_request_correlation = (
+        provider_request_correlation or current_provider_request_correlation()
+    )
+
     async def _invoke(tool_name: str, arguments: dict[str, Any]) -> str:
+        call_provider_request_correlation = (
+            provider_request_correlation
+            or derive_provider_request_correlation(
+                current_provider_request_correlation()
+                or inherited_provider_request_correlation,
+                execution_id=uuid.uuid4().hex,
+                call_kind="auxiliary.meta",
+            )
+        )
         call = ToolCall(
             tool_use_id=f"meta_tool_{uuid.uuid4().hex[:12]}",
             tool_name=tool_name,
             arguments=arguments,
             origin_trace="meta-orchestrator",
         )
-        result = await tool_handler(call)
+        with bind_provider_request_correlation(call_provider_request_correlation):
+            result = await tool_handler(call)
         if getattr(result, "is_error", False):
             raise RuntimeError(
                 f"tool {tool_name!r} failed: {getattr(result, 'content', '')!s}",

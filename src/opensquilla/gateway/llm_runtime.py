@@ -67,10 +67,12 @@ def resolve_llm_credential(
     ``LlmProviderConfig`` reads the two ``OPENSQUILLA_LLM_*`` settings
     variables when it is constructed.  Hot config mutations do not reconstruct
     that model, so consult those external inputs explicitly as well.  Stored
-    config still wins, followed by the configured/settings/registry env-name
-    chain and finally the generic settings key.  Runtime callers may retain an
-    already-materialized environment secret; observability and reveal surfaces
-    disable that cache so they describe only currently inspectable sources.
+    config still wins. An explicitly configured env-name is authoritative: if
+    it is missing, resolution fails closed instead of substituting another
+    source. Otherwise settings/registry env names precede the generic settings
+    key. Runtime callers may retain an already-materialized environment secret;
+    observability and reveal surfaces disable that cache so they describe only
+    currently inspectable sources.
     """
 
     llm = getattr(config, "llm", None)
@@ -101,6 +103,9 @@ def resolve_llm_credential(
             env_name=env_name,
         )
 
+    if configured_env_name:
+        return ResolvedLlmCredential(env_name=configured_env_name)
+
     settings_api_key = environment_value("OPENSQUILLA_LLM_API_KEY")
     if settings_api_key:
         return ResolvedLlmCredential(
@@ -109,9 +114,10 @@ def resolve_llm_credential(
             env_name="OPENSQUILLA_LLM_API_KEY",
         )
 
-    # A value materialized from the environment earlier in this process may
-    # remain usable after the source variable is removed.  Keep its runtime
-    # provenance instead of misclassifying that cached secret as explicit.
+    # With no authoritative configured reference, a value materialized from
+    # the environment earlier in this process may remain usable after its
+    # source variable is removed. Keep its runtime provenance instead of
+    # misclassifying that cached secret as explicit.
     if (
         include_runtime_cache
         and stored_api_key
@@ -198,6 +204,59 @@ def resolve_llm_runtime_config(config: Any) -> LlmRuntimeConfig:
     base_url_env_name = provider_base_url_env_name(provider) if spec is not None else ""
     env_base_url = environment_value(base_url_env_name) if base_url_env_name else ""
     api_key = credential.api_key
+    resolution_getter = getattr(config, "provider_resolution", None)
+    resolution = resolution_getter() if callable(resolution_getter) else {}
+    provider_resolution_blocked = bool(resolution.get("action_required", False))
+    from opensquilla.provider.credentials import (
+        credential_provider_hint,
+        endpoint_provider_hint,
+    )
+
+    credential_hint = credential_provider_hint(
+        api_key,
+        api_key_env=credential.env_name or getattr(llm, "api_key_env", ""),
+    )
+    credential_mismatch = bool(credential_hint and credential_hint != provider)
+    if provider_resolution_blocked or credential_mismatch:
+        reason_code = (
+            "credential_provider_mismatch"
+            if credential_mismatch
+            else str(resolution.get("reason_code") or "provider_resolution_blocked")
+        )
+        log.warning(
+            "llm_runtime.credential_withheld",
+            provider=provider,
+            credential_provider_hint=credential_hint or None,
+            reason_code=reason_code,
+        )
+        # Preserve an explicitly stored value across unrelated sparse saves,
+        # but remove it from every runtime-facing config path before any
+        # provider or ensemble can construct an Authorization header.
+        if (
+            api_key
+            and credential.source == "explicit"
+            and hasattr(config, "record_runtime_override")
+        ):
+            config.record_runtime_override(
+                "llm.api_key",
+                str(getattr(llm, "api_key", "") or ""),
+                "",
+            )
+        api_key = ""
+        setter = getattr(config, "set_provider_resolution", None)
+        if (
+            callable(setter)
+            and credential_mismatch
+            and not provider_resolution_blocked
+        ):
+            setter(
+                status="conflict",
+                effective_provider=provider,
+                source="credential_shape",
+                reason_code=reason_code,
+                action_required=True,
+                action_recommended=True,
+            )
     # Explicit config > derived env > spec default, mirroring the api_key
     # rule (#484): a base_url the operator chose must not be overridden by
     # OPENAI_BASE_URL-style vars on the next boot/reload. Derived stored
@@ -213,6 +272,42 @@ def resolve_llm_runtime_config(config: Any) -> LlmRuntimeConfig:
         base_url = stored_base_url
     else:
         base_url = env_base_url or (spec.default_base_url if spec else stored_base_url)
+    endpoint_hint = endpoint_provider_hint(base_url)
+    credential_endpoint_mismatch = bool(
+        api_key
+        and credential_hint
+        and endpoint_hint
+        and credential_hint != endpoint_hint
+    )
+    if credential_endpoint_mismatch:
+        reason_code = "credential_endpoint_provider_mismatch"
+        log.warning(
+            "llm_runtime.credential_withheld",
+            provider=provider,
+            credential_provider_hint=credential_hint,
+            endpoint_provider_hint=endpoint_hint,
+            reason_code=reason_code,
+        )
+        if (
+            credential.source == "explicit"
+            and hasattr(config, "record_runtime_override")
+        ):
+            config.record_runtime_override(
+                "llm.api_key",
+                str(getattr(llm, "api_key", "") or ""),
+                "",
+            )
+        api_key = ""
+        setter = getattr(config, "set_provider_resolution", None)
+        if callable(setter):
+            setter(
+                status="conflict",
+                effective_provider=provider,
+                source="credential_endpoint",
+                reason_code=reason_code,
+                action_required=True,
+                action_recommended=True,
+            )
     base_url_from_env = bool(env_base_url) and base_url == env_base_url
     proxy = environment_value("OPENSQUILLA_LLM_PROXY") or getattr(llm, "proxy", "")
 

@@ -7,7 +7,11 @@ import {
 } from '@/composables/chat/useChatPendingQueue'
 import type { Attachment, ChatMessage } from '@/types/chat'
 import type { FoldLiveTurnMode } from './useChatTurnLog'
-import { useChatSend, type UseChatSendOptions } from './useChatSend'
+import {
+  useChatSend,
+  type ChatSendOutcome,
+  type UseChatSendOptions,
+} from './useChatSend'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
 
 vi.mock('@/composables/useToasts', () => ({
@@ -86,7 +90,10 @@ describe('chat send session handoff', () => {
     const trace: string[] = []
     let resolveSend!: (value: unknown) => void
     let sendCurrentInput: () => void = () => {}
-    let dispatchHiddenControl: (providerText: string, displayText: string) => void = () => {}
+    let dispatchHiddenControl: (
+      item: import('@/types/chat').ChatPendingItem,
+      ownerSessionKey: string,
+    ) => Promise<ChatSendOutcome> = async () => 'not_sent'
 
     const persistSession = vi.fn((key: string) => {
       trace.push(`persist:${key}`)
@@ -110,6 +117,20 @@ describe('chat send session handoff', () => {
     const loadHistory = vi.fn(() => {
       trace.push(`history:${sessionKey.value}:${messages.value.length}`)
     })
+    const startSessionBootstrap = vi.fn(() => {
+      const live = subscribeSession().then(() => ({
+        authoritative: true,
+        live: true,
+        backgroundOnly: false,
+      }))
+      loadHistory()
+      return {
+        generation: 1,
+        criticalRequestsQueued: Promise.resolve(),
+        history: Promise.resolve({ ok: true }),
+        live,
+      }
+    })
     const resetStreamLiveTurnState = vi.fn(() => {
       trace.push(`reset:${sessionKey.value}`)
       isStreaming.value = false
@@ -126,9 +147,8 @@ describe('chat send session handoff', () => {
       sendCurrentInput: () => sendCurrentInput(),
       resetInputHistory: vi.fn(),
       hasComposer: () => true,
-      dispatchHiddenControl: (providerText, displayText) => {
-        dispatchHiddenControl(providerText, displayText)
-      },
+      dispatchHiddenControl: (item, ownerSessionKey) =>
+        dispatchHiddenControl(item, ownerSessionKey),
     })
     inputText.value = 'existing parent follow-up'
     pendingQueueRuntime.enqueuePendingInput(
@@ -164,9 +184,8 @@ describe('chat send session handoff', () => {
       usageModel: ref('test-model'),
       createSessionKey: vi.fn(() => childSessionKey),
       persistSession,
-      unsubscribeSession,
-      subscribeSession,
-      loadHistory,
+      cancelSessionBootstrap: unsubscribeSession,
+      startSessionBootstrap,
       loadCurrentSessionUsage: vi.fn(),
       applySessionRunState: vi.fn(),
       setCompactInFlight: vi.fn(),
@@ -219,9 +238,10 @@ describe('chat send session handoff', () => {
       modelRoutingMode: ref<'off'>('off'),
       modelRoutingSettingsBusy: ref(false),
       elevatedMode: ref(''),
-      runMode: ref('trusted'),
+      runMode: ref('safe'),
       pendingAttachments,
       pendingSessionIntent,
+      initialCollaborationMode: ref<'default' | 'plan'>('default'),
       pendingForkBeforeMessageId: ref('msg-B'),
       aborted,
       activeStreamTaskId,
@@ -244,7 +264,7 @@ describe('chat send session handoff', () => {
       scrollToBottom: vi.fn(),
     })
     sendCurrentInput = send.onSend
-    dispatchHiddenControl = send.dispatchHiddenSend
+    dispatchHiddenControl = send.dispatchQueuedHiddenSend
 
     const firstSend = send.onSend()
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(

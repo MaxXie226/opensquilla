@@ -41,7 +41,9 @@ root release README with task-oriented guides.
 
 ## Surfaces and Operations
 
-- [`releases/0.5.0rc4.md`](releases/0.5.0rc4.md) - OpenSquilla 0.5.0 Preview 4 release notes.
+- [`releases/0.5.2.md`](releases/0.5.2.md) - OpenSquilla 0.5.2 release notes.
+- [`releases/0.5.1.md`](releases/0.5.1.md) - OpenSquilla 0.5.1 release notes.
+- [`releases/0.5.0.md`](releases/0.5.0.md) - OpenSquilla 0.5.0 release notes.
 - [`releases/0.5.0rc3.md`](releases/0.5.0rc3.md) - OpenSquilla 0.5.0 Preview 3 release notes.
 - [`releases/0.5.0rc2.md`](releases/0.5.0rc2.md) - OpenSquilla 0.5.0 Preview 2 release notes.
 - [`releases/0.5.0rc1.md`](releases/0.5.0rc1.md) - OpenSquilla 0.5.0 Preview 1 release notes.
@@ -56,6 +58,8 @@ root release README with task-oriented guides.
   files, images, PDF, and TTS.
 - [`tools-and-sandbox.md`](tools-and-sandbox.md) - built-in tools, approvals,
   sandbox posture, and write policy.
+- [`sandbox-security.md`](sandbox-security.md) - Safe and Full execution modes,
+  guest isolation, policy behavior, bundled runtimes, and upgrade compatibility.
 - [`approvals-and-permissions.md`](approvals-and-permissions.md) - permission
   profiles, approval commands, workspace containment, and sandbox posture.
 - [`agents.md`](agents.md) - durable named agents and workspace defaults.

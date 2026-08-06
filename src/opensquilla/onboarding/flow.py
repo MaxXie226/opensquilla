@@ -32,6 +32,9 @@ from opensquilla.onboarding.image_generation_specs import (
     get_image_generation_provider_setup_spec,
     list_image_generation_provider_setup_specs,
 )
+from opensquilla.onboarding.image_generation_state import (
+    default_image_generation_intent_for_provider,
+)
 from opensquilla.onboarding.memory_embedding_specs import (
     MemoryEmbeddingProviderSetupSpec,
     get_memory_embedding_provider_setup_spec,
@@ -1202,6 +1205,11 @@ def run_interactive_image_generation_configure(
     questionary = _styled(_qmod)
 
     cfg = load_config(config_path)
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
+
+    prewarm_tokenrhythm_install_id(config=cfg)
     spec, provider_id = _ask_image_generation_choice(questionary, cfg)
     _print_image_generation_intro(spec)
     answers = _ask_image_generation_fields(questionary, spec, cfg)
@@ -2024,6 +2032,36 @@ def _print_channel_intro(spec: ChannelSetupSpec) -> None:
     )
 
 
+_RELEASE_VERSION_RE = re.compile(r"^\d+(?:\.\d+)*(?:(?:a|b|rc)\d+)?$")
+
+
+def _installed_reinstall_command_lines() -> str:
+    """Reinstall lines for the running release, never a stale pinned tag.
+
+    A release build reinstalls its own wheel with the ``recommended`` extra so
+    the command adds the missing optional dependency without changing version.
+    Dev or unknown builds cannot map to a published wheel, so they are pointed
+    at the latest-release page instead of a guessed URL.
+    """
+    from opensquilla import __version__
+
+    if _RELEASE_VERSION_RE.match(__version__):
+        wheel_url = (
+            "https://github.com/opensquilla/opensquilla/releases/download/"
+            f"v{__version__}/opensquilla-{__version__}-py3-none-any.whl"
+        )
+        return (
+            "  uv tool install --python 3.12 --force "
+            f"\"opensquilla[recommended] @ {wheel_url}\"\n"
+        )
+    return (
+        "  uv tool install --python 3.12 --force "
+        "\"opensquilla[recommended] @ <wheel-url>\"\n"
+        "  (use the wheel from the latest release: "
+        "https://github.com/opensquilla/opensquilla/releases/latest)\n"
+    )
+
+
 def _warn_channel_dependency_gaps(spec: ChannelSetupSpec, answers: dict[str, Any]) -> None:
     """Warn about optional channel dependencies that will fail at gateway start."""
     if spec.type == "feishu" and answers.get("connection_mode") == "websocket":
@@ -2035,10 +2073,7 @@ def _warn_channel_dependency_gaps(spec: ChannelSetupSpec, answers: dict[str, Any
                     "[bold]Portable zip:[/]\n"
                     "  Use the latest recommended portable package, then restart.\n\n"
                     "[bold]Installed command:[/]\n"
-                    "  uv tool install --python 3.12 --force "
-                    "\"opensquilla[recommended] @ "
-                    "https://github.com/opensquilla/opensquilla/releases/download/"
-                    "v0.5.0rc4/opensquilla-0.5.0rc4-py3-none-any.whl\"\n"
+                    + _installed_reinstall_command_lines() +
                     "  opensquilla gateway restart\n\n"
                     "[bold]Development checkout:[/]\n"
                     "  uv sync --extra recommended\n"
@@ -2379,7 +2414,13 @@ def _migration_result_path(
 
 def _reload_after_migration(config_path: Path, fallback: Any):
     try:
-        return load_config(config_path)
+        config = load_config(config_path)
+        from opensquilla.provider.tokenrhythm_correlation import (
+            prewarm_tokenrhythm_install_id,
+        )
+
+        prewarm_tokenrhythm_install_id(config=config)
+        return config
     except Exception as exc:
         console.print(
             warning_panel(
@@ -2432,6 +2473,18 @@ def _provider_id_from_config(cfg: Any) -> str:
     return str(getattr(llm, "provider", "") or "")
 
 
+def _onboard_image_generation_intent(
+    provider_id: str,
+    *,
+    skip_image_generation: bool,
+) -> str:
+    """Honor an explicit CLI skip before applying first-party defaults."""
+
+    if skip_image_generation:
+        return "preserve"
+    return default_image_generation_intent_for_provider(provider_id)
+
+
 def _imported_provider_key_payload(llm: Any) -> dict[str, str]:
     api_key = str(getattr(llm, "api_key", "") or "")
     api_key_env = str(getattr(llm, "api_key_env", "") or "")
@@ -2447,6 +2500,7 @@ def _use_imported_provider_credentials_with_router_defaults(
     requested_mode: str,
     explicit_mode: bool = False,
     config_path: str | Path | None = None,
+    skip_image_generation: bool = False,
 ):
     llm = getattr(cfg, "llm", None)
     provider = _provider_id_from_config(cfg)
@@ -2460,6 +2514,10 @@ def _use_imported_provider_credentials_with_router_defaults(
         base_url=str(getattr(llm, "base_url", "") or ""),
         proxy=str(getattr(llm, "proxy", "") or ""),
         provider_routing=dict(getattr(llm, "provider_routing", {}) or {}),
+        image_generation_intent=_onboard_image_generation_intent(
+            provider,
+            skip_image_generation=skip_image_generation,
+        ),
     )
     cfg_after_provider = res.config
     if requested_mode:
@@ -2474,7 +2532,12 @@ def _use_imported_provider_credentials_with_router_defaults(
     return cfg_after_provider
 
 
-def _complete_imported_provider_credentials(questionary, cfg: Any):
+def _complete_imported_provider_credentials(
+    questionary,
+    cfg: Any,
+    *,
+    skip_image_generation: bool = False,
+):
     llm = getattr(cfg, "llm", None)
     provider = str(getattr(llm, "provider", "") or "")
     model = str(getattr(llm, "model", "") or "")
@@ -2509,6 +2572,10 @@ def _complete_imported_provider_credentials(questionary, cfg: Any):
         api_key=credentials["api_key"],
         api_key_env=credentials["api_key_env"],
         base_url=base_url,
+        image_generation_intent=_onboard_image_generation_intent(
+            provider,
+            skip_image_generation=skip_image_generation,
+        ),
     )
     return res.config
 
@@ -2720,6 +2787,11 @@ def _restore_reset_backup(reset_backup: tuple[Path, Path]) -> None:
 
 def run_interactive_onboard(options: OnboardOptions) -> PersistResult:
     cfg = load_config(options.config_path)
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
+
+    prewarm_tokenrhythm_install_id(config=cfg)
     status = get_onboarding_status(cfg)
     if options.if_needed and status.has_config and not status.needs_onboarding:
         return persist_config(
@@ -2855,6 +2927,7 @@ def _run_onboard_walk(
                     requested_mode=requested_router_mode,
                     explicit_mode=explicit_router_mode,
                     config_path=options.config_path,
+                    skip_image_generation=options.skip_image_generation,
                 )
                 persist = persist_config(
                     cfg_after_provider,
@@ -2874,7 +2947,11 @@ def _run_onboard_walk(
             )
     if not keep_imported:
         completed_imported = (
-            _complete_imported_provider_credentials(questionary, cfg)
+            _complete_imported_provider_credentials(
+                questionary,
+                cfg,
+                skip_image_generation=options.skip_image_generation,
+            )
             if migration_result is not None and not status.llm_configured
             else None
         )
@@ -2907,6 +2984,10 @@ def _run_onboard_walk(
                 api_key_env=answers.get("api_key_env", ""),
                 base_url=answers.get("base_url", ""),
                 proxy=answers.get("proxy", ""),
+                image_generation_intent=_onboard_image_generation_intent(
+                    provider_id,
+                    skip_image_generation=options.skip_image_generation,
+                ),
             )
             cfg_after_provider = res.config
             cfg_after_provider = _apply_router_section(
@@ -2958,9 +3039,18 @@ def _run_onboard_walk(
             ),
         )
 
-    if not options.skip_image_generation and questionary.confirm(
-        "Enable image generation now?", default=False
-    ).ask():
+    image_state = get_onboarding_status(
+        load_config(options.config_path)
+    ).image_generation_state
+    image_effective = image_state.get("effective")
+    image_generation_already_enabled = bool(
+        isinstance(image_effective, dict) and image_effective.get("enabled")
+    )
+    if (
+        not options.skip_image_generation
+        and not image_generation_already_enabled
+        and questionary.confirm("Enable image generation now?", default=False).ask()
+    ):
         persist = _fold_persist_result(
             persist,
             _run_optional_section(

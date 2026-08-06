@@ -48,15 +48,15 @@ def test_wheel_contains_migrations_and_webui_artifact(
         for n in names
     ), f"V024 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
     assert any(
-        n.endswith("opensquilla/_migrations/V025__meta_control_intents.py") for n in names
-    ), f"V025 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+        n.endswith("opensquilla/_migrations/V030__meta_control_intents.py") for n in names
+    ), f"V030 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
     assert any(
-        n.endswith("opensquilla/_migrations/V026__meta_launch_drafts.py") for n in names
-    ), f"V026 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+        n.endswith("opensquilla/_migrations/V031__meta_launch_drafts.py") for n in names
+    ), f"V031 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
     assert any(
-        n.endswith("opensquilla/_migrations/V027__meta_launch_discard_tombstones.py")
+        n.endswith("opensquilla/_migrations/V032__meta_launch_discard_tombstones.py")
         for n in names
-    ), f"V027 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
+    ), f"V032 missing from wheel; found: {[n for n in names if '_migrations' in n]}"
     assert "opensquilla/gateway/static/dist/index.html" in names
     assert f"opensquilla/gateway/static/dist/{MANIFEST_NAME}" in names
     assert packaged_probe == SYNTHETIC_JS
@@ -137,12 +137,12 @@ def test_installed_wheel_resolves_migrations(
                 "        f'V023 missing in {d}';"
                 " assert (d / 'V024__usage_native_billing_receipts.py').exists(),"
                 "        f'V024 missing in {d}';"
-                " assert (d / 'V025__meta_control_intents.py').exists(),"
-                "        f'V025 missing in {d}';"
-                " assert (d / 'V026__meta_launch_drafts.py').exists(),"
-                "        f'V026 missing in {d}';"
-                " assert (d / 'V027__meta_launch_discard_tombstones.py').exists(),"
-                "        f'V027 missing in {d}';"
+                " assert (d / 'V030__meta_control_intents.py').exists(),"
+                "        f'V030 missing in {d}';"
+                " assert (d / 'V031__meta_launch_drafts.py').exists(),"
+                "        f'V031 missing in {d}';"
+                " assert (d / 'V032__meta_launch_discard_tombstones.py').exists(),"
+                "        f'V032 missing in {d}';"
                 " print('OK', d)"
             ),
         ],
@@ -196,9 +196,9 @@ def test_docker_image_resolves_migrations() -> None:
                 " assert (d / 'V022__telemetry_daily_usage.py').exists();"
                 " assert (d / 'V023__router_deployment_telemetry.py').exists();"
                 " assert (d / 'V024__usage_native_billing_receipts.py').exists();"
-                " assert (d / 'V025__meta_control_intents.py').exists();"
-                " assert (d / 'V026__meta_launch_drafts.py').exists();"
-                " assert (d / 'V027__meta_launch_discard_tombstones.py').exists();"
+                " assert (d / 'V030__meta_control_intents.py').exists();"
+                " assert (d / 'V031__meta_launch_drafts.py').exists();"
+                " assert (d / 'V032__meta_launch_discard_tombstones.py').exists();"
                 " print('OK', d)"
             ),
         ],

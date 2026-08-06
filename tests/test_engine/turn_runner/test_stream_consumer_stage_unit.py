@@ -11,8 +11,12 @@ runtime wrapper.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -45,6 +49,7 @@ from opensquilla.engine.types import (
     WarningEvent,
 )
 from opensquilla.provider.types import EnsembleProgressEvent as ProviderEnsembleProgressEvent
+from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes
@@ -91,6 +96,7 @@ class _RecordingAgentRun:
 class _RecordingCompactionPersist:
     calls: list[dict[str, Any]] = field(default_factory=list)
     raises: type[BaseException] | None = None
+    result: bool | None = None
 
     async def persist_and_notify(
         self,
@@ -98,18 +104,45 @@ class _RecordingCompactionPersist:
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
-    ) -> None:
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int = 0,
+        source_entries: tuple[Any, ...] | None = None,
+        source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+    ) -> bool | None:
         self.calls.append(
             {
                 "session_key": session_key,
                 "summary": summary,
                 "kept_entries": kept_entries,
+                "summary_payload": summary_payload,
+                "summary_format": summary_format,
+                "coverage_status": coverage_status,
+                "missing_obligations": missing_obligations,
+                "critical_carry_forward": critical_carry_forward,
                 "compaction_id": compaction_id,
+                "compaction_deadline_at_monotonic": (
+                    compaction_deadline_at_monotonic
+                ),
+                "compaction_timeout_seconds": compaction_timeout_seconds,
+                "removed_count": removed_count,
+                "source_entries": source_entries,
+                "source_preimage": source_preimage,
+                "source_boundary_message_id": source_boundary_message_id,
+                "source_boundary_entry_id": source_boundary_entry_id,
             }
         )
         if self.raises is not None:
             raise self.raises("recording persist boom")
+        return self.result
 
 
 @dataclass
@@ -204,6 +237,11 @@ def _make_input(
     sync_manager: Any | None = None,
     input_provenance: dict[str, Any] | None = None,
     pending_input_provider: Any | None = None,
+    tool_context: Any | None = None,
+    compaction_source_entries: tuple[Any, ...] | None = None,
+    compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+    compaction_source_boundary_message_id: str | None = None,
+    compaction_source_boundary_entry_id: int | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
         agent=SimpleNamespace(),
@@ -225,6 +263,13 @@ def _make_input(
         session_manager_present=session_manager_present,
         state=state if state is not None else _make_state(),
         pending_input_provider=pending_input_provider,
+        tool_context=tool_context,
+        compaction_source_entries=compaction_source_entries,
+        compaction_source_preimage=compaction_source_preimage,
+        compaction_source_boundary_message_id=(
+            compaction_source_boundary_message_id
+        ),
+        compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
     )
 
 
@@ -945,6 +990,68 @@ def test_tool_result_handler_replaces_intermediate_approval_result() -> None:
     assert state.turn_segments[0]["input"]["approval_id"] == "approval-1"
 
 
+def test_tool_result_handler_preserves_initial_user_input_request() -> None:
+    state = _make_state()
+    handler = _ToolResultHandler()
+    request = {
+        "status": "input_required",
+        "kind": "user_input",
+        "paused": True,
+        "request_id": "request-1",
+        "run_id": "run-1",
+        "step": "plan",
+        "clarify_schema": {
+            "mode": "form",
+            "presentation": "plan_questionnaire_v1",
+            "fields": [{"name": "scope", "required": True}],
+        },
+    }
+
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="call-input",
+            tool_name="request_user_input",
+            result=json.dumps(request),
+        ),
+        state,
+    )
+    handler.handle(
+        ToolResultEvent(
+            tool_use_id="call-input",
+            tool_name="request_user_input",
+            result=json.dumps(
+                {
+                    "status": "answered",
+                    "kind": "user_input",
+                    "paused": False,
+                    "request_id": "request-1",
+                    "answers": {"scope": "focused"},
+                }
+            ),
+        ),
+        state,
+    )
+
+    assert state.turn_segments == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-input",
+            "name": "request_user_input",
+            "result": json.dumps(
+                {
+                    "status": "answered",
+                    "kind": "user_input",
+                    "paused": False,
+                    "request_id": "request-1",
+                    "answers": {"scope": "focused"},
+                }
+            ),
+            "is_error": False,
+            "user_input_request": request,
+        }
+    ]
+
+
 def test_artifact_handler_appends_payload() -> None:
     state = _make_state()
     handler = _ArtifactHandler()
@@ -1052,15 +1159,21 @@ def test_warning_handler_forwards_through_transformer() -> None:
     assert state.current_text_parts == ["keep"]
 
 
-def test_warning_handler_discards_superseded_workspace_recovery_text() -> None:
+@pytest.mark.parametrize(
+    "warning_code",
+    ["workspace_diff_recovery", "plan_run_reconciliation"],
+)
+def test_warning_handler_discards_superseded_recovery_text(
+    warning_code: str,
+) -> None:
     state = _make_state()
     state.final_text_parts = ["Earlier.", "Implemented the fix."]
     state.current_text_parts = ["Implemented the fix."]
 
     handler = _WarningHandler(lambda event: event)
-    out = handler.handle(WarningEvent(code="workspace_diff_recovery", message="m"), state)
+    out = handler.handle(WarningEvent(code=warning_code, message="m"), state)
 
-    assert out.code == "workspace_diff_recovery"
+    assert out.code == warning_code
     assert state.final_text_parts == ["Earlier."]
     assert state.current_text_parts == []
 
@@ -1200,17 +1313,58 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
         memory_snapshot=snapshot,
         system_prompt=prompt,
     )
-    inp = _make_input()
+    source_entries = (SimpleNamespace(message_id="source-boundary", id=7),)
+    source_preimage = ((7, "source-boundary"),)
+    inp = _make_input(
+        compaction_source_entries=source_entries,
+        compaction_source_preimage=source_preimage,
+        compaction_source_boundary_message_id="source-boundary",
+        compaction_source_boundary_entry_id=7,
+    )
     await handler.handle(
-        CompactionEvent(compaction_id="cmp_inline_1", summary="s", kept_entries=[1, 2]),
+        CompactionEvent(
+            compaction_id="cmp_inline_1",
+            summary="s",
+            kept_entries=[1, 2],
+            removed_count=4,
+        ),
         inp,
     )
     assert len(persist.calls) == 1
     assert persist.calls[0]["summary"] == "s"
     assert persist.calls[0]["kept_entries"] == [1, 2]
     assert persist.calls[0]["compaction_id"] == "cmp_inline_1"
+    assert persist.calls[0]["removed_count"] == 4
+    assert persist.calls[0]["source_entries"] is source_entries
+    assert persist.calls[0]["source_preimage"] is source_preimage
+    assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
+    assert persist.calls[0]["source_boundary_entry_id"] == 7
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_handler_does_not_refresh_after_stale_source() -> None:
+    persist = _RecordingCompactionPersist(result=False)
+    snapshot = _RecordingMemorySnapshotRefresh()
+    prompt = _RecordingSystemPromptRefresh()
+    handler = _CompactionHandler(
+        persist=persist,
+        memory_snapshot=snapshot,
+        system_prompt=prompt,
+    )
+
+    await handler.handle(
+        CompactionEvent(summary="stale", kept_entries=[], removed_count=1),
+        _make_input(
+            compaction_source_entries=(),
+            compaction_source_preimage=(),
+        ),
+    )
+
+    assert len(persist.calls) == 1
+    assert snapshot.calls == []
+    assert prompt.calls == []
 
 
 @pytest.mark.asyncio
@@ -1273,6 +1427,371 @@ async def test_outer_stage_yields_text_then_done_and_notifies_post_stream() -> N
     assert len(recs["memory_sync_notify"].calls) == 1
     assert recs["memory_sync_notify"].calls[0]["runtime_message"] == "hello there"
     assert recs["memory_sync_notify"].calls[0]["sync_manager_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_outer_stage_runs_only_publish_off_the_event_loop() -> None:
+    """The done handler's artifact publish re-reads and fully validates
+    deliverables (PPTX inflation plus deck parse), so the stage must run
+    THAT phase in a worker thread. The state-mutating pre/post-publish
+    phases stay on the event loop so the shared, by-reference stream
+    accumulators are never mutated concurrently with a cancellation."""
+    agent_run = _RecordingAgentRun(events=[DoneEvent(text="hi world")])
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input()
+
+    pre_threads: list[threading.Thread] = []
+    publish_threads: list[threading.Thread] = []
+    post_threads: list[threading.Thread] = []
+    real_pre = stage._done_handler.pre_publish
+    real_publish = stage._done_handler.run_publish
+    real_post = stage._done_handler.post_publish
+
+    def recording_pre(event: Any, inner_inp: Any, state: Any) -> Any:
+        pre_threads.append(threading.current_thread())
+        return real_pre(event, inner_inp, state)
+
+    def recording_publish(inner_inp: Any, accumulated_text: str) -> Any:
+        publish_threads.append(threading.current_thread())
+        return real_publish(inner_inp, accumulated_text)
+
+    def recording_post(pre: Any, result: Any, inner_inp: Any, state: Any) -> Any:
+        post_threads.append(threading.current_thread())
+        return real_post(pre, result, inner_inp, state)
+
+    stage._done_handler.pre_publish = recording_pre  # type: ignore[method-assign]
+    stage._done_handler.run_publish = recording_publish  # type: ignore[method-assign]
+    stage._done_handler.post_publish = recording_post  # type: ignore[method-assign]
+    loop_thread = threading.current_thread()
+    yielded = await _drain(stage, inp)
+
+    assert [type(e).__name__ for e in yielded] == ["DoneEvent"]
+    # Blocking publish ran off the loop thread.
+    assert publish_threads
+    assert all(thread is not loop_thread for thread in publish_threads)
+    # State mutations stayed on the loop thread.
+    assert pre_threads == [loop_thread]
+    assert post_threads == [loop_thread]
+
+
+@pytest.mark.asyncio
+async def test_done_publish_cancellation_does_not_race_finalizer() -> None:
+    """Cancelling a turn while the artifact publish is in flight must not
+    tear the shared stream accumulators or leave a half-applied result.
+
+    The publish runs in a worker thread that cannot be interrupted, so the
+    stage must (a) keep every ``_StreamState`` mutation on the event loop --
+    the pre-publish mutations are applied deterministically before the
+    publish starts and the post-publish result is applied only after it
+    completes -- and (b) wait for the worker to drain before the
+    CancelledError unwinds, so a steered follow-up turn's finalizer never
+    reads the accumulators while the worker is still writing to disk.
+    """
+    from opensquilla.engine.artifact_delivery import OmittedArtifactPublishResult
+
+    publish_started = threading.Event()
+    release_publish = threading.Event()
+    publish_finished = threading.Event()
+
+    def blocking_publish(inner_inp: Any, accumulated_text: str) -> Any:
+        # Runs in a worker thread. Announce entry, then block until the test
+        # releases us, mimicking a slow ArtifactStore write.
+        publish_started.set()
+        assert release_publish.wait(timeout=5.0), "publish was never released"
+        publish_finished.set()
+        # A post-publish result that WOULD mutate shared state if applied.
+        return OmittedArtifactPublishResult(
+            failure_summaries=["would-be delivery failure"],
+        )
+
+    agent_run = _RecordingAgentRun(events=[DoneEvent(text="hi world")])
+    stage, _ = _make_stage(agent_run=agent_run)
+    stage._done_handler.run_publish = blocking_publish  # type: ignore[method-assign]
+    state = _make_state()
+    inp = _make_input(state=state)
+
+    task = asyncio.ensure_future(_drain(stage, inp))
+
+    # Handshake: wait until the worker thread has entered the publish.
+    assert await asyncio.to_thread(publish_started.wait, 5.0)
+
+    # Pre-publish ran on the loop and is fully applied before the publish;
+    # post-publish has not run, so its result is not yet in shared state.
+    assert state.done_event is not None
+    assert state.turn_artifacts == []
+    assert state.artifact_delivery_failures == []
+
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # The cancel is pending on the shielded wait for the worker: the stage
+    # has NOT unwound yet because the worker is still blocked. (Under the
+    # whole-handler offload this task would already be done.)
+    assert not task.done()
+    assert not publish_finished.is_set()
+
+    # Release the worker; the stage drains it, then re-raises CancelledError.
+    release_publish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The worker completed before the turn unwound -- a finalizer running
+    # after this point cannot race an in-flight store write.
+    assert publish_finished.is_set()
+    # The drained result's side effects ARE recorded (its failure summary
+    # reaches the shared state the finalizer persists from), while the
+    # notice/warning phases of post_publish stay skipped. It published no
+    # artifacts, so turn_artifacts stays empty.
+    assert state.turn_artifacts == []
+    assert state.artifact_delivery_failures == ["would-be delivery failure"]
+
+
+def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
+    """Real publish fixtures: a workspace file the model created and named
+    in its final text, plus an ArtifactStore media root under tmp_path."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    report = workspace / "report.csv"
+    report.write_text("col_a,col_b\n1,2\n", encoding="utf-8")
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(media_root),
+        artifact_session_id="sess-artifact-1",
+        session_key="agent:main:s1",
+        workspace_file_writes=[
+            {
+                "path": str(report),
+                "relative_path": "report.csv",
+                "name": "report.csv",
+                "suffix": ".csv",
+                "operation": "write",
+                "created": True,
+            }
+        ],
+    )
+    return ctx, media_root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "run_status",
+        "current_step_id",
+        "step_status",
+        "active_task_id",
+        "expected_artifact_count",
+    ),
+    [
+        pytest.param(
+            "running",
+            "step-1",
+            "in_progress",
+            "task-artifact",
+            0,
+            id="running-current-step",
+        ),
+        pytest.param(
+            "running",
+            None,
+            "completed",
+            "task-artifact",
+            1,
+            id="running-delivery-ready-owner",
+        ),
+        pytest.param(
+            "running",
+            None,
+            "completed",
+            "other-task",
+            0,
+            id="running-delivery-ready-other-owner",
+        ),
+        pytest.param(
+            "completed",
+            None,
+            "completed",
+            None,
+            1,
+            id="completed",
+        ),
+    ],
+)
+async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
+    tmp_path: Path,
+    run_status: str,
+    current_step_id: str | None,
+    step_status: str,
+    active_task_id: str | None,
+    expected_artifact_count: int,
+) -> None:
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            self.calls.append(run_id)
+            return SimpleNamespace(
+                status=run_status,
+                current_step_id=current_step_id,
+                active_task_id=active_task_id,
+                step_states=[
+                    {
+                        "step_id": "step-1",
+                        "title": "Create report",
+                        "status": step_status,
+                    }
+                ],
+            )
+
+    ctx, _media_root = _make_publish_tool_context(tmp_path)
+    storage = PlanStorage()
+    ctx.task_id = "task-artifact"
+    ctx.plan_run_id = "run-artifact"
+    ctx.plan_storage = storage
+    state = _make_state()
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="Wrote report.csv"),
+                DoneEvent(text="Wrote report.csv"),
+            ]
+        )
+    )
+
+    await _drain(stage, _make_input(state=state, tool_context=ctx))
+
+    assert storage.calls == ["run-artifact"]
+    assert len(ctx.published_artifacts) == expected_artifact_count
+    assert state.turn_artifacts == ctx.published_artifacts
+
+
+def _gate_real_publish(
+    stage: StreamConsumerStage,
+) -> tuple[threading.Event, threading.Event, threading.Event, list[threading.Thread]]:
+    """Wrap the bound ``run_publish`` with an Event handshake: signal entry,
+    block until released, then run the REAL publish (real ArtifactStore
+    writes) and signal completion."""
+    publish_started = threading.Event()
+    release_publish = threading.Event()
+    publish_finished = threading.Event()
+    worker_threads: list[threading.Thread] = []
+    real_publish = stage._done_handler.run_publish
+
+    def gated_publish(inner_inp: Any, accumulated_text: str) -> Any:
+        worker_threads.append(threading.current_thread())
+        publish_started.set()
+        assert release_publish.wait(timeout=5.0), "publish was never released"
+        result = real_publish(inner_inp, accumulated_text)
+        publish_finished.set()
+        return result
+
+    stage._done_handler.run_publish = gated_publish  # type: ignore[method-assign]
+    return publish_started, release_publish, publish_finished, worker_threads
+
+
+@pytest.mark.asyncio
+async def test_single_cancel_records_completed_publish(tmp_path: Path) -> None:
+    """A publish that COMPLETES during a cancelled turn must be recorded.
+
+    The worker's store write and ``ctx.published_artifacts`` append cannot be
+    undone, so the cancel path must still record the result into
+    ``state.turn_artifacts`` (the by-reference accumulator the cancel
+    finalizer persists the transcript from). Invariant: a completed publish
+    is never orphaned -- otherwise the file exists on disk, counts against
+    the disk budget, and is never surfaced to the user.
+    """
+    ctx, media_root = _make_publish_tool_context(tmp_path)
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="Wrote report.csv"),
+            DoneEvent(text="Wrote report.csv"),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    publish_started, release_publish, publish_finished, _ = _gate_real_publish(stage)
+    state = _make_state()
+    inp = _make_input(state=state, tool_context=ctx)
+
+    task = asyncio.ensure_future(_drain(stage, inp))
+    assert await asyncio.to_thread(publish_started.wait, 5.0)
+
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    # The stage is draining the shielded worker; it has not unwound yet.
+    assert not task.done()
+
+    release_publish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert publish_finished.is_set()
+    # The real publish took effect: bytes exist under the media root and the
+    # tool context saw the published payload.
+    assert [p for p in media_root.rglob("*") if p.is_file()]
+    assert len(ctx.published_artifacts) == 1
+    assert ctx.published_artifacts[0]["name"] == "report.csv"
+    # ...so the shared turn state must carry the same payload: the cancel
+    # finalizer's transcript persists from state.turn_artifacts.
+    assert state.turn_artifacts == ctx.published_artifacts
+
+
+@pytest.mark.asyncio
+async def test_double_cancel_waits_for_worker_before_unwind(tmp_path: Path) -> None:
+    """A SECOND cancel arriving during the drain must not unwind the turn
+    while the worker thread is still writing to the ArtifactStore -- that
+    would let a finalizer run concurrently with the in-flight store write."""
+    ctx, media_root = _make_publish_tool_context(tmp_path)
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="Wrote report.csv"),
+            DoneEvent(text="Wrote report.csv"),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    publish_started, release_publish, publish_finished, worker_threads = (
+        _gate_real_publish(stage)
+    )
+    state = _make_state()
+    inp = _make_input(state=state, tool_context=ctx)
+
+    task = asyncio.ensure_future(_drain(stage, inp))
+    assert await asyncio.to_thread(publish_started.wait, 5.0)
+
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not task.done()
+
+    # Second cancel while the drain wait is pending.
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    # The coroutine absorbs the repeated cancel: it must NOT finish while
+    # the worker is still blocked mid-publish.
+    assert not task.done()
+    assert not publish_finished.is_set()
+
+    release_publish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # By the time the cancellation unwound, the worker had already finished
+    # its store write.
+    assert publish_finished.is_set()
+
+    # Nothing mutates after the task completed: every store write and
+    # ctx.published_artifacts append happened strictly before the unwind.
+    published_snapshot = list(ctx.published_artifacts)
+    files_snapshot = sorted(str(p) for p in media_root.rglob("*") if p.is_file())
+    for thread in worker_threads:
+        await asyncio.to_thread(thread.join, 5.0)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert list(ctx.published_artifacts) == published_snapshot
+    assert sorted(str(p) for p in media_root.rglob("*") if p.is_file()) == files_snapshot
 
 
 @pytest.mark.asyncio
