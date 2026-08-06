@@ -11,6 +11,7 @@ from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandid
 from opensquilla.gateway.prompt_cache_keepalive import PromptCacheKeepaliveService
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.provider import ChatConfig, DoneEvent, Message
 
@@ -54,6 +55,36 @@ def _candidate(provider: _Provider) -> PromptCacheKeepaliveCandidate:
         tools=(),
         config=ChatConfig(max_tokens=99, timeout=120),
     )
+
+
+def test_prompt_cache_keepalive_methods_keep_operator_scopes() -> None:
+    assert METHOD_SCOPES["sessions.promptCacheKeepalive.status"] == READ_SCOPE
+    assert METHOD_SCOPES["sessions.promptCacheKeepalive.set"] == WRITE_SCOPE
+
+
+@pytest.mark.asyncio
+async def test_default_off_ignores_candidates_and_schedules_no_provider_work() -> None:
+    runtime = _IdleRuntime()
+    provider = _Provider(cached_tokens=9)
+    service = PromptCacheKeepaliveService(
+        task_runtime=runtime,
+        session_manager=None,
+        usage_event_sink=None,
+    )
+    key = "agent:main:webchat:test"
+
+    service.record_candidate(_candidate(provider))
+    await asyncio.sleep(0)
+
+    status = service.status(key)
+    assert status["enabled"] is False
+    assert status["state"] == "off"
+    assert status["hasSnapshot"] is False
+    assert status["nextProbeAt"] is None
+    assert service._leases == {}
+    assert provider.calls == []
+    assert runtime.cancelled == []
+    await service.close()
 
 
 @pytest.mark.asyncio

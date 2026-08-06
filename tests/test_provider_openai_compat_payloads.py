@@ -219,6 +219,36 @@ def test_openrouter_receives_only_opaque_session_affinity_header(
     assert "agent:" not in captured["headers"]["X-Session-Id"]
 
 
+def test_openrouter_normal_request_omits_keepalive_affinity_header(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="synthetic-key",
+        model="synthetic/model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="opaque-session-id",
+        turn_id="turn-id",
+        execution_id="execution-id",
+        call_kind="agent.chat",
+    )
+
+    async def run() -> None:
+        async for _ in provider.chat(
+            [Message(role="user", content="hello")],
+            config=ChatConfig(provider_request_correlation=correlation),
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert "X-Session-Id" not in captured["headers"]
+
+
 def _payload_tool_descriptions(payload: dict[str, Any]) -> str:
     return "\n".join(
         str(tool["function"].get("description", ""))

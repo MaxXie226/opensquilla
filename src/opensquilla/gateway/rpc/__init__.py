@@ -52,6 +52,7 @@ __all__ = [
 # METHOD_NOT_FOUND.
 import opensquilla.gateway.rpc_agents  # noqa: E402, F401
 import opensquilla.gateway.rpc_approvals  # noqa: E402, F401
+import opensquilla.gateway.rpc_artifacts  # noqa: E402, F401
 import opensquilla.gateway.rpc_channels  # noqa: E402, F401
 import opensquilla.gateway.rpc_chat  # noqa: E402, F401
 import opensquilla.gateway.rpc_commands  # noqa: E402, F401
