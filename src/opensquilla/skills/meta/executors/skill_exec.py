@@ -103,6 +103,11 @@ _BASE_ENV_KEYS = frozenset(
         "lang",
         "language",
         "tz",
+        # Explicit Python child encoding choices are operator/runtime intent.
+        # Preserve them so the Windows UTF-8 compatibility default remains a
+        # default instead of silently overriding a declared legacy code page.
+        "pythonioencoding",
+        "pythonutf8",
         # Common TLS trust-store overrides. These are paths, not provider
         # credentials, and are needed in managed/corporate installations.
         "ssl_cert_file",
