@@ -25,6 +25,9 @@ log = structlog.get_logger(__name__)
 DEFAULT_TTL_SECONDS = 300
 MIN_TTL_SECONDS = 300
 MAX_TTL_SECONDS = 86_400
+DEFAULT_IDLE_TIMEOUT_SECONDS = 3_600
+MIN_IDLE_TIMEOUT_SECONDS = 300
+MAX_IDLE_TIMEOUT_SECONDS = 86_400
 _PROBE_RATIO = 0.8
 _MAX_SNAPSHOT_CHARS = 2_000_000
 _PROBE_MESSAGE = "OpenSquilla prompt cache keepalive probe."
@@ -33,6 +36,7 @@ _PROBE_MESSAGE = "OpenSquilla prompt cache keepalive probe."
 @dataclass(slots=True)
 class _Lease:
     ttl_seconds: int
+    idle_timeout_seconds: int
     generation: int = 0
     enabled: bool = True
     state: str = "waiting"
@@ -42,6 +46,8 @@ class _Lease:
     next_probe_at_ms: int | None = None
     last_probe_at_ms: int | None = None
     last_cache_hit_tokens: int = 0
+    idle_deadline_monotonic: float | None = None
+    idle_expires_at_ms: int | None = None
 
 
 class PromptCacheKeepaliveService:
@@ -70,6 +76,7 @@ class PromptCacheKeepaliveService:
         *,
         enabled: bool,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         key = canonicalize_session_key(session_key)
         previous = self._leases.get(key)
@@ -81,7 +88,10 @@ class PromptCacheKeepaliveService:
             self._leases.pop(key, None)
             return self.status(key)
 
-        self._leases[key] = _Lease(ttl_seconds=ttl_seconds)
+        self._leases[key] = _Lease(
+            ttl_seconds=ttl_seconds,
+            idle_timeout_seconds=idle_timeout_seconds,
+        )
         return self.status(key)
 
     def is_enabled(self, session_key: str) -> bool:
@@ -105,10 +115,16 @@ class PromptCacheKeepaliveService:
             lease.state = "waiting"
             lease.reason = reason
             lease.next_probe_at_ms = None
+            lease.idle_deadline_monotonic = None
+            lease.idle_expires_at_ms = None
             return
         lease.candidate = safe_candidate
         lease.state = "scheduled"
         lease.reason = None
+        lease.idle_deadline_monotonic = time.monotonic() + lease.idle_timeout_seconds
+        lease.idle_expires_at_ms = int(
+            (time.time() + lease.idle_timeout_seconds) * 1000
+        )
         self._schedule(key, lease, delay=lease.ttl_seconds * _PROBE_RATIO)
 
     def refresh_required(self, session_key: str, reason: str = "session_history_changed") -> None:
@@ -123,6 +139,8 @@ class PromptCacheKeepaliveService:
         lease.candidate = None
         lease.state = "waiting"
         lease.reason = reason
+        lease.idle_deadline_monotonic = None
+        lease.idle_expires_at_ms = None
 
     def status(self, session_key: str) -> dict[str, Any]:
         key = canonicalize_session_key(session_key)
@@ -132,6 +150,8 @@ class PromptCacheKeepaliveService:
                 "enabled": False,
                 "ttlSeconds": DEFAULT_TTL_SECONDS,
                 "intervalSeconds": int(DEFAULT_TTL_SECONDS * _PROBE_RATIO),
+                "idleTimeoutSeconds": DEFAULT_IDLE_TIMEOUT_SECONDS,
+                "idleExpiresAt": None,
                 "state": "off",
                 "reason": None,
                 "hasSnapshot": False,
@@ -146,6 +166,8 @@ class PromptCacheKeepaliveService:
             "enabled": lease.enabled,
             "ttlSeconds": lease.ttl_seconds,
             "intervalSeconds": int(lease.ttl_seconds * _PROBE_RATIO),
+            "idleTimeoutSeconds": lease.idle_timeout_seconds,
+            "idleExpiresAt": lease.idle_expires_at_ms,
             "state": lease.state,
             "reason": lease.reason,
             "hasSnapshot": candidate is not None,
@@ -238,13 +260,27 @@ class PromptCacheKeepaliveService:
             return
         generation = lease.generation
         delay = max(0.0, float(delay))
-        lease.next_probe_at_ms = int((time.time() + delay) * 1000)
+        wake_for_idle_expiry = False
+        if lease.idle_deadline_monotonic is not None:
+            remaining = max(0.0, lease.idle_deadline_monotonic - time.monotonic())
+            if delay >= remaining:
+                delay = remaining
+                wake_for_idle_expiry = True
+        lease.next_probe_at_ms = (
+            None if wake_for_idle_expiry else int((time.time() + delay) * 1000)
+        )
         lease.timer_task = asyncio.create_task(
-            self._run_after(key, generation, delay),
+            self._run_after(key, generation, delay, wake_for_idle_expiry),
             name=f"prompt-cache-keepalive-{key}",
         )
 
-    async def _run_after(self, key: str, generation: int, delay: float) -> None:
+    async def _run_after(
+        self,
+        key: str,
+        generation: int,
+        delay: float,
+        wake_for_idle_expiry: bool = False,
+    ) -> None:
         try:
             await asyncio.sleep(delay)
             lease = self._leases.get(key)
@@ -254,6 +290,12 @@ class PromptCacheKeepaliveService:
                 or lease.generation != generation
                 or lease.candidate is None
             ):
+                return
+            if wake_for_idle_expiry or (
+                lease.idle_deadline_monotonic is not None
+                and time.monotonic() >= lease.idle_deadline_monotonic
+            ):
+                self._pause_for_idle_timeout(key, generation)
                 return
             lease.state = "probing"
             lease.next_probe_at_ms = None
@@ -374,11 +416,28 @@ class PromptCacheKeepaliveService:
         lease.reason = reason
         lease.next_probe_at_ms = None
         lease.timer_task = None
+        lease.candidate = None
+        lease.idle_deadline_monotonic = None
+        lease.idle_expires_at_ms = None
+
+    def _pause_for_idle_timeout(self, key: str, generation: int) -> None:
+        lease = self._leases.get(key)
+        if lease is None or lease.generation != generation or not lease.enabled:
+            return
+        lease.state = "paused"
+        lease.reason = "idle_timeout"
+        lease.next_probe_at_ms = None
+        lease.timer_task = None
+        lease.candidate = None
+        lease.idle_deadline_monotonic = None
 
 
 __all__ = [
+    "DEFAULT_IDLE_TIMEOUT_SECONDS",
     "DEFAULT_TTL_SECONDS",
+    "MAX_IDLE_TIMEOUT_SECONDS",
     "MAX_TTL_SECONDS",
+    "MIN_IDLE_TIMEOUT_SECONDS",
     "MIN_TTL_SECONDS",
     "PromptCacheKeepaliveService",
 ]

@@ -5,8 +5,11 @@ from __future__ import annotations
 from typing import Any, cast
 
 from opensquilla.gateway.prompt_cache_keepalive import (
+    DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_TTL_SECONDS,
+    MAX_IDLE_TIMEOUT_SECONDS,
     MAX_TTL_SECONDS,
+    MIN_IDLE_TIMEOUT_SECONDS,
     MIN_TTL_SECONDS,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
@@ -58,12 +61,28 @@ async def _set(params: Any, ctx: RpcContext) -> dict[str, Any]:
             f"params.ttlSeconds must be between {MIN_TTL_SECONDS} and "
             f"{MAX_TTL_SECONDS}"
         )
+    minimum_useful_idle_timeout = int(ttl * 0.8) + 1
+    idle_timeout = params.get("idleTimeoutSeconds")
+    if idle_timeout is None:
+        idle_timeout = max(DEFAULT_IDLE_TIMEOUT_SECONDS, minimum_useful_idle_timeout)
+    if type(idle_timeout) is not int:
+        raise ValueError("params.idleTimeoutSeconds must be an integer")
+    if enabled and not MIN_IDLE_TIMEOUT_SECONDS <= idle_timeout <= MAX_IDLE_TIMEOUT_SECONDS:
+        raise ValueError(
+            "params.idleTimeoutSeconds must be between "
+            f"{MIN_IDLE_TIMEOUT_SECONDS} and {MAX_IDLE_TIMEOUT_SECONDS}"
+        )
+    if enabled and idle_timeout < minimum_useful_idle_timeout:
+        raise ValueError(
+            "params.idleTimeoutSeconds must be longer than the probe interval"
+        )
     return cast(
         dict[str, Any],
         await _service(ctx).set_enabled(
             key,
             enabled=enabled,
             ttl_seconds=ttl,
+            idle_timeout_seconds=idle_timeout,
         ),
     )
 

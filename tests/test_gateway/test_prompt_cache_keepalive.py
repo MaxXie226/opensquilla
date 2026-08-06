@@ -66,7 +66,12 @@ async def test_probe_is_ephemeral_bounded_and_reschedules_only_on_cache_hit() ->
         usage_event_sink=None,
     )
     key = "agent:main:webchat:test"
-    await service.set_enabled(key, enabled=True, ttl_seconds=300)
+    await service.set_enabled(
+        key,
+        enabled=True,
+        ttl_seconds=300,
+        idle_timeout_seconds=3_600,
+    )
     service.record_candidate(_candidate(provider))
     lease = service._leases[key]
     service._cancel_timer(lease)
@@ -75,6 +80,8 @@ async def test_probe_is_ephemeral_bounded_and_reschedules_only_on_cache_hit() ->
 
     assert service.status(key)["state"] == "scheduled"
     assert service.status(key)["lastCacheHitTokens"] == 9
+    assert service.status(key)["idleTimeoutSeconds"] == 3_600
+    assert service.status(key)["idleExpiresAt"] is not None
     assert len(provider.calls) == 1
     messages, tools, config = provider.calls[0]
     assert [message.content for message in messages[:1]] == ["stable history"]
@@ -127,6 +134,46 @@ async def test_history_change_preserves_opt_in_but_discards_snapshot() -> None:
     assert status["state"] == "waiting"
     assert status["hasSnapshot"] is False
     assert status["ttlSeconds"] == 600
+    assert status["idleExpiresAt"] is None
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_pauses_without_disabling_and_next_turn_rearms() -> None:
+    provider = _Provider(cached_tokens=7)
+    service = PromptCacheKeepaliveService(
+        task_runtime=_IdleRuntime(),
+        session_manager=None,
+        usage_event_sink=None,
+    )
+    key = "agent:main:webchat:test"
+    await service.set_enabled(
+        key,
+        enabled=True,
+        ttl_seconds=300,
+        idle_timeout_seconds=300,
+    )
+    service.record_candidate(_candidate(provider))
+    lease = service._leases[key]
+    service._cancel_timer(lease)
+
+    await service._run_after(key, lease.generation, 0, True)
+
+    status = service.status(key)
+    assert status["enabled"] is True
+    assert status["state"] == "paused"
+    assert status["reason"] == "idle_timeout"
+    assert status["hasSnapshot"] is False
+    assert status["nextProbeAt"] is None
+    assert provider.calls == []
+
+    service.record_candidate(_candidate(provider))
+
+    rearmed = service.status(key)
+    assert rearmed["enabled"] is True
+    assert rearmed["state"] == "scheduled"
+    assert rearmed["hasSnapshot"] is True
+    assert rearmed["idleExpiresAt"] is not None
     await service.close()
 
 
@@ -160,7 +207,7 @@ class _Storage:
 
 class _RpcService:
     def __init__(self) -> None:
-        self.saved: tuple[str, bool, int] | None = None
+        self.saved: tuple[str, bool, int, int] | None = None
 
     def status(self, _key: str) -> dict[str, Any]:
         return {"enabled": False, "ttlSeconds": 300}
@@ -171,9 +218,14 @@ class _RpcService:
         *,
         enabled: bool,
         ttl_seconds: int,
+        idle_timeout_seconds: int,
     ) -> dict[str, Any]:
-        self.saved = (key, enabled, ttl_seconds)
-        return {"enabled": enabled, "ttlSeconds": ttl_seconds}
+        self.saved = (key, enabled, ttl_seconds, idle_timeout_seconds)
+        return {
+            "enabled": enabled,
+            "ttlSeconds": ttl_seconds,
+            "idleTimeoutSeconds": idle_timeout_seconds,
+        }
 
 
 @pytest.mark.asyncio
@@ -198,11 +250,50 @@ async def test_rpc_requires_explicit_boolean_and_bounded_ttl() -> None:
     valid = await dispatcher.dispatch(
         "2",
         "sessions.promptCacheKeepalive.set",
-        {"key": "agent:main:webchat:test", "enabled": True, "ttlSeconds": 600},
+        {
+            "key": "agent:main:webchat:test",
+            "enabled": True,
+            "ttlSeconds": 600,
+            "idleTimeoutSeconds": 3_600,
+        },
         ctx,
     )
     assert valid.ok is True
-    assert service.saved == ("agent:main:webchat:test", True, 600)
+    assert service.saved == ("agent:main:webchat:test", True, 600, 3_600)
+
+    too_short = await dispatcher.dispatch(
+        "3",
+        "sessions.promptCacheKeepalive.set",
+        {
+            "key": "agent:main:webchat:test",
+            "enabled": True,
+            "ttlSeconds": 3_600,
+            "idleTimeoutSeconds": 2_880,
+        },
+        ctx,
+    )
+    assert too_short.ok is False
+    assert too_short.error is not None and too_short.error.code == "INVALID_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_rpc_defaults_idle_timeout_for_existing_clients() -> None:
+    service = _RpcService()
+    ctx = RpcContext(
+        conn_id="test",
+        session_manager=SimpleNamespace(storage=_Storage()),
+        prompt_cache_keepalive_service=service,
+    )
+
+    result = await get_dispatcher().dispatch(
+        "1",
+        "sessions.promptCacheKeepalive.set",
+        {"key": "agent:main:webchat:test", "enabled": True, "ttlSeconds": 600},
+        ctx,
+    )
+
+    assert result.ok is True
+    assert service.saved == ("agent:main:webchat:test", True, 600, 3_600)
 
 
 def test_real_enqueue_preempts_auxiliary_before_reservation(
