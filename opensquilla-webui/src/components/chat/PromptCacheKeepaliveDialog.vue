@@ -27,11 +27,15 @@
             <p v-if="loading" class="keepalive-dialog__muted">{{ t('chat.loadingSession') }}</p>
             <template v-else>
               <label class="keepalive-dialog__toggle">
-                <input v-model="draftEnabled" type="checkbox" />
                 <span>
                   <strong>{{ t('chat.promptCacheKeepalive.enable') }}</strong>
                   <small>{{ t('chat.promptCacheKeepalive.enableHint') }}</small>
                 </span>
+                <ControlSwitch
+                  v-model:checked="draftEnabled"
+                  name="prompt_cache_keepalive_enabled"
+                  :aria-label="t('chat.promptCacheKeepalive.enable')"
+                />
               </label>
 
               <div class="keepalive-dialog__timing" :class="{ 'is-disabled': !draftEnabled }">
@@ -167,34 +171,30 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import ControlSwitch from '@/components/ControlSwitch.vue'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
+import { useToasts } from '@/composables/useToasts'
 import { useRpcStore } from '@/stores/rpc'
-
-interface KeepaliveStatus {
-  enabled: boolean
-  ttlSeconds: number
-  intervalSeconds: number
-  idleTimeoutSeconds?: number
-  idleExpiresAt?: number | null
-  state: string
-  reason?: string | null
-  hasSnapshot: boolean
-  lastCacheHitTokens: number
-  provider?: string | null
-  model?: string | null
-}
+import type {
+  PromptCacheKeepaliveStatus,
+  PromptCacheKeepaliveStatusUpdate,
+} from '@/types/promptCacheKeepalive'
 
 const props = defineProps<{ open: boolean; sessionKey: string }>()
-const emit = defineEmits<{ close: [] }>()
+const emit = defineEmits<{
+  close: []
+  saved: [update: PromptCacheKeepaliveStatusUpdate]
+}>()
 const { t } = useI18n()
+const { pushToast } = useToasts()
 const rpc = useRpcStore()
 const dialogRef = ref<HTMLElement | null>(null)
 const closeButtonRef = ref<HTMLElement | null>(null)
 const loading = ref(false)
 const saving = ref(false)
 const error = ref('')
-const status = ref<KeepaliveStatus | null>(null)
+const status = ref<PromptCacheKeepaliveStatus | null>(null)
 const draftEnabled = ref(false)
 const draftTtlMinutes = ref(5)
 const draftIdleTimeoutMinutes = ref(60)
@@ -239,7 +239,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const next = await rpc.call<KeepaliveStatus>(
+    const next = await rpc.call<PromptCacheKeepaliveStatus>(
       'sessions.promptCacheKeepalive.status',
       { key: props.sessionKey },
     )
@@ -264,6 +264,7 @@ async function save() {
   if (!validConfig.value) return
   saving.value = true
   error.value = ''
+  const savedSessionKey = props.sessionKey
   try {
     const ttlSeconds = Number.isInteger(draftTtlMinutes.value)
       ? Math.round(draftTtlMinutes.value * 60)
@@ -271,15 +272,20 @@ async function save() {
     const idleTimeoutSeconds = Number.isInteger(draftIdleTimeoutMinutes.value)
       ? Math.round(draftIdleTimeoutMinutes.value * 60)
       : (status.value?.idleTimeoutSeconds || 3_600)
-    status.value = await rpc.call<KeepaliveStatus>(
+    const next = await rpc.call<PromptCacheKeepaliveStatus>(
       'sessions.promptCacheKeepalive.set',
       {
-        key: props.sessionKey,
+        key: savedSessionKey,
         enabled: draftEnabled.value,
         ttlSeconds,
         idleTimeoutSeconds,
       },
     )
+    status.value = next
+    emit('saved', { sessionKey: savedSessionKey, status: next })
+    pushToast(t(next.enabled
+      ? 'chat.promptCacheKeepalive.enabledToast'
+      : 'chat.promptCacheKeepalive.disabledToast'), { tone: 'ok' })
     emit('close')
   } catch (cause) {
     const detail = cause instanceof Error ? cause.message : String(cause)
@@ -335,8 +341,14 @@ useDialogA11y(dialogRef, computed(() => props.open), close, {
 .keepalive-dialog__header h2 { font-size: var(--fs-lg); margin: 0; }
 .keepalive-dialog__close { background: none; border: 0; color: var(--text-muted); cursor: pointer; padding: var(--sp-1); }
 .keepalive-dialog__body { display: grid; gap: var(--sp-3); padding: var(--sp-5); }
-.keepalive-dialog__toggle { align-items: flex-start; display: flex; gap: var(--sp-3); }
-.keepalive-dialog__toggle input { margin-top: 3px; }
+.keepalive-dialog__toggle {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: var(--sp-3);
+  justify-content: space-between;
+}
+.keepalive-dialog__toggle > span { min-width: 0; }
 .keepalive-dialog__toggle span,
 .keepalive-dialog__toggle small { display: block; }
 .keepalive-dialog__toggle small,

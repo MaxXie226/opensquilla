@@ -515,6 +515,7 @@
       :replan-active="replanActive"
       :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
       :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
+      :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -536,6 +537,7 @@
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
       @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
+      @refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"
     />
     <SandboxSetupDialog
       :open="composerSandboxSetupOpen"
@@ -591,6 +593,7 @@
       :open="promptCacheKeepaliveOpen"
       :session-key="sessionKey"
       @close="promptCacheKeepaliveOpen = false"
+      @saved="onPromptCacheKeepaliveSaved"
     />
 
     <!-- Persistent completion announcer: the live block's role="status" phase
@@ -743,6 +746,10 @@ import {
   type SandboxRunMode,
 } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type {
+  PromptCacheKeepaliveStatus,
+  PromptCacheKeepaliveStatusUpdate,
+} from '@/types/promptCacheKeepalive'
 import type {
   CollaborationMode,
   PlanCardAction,
@@ -899,6 +906,7 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 
 const sessionKey = ref('')
 const promptCacheKeepaliveOpen = ref(false)
+const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
   rpc.supportsMethod('sessions.promptCacheKeepalive.status')
   && rpc.supportsMethod('sessions.promptCacheKeepalive.set')
@@ -1039,6 +1047,34 @@ const pendingSessionIntent = ref<string | null>(null)
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
 const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
+
+async function refreshPromptCacheKeepaliveStatus() {
+  const key = sessionKey.value
+  if (
+    !key
+    || !promptCacheKeepaliveAvailable.value
+    || !promptCacheKeepaliveSessionReady.value
+  ) return
+  try {
+    const next = await rpc.call<PromptCacheKeepaliveStatus>(
+      'sessions.promptCacheKeepalive.status',
+      { key },
+    )
+    if (sessionKey.value === key) promptCacheKeepaliveStatus.value = next
+  } catch {
+    // The settings dialog owns actionable RPC errors. Menu refresh is best effort.
+  }
+}
+
+function onPromptCacheKeepaliveSaved(update: PromptCacheKeepaliveStatusUpdate) {
+  if (update.sessionKey === sessionKey.value) {
+    promptCacheKeepaliveStatus.value = update.status
+  }
+}
+
+watch(sessionKey, () => {
+  promptCacheKeepaliveStatus.value = null
+})
 
 function activeSnapshot(workspace: ProjectWorkspaceItem): ActiveProjectWorkspaceSnapshot {
   return {

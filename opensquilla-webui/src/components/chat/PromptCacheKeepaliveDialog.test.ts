@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 
 import i18n from '@/i18n'
+import { useToasts } from '@/composables/useToasts'
 import { useRpcStore } from '@/stores/rpc'
 import PromptCacheKeepaliveDialog from './PromptCacheKeepaliveDialog.vue'
 
@@ -16,6 +17,8 @@ async function settle() {
 beforeEach(() => {
   document.body.innerHTML = ''
   i18n.global.locale.value = 'en'
+  const { toasts, dismissToast } = useToasts()
+  for (const toast of [...toasts.value]) dismissToast(toast.id)
   vi.restoreAllMocks()
 })
 
@@ -24,7 +27,7 @@ describe('PromptCacheKeepaliveDialog', () => {
     const pinia = createPinia()
     setActivePinia(pinia)
     const rpc = useRpcStore(pinia)
-    const call = vi.spyOn(rpc, 'call').mockResolvedValue({
+    const scheduledStatus = {
       enabled: true,
       ttlSeconds: 300,
       intervalSeconds: 240,
@@ -36,13 +39,28 @@ describe('PromptCacheKeepaliveDialog', () => {
       lastCacheHitTokens: 42,
       provider: 'synthetic',
       model: 'synthetic-model',
-    })
+    } as const
+    const waitingStatus = {
+      ...scheduledStatus,
+      idleExpiresAt: null,
+      state: 'waiting',
+      reason: 'waiting_for_stable_prefix',
+      hasSnapshot: false,
+      lastCacheHitTokens: 0,
+    } as const
+    const call = vi.spyOn(rpc, 'call')
+      .mockResolvedValueOnce(scheduledStatus)
+      .mockResolvedValueOnce(waitingStatus)
+    const saved = vi.fn()
+    const closed = vi.fn()
 
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(PromptCacheKeepaliveDialog, {
       open: true,
       sessionKey: 'agent:main:webchat:test',
+      onSaved: saved,
+      onClose: closed,
     })
     app.use(pinia)
     app.use(i18n)
@@ -56,6 +74,12 @@ describe('PromptCacheKeepaliveDialog', () => {
     expect(document.body.textContent).toContain('Scheduled')
     expect(document.body.textContent).not.toContain('Keepalive plan')
     expect(document.body.querySelector('.keepalive-dialog__plan')).toBeNull()
+    const enableSwitch = document.body.querySelector<HTMLInputElement>(
+      '[role="switch"][name="prompt_cache_keepalive_enabled"]',
+    )
+    expect(enableSwitch?.checked).toBe(true)
+    expect(enableSwitch?.getAttribute('aria-checked')).toBe('true')
+    expect(document.body.textContent).toContain('applies after saving')
 
     const ttlHelp = document.body.querySelector<HTMLElement>(
       '[aria-describedby="prompt-cache-keepalive-ttl-tip"]',
@@ -80,6 +104,69 @@ describe('PromptCacheKeepaliveDialog', () => {
         idleTimeoutSeconds: 3_600,
       },
     )
+    expect(saved).toHaveBeenCalledWith({
+      sessionKey: 'agent:main:webchat:test',
+      status: waitingStatus,
+    })
+    expect(closed).toHaveBeenCalledTimes(1)
+    const enabledToasts = useToasts().toasts.value
+    expect(enabledToasts[enabledToasts.length - 1]).toMatchObject({
+      message: 'Keepalive enabled. It will begin after the next successful message.',
+      tone: 'ok',
+    })
+    app.unmount()
+  })
+
+  it('confirms when keepalive is turned off', async () => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const rpc = useRpcStore(pinia)
+    const enabledStatus = {
+      enabled: true,
+      ttlSeconds: 300,
+      intervalSeconds: 240,
+      idleTimeoutSeconds: 3_600,
+      idleExpiresAt: null,
+      state: 'waiting',
+      reason: 'waiting_for_stable_prefix',
+      hasSnapshot: false,
+      lastCacheHitTokens: 0,
+    } as const
+    const offStatus = {
+      ...enabledStatus,
+      enabled: false,
+      state: 'off',
+      reason: null,
+    } as const
+    vi.spyOn(rpc, 'call')
+      .mockResolvedValueOnce(enabledStatus)
+      .mockResolvedValueOnce(offStatus)
+
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(PromptCacheKeepaliveDialog, {
+      open: true,
+      sessionKey: 'agent:main:webchat:test',
+    })
+    app.use(pinia)
+    app.use(i18n)
+    app.mount(host)
+    await settle()
+
+    const checkbox = document.body.querySelector<HTMLInputElement>('[role="switch"]')
+    if (!checkbox) throw new Error('keepalive toggle was not rendered')
+    checkbox.click()
+    await settle()
+    expect(checkbox.checked).toBe(false)
+    expect(checkbox.getAttribute('aria-checked')).toBe('false')
+    document.body.querySelector<HTMLButtonElement>('.btn--primary')?.click()
+    await settle()
+
+    const disabledToasts = useToasts().toasts.value
+    expect(disabledToasts[disabledToasts.length - 1]).toMatchObject({
+      message: 'Prompt cache keepalive turned off.',
+      tone: 'ok',
+    })
     app.unmount()
   })
 

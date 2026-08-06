@@ -246,7 +246,7 @@
                   :title="promptCacheKeepaliveSessionReady
                     ? t('chat.promptCacheKeepalive.action')
                     : t('chat.promptCacheKeepalive.unavailableHint')"
-                  :aria-label="t('chat.promptCacheKeepalive.action')"
+                  :aria-label="promptCacheKeepaliveAriaLabel"
                   :disabled="!promptCacheKeepaliveSessionReady"
                   @click="openPromptCacheKeepalive"
                 >
@@ -255,6 +255,14 @@
                     <span>{{ t('chat.promptCacheKeepalive.action') }}</span>
                     <small v-if="!promptCacheKeepaliveSessionReady">
                       {{ t('chat.promptCacheKeepalive.unavailableHint') }}
+                    </small>
+                    <small
+                      v-else-if="promptCacheKeepaliveStatusText"
+                      class="chat-more-actions-menu__keepalive-status"
+                      :data-state="promptCacheKeepaliveStatus?.state"
+                    >
+                      <span class="chat-more-actions-menu__status-dot" aria-hidden="true" />
+                      {{ promptCacheKeepaliveStatusText }}
                     </small>
                   </span>
                 </button>
@@ -335,6 +343,7 @@ import type { Attachment } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
+import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
 
 interface ChatComposerExpose {
@@ -381,6 +390,7 @@ const props = withDefaults(defineProps<{
   replanActive?: boolean
   promptCacheKeepaliveAvailable?: boolean
   promptCacheKeepaliveSessionReady?: boolean
+  promptCacheKeepaliveStatus?: PromptCacheKeepaliveStatus | null
 }>(), {
   canChooseProject: true,
   codingModeEnabled: false,
@@ -411,6 +421,7 @@ const emit = defineEmits<{
   chooseProject: []
   closeProject: []
   openPromptCacheKeepalive: []
+  refreshPromptCacheKeepalive: []
 }>()
 
 const { t } = useI18n()
@@ -425,6 +436,17 @@ const moreActionsOpen = ref(false)
 const showProjectContext = computed(() =>
   Boolean(props.projectWorkspace && (props.canCloseProject || props.projectStatusMessage)),
 )
+const promptCacheKeepaliveStatusText = computed(() => {
+  const status = props.promptCacheKeepaliveStatus
+  if (!status || status.state === 'off') return ''
+  return t(`chat.promptCacheKeepalive.states.${status.state}`)
+})
+const promptCacheKeepaliveAriaLabel = computed(() => {
+  const action = t('chat.promptCacheKeepalive.action')
+  return promptCacheKeepaliveStatusText.value
+    ? `${action}. ${promptCacheKeepaliveStatusText.value}`
+    : action
+})
 
 // "NEW" badge on the routing control — the single-model AI router is now the
 // default, so flag it until the user first opens the control, then never again.
@@ -521,6 +543,12 @@ function toggleMoreActions() {
     addMenuOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false
+    if (
+      props.promptCacheKeepaliveAvailable
+      && props.promptCacheKeepaliveSessionReady
+    ) {
+      emit('refreshPromptCacheKeepalive')
+    }
   }
 }
 
@@ -1031,6 +1059,32 @@ defineExpose<ChatComposerExpose>({
   margin-top: 2px;
   color: var(--text-dim);
   font-size: var(--fs-xs);
+}
+
+.chat-more-actions-menu__keepalive-status {
+  align-items: center;
+  display: flex !important;
+  gap: 0.375rem;
+}
+
+.chat-more-actions-menu__status-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+
+.chat-more-actions-menu__keepalive-status[data-state='scheduled']
+  .chat-more-actions-menu__status-dot,
+.chat-more-actions-menu__keepalive-status[data-state='probing']
+  .chat-more-actions-menu__status-dot {
+  background: var(--accent);
+}
+
+.chat-more-actions-menu__keepalive-status[data-state='stopped']
+  .chat-more-actions-menu__status-dot {
+  background: var(--danger);
 }
 
 .chat-input-actions--right {
