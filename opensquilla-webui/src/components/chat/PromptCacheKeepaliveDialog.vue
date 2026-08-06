@@ -35,19 +35,30 @@
               </label>
 
               <div class="keepalive-dialog__timing" :class="{ 'is-disabled': !draftEnabled }">
-                <label class="keepalive-dialog__field">
+                <div class="keepalive-dialog__field">
                   <span class="keepalive-dialog__field-label">
-                    <strong>{{ t('chat.promptCacheKeepalive.ttlMinutes') }}</strong>
-                    <span
+                    <label for="prompt-cache-keepalive-ttl">
+                      <strong>{{ t('chat.promptCacheKeepalive.ttlMinutes') }}</strong>
+                    </label>
+                    <button
+                      type="button"
                       class="keepalive-dialog__field-help"
                       :aria-label="t('chat.promptCacheKeepalive.ttlHint')"
-                      :title="t('chat.promptCacheKeepalive.ttlHint')"
+                      aria-describedby="prompt-cache-keepalive-ttl-tip"
                     >
-                      <Icon name="info" :size="14" />
-                    </span>
+                      <Icon name="info" :size="14" aria-hidden="true" />
+                      <span
+                        id="prompt-cache-keepalive-ttl-tip"
+                        class="keepalive-dialog__field-tooltip"
+                        role="tooltip"
+                      >
+                        {{ t('chat.promptCacheKeepalive.ttlHint') }}
+                      </span>
+                    </button>
                   </span>
                   <span class="keepalive-dialog__input-wrap">
                     <input
+                      id="prompt-cache-keepalive-ttl"
                       v-model.number="draftTtlMinutes"
                       data-testid="prompt-cache-keepalive-ttl"
                       type="number"
@@ -58,21 +69,32 @@
                     />
                     <span>{{ t('chat.promptCacheKeepalive.minutesUnit') }}</span>
                   </span>
-                </label>
+                </div>
 
-                <label class="keepalive-dialog__field">
+                <div class="keepalive-dialog__field">
                   <span class="keepalive-dialog__field-label">
-                    <strong>{{ t('chat.promptCacheKeepalive.idleTimeoutMinutes') }}</strong>
-                    <span
+                    <label for="prompt-cache-keepalive-idle-timeout">
+                      <strong>{{ t('chat.promptCacheKeepalive.idleTimeoutMinutes') }}</strong>
+                    </label>
+                    <button
+                      type="button"
                       class="keepalive-dialog__field-help"
                       :aria-label="t('chat.promptCacheKeepalive.idleTimeoutHint')"
-                      :title="t('chat.promptCacheKeepalive.idleTimeoutHint')"
+                      aria-describedby="prompt-cache-keepalive-idle-tip"
                     >
-                      <Icon name="info" :size="14" />
-                    </span>
+                      <Icon name="info" :size="14" aria-hidden="true" />
+                      <span
+                        id="prompt-cache-keepalive-idle-tip"
+                        class="keepalive-dialog__field-tooltip"
+                        role="tooltip"
+                      >
+                        {{ t('chat.promptCacheKeepalive.idleTimeoutHint') }}
+                      </span>
+                    </button>
                   </span>
                   <span class="keepalive-dialog__input-wrap">
                     <input
+                      id="prompt-cache-keepalive-idle-timeout"
                       v-model.number="draftIdleTimeoutMinutes"
                       data-testid="prompt-cache-keepalive-idle-timeout"
                       type="number"
@@ -83,7 +105,7 @@
                     />
                     <span>{{ t('chat.promptCacheKeepalive.minutesUnit') }}</span>
                   </span>
-                </label>
+                </div>
               </div>
 
               <p v-if="draftEnabled && !validIdleTimeout" class="keepalive-dialog__validation" role="alert">
@@ -325,7 +347,68 @@ useDialogA11y(dialogRef, computed(() => props.open), close, {
 .keepalive-dialog__field { display: grid; gap: var(--sp-2); min-width: 0; }
 .keepalive-dialog__field-label { align-items: center; display: flex; gap: var(--sp-1); }
 .keepalive-dialog__field strong { font-size: var(--fs-sm); font-weight: 600; }
-.keepalive-dialog__field-help { color: var(--text-dim); cursor: help; display: inline-flex; }
+.keepalive-dialog__field-help {
+  align-items: center;
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  display: inline-flex;
+  padding: 0;
+  position: relative;
+}
+.keepalive-dialog__field-help:hover { color: var(--text); }
+.keepalive-dialog__field-tooltip {
+  background: var(--text);
+  border-radius: var(--radius-sm);
+  bottom: calc(100% + 8px);
+  box-shadow: var(--shadow-md);
+  color: var(--bg-elevated);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  left: 50%;
+  line-height: 1.45;
+  max-width: min(280px, 70vw);
+  opacity: 0;
+  padding: 7px 9px;
+  pointer-events: none;
+  position: absolute;
+  text-align: left;
+  transform: translateX(-50%);
+  visibility: hidden;
+  white-space: normal;
+  width: max-content;
+  z-index: 40;
+}
+.keepalive-dialog__field-tooltip::after {
+  border: 5px solid transparent;
+  border-top-color: var(--text);
+  content: '';
+  left: 50%;
+  position: absolute;
+  top: 100%;
+  transform: translateX(-50%);
+}
+.keepalive-dialog__field-help:hover .keepalive-dialog__field-tooltip,
+.keepalive-dialog__field-help:focus .keepalive-dialog__field-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+.keepalive-dialog__field-help:focus-visible {
+  border-radius: var(--radius-full);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.keepalive-dialog__field:last-child .keepalive-dialog__field-tooltip {
+  left: auto;
+  right: -8px;
+  transform: none;
+}
+.keepalive-dialog__field:last-child .keepalive-dialog__field-tooltip::after {
+  left: auto;
+  right: 9px;
+  transform: none;
+}
 .keepalive-dialog__input-wrap { align-items: center; background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm); display: flex; overflow: hidden; }
 .keepalive-dialog__input-wrap input { background: transparent; border: 0; border-radius: 0; color: var(--text); min-width: 0; padding: 8px 10px; width: 100%; }
 .keepalive-dialog__input-wrap input:focus { box-shadow: none; }

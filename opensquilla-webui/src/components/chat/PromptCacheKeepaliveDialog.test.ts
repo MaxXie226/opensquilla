@@ -57,6 +57,16 @@ describe('PromptCacheKeepaliveDialog', () => {
     expect(document.body.textContent).not.toContain('Keepalive plan')
     expect(document.body.querySelector('.keepalive-dialog__plan')).toBeNull()
 
+    const ttlHelp = document.body.querySelector<HTMLElement>(
+      '[aria-describedby="prompt-cache-keepalive-ttl-tip"]',
+    )
+    const ttlTooltip = document.body.querySelector<HTMLElement>(
+      '#prompt-cache-keepalive-ttl-tip[role="tooltip"]',
+    )
+    expect(ttlHelp?.tagName).toBe('BUTTON')
+    expect(ttlHelp?.hasAttribute('title')).toBe(false)
+    expect(ttlTooltip?.textContent).toContain('cache lifetime published')
+
     const save = document.body.querySelector<HTMLButtonElement>('.btn--primary')
     save?.click()
     await settle()
