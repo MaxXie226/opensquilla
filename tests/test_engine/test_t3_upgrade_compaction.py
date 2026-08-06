@@ -427,10 +427,6 @@ async def test_t3_budget_check_counts_full_tool_call_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import opensquilla.session.compaction as compaction_module
-    from opensquilla.session.compaction import (
-        estimate_entry_model_replay_tokens,
-        estimate_entry_replay_tokens,
-    )
 
     monkeypatch.setattr(
         compaction_module,
@@ -438,8 +434,10 @@ async def test_t3_budget_check_counts_full_tool_call_replay(
         lambda text: max(1, len(text) // 4),
     )
     transcript = _tool_heavy_transcript()
-    summarized = sum(estimate_entry_replay_tokens(e) for e in transcript)
-    model_replay = sum(estimate_entry_model_replay_tokens(e) for e in transcript)
+    summarized = sum(compaction_module.estimate_entry_replay_tokens(e) for e in transcript)
+    model_replay = sum(
+        compaction_module.estimate_entry_model_replay_tokens(e) for e in transcript
+    )
     # Derive the window from the estimators instead of hard-coding a token
     # count. This assertion is about WHICH estimator the budget check consults,
     # not about an incidental absolute token count. The midpoint of the valid

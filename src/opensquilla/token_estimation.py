@@ -11,8 +11,8 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+_ENCODING_UNAVAILABLE = object()
 _encoding = None
-_tiktoken_available: bool | None = None
 _TOKENIZER_CHUNK_CHARS = 100_000
 _ENCODING_LOAD_TIMEOUT_SECONDS = 5.0
 _ENCODING_LOAD_TIMEOUT_MAX_SECONDS = min(60.0, threading.TIMEOUT_MAX)
@@ -59,14 +59,14 @@ def _load_encoding():
 
 
 def _get_encoding():
-    global _encoding, _tiktoken_available
-    if _tiktoken_available is False:
+    global _encoding
+    if _encoding is _ENCODING_UNAVAILABLE:
         return None
     if _encoding is not None:
         return _encoding
     with _load_lock:
         # Re-check under the lock; a concurrent caller may have settled it.
-        if _tiktoken_available is False:
+        if _encoding is _ENCODING_UNAVAILABLE:
             return None
         if _encoding is not None:
             return _encoding
@@ -94,25 +94,24 @@ def _get_encoding():
             # Thread exhaustion and platform timeout errors must preserve the
             # estimator's historical fallback contract rather than escape into
             # request admission or gateway coroutines.
-            _tiktoken_available = False
+            _encoding = _ENCODING_UNAVAILABLE
             log.warning("tiktoken_encoding_load_worker_failed", error=str(exc))
             return None
 
         if worker.is_alive():
             # The daemon may finish later and populate tiktoken's own cache, but
             # this process keeps a stable fallback verdict until restart.
-            _tiktoken_available = False
+            _encoding = _ENCODING_UNAVAILABLE
             log.warning("tiktoken_encoding_load_timeout", timeout_seconds=timeout)
             return None
         if "encoding" in outcome:
             _encoding = outcome["encoding"]
-            _tiktoken_available = True
             return _encoding
         if "import_error" in outcome:
-            _tiktoken_available = False
+            _encoding = _ENCODING_UNAVAILABLE
             log.info("tiktoken_unavailable_fallback")
             return None
-        _tiktoken_available = False
+        _encoding = _ENCODING_UNAVAILABLE
         log.warning(
             "tiktoken_encoding_unavailable_fallback",
             error=str(outcome.get("error")),

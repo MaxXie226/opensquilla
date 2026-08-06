@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import pytest
 
-import opensquilla.session.compaction as compaction_module
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
@@ -177,8 +176,7 @@ async def test_new_skips_when_only_cut_would_orphan_tool_result(monkeypatch):
     — stay deterministic and offline instead of loading an optional tokenizer.
     """
     monkeypatch.setattr(
-        compaction_module,
-        "_estimate_tokens",
+        "opensquilla.session.compaction._estimate_tokens",
         lambda text: max(1, len(text) // 4),
     )
     entries = [

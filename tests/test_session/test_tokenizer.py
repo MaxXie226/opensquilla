@@ -53,7 +53,6 @@ def _reset_tokenizer_state(monkeypatch: pytest.MonkeyPatch):
     """Keep the process-wide loader verdict isolated between tests."""
 
     monkeypatch.setattr(token_estimation, "_encoding", None)
-    monkeypatch.setattr(token_estimation, "_tiktoken_available", None)
     monkeypatch.setattr(token_estimation, "_load_lock", threading.Lock())
     monkeypatch.delenv(token_estimation._ENCODING_LOAD_TIMEOUT_ENV, raising=False)
     yield
@@ -65,7 +64,7 @@ def test_estimate_tokens_uses_the_encoding_when_it_loads(
     monkeypatch.setattr(token_estimation, "_load_encoding", lambda: _FakeEncoding(2))
 
     assert tokenizer.estimate_tokens("abcdefgh") == 4
-    assert token_estimation._tiktoken_available is True
+    assert isinstance(token_estimation._encoding, _FakeEncoding)
 
 
 def test_estimate_tokens_falls_back_when_tiktoken_is_missing(
@@ -80,7 +79,7 @@ def test_estimate_tokens_falls_back_when_tiktoken_is_missing(
         200,
         "utf8_unicode_conservative",
     )
-    assert token_estimation._tiktoken_available is False
+    assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
 
 
 def test_estimate_tokens_falls_back_when_the_encoding_fetch_fails(
@@ -95,7 +94,7 @@ def test_estimate_tokens_falls_back_when_the_encoding_fetch_fails(
         200,
         "utf8_unicode_conservative",
     )
-    assert token_estimation._tiktoken_available is False
+    assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
 
 
 def test_estimate_tokens_never_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,7 +173,7 @@ def test_a_wedged_encoding_load_returns_within_the_configured_budget(
         assert entered.is_set()
         assert estimate == (200, "utf8_unicode_conservative")
         assert elapsed < 0.5
-        assert token_estimation._tiktoken_available is False
+        assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
     finally:
         release.set()
         assert completed.wait(1)
@@ -204,7 +203,7 @@ def test_a_timed_out_load_is_sticky_and_is_not_retried(
 
         assert first == second == (200, "utf8_unicode_conservative")
         assert len(calls) == 1
-        assert token_estimation._encoding is None
+        assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
     finally:
         release.set()
 
@@ -328,7 +327,7 @@ def test_thread_start_failure_is_sticky_fallback(
 
     assert first == second == (200, "utf8_unicode_conservative")
     assert constructed == [1]
-    assert token_estimation._tiktoken_available is False
+    assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
 
 
 def test_join_failure_is_sticky_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -348,7 +347,7 @@ def test_join_failure_is_sticky_fallback(monkeypatch: pytest.MonkeyPatch) -> Non
         200,
         "utf8_unicode_conservative",
     )
-    assert token_estimation._tiktoken_available is False
+    assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
 
 
 def test_fork_child_resets_a_possibly_orphaned_loader_lock() -> None:
