@@ -2273,6 +2273,122 @@ async def test_provider_native_g1_recovery_never_enters_outer_generation_retry(
     assert paid_attempt_sink["provider_native_g1_recovery"] is True
 
 
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+def test_provider_native_retry_suppression_is_scoped_to_proposer_failures(module) -> None:
+    assert module.provider_native_proposer_retry_reason(
+        "ensemble_insufficient_proposers"
+    )
+    assert module.provider_native_proposer_retry_reason(
+        "llm ensemble had 1 successful proposer(s), requires 2"
+    )
+    assert module.provider_native_proposer_retry_reason(
+        "ensemble_proposer_close_timeout"
+    )
+    assert not module.provider_native_proposer_retry_reason(
+        "invalid_agent_call_output_binding"
+    )
+    assert not module.provider_native_proposer_retry_reason(
+        "Provider stream ended with an incomplete tool call"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_provider_native_non_proposer_failure_uses_outer_generation_retry(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = {
+        "strategy": "router_dynamic",
+        "selection_mode": "router_dynamic",
+        "selected_P": [
+            "openrouter:model-a",
+            "openrouter:model-b",
+            "openrouter:model-c",
+        ],
+        "proposer_models": ["model-a", "model-b", "model-c"],
+        "proposer_sample_count": 3,
+        "effective_min_successful_proposers": 2,
+        "backup_P": ["openrouter:model-d", "openrouter:model-e"],
+        "configured_proposer_backup_count": 2,
+        "effective_proposer_backup_count": 2,
+        "selected_A": "openrouter:model-f",
+        "aggregator_candidates": ["openrouter:model-f"],
+        "proposer_recovery_policy": {
+            "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+            "configured_backup_count": 2,
+            "effective_backup_count": 2,
+            "max_additional_physical_requests": 3,
+            "quorum_required": 2,
+            "max_tokens_cap": 65_536,
+            "visible_answer_reserve_tokens": 4_096,
+            "thinking_downgrade_order": ["one_strictly_lower"],
+            "transient_same_model_retries": 1,
+            "backup_reasoning_downgrades": 1,
+        },
+    }
+
+    class Provider:
+        selection_plan = plan
+
+    calls: list[object] = []
+
+    async def fake_collect_run(active_provider, *_args, **_kwargs):
+        calls.append(active_provider)
+        return module.RunResult(
+            final_text="usable draft",
+            done=DoneEvent(
+                usage_missing_count=0,
+                ensemble_trace={
+                    "selection_plan": deepcopy(plan),
+                    "proposer_recovery": {
+                        "schema": "opensquilla.router-dynamic-proposer-recovery/v1",
+                        "max_additional_physical_requests": 3,
+                        "additional_physical_requests_started": 0,
+                        "remaining_additional_physical_requests": 3,
+                        "quorum_reached": True,
+                    },
+                },
+            ),
+            routing_trace={"selection_plan": deepcopy(plan)},
+        )
+
+    retry_reasons = iter(["invalid_agent_call_output_binding", ""])
+    monkeypatch.setattr(module, "collect_run", fake_collect_run)
+    monkeypatch.setattr(
+        module,
+        "generation_retry_reason",
+        lambda *_args, **_kwargs: next(retry_reasons),
+    )
+    monkeypatch.setattr(
+        module,
+        "g1_attempt_plan_consistency_reason",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        module,
+        "g1_retry_physical_usage_binding_reasons",
+        lambda *_args, **_kwargs: [],
+    )
+
+    result, attempts, selected_attempt = await module.collect_generation_with_retries(
+        Provider(),
+        "prompt",
+        timeout=30,
+        group="G1",
+        max_attempts=3,
+        retry_backoff_seconds=0,
+    )
+
+    assert result.final_text == "usable draft"
+    assert len(calls) == 2
+    assert len(attempts) == 2
+    assert attempts[0]["retry_reason"] == "invalid_agent_call_output_binding"
+    assert attempts[0]["retry_suppressed_reason"] == ""
+    assert attempts[0]["will_retry"] is True
+    assert selected_attempt == 2
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
 async def test_reasoning_only_length_retry_rebuilds_roster_and_tracks_each_plan(
@@ -11056,6 +11172,18 @@ def test_resume_provider_native_exhaustion_is_terminal_across_waves() -> None:
             current_run_compatibility_contract=(_enabled_g1_frozen_lifecycle_contract()),
         )
         is False
+    )
+
+
+def test_resume_provider_native_non_proposer_failure_can_retry_across_waves() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    attempt["retry_reason"] = "invalid_agent_call_output_binding"
+    attempt["retry_suppressed_reason"] = ""
+
+    assert (
+        resume_runner.provider_native_proposer_recovery_terminal_evidence(row)
+        is None
     )
 
 

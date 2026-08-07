@@ -9315,6 +9315,28 @@ def generation_retry_reason(
     return ""
 
 
+_PROVIDER_NATIVE_PROPOSER_RETRY_REASONS = frozenset(
+    {
+        "ensemble_insufficient_proposers",
+        "ensemble_no_proposers",
+        "insufficient_actual_proposer_quorum",
+        "insufficient_selected_proposer_quorum",
+        "missing_actual_proposer_candidates",
+    }
+)
+
+
+def provider_native_proposer_retry_reason(reason: str) -> bool:
+    """Return whether provider-owned proposer recovery exhausts this reason."""
+
+    normalized = str(reason or "").strip().casefold()
+    return bool(
+        normalized in _PROVIDER_NATIVE_PROPOSER_RETRY_REASONS
+        or normalized.startswith("ensemble_proposer_")
+        or ("successful proposer" in normalized and "requires" in normalized)
+    )
+
+
 def is_agent_hard_timeout(result: RunResult) -> bool:
     if any(str(event.get("kind") or "") == "timeout" for event in result.trace_events):
         return True
@@ -10464,6 +10486,7 @@ async def collect_generation_with_retries(
         if (
             provider_native_g1_recovery
             and reason
+            and provider_native_proposer_retry_reason(reason)
             and not retry_suppressed_reason
         ):
             retry_suppressed_reason = (

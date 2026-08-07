@@ -9748,6 +9748,28 @@ def generation_retry_reason(
     return ""
 
 
+_PROVIDER_NATIVE_PROPOSER_RETRY_REASONS = frozenset(
+    {
+        "ensemble_insufficient_proposers",
+        "ensemble_no_proposers",
+        "insufficient_actual_proposer_quorum",
+        "insufficient_selected_proposer_quorum",
+        "missing_actual_proposer_candidates",
+    }
+)
+
+
+def provider_native_proposer_retry_reason(reason: str) -> bool:
+    """Return whether provider-owned proposer recovery exhausts this reason."""
+
+    normalized = str(reason or "").strip().casefold()
+    return bool(
+        normalized in _PROVIDER_NATIVE_PROPOSER_RETRY_REASONS
+        or normalized.startswith("ensemble_proposer_")
+        or ("successful proposer" in normalized and "requires" in normalized)
+    )
+
+
 def is_agent_hard_timeout(result: RunResult) -> bool:
     if any(str(event.get("kind") or "") == "timeout" for event in result.trace_events):
         return True
@@ -10882,6 +10904,7 @@ async def collect_generation_with_retries(
         if (
             provider_native_g1_recovery
             and reason
+            and provider_native_proposer_retry_reason(reason)
             and not retry_suppressed_reason
         ):
             retry_suppressed_reason = (
@@ -18974,9 +18997,10 @@ def provider_native_proposer_recovery_terminal_evidence(
     """Classify explicit provider-owned recovery as terminal across Waves.
 
     The provider owns every additional proposer request inside one run-turn
-    scope.  Once that scope returns, the DRACO outer attempt must never replay
-    the whole roster.  Malformed or interrupted receipts therefore fail
-    closed as terminal evidence rather than authorizing another paid call.
+    scope.  Provider-owned proposer failures must not replay the whole roster,
+    while later agent or aggregator failures retain their outer task retry
+    budget. Malformed receipts remain terminal rather than authorizing a paid
+    call whose proposer recovery state cannot be proven.
     """
 
     execution = row.get("execution")
@@ -19006,6 +19030,12 @@ def provider_native_proposer_recovery_terminal_evidence(
     attempt = native_attempts[-1]
     selected_generation_succeeded = row.get("selected_generation_succeeded") is True
     retry_reason = str(attempt.get("retry_reason") or "").strip()
+    if (
+        not selected_generation_succeeded
+        and retry_reason
+        and not provider_native_proposer_retry_reason(retry_reason)
+    ):
+        return None
     suppression_required = not (selected_generation_succeeded and not retry_reason)
     if attempt.get("will_retry") is not False or (
         suppression_required
