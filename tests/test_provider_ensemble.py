@@ -10794,16 +10794,17 @@ async def test_router_dynamic_uses_partial_unclosed_draft_for_two_draft_quorum(
         text="This partial draft is useful enough to aggregate.",
         error="provider stream cleanup did not finish",
         error_code="ensemble_proposer_close_timeout",
-        usage_reported=False,
+        usage_reported=True,
         physical_attempt_id=partial_attempt_id,
     )
     partial.stream_closed = False
-    partial.model_usage_breakdown = []
     partial.execution["physical_attempts"][0].update(
         {
             "attempt": 1,
             "identity": "fake:p1",
-            "outcome": "interrupted",
+            # This is the contradictory provider state observed in the live
+            # DRACO run: usage was sealed but stream cleanup never completed.
+            "outcome": "succeeded",
             "stream_closed": False,
         }
     )
@@ -10857,13 +10858,17 @@ async def test_router_dynamic_uses_partial_unclosed_draft_for_two_draft_quorum(
     assert marker["recovery_skipped"] is True
     assert trace["proposer_partial_quorum"]["aggregator_isolated"] is True
     assert trace["proposer_recovery"]["attempts"] == []
-    [unknown_row] = [
+    [usage_row] = [
         row
         for row in done.model_usage_breakdown
         if row.get("physical_attempt_id") == partial_attempt_id
     ]
-    assert unknown_row["usage_unknown"] is True
-    assert done.usage_missing_count == 1
+    assert usage_row.get("usage_unknown") is not True
+    assert usage_row["billed_cost"] == pytest.approx(0.01)
+    assert done.usage_missing_count == 0
+    [partial_attempt] = partial_trace["execution"]["physical_attempts"]
+    assert partial_attempt["stream_closed"] is False
+    assert partial_attempt["outcome"] == "cleanup_unproven"
     assert provider.end_provider_retry_scope(scope_id)
 
 

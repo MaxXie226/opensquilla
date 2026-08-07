@@ -7583,6 +7583,7 @@ class EnsembleProvider:
             return False
         attempt_ids: list[str] = []
         unclosed_attempt_ids: list[str] = []
+        unclosed_success_attempts: list[dict[str, Any]] = []
         for ordinal, attempt in enumerate(attempts, start=1):
             if not isinstance(attempt, Mapping):
                 return False
@@ -7605,7 +7606,20 @@ class EnsembleProvider:
                 return False
             attempt_ids.append(physical_attempt_id)
             if stream_closed is False:
-                if attempt.get("outcome") not in {
+                outcome = attempt.get("outcome")
+                if (
+                    outcome == "succeeded"
+                    and isinstance(attempt, dict)
+                    and not result.ok
+                    and result.usable_for_aggregation
+                    and result.completion_outcome == "partial_usable"
+                ):
+                    # A request that emitted a usable draft and a usage receipt
+                    # can still time out while closing its stream.  Preserve the
+                    # draft and billing evidence, but do not leave the physical
+                    # attempt claiming a lifecycle success that never happened.
+                    unclosed_success_attempts.append(attempt)
+                elif outcome not in {
                     "interrupted",
                     "failed",
                     "cleanup_unproven",
@@ -7676,6 +7690,8 @@ class EnsembleProvider:
             not _is_missing_request_placeholder(row)
             for row in result.model_usage_breakdown
         )
+        for attempt in unclosed_success_attempts:
+            attempt["outcome"] = "cleanup_unproven"
         return len(result.model_usage_breakdown) == result.physical_request_count
 
     def _seal_clean_proposer_cleanup(
