@@ -5892,6 +5892,36 @@ def test_adaptive_g1_lifecycle_audits_serialized_prior_attempt_trace(
         contracts=paid_attempt_contracts,
     )
 
+    dynamic_cap_history = deepcopy(serialized)
+
+    def replace_aggregator_cap(value: object) -> None:
+        if isinstance(value, dict):
+            if "aggregator_max_tokens_cap" in value:
+                value["aggregator_max_tokens_cap"] = 32_768
+            for child in value.values():
+                replace_aggregator_cap(child)
+        elif isinstance(value, list):
+            for child in value:
+                replace_aggregator_cap(child)
+
+    replace_aggregator_cap(dynamic_cap_history)
+    dynamic_cap_contract = deepcopy(paid_attempt_contracts["G1"])
+    dynamic_cap_contract["formal_runtime_freeze"]["aggregator_max_tokens_cap"] = 32_768
+    dynamic_cap_contract["gateway_execution"]["llm_ensemble"][
+        "aggregator_max_tokens_cap"
+    ] = 32_768
+    module.validate_g1_paid_attempt_plan_history(
+        [
+            module.SourceRecord(
+                path=Path("dynamic-cap-wave-1.jsonl"),
+                source_index=0,
+                line=1,
+                row=dynamic_cap_history,
+            )
+        ],
+        contracts={"G1": dynamic_cap_contract},
+    )
+
     duplicate_cross_task_analyzer = deepcopy(serialized)
     duplicate_cross_task_analyzer["task_id"] = "task-2"
     with pytest.raises(

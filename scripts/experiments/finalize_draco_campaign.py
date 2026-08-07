@@ -8001,6 +8001,9 @@ def validate_g1_paid_attempt_plan_history(
     )
     if not isinstance(registry, Mapping):
         raise FinalizationError("G1 paid-attempt audit lacks a registry contract")
+    aggregator_recovery_policy, proposer_recovery_policy = contract_recovery_policies(
+        group_contract
+    )
     analyzer_policy = g1_task_analyzer_execution_policy(registry)
     if analyzer_policy is None:
         raise FinalizationError("G1 paid-attempt audit lacks an authenticated analyzer policy")
@@ -8322,6 +8325,8 @@ def validate_g1_paid_attempt_plan_history(
             physical_plans=(),
             initial_reasons=(),
             allow_legacy_managed_v3=allow_legacy_managed_v3,
+            aggregator_recovery_policy=aggregator_recovery_policy,
+            proposer_recovery_policy=proposer_recovery_policy,
         )
         fatal_reasons = [reason for reason in audit_reasons if reason not in selected_only_reasons]
         if fatal_reasons:
