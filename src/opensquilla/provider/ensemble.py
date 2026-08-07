@@ -488,6 +488,15 @@ def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
     )
 
 
+def _proposer_provider_config(member: EnsembleMemberConfig) -> ProviderConfig:
+    """Return the provider boundary used by every proposer-side operation."""
+
+    return replace(
+        member.provider_config,
+        replay_provider_state=False,
+    )
+
+
 _ENSEMBLE_CORRELATION_PHASES = frozenset(
     {
         "proposer",
@@ -1357,7 +1366,7 @@ class EnsembleProvider:
                 role="proposer",
             ).model_copy(update=proposer_updates)
             _require_projection(
-                _build_provider(member.provider_config),
+                _build_provider(_proposer_provider_config(member)),
                 member_config,
                 synthetic_messages=additional_messages,
             )
@@ -1969,7 +1978,11 @@ class EnsembleProvider:
                     ),
                 )
             return result
-        provider = _build_provider(member.provider_config)
+        # Proposers consume the visible conversation as independent candidate
+        # generators. Provider-private continuity state (reasoning_content,
+        # thinking blocks, thought signatures) belongs to the model that
+        # minted it and must not be replayed into any proposer physical call.
+        provider = _build_provider(_proposer_provider_config(member))
         text_parts: list[str] = []
         got_done = False
         result.request_started = True

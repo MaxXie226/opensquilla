@@ -101,6 +101,7 @@ from .types import (
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ProviderRequestCorrelation,
     ReasoningDeltaEvent,
     StreamEvent,
     TextDeltaEvent,
@@ -2090,19 +2091,80 @@ def _payload_cache_shape(
         else None
     )
     non_system_prefix_item_hashes = _openrouter_non_system_prefix_item_hashes(openai_messages)
+    wire_message_hashes = [_stable_json_hash(message) for message in openai_messages]
+    wire_message_roles = [str(message.get("role", "")) for message in openai_messages]
+    wire_prefix_payload = {
+        "model": payload.get("model", ""),
+        "tools": payload.get("tools", []),
+        "messages": openai_messages[:-1],
+    }
     return {
         "top_level_cache_control": bool(payload.get("cache_control")),
         "explicit_cache_markers": _cache_marker_positions(openai_messages),
         "explicit_cache_marker_count": _count_explicit_cache_markers(openai_messages),
         "system_hash": _stable_json_hash(system_payload) if system_payload else "",
         "tools_hash": _stable_json_hash(payload.get("tools", [])) if tools else "",
+        "wire_prefix_hash": _stable_json_hash(wire_prefix_payload),
         "messages_prefix_hash": _stable_json_hash(openai_messages[:-1]),
+        "full_messages_hash": _stable_json_hash(openai_messages),
+        "last_message_hash": wire_message_hashes[-1] if wire_message_hashes else "",
+        "wire_message_hashes": wire_message_hashes,
+        "wire_message_roles": wire_message_roles,
         "first_non_system_hash": (
             non_system_prefix_item_hashes[0] if non_system_prefix_item_hashes else ""
         ),
         "non_system_prefix_item_hashes": non_system_prefix_item_hashes,
         "message_count": len(openai_messages),
     }
+
+
+def _ensemble_correlation_phase(
+    correlation: ProviderRequestCorrelation | None,
+) -> str | None:
+    if correlation is None:
+        return None
+    call_kind = correlation.call_kind
+    for phase in ("proposer", "aggregator"):
+        if f".ensemble.{phase}" in call_kind:
+            return phase
+    return None
+
+
+def _log_ensemble_prefix_fingerprint(
+    *,
+    provider: str,
+    provider_kind: str,
+    model: str,
+    correlation: ProviderRequestCorrelation | None,
+    transport: str,
+    cache_shape: Mapping[str, Any],
+) -> None:
+    phase = _ensemble_correlation_phase(correlation)
+    if phase is None or correlation is None:
+        return
+    log.info(
+        "provider.ensemble_prefix_fingerprint",
+        fingerprint_version=1,
+        provider=provider,
+        provider_kind=provider_kind,
+        model=model,
+        phase=phase,
+        transport=transport,
+        session_id=correlation.session_id,
+        turn_id=correlation.turn_id,
+        execution_id=correlation.execution_id,
+        call_kind=correlation.call_kind,
+        system_hash=cache_shape.get("system_hash", ""),
+        tools_hash=cache_shape.get("tools_hash", ""),
+        wire_prefix_hash=cache_shape.get("wire_prefix_hash", ""),
+        messages_prefix_hash=cache_shape.get("messages_prefix_hash", ""),
+        full_messages_hash=cache_shape.get("full_messages_hash", ""),
+        last_message_hash=cache_shape.get("last_message_hash", ""),
+        wire_message_hashes=cache_shape.get("wire_message_hashes", []),
+        wire_message_roles=cache_shape.get("wire_message_roles", []),
+        message_count=cache_shape.get("message_count", 0),
+        explicit_cache_marker_count=cache_shape.get("explicit_cache_marker_count", 0),
+    )
 
 
 def _log_provider_cache_usage(
@@ -3443,6 +3505,14 @@ class OpenAIProvider:
                 "tools_count": len(tools or []),
                 "request_proof": budget_decision.proof,
             },
+        )
+        _log_ensemble_prefix_fingerprint(
+            provider=self.provider_id,
+            provider_kind=self._provider_kind,
+            model=self._model,
+            correlation=cfg.provider_request_correlation,
+            transport="stream",
+            cache_shape=cache_shape,
         )
         if self._compat.log_payload_cache_shape:
             log.debug(
@@ -5090,6 +5160,14 @@ class OpenAIProvider:
                     max_len=2000,
                 ),
             },
+        )
+        _log_ensemble_prefix_fingerprint(
+            provider=self.provider_id,
+            provider_kind=self._provider_kind,
+            model=self._model,
+            correlation=cfg.provider_request_correlation,
+            transport="non_stream_fallback",
+            cache_shape=cache_shape,
         )
 
         try:

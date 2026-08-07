@@ -767,6 +767,86 @@ def test_tokenrhythm_chat_adds_session_correlation_headers_only(
     assert "agent.chat" not in serialized_payload
 
 
+@pytest.mark.parametrize(
+    ("call_kind", "expected_phase"),
+    [
+        ("agent.ensemble.proposer", "proposer"),
+        ("agent.ensemble.aggregator", "aggregator"),
+    ],
+)
+def test_ensemble_request_logs_stable_wire_prefix_hash_without_prompt_content(
+    monkeypatch: Any,
+    call_kind: str,
+    expected_phase: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-v4-pro",
+        base_url="https://tokenrhythm.studio/v1",
+        provider_kind="tokenrhythm",
+        provider_id="tokenrhythm",
+        replay_provider_state=False,
+    )
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind=call_kind,
+    )
+
+    async def run(last_user_content: str) -> None:
+        async for _ in provider.chat(
+            [
+                Message(
+                    role="assistant",
+                    content="stable visible answer",
+                    reasoning_content="private reasoning must not be logged",
+                ),
+                Message(role="user", content=last_user_content),
+            ],
+            config=ChatConfig(
+                system="stable system",
+                provider_request_correlation=correlation,
+            ),
+        ):
+            pass
+
+    old_config = structlog.get_config()
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.NOTSET))
+    try:
+        with structlog.testing.capture_logs() as captured_logs:
+            asyncio.run(run("volatile tail one"))
+            asyncio.run(run("volatile tail two"))
+    finally:
+        structlog.configure(**old_config)
+
+    fingerprints = [
+        item
+        for item in captured_logs
+        if item["event"] == "provider.ensemble_prefix_fingerprint"
+    ]
+    assert len(fingerprints) == 2
+    first, second = fingerprints
+    assert first["provider"] == "tokenrhythm"
+    assert first["provider_kind"] == "tokenrhythm"
+    assert first["model"] == "deepseek-v4-pro"
+    assert first["phase"] == expected_phase
+    assert first["call_kind"] == call_kind
+    assert first["transport"] == "stream"
+    assert first["wire_prefix_hash"] == second["wire_prefix_hash"]
+    assert first["full_messages_hash"] != second["full_messages_hash"]
+    assert first["last_message_hash"] != second["last_message_hash"]
+    assert first["wire_message_roles"] == ["system", "assistant", "user"]
+    assert len(first["wire_message_hashes"]) == first["message_count"] == 3
+    serialized_logs = json.dumps(fingerprints, ensure_ascii=False, sort_keys=True)
+    assert "stable visible answer" not in serialized_logs
+    assert "private reasoning must not be logged" not in serialized_logs
+    assert "volatile tail one" not in serialized_logs
+    assert "volatile tail two" not in serialized_logs
+
+
 def test_tokenrhythm_chat_never_forwards_correlation_across_redirects(
     monkeypatch: Any,
 ) -> None:
