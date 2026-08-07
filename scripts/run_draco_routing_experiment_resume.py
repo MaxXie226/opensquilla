@@ -9766,6 +9766,7 @@ def provider_native_proposer_retry_reason(reason: str) -> bool:
     return bool(
         normalized in _PROVIDER_NATIVE_PROPOSER_RETRY_REASONS
         or normalized.startswith("ensemble_proposer_")
+        or normalized.startswith("ensemble proposer ")
         or ("successful proposer" in normalized and "requires" in normalized)
     )
 
@@ -19030,17 +19031,26 @@ def provider_native_proposer_recovery_terminal_evidence(
     attempt = native_attempts[-1]
     selected_generation_succeeded = row.get("selected_generation_succeeded") is True
     retry_reason = str(attempt.get("retry_reason") or "").strip()
+    retry_suppressed_reason = str(
+        attempt.get("retry_suppressed_reason") or ""
+    ).strip()
     if (
         not selected_generation_succeeded
         and retry_reason
         and not provider_native_proposer_retry_reason(retry_reason)
+        and not provider_native_proposer_retry_reason(
+            retry_suppressed_reason
+        )
     ):
         return None
     suppression_required = not (selected_generation_succeeded and not retry_reason)
     if attempt.get("will_retry") is not False or (
         suppression_required
-        and str(attempt.get("retry_suppressed_reason") or "")
+        and retry_suppressed_reason
         != "provider_native_proposer_recovery_terminal"
+        and not provider_native_proposer_retry_reason(
+            retry_suppressed_reason
+        )
     ):
         reasons.append("provider_native_outer_retry_not_suppressed")
     plan = attempt.get("selection_plan")

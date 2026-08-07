@@ -2284,6 +2284,10 @@ def test_provider_native_retry_suppression_is_scoped_to_proposer_failures(module
     assert module.provider_native_proposer_retry_reason(
         "ensemble_proposer_close_timeout"
     )
+    assert module.provider_native_proposer_retry_reason(
+        "ensemble proposer cleanup did not finish; recovery, aggregation, "
+        "and fallback were not started"
+    )
     assert not module.provider_native_proposer_retry_reason(
         "invalid_agent_call_output_binding"
     )
@@ -11173,6 +11177,25 @@ def test_resume_provider_native_exhaustion_is_terminal_across_waves() -> None:
         )
         is False
     )
+
+
+def test_resume_provider_native_cleanup_code_is_terminal_across_waves() -> None:
+    row = _provider_native_exhausted_resume_row()
+    attempt = row["execution"]["generation_attempts"][0]
+    attempt["retry_reason"] = (
+        "ensemble proposer cleanup did not finish; recovery, aggregation, "
+        "and fallback were not started"
+    )
+    attempt["retry_suppressed_reason"] = "ensemble_proposer_close_timeout"
+
+    evidence = resume_runner.provider_native_proposer_recovery_terminal_evidence(
+        row
+    )
+
+    assert evidence is not None
+    assert evidence["status"] == "budget_exhausted"
+    assert evidence["receipt_valid"] is True
+    assert evidence["automatic_generation_retry_allowed"] is False
 
 
 def test_resume_provider_native_non_proposer_failure_can_retry_across_waves() -> None:

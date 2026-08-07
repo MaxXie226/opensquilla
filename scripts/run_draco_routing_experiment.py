@@ -9333,6 +9333,7 @@ def provider_native_proposer_retry_reason(reason: str) -> bool:
     return bool(
         normalized in _PROVIDER_NATIVE_PROPOSER_RETRY_REASONS
         or normalized.startswith("ensemble_proposer_")
+        or normalized.startswith("ensemble proposer ")
         or ("successful proposer" in normalized and "requires" in normalized)
     )
 
