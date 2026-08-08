@@ -15666,6 +15666,55 @@ def _json_safe(value: Any) -> Any:
     return convert(value)
 
 
+# Only these turn-metadata fields are read while rebuilding a router-dynamic
+# lineup. Turn metadata also carries live runtime collaborators (for example
+# ``SkillLoader`` and callback objects), so it is not a serializable retry
+# boundary and must never be copied wholesale.
+_ROUTER_DYNAMIC_RETRY_METADATA_FIELDS = (
+    "routed_tier",
+    "routing_confidence",
+    "routing_extra",
+    "router_dynamic_task_text",
+    # ``build_request_context`` consumes the remaining fields, including the
+    # compatibility aliases paired below.
+    "router_dynamic_request_context",
+    "request_context",
+    "router_history_user_texts",
+    "router_prev_assistant_text",
+    "router_dynamic_last_route",
+    "last_route",
+    "input_normalization",
+    "input_tokens",
+    "material_estimated_tokens",
+    "tool_log_tokens",
+)
+
+
+def _router_dynamic_retry_metadata_snapshot(
+    turn_metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project retry-relevant turn metadata into detached, pure data.
+
+    The projection deliberately follows the read surface of
+    ``_build_router_dynamic_members`` and ``build_request_context``. Using
+    ``_json_safe`` both detaches nested containers and prevents runtime-only
+    values inside otherwise relevant mappings from leaking into the retry
+    factory.
+    """
+
+    if not isinstance(turn_metadata, Mapping):
+        return {}
+    snapshot = {
+        key: _json_safe(turn_metadata[key])
+        for key in _ROUTER_DYNAMIC_RETRY_METADATA_FIELDS
+        if key in turn_metadata
+    }
+    # Keep the retry boundary mechanically verifiable as pure data. This
+    # deepcopy is safe by construction and catches accidental regressions if
+    # the projection helper is later changed to retain runtime objects.
+    return deepcopy(snapshot)
+
+
 _TEXT_TIER_INDEX = {"c0": 0, "c1": 1, "c2": 2, "c3": 3}
 _TEXT_TIER_BY_INDEX = {value: key for key, value in _TEXT_TIER_INDEX.items()}
 
@@ -18382,7 +18431,9 @@ def build_ensemble_provider_from_config(
                     config=config_copy,
                     inherited_provider_config=inherited_copy,
                     fallback_provider=fallback_provider,
-                    turn_metadata=deepcopy(dict(turn_metadata or {})),
+                    turn_metadata=_router_dynamic_retry_metadata_snapshot(
+                        turn_metadata
+                    ),
                     enable_member_request_budget_rebinding=(
                         _enable_member_request_budget_rebinding
                     ),

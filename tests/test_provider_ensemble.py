@@ -3802,6 +3802,131 @@ def test_router_dynamic_selection_plan_is_materialized_without_rewriting_members
     )
 
 
+def test_router_dynamic_retry_metadata_projects_around_real_skill_loader(
+    tmp_path: Any,
+) -> None:
+    from opensquilla.skills.loader import PinnedSkillLoader, SkillLoader
+
+    live_skill_loader = SkillLoader(
+        bundled_dir=tmp_path,
+        snapshot_path=tmp_path / "skills-snapshot.json",
+    )
+    skill_loader = PinnedSkillLoader(
+        live_skill_loader.snapshot(),
+        live_skill_loader,
+    )
+
+    class _NonDeepcopyableSentinel:
+        def __deepcopy__(self, memo: Any) -> Any:
+            del memo
+            raise RuntimeError("runtime sentinel must not be copied")
+
+    runtime_sentinel = _NonDeepcopyableSentinel()
+    with pytest.raises(RuntimeError, match="runtime sentinel must not be copied"):
+        deepcopy(runtime_sentinel)
+
+    metadata = {
+        "routed_tier": "c2",
+        "routing_confidence": 0.91,
+        "routing_extra": {
+            "base_tier": "c1",
+            "final_tier": "c2",
+        },
+        "router_dynamic_task_text": "compare two technical systems",
+        "router_dynamic_request_context": {
+            "conversation": {
+                "summary": "earlier comparison",
+                "recent_turns": ["user: compare the alternatives"],
+            },
+            "routing_budget": {
+                "estimated_input_tokens": 4_321,
+                "tool_log_tokens": 12,
+            },
+        },
+        "request_context": {"conversation": {"summary": "compatibility alias"}},
+        "router_history_user_texts": ["compare the alternatives"],
+        "router_prev_assistant_text": "I will compare them.",
+        "router_dynamic_last_route": {
+            "tier": "c1",
+            "model_ids": ["deepseek/deepseek-v4-pro"],
+        },
+        "last_route": {"tier": "c0"},
+        "input_normalization": {"material_estimated_tokens": 4_000},
+        "input_tokens": 4_100,
+        "material_estimated_tokens": 4_200,
+        "tool_log_tokens": 12,
+        # This is the production runtime object that caused the RLock
+        # serialization failure. It is unrelated to dynamic selection and
+        # must not cross the retry-factory boundary.
+        "skill_loader": skill_loader,
+        "runtime_sentinel": runtime_sentinel,
+    }
+    with pytest.raises(TypeError, match="cannot pickle.*RLock"):
+        deepcopy(metadata)
+
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+        },
+    )
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata=metadata,
+    )
+
+    retry_context = provider._router_dynamic_retry_context
+    assert retry_context is not None
+    retry_factory = retry_context.retry_factory
+    retry_metadata = retry_factory.turn_metadata
+    assert "skill_loader" not in retry_metadata
+    expected_keys = {
+        "routed_tier",
+        "routing_confidence",
+        "routing_extra",
+        "router_dynamic_task_text",
+        "router_dynamic_request_context",
+        "request_context",
+        "router_history_user_texts",
+        "router_prev_assistant_text",
+        "router_dynamic_last_route",
+        "last_route",
+        "input_normalization",
+        "input_tokens",
+        "material_estimated_tokens",
+        "tool_log_tokens",
+    }
+    assert set(retry_metadata) == expected_keys
+    assert retry_metadata == {
+        key: value for key, value in metadata.items() if key in expected_keys
+    }
+    assert retry_metadata["routing_extra"] is not metadata["routing_extra"]
+    metadata["routing_extra"]["final_tier"] = "c0"
+    assert retry_metadata["routing_extra"]["final_tier"] == "c2"
+
+    # The retained retry context can actually rebuild the dynamic provider;
+    # it is not merely deepcopy-compatible bookkeeping.
+    retry_provider = retry_factory(retry_context.frozen_ranking_inputs)
+    assert isinstance(retry_provider, EnsembleProvider)
+    assert retry_provider._router_dynamic_retry_context is not None
+    assert (
+        retry_provider.selection_plan["request_context_hash"]
+        == provider.selection_plan["request_context_hash"]
+    )
+
+
 def test_router_dynamic_default_off_ignores_managed_only_request_inputs_exactly() -> None:
     config = GatewayConfig(
         llm={

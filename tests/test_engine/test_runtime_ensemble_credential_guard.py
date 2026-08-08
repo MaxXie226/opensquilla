@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -491,6 +492,52 @@ async def test_router_dynamic_wrap_is_not_credential_gated(
         "unsupported_level_fallbacks",
         "policy_versions",
     }.intersection(turn.metadata["router_dynamic_decision"])
+
+
+async def test_router_dynamic_wraps_with_pinned_skill_loader_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from opensquilla.skills.loader import PinnedSkillLoader, SkillLoader
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    live_skill_loader = SkillLoader(
+        bundled_dir=tmp_path,
+        snapshot_path=tmp_path / "skills-snapshot.json",
+    )
+    skill_catalog = live_skill_loader.snapshot()
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_static_b5_config(selection_mode="router_dynamic"),
+        skill_loader=live_skill_loader,
+    )
+    selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
+
+    turn, provider = await runner._run_pipeline(
+        "hello",
+        "agent:main:pinned-skill-loader",
+        _Provider(),
+        selector,
+        [],
+        "system prompt",
+        [],
+        skill_catalog=skill_catalog,
+    )
+
+    pinned_skill_loader = turn.metadata["skill_loader"]
+    assert isinstance(pinned_skill_loader, PinnedSkillLoader)
+    with pytest.raises(TypeError, match="cannot pickle.*RLock"):
+        deepcopy(pinned_skill_loader)
+    assert isinstance(provider, EnsembleProvider)
+    assert provider.selection_plan["selection_mode"] == "router_dynamic"
+    assert provider.selection_plan["selected_P"]
+    assert provider.selection_plan["selected_A"]
+    assert turn.metadata["ensemble_enabled"] is True
+    assert "ensemble_wrap_skipped_reason" not in turn.metadata
+    retry_context = provider._router_dynamic_retry_context
+    assert retry_context is not None
+    retry_factory = retry_context.retry_factory
+    assert "skill_loader" not in retry_factory.turn_metadata
 
 
 async def test_router_dynamic_uses_fixed_opus_task_analyzer(
