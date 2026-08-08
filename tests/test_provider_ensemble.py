@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
 import time
@@ -62,6 +63,7 @@ from opensquilla.provider.ensemble import (
     _summed_float,
     _unrepresented_diagnostic_usage_rows,
     _visible_answer_is_progress_only,
+    _visible_answer_is_repetitive_stall,
     _visible_answer_looks_usable,
     build_ensemble_provider_from_config,
     openrouter_static_capabilities,
@@ -192,6 +194,69 @@ def test_finance_progress_narration_is_not_a_deliverable_answer() -> None:
         "Checking is disabled by policy now.",
     ):
         assert _visible_answer_is_progress_only(substantive) is False
+
+
+@pytest.mark.parametrize(
+    "status_only",
+    [
+        (
+            "I'll work through this systematically: first clarify the bug, then "
+            "explore how `bat` merges config and CLI paging flags so we can make "
+            "`-P`/`-pp` override `--paging=always`."
+        ),
+        (
+            "I'll implement combining fast-delete queries in Django's deletion "
+            "collector. Starting by inspecting the repo layout and the collector "
+            "code.[[reply_to_current]]"
+        ),
+        (
+            "I'll start by inspecting the repository layout and the "
+            "try/finally-related code paths so we can reproduce the MicroPython "
+            "bug accurately."
+        ),
+    ],
+)
+def test_swebench_planning_only_outputs_are_not_deliverable(
+    status_only: str,
+) -> None:
+    """Real planning-only outputs must not be mistaken for completed patches."""
+
+    assert _visible_answer_is_progress_only(status_only) is True
+    assert _visible_answer_looks_usable(
+        status_only,
+        reject_progress_only=True,
+    ) is False
+
+
+def test_long_repeated_swebench_plan_remains_progress_only() -> None:
+    repeated_plan = (
+        "I'll reproduce the blank RadioSelect option first, then inspect the "
+        "widget and ModelChoiceField paths before applying a minimal fix.\n"
+    ) * 700
+
+    assert len(repeated_plan) > 80_000
+    assert _visible_answer_is_progress_only(repeated_plan) is True
+    assert _visible_answer_looks_usable(
+        repeated_plan,
+        reject_progress_only=True,
+    ) is False
+
+
+def test_long_repeated_non_progress_fragment_is_a_repetitive_stall() -> None:
+    fragment = (
+        "Repository state remained unchanged across the sampled iterations, "
+        "with no patch, tool evidence, or completed implementation produced."
+    )
+    stalled_output = (fragment + "\n") * 64
+
+    assert len(stalled_output) > 4_096
+    assert _visible_answer_is_progress_only(stalled_output) is False
+    assert _visible_answer_is_repetitive_stall(stalled_output) is True
+    assert _visible_answer_is_repetitive_stall(
+        fragment
+        + " The implementation now changes the widget behavior and adds a "
+        "regression test that verifies the corrected result."
+    ) is False
 
 
 def test_progress_heavy_failed_proposer_does_not_count_toward_quorum() -> None:
@@ -1662,7 +1727,12 @@ def test_unmanaged_candidate_trace_row_preserves_reasoning_usage_evidence() -> N
         "reasoning_tokens": 17,
         "billed_cost": 0.0,
         "cost_source": "none",
-        "content": {"text": "draft", "chars": 5, "truncated": False},
+        "content": {
+            "text": "draft",
+            "chars": 5,
+            "truncated": False,
+            "sha256": hashlib.sha256(b"draft").hexdigest(),
+        },
     }
 
 
@@ -10857,6 +10927,12 @@ async def test_router_dynamic_uses_partial_unclosed_draft_for_two_draft_quorum(
     assert marker["usable_proposers"] == 2
     assert marker["recovery_skipped"] is True
     assert trace["proposer_partial_quorum"]["aggregator_isolated"] is True
+    assert trace["run_outcome"] == "partial_proposer_quorum"
+    assert trace["delivery_outcome"] == "degraded_success"
+    assert trace["execution_outcome"] == "degraded_success"
+    assert trace["audit_outcome"] == "incomplete"
+    assert trace["degradation_reasons"] == ["partial_proposer_quorum"]
+    assert trace["aggregator_recovery"]["upstream_partial_quorum"] is True
     assert trace["proposer_recovery"]["attempts"] == []
     [usage_row] = [
         row
@@ -14975,7 +15051,289 @@ async def test_partial_quorum_can_recover_a_progress_only_aggregator(
         done.ensemble_trace["aggregator_recovery"]["selected_kind"]
         == "same_model_recovery"
     )
+    recovered_request = done.ensemble_trace["final_request"]
+    recovered_input = recovered_request["input"]
+    recovered_binding = recovered_request["candidate_binding"]
+    assert recovered_binding["message_index"] == recovered_input["message_count"] - 2
+    [bound_prompt_row] = [
+        row
+        for row in recovered_input["messages"]
+        if row["index"] == recovered_binding["message_index"]
+    ]
+    assert recovered_binding["prompt"] == bound_prompt_row["content"]
     assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_long_repeated_swebench_plan_is_discarded_before_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repeated_plan = (
+        "I'll reproduce the blank RadioSelect option first, then inspect the "
+        "widget and ModelChoiceField paths before applying a minimal fix.\n"
+    ) * 700
+    final_answer = "Implemented the widget-aware fix and added its regression test."
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [
+                [TextDeltaEvent(text="Draft zero."), _billed_done("p0", cost=0.1)]
+            ],
+            "p1": [
+                [TextDeltaEvent(text="Draft one."), _billed_done("p1", cost=0.1)]
+            ],
+            "agg": [
+                [
+                    TextDeltaEvent(text=repeated_plan),
+                    _billed_done("agg", cost=0.2, stop_reason="length"),
+                ],
+                [
+                    TextDeltaEvent(text=final_answer),
+                    _billed_done("agg", cost=0.2),
+                ],
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-long-repeated-plan"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"p0": 1, "p1": 1, "agg": 2}
+    visible = "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    )
+    assert visible == final_answer
+    assert repeated_plan not in visible
+    assert done.ensemble_trace["assembled_output"]["text"] == final_answer
+    rejected = [
+        attempt
+        for attempt in done.ensemble_trace["aggregator_recovery"]["attempts"]
+        if attempt.get("content_outcome") == "progress_only"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["assembled_output_discarded"] is True
+    assert (
+        done.ensemble_trace["aggregator_recovery"]["selected_kind"]
+        == "same_model_recovery"
+    )
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_kind", ["error", "incomplete"])
+async def test_repetitive_stall_before_failed_terminal_recovers_without_leaking(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_kind: str,
+) -> None:
+    fragment = (
+        "Repository state remained unchanged across the sampled iterations, "
+        "with no patch, tool evidence, or completed implementation produced."
+    )
+    stalled_output = (fragment + "\n") * 64
+    final_answer = "Implemented the fix and produced a non-empty patch."
+    failed_events: list[StreamEvent] = [TextDeltaEvent(text=stalled_output)]
+    if terminal_kind == "error":
+        failed_events.append(
+            ErrorEvent(
+                message="upstream stream failed after repeated output",
+                code="upstream_interrupted",
+                diagnostic_done=_billed_done("agg", cost=0.2),
+                request_started=True,
+                physical_request_count=1,
+            )
+        )
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [
+                [TextDeltaEvent(text="Draft zero."), _billed_done("p0", cost=0.1)]
+            ],
+            "p1": [
+                [TextDeltaEvent(text="Draft one."), _billed_done("p1", cost=0.1)]
+            ],
+            "agg": [
+                failed_events,
+                [
+                    TextDeltaEvent(text=final_answer),
+                    _billed_done("agg", cost=0.2),
+                ],
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = f"router-dynamic-repetitive-{terminal_kind}"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert registry.call_counts == {"p0": 1, "p1": 1, "agg": 2}
+    visible = "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    )
+    assert visible == final_answer
+    assert stalled_output not in visible
+    assert done.ensemble_trace["assembled_output"]["text"] == final_answer
+    recovery = done.ensemble_trace["aggregator_recovery"]
+    assert recovery["selected_kind"] == "same_model_recovery"
+    assert any(
+        attempt.get("trigger") == "repetitive_stall_terminal"
+        for attempt in recovery["attempts"]
+    )
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_trace_sha256_binds_truncated_candidates_to_aggregator_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_texts = [
+        "  candidate-zero:" + ("A" * 9_000) + "\n ",
+        "candidate-one:" + ("B" * 9_000),
+    ]
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [
+                [
+                    TextDeltaEvent(text=candidate_texts[0]),
+                    _billed_done("p0", cost=0.1),
+                ]
+            ],
+            "p1": [
+                [
+                    TextDeltaEvent(text=candidate_texts[1]),
+                    _billed_done("p1", cost=0.1),
+                ]
+            ],
+            "agg": [
+                [
+                    TextDeltaEvent(text="Fused final answer."),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="trace-candidate-binding",
+        proposers=[_member("p0"), _member("p1")],
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    trace = done.ensemble_trace
+    assert trace["content_binding_schema"] == "opensquilla.trace-content-sha256/v1"
+    for candidate_trace, candidate_text in zip(
+        trace["candidates"],
+        candidate_texts,
+        strict=True,
+    ):
+        content = candidate_trace["content"]
+        assert content["text"] == candidate_text[:8_000]
+        assert content["chars"] == len(candidate_text)
+        assert content["truncated"] is True
+        assert content["sha256"] == hashlib.sha256(
+            candidate_text.encode("utf-8")
+        ).hexdigest()
+
+    [aggregator_call] = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    prompt_text = str(aggregator_call["messages"][-1].content)
+    prompt_digest = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    final_request = trace["final_request"]
+    input_trace = final_request["input"]
+    prompt_trace = input_trace["messages"][-1]["content"]
+    assert input_trace["content_binding_schema"] == (
+        "opensquilla.trace-content-sha256/v1"
+    )
+    assert prompt_trace["text"] == prompt_text[:8_000]
+    assert prompt_trace["chars"] == len(prompt_text)
+    assert prompt_trace["truncated"] is True
+    assert prompt_trace["sha256"] == prompt_digest
+
+    binding = final_request["candidate_binding"]
+    assert binding["schema"] == (
+        "opensquilla.ensemble-aggregator-candidate-binding/v2"
+    )
+    assert binding["content_binding_schema"] == (
+        "opensquilla.trace-content-sha256/v1"
+    )
+    assert binding["message_index"] == len(aggregator_call["messages"]) - 1
+    assert binding["prompt"] == prompt_trace
+    assert [row["candidate_index"] for row in binding["candidates"]] == [0, 1]
+    assert [row["display_index"] for row in binding["candidates"]] == [1, 2]
+    for row, candidate_text in zip(
+        binding["candidates"],
+        candidate_texts,
+        strict=True,
+    ):
+        normalized_candidate_text = candidate_text.strip()
+        assert row["normalization"] == "strip/v1"
+        assert row["source_chars"] == len(candidate_text)
+        assert row["source_sha256"] == hashlib.sha256(
+            candidate_text.encode("utf-8")
+        ).hexdigest()
+        assert row["chars"] == len(normalized_candidate_text)
+        assert row["sha256"] == hashlib.sha256(
+            normalized_candidate_text.encode("utf-8")
+        ).hexdigest()
+        block = prompt_text[row["block_start"] : row["block_end"]]
+        assert block.startswith(f'<CANDIDATE {row["display_index"]}>')
+        assert block.endswith(f'</CANDIDATE {row["display_index"]}>')
+        assert normalized_candidate_text in block
 
 
 @pytest.mark.asyncio

@@ -75,6 +75,10 @@ from .types import (
 )
 
 TRACE_CONTENT_MAX_CHARS = 8_000
+TRACE_CONTENT_BINDING_SCHEMA = "opensquilla.trace-content-sha256/v1"
+AGGREGATOR_CANDIDATE_BINDING_SCHEMA = (
+    "opensquilla.ensemble-aggregator-candidate-binding/v2"
+)
 _UINT64_MAX = (1 << 64) - 1
 _ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS = 15.0
 _ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS = 5.0
@@ -183,6 +187,30 @@ _STRONG_PROGRESS_ACTION_PREFIXES = (
     "i will search ",
     "i'm searching ",
     "i am searching ",
+    "i'll start ",
+    "i will start ",
+    "i'll inspect ",
+    "i will inspect ",
+    "i'll investigate ",
+    "i will investigate ",
+    "i'll implement ",
+    "i will implement ",
+    "i'll reproduce ",
+    "i will reproduce ",
+    "i'll create ",
+    "i will create ",
+    "i'll write ",
+    "i will write ",
+    "i'll apply ",
+    "i will apply ",
+    "i'll work through ",
+    "i will work through ",
+    "starting ",
+    "inspecting ",
+    "investigating ",
+    "implementing ",
+    "reproducing ",
+    "creating ",
     "正在搜索",
     "正在查询",
     "正在获取",
@@ -205,6 +233,12 @@ _STRONG_PROGRESS_ACTION_EXACT = (
     "retrieving",
     "browsing",
     "checking",
+    "starting",
+    "inspecting",
+    "investigating",
+    "implementing",
+    "reproducing",
+    "creating",
 )
 _AMBIGUOUS_PROGRESS_ACTION_PREFIXES = (
     "pulling ",
@@ -225,11 +259,8 @@ _PROGRESS_SUBSTANTIVE_MARKERS = (
     " found ",
     " confirms ",
     " confirmed ",
-    " is ",
-    " are ",
-    " was ",
-    " were ",
-    "=",
+    " answer is ",
+    " disabled ",
     "%",
     "$",
     "结果是",
@@ -265,7 +296,12 @@ _PROGRESS_DEFER_SUFFIXES = (
     " to finish the calculations",
     " to finish the answer",
 )
-_PROGRESS_ONLY_MAX_CHARS = 1_200
+# Experiment-mode aggregation buffers visible text until it can distinguish a
+# substantive answer from a planning/status loop.  Real SWE-bench failures have
+# repeated the same planning sentence for more than 80K characters, so this
+# guard deliberately has no size cutoff.
+_REPETITIVE_STALL_MIN_CHARS = 4_096
+_REPETITIVE_STALL_MIN_SEGMENT_CHARS = 48
 _EMBEDDED_PROGRESS_ACTIONS = (
     " so i'm searching ",
     " so i am searching ",
@@ -2202,27 +2238,22 @@ def _visible_answer_is_progress_only(text: str) -> bool:
     """Detect a status update that defers, rather than answers, the task.
 
     This is intentionally deterministic and conservative.  It only rejects a
-    short response when every sentence is framed as an evidence-gathering or
-    verification action.  A response containing even one substantive sentence
-    remains eligible for normal or degraded delivery.
+    response when every sentence is framed as an evidence-gathering or
+    implementation action.  A response containing even one substantive
+    sentence remains eligible for normal or degraded delivery.
     """
 
     candidate = str(text or "").strip()
-    if not candidate or len(candidate) > _PROGRESS_ONLY_MAX_CHARS:
-        return False
-    # Colons and semicolons commonly introduce the actual conclusion after a
-    # short framing phrase (for example, "Checking the filing: margin is
-    # 18.4%").  Prefer one bounded recovery false-negative over discarding a
-    # concise substantive answer.
-    if any(
-        delimiter in candidate
-        for delimiter in (":", ";", "：", "；", "—", "–")
-    ):
+    if not candidate:
         return False
     segments = [
         segment.strip().lstrip("-*\u2022 ")
         for segment in re.split(r"[\r\n]+|[.!?。！？]+", candidate)
         if segment.strip().lstrip("-*\u2022 ")
+        and not re.fullmatch(
+            r"\[\[[a-z0-9_:-]+\]\]",
+            segment.strip().lstrip("-*\u2022 ").casefold(),
+        )
     ]
     if not segments:
         return False
@@ -2251,6 +2282,36 @@ def _visible_answer_is_progress_only(text: str) -> bool:
         ) or normalized.endswith(_PROGRESS_DEFER_SUFFIXES)
 
     return all(is_progress_segment(segment) for segment in segments)
+
+
+def _visible_answer_is_repetitive_stall(text: str) -> bool:
+    """Reject a long output dominated by the same non-answer fragment.
+
+    This is deliberately limited to long, sentence-sized repeats.  Ordinary
+    code, lists, and short repeated labels are not treated as a stall.  The
+    guard exists for provider streams that consume their entire output budget
+    repeating one planning paragraph without adding new information.
+    """
+
+    candidate = str(text or "").strip()
+    if len(candidate) < _REPETITIVE_STALL_MIN_CHARS:
+        return False
+    segments = [
+        " ".join(segment.casefold().split())
+        for segment in re.split(r"[\r\n]+|[.!?。！？]+", candidate)
+        if len(" ".join(segment.split())) >= _REPETITIVE_STALL_MIN_SEGMENT_CHARS
+    ]
+    if len(segments) < 6:
+        return False
+    counts: dict[str, int] = {}
+    for segment in segments:
+        counts[segment] = counts.get(segment, 0) + 1
+    repeated_chars = sum(
+        len(segment) * count for segment, count in counts.items() if count >= 3
+    )
+    return max(counts.values(), default=0) >= 4 and repeated_chars * 10 >= len(
+        candidate
+    ) * 6
 
 
 def _visible_answer_looks_usable(
@@ -6892,6 +6953,7 @@ class EnsembleProvider:
                     initial_trigger=initial_aggregator_trigger,
                     initial_unstarted_attempts=initial_unstarted_attempts,
                     disable_recovery=False,
+                    binding_candidates=ordered_candidates,
                 ),
                 phase="ensemble_final_aggregator_attempt_relay",
             ) as aggregator_stream:
@@ -6984,6 +7046,7 @@ class EnsembleProvider:
                 initial_trigger=initial_aggregator_trigger,
                 initial_unstarted_attempts=initial_unstarted_attempts,
                 disable_recovery=False,
+                binding_candidates=ordered_candidates,
             ),
             phase="ensemble_soft_deadline_aggregator_relay",
         ) as child_stream:
@@ -7116,6 +7179,10 @@ class EnsembleProvider:
                 direct_messages,
                 max_chars=TRACE_CONTENT_MAX_CHARS,
             ),
+            "candidate_binding": _aggregator_candidate_input_binding(
+                direct_messages,
+                ordered_candidates,
+            ),
         }
         yield ProviderHeartbeatEvent(
             phase="ensemble_soft_deadline_finalizer",
@@ -7160,6 +7227,7 @@ class EnsembleProvider:
                 initial_fallback_index=initial_aggregator_fallback_index,
                 initial_trigger=initial_aggregator_trigger,
                 disable_recovery=True,
+                binding_candidates=ordered_candidates,
             ),
             phase="ensemble_soft_deadline_finalizer_relay",
         ) as child_stream:
@@ -10798,6 +10866,7 @@ class EnsembleProvider:
         )
         trace = {
             "output_binding_schema": "opensquilla.ensemble-output-binding/v1",
+            "content_binding_schema": TRACE_CONTENT_BINDING_SCHEMA,
             "output_components": [],
             "mode": "b5_fusion",
             "profile": self.profile_name,
@@ -10926,6 +10995,28 @@ class EnsembleProvider:
                 final_request_messages,
                 max_chars=TRACE_CONTENT_MAX_CHARS,
             )
+            if selected and final_request_role == "aggregator":
+                selected_by_index = {candidate.index: candidate for candidate in selected}
+                display_order = list(candidate_display_order or [])
+                if display_order:
+                    if (
+                        len(display_order) != len(selected_by_index)
+                        or set(display_order) != set(selected_by_index)
+                    ):
+                        raise ValueError(
+                            "aggregator candidate display order does not match selection"
+                        )
+                    binding_candidates = [
+                        selected_by_index[index] for index in display_order
+                    ]
+                else:
+                    binding_candidates = selected
+                final_request["candidate_binding"] = (
+                    _aggregator_candidate_input_binding(
+                        final_request_messages,
+                        binding_candidates,
+                    )
+                )
         trace["final_request"] = final_request
         return trace
 
@@ -10946,6 +11037,7 @@ class EnsembleProvider:
         initial_trigger: str = "",
         initial_unstarted_attempts: Sequence[Mapping[str, Any]] = (),
         disable_recovery: bool = False,
+        binding_candidates: Sequence[_CandidateResult] = (),
     ) -> AsyncIterator[StreamEvent]:
         recovery_guard_reason = self._proposer_recovery_plan_guard_reason()
         if recovery_guard_reason:
@@ -11008,11 +11100,21 @@ class EnsembleProvider:
             and recovery_mode == "experiment"
         )
 
+        def aggregator_visible_stall_kind(text: str) -> str:
+            if not progress_gate_enabled:
+                return ""
+            if _visible_answer_is_progress_only(text):
+                return "progress_only"
+            if _visible_answer_is_repetitive_stall(text):
+                return "repetitive_stall"
+            return ""
+
         def aggregator_visible_answer_looks_usable(text: str) -> bool:
-            return _visible_answer_looks_usable(
+            usable = _visible_answer_looks_usable(
                 text,
                 reject_progress_only=progress_gate_enabled,
             )
+            return usable and not aggregator_visible_stall_kind(text)
 
         # Keep the full ranked chain available in serving mode as well.
         # Unavailable/unbuildable candidates do not consume the one allowed
@@ -11185,6 +11287,15 @@ class EnsembleProvider:
                 active_messages,
                 max_chars=TRACE_CONTENT_MAX_CHARS,
             )
+            if binding_candidates:
+                final_request["candidate_binding"] = (
+                    _aggregator_candidate_input_binding(
+                        active_messages,
+                        binding_candidates,
+                    )
+                )
+            else:
+                final_request.pop("candidate_binding", None)
 
         def activate_recovery_attempt(
             *,
@@ -11745,6 +11856,21 @@ class EnsembleProvider:
                 trace["audit_outcome"] = str(
                     recovery_trace.get("audit_outcome") or "incomplete"
                 )
+            elif (
+                isinstance(trace.get("proposer_partial_quorum"), Mapping)
+                and trace["proposer_partial_quorum"].get("applied") is True
+            ):
+                # The aggregator request itself completed, but at least one
+                # selected proposer was only partially observed.  Keep that
+                # execution degradation explicit instead of reporting a fully
+                # complete ensemble result and forcing downstream auditors to
+                # infer it from a separate marker.
+                trace["run_outcome"] = "partial_proposer_quorum"
+                trace["delivery_outcome"] = "degraded_success"
+                trace["execution_outcome"] = "degraded_success"
+                trace["audit_outcome"] = "incomplete"
+                trace["degradation_reasons"] = ["partial_proposer_quorum"]
+                recovery_trace["upstream_partial_quorum"] = True
             else:
                 trace["run_outcome"] = (
                     "aggregator_recovered" if selected_kind != "primary" else "success"
@@ -12482,14 +12608,6 @@ class EnsembleProvider:
                         if not attempt_kind.startswith("continuation"):
                             if buffer_visible_text:
                                 pending_visible_events.append(event)
-                                if (
-                                    len("".join(attempt_text_parts))
-                                    > _PROGRESS_ONLY_MAX_CHARS
-                                ):
-                                    for pending_event in pending_visible_events:
-                                        yield pending_event
-                                    pending_visible_events.clear()
-                                    buffer_visible_text = False
                             else:
                                 yield event
                     elif isinstance(event, ProviderHeartbeatEvent):
@@ -12606,25 +12724,18 @@ class EnsembleProvider:
                     if attempt_visible_text:
                         final_text_parts.append(attempt_visible_text)
                         continuation_event = TextDeltaEvent(text=attempt_visible_text)
-                        if (
-                            buffer_visible_text
-                            and len(attempt_visible_text)
-                            <= _PROGRESS_ONLY_MAX_CHARS
-                        ):
+                        if buffer_visible_text:
                             pending_visible_events.append(continuation_event)
                         else:
                             buffer_visible_text = False
                             yield continuation_event
                 if not stream_closed:
-                    discarded_progress_only = False
+                    discarded_stalled_visible = False
                     if pending_visible_events:
-                        discarded_progress_only = bool(
-                            progress_gate_enabled
-                            and _visible_answer_is_progress_only(
-                                attempt_visible_text
-                            )
+                        discarded_stalled_visible = bool(
+                            aggregator_visible_stall_kind(attempt_visible_text)
                         )
-                        if discarded_progress_only:
+                        if discarded_stalled_visible:
                             del final_text_parts[assembled_part_count_before_attempt:]
                         else:
                             for pending_event in pending_visible_events:
@@ -12649,7 +12760,7 @@ class EnsembleProvider:
                     ):
                         selected_prior_attempt = (
                             last_visible_attempt_sequence
-                            if discarded_progress_only
+                            if discarded_stalled_visible
                             and attempt_kind.startswith("continuation")
                             else None
                         )
@@ -12693,17 +12804,22 @@ class EnsembleProvider:
                     and bool(attempt_visible_text.strip())
                     and not tool_output_streamed
                 )
-                progress_only_terminal = bool(
-                    progress_gate_enabled
-                    and attempt_visible_text.strip()
-                    and not tool_output_streamed
-                    and _visible_answer_is_progress_only(attempt_visible_text)
+                visible_stall_kind = (
+                    aggregator_visible_stall_kind(attempt_visible_text)
+                    if attempt_visible_text.strip() and not tool_output_streamed
+                    else ""
                 )
+                progress_only_terminal = visible_stall_kind == "progress_only"
+                repetitive_stall_terminal = visible_stall_kind == "repetitive_stall"
+                stalled_visible_terminal = bool(visible_stall_kind)
                 diagnostic_error = ErrorEvent(
                     message=(
                         "ensemble aggregator returned only evidence-gathering "
                         "progress instead of a substantive final answer"
                         if progress_only_terminal
+                        else "ensemble aggregator output stalled in a repeated "
+                        "non-answer fragment"
+                        if repetitive_stall_terminal
                         else "ensemble aggregator produced no deliverable final answer"
                         if empty_terminal
                         else "ensemble aggregator exhausted its output budget "
@@ -12712,6 +12828,8 @@ class EnsembleProvider:
                     code=(
                         "ensemble_aggregator_progress_only_terminal"
                         if progress_only_terminal
+                        else "ensemble_aggregator_repetitive_stall_terminal"
+                        if repetitive_stall_terminal
                         else "ensemble_aggregator_reasoning_only_length"
                         if reasoning_only_length
                         else "ensemble_aggregator_empty_length"
@@ -12727,7 +12845,7 @@ class EnsembleProvider:
                     physical_request_count=1,
                 )
 
-                if progress_only_terminal:
+                if stalled_visible_terminal:
                     # The provider call completed and is fully auditable, but
                     # its text is only a status update.  Remove it from the
                     # authoritative assembled answer, retain the physical
@@ -12738,7 +12856,11 @@ class EnsembleProvider:
                     pending_visible_events.clear()
                     rejected_attempt = record_abandoned_attempt(
                         diagnostic_error,
-                        trigger="progress_only_terminal",
+                        trigger=(
+                            "progress_only_terminal"
+                            if progress_only_terminal
+                            else "repetitive_stall_terminal"
+                        ),
                         stream_closed=True,
                         stop_reason=stop_reason,
                         physical_output_text="".join(attempt_text_parts),
@@ -12748,7 +12870,11 @@ class EnsembleProvider:
                         if recovery_attempt.get("attempt") == rejected_attempt:
                             recovery_attempt.update(
                                 {
-                                    "content_outcome": "progress_only",
+                                    "content_outcome": (
+                                        "progress_only"
+                                        if progress_only_terminal
+                                        else "repetitive_stall"
+                                    ),
                                     "assembled_output_discarded": True,
                                 }
                             )
@@ -12762,11 +12888,19 @@ class EnsembleProvider:
                         activated_same_model = activate_recovery_attempt(
                             member=active_member,
                             kind="same_model_recovery",
-                            trigger="progress_only_terminal",
+                            trigger=(
+                                "progress_only_terminal"
+                                if progress_only_terminal
+                                else "repetitive_stall_terminal"
+                            ),
                             fallback_index=active_fallback_index,
                         )
                     activated = activated_same_model or activate_next_fallback(
-                        trigger="progress_only_terminal"
+                        trigger=(
+                            "progress_only_terminal"
+                            if progress_only_terminal
+                            else "repetitive_stall_terminal"
+                        )
                     )
                     if activated:
                         attempt += 1
@@ -12778,7 +12912,8 @@ class EnsembleProvider:
                                 else "ensemble_aggregator_model_fallback"
                             ),
                             message=(
-                                "Ensemble aggregator returned only progress; "
+                                "Ensemble aggregator returned a non-deliverable "
+                                "answer; "
                                 + (
                                     "retrying once with tools disabled and a "
                                     "direct final-answer instruction"
@@ -12790,7 +12925,7 @@ class EnsembleProvider:
                         continue
                     terminal_stream_error = diagnostic_error
 
-                if not progress_only_terminal and pending_visible_events:
+                if not stalled_visible_terminal and pending_visible_events:
                     for pending_event in pending_visible_events:
                         yield pending_event
                     pending_visible_events.clear()
@@ -13150,13 +13285,12 @@ class EnsembleProvider:
                     yield done_event
                     return
             if terminal_stream_error is not None:
+                terminal_stall_kind = ""
                 if pending_visible_events:
-                    if (
-                        progress_gate_enabled
-                        and _visible_answer_is_progress_only(
-                            "".join(attempt_text_parts)
-                        )
-                    ):
+                    terminal_stall_kind = aggregator_visible_stall_kind(
+                        "".join(attempt_text_parts)
+                    )
+                    if terminal_stall_kind:
                         del final_text_parts[assembled_part_count_before_attempt:]
                     else:
                         for pending_event in pending_visible_events:
@@ -13171,6 +13305,61 @@ class EnsembleProvider:
                         ),
                         code="ensemble_aggregator_close_timeout",
                     )
+                if (
+                    terminal_stall_kind
+                    and stream_closed
+                    and recovery_mode == "experiment"
+                ):
+                    stalled_error = replace(
+                        terminal_stream_error,
+                        message=(
+                            "ensemble aggregator returned only progress before "
+                            "the request failed"
+                            if terminal_stall_kind == "progress_only"
+                            else "ensemble aggregator stalled in repeated output "
+                            "before the request failed"
+                        ),
+                        code=(
+                            "ensemble_aggregator_progress_only_terminal"
+                            if terminal_stall_kind == "progress_only"
+                            else "ensemble_aggregator_repetitive_stall_terminal"
+                        ),
+                    )
+                    record_abandoned_attempt(
+                        stalled_error,
+                        trigger=f"{terminal_stall_kind}_terminal",
+                        stream_closed=True,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text="",
+                    )
+                    activated_same_model = False
+                    if same_model_recoveries < 1 and recovery_budget_available():
+                        same_model_recoveries += 1
+                        activated_same_model = activate_recovery_attempt(
+                            member=active_member,
+                            kind="same_model_recovery",
+                            trigger=f"{terminal_stall_kind}_terminal",
+                            fallback_index=active_fallback_index,
+                        )
+                    activated = activated_same_model or activate_next_fallback(
+                        trigger=f"{terminal_stall_kind}_terminal"
+                    )
+                    if activated:
+                        attempt += 1
+                        trace.setdefault("final_request", {})["retry_count"] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase=(
+                                "ensemble_aggregator_final_answer_recovery"
+                                if activated_same_model
+                                else "ensemble_aggregator_model_fallback"
+                            ),
+                            message=(
+                                "Ensemble aggregator failed after non-deliverable "
+                                "output; retrying bounded finalization"
+                            ),
+                        )
+                        continue
+                    terminal_stream_error = stalled_error
                 degraded_contribution = (
                     "".join(attempt_text_parts)
                     if not attempt_kind.startswith("continuation")
@@ -13416,13 +13605,12 @@ class EnsembleProvider:
                 )
                 yield partial_error(terminal_stream_error)
                 return
+            incomplete_stall_kind = ""
             if pending_visible_events:
-                if (
-                    progress_gate_enabled
-                    and _visible_answer_is_progress_only(
-                        "".join(attempt_text_parts)
-                    )
-                ):
+                incomplete_stall_kind = aggregator_visible_stall_kind(
+                    "".join(attempt_text_parts)
+                )
+                if incomplete_stall_kind:
                     del final_text_parts[assembled_part_count_before_attempt:]
                 else:
                     for pending_event in pending_visible_events:
@@ -13448,6 +13636,60 @@ class EnsembleProvider:
                     message="ensemble aggregator stream ended before DoneEvent",
                     code="ensemble_aggregator_incomplete",
                 )
+                if (
+                    incomplete_stall_kind
+                    and stream_closed
+                    and recovery_mode == "experiment"
+                ):
+                    error = replace(
+                        error,
+                        message=(
+                            "ensemble aggregator returned only progress before "
+                            "ending without DoneEvent"
+                            if incomplete_stall_kind == "progress_only"
+                            else "ensemble aggregator stalled in repeated output "
+                            "before ending without DoneEvent"
+                        ),
+                        code=(
+                            "ensemble_aggregator_progress_only_terminal"
+                            if incomplete_stall_kind == "progress_only"
+                            else "ensemble_aggregator_repetitive_stall_terminal"
+                        ),
+                    )
+                    record_abandoned_attempt(
+                        error,
+                        trigger=f"{incomplete_stall_kind}_terminal",
+                        stream_closed=True,
+                        physical_output_text="".join(attempt_text_parts),
+                        assembled_contribution_text="",
+                    )
+                    activated_same_model = False
+                    if same_model_recoveries < 1 and recovery_budget_available():
+                        same_model_recoveries += 1
+                        activated_same_model = activate_recovery_attempt(
+                            member=active_member,
+                            kind="same_model_recovery",
+                            trigger=f"{incomplete_stall_kind}_terminal",
+                            fallback_index=active_fallback_index,
+                        )
+                    activated = activated_same_model or activate_next_fallback(
+                        trigger=f"{incomplete_stall_kind}_terminal"
+                    )
+                    if activated:
+                        attempt += 1
+                        trace.setdefault("final_request", {})["retry_count"] = attempt
+                        yield ProviderHeartbeatEvent(
+                            phase=(
+                                "ensemble_aggregator_final_answer_recovery"
+                                if activated_same_model
+                                else "ensemble_aggregator_model_fallback"
+                            ),
+                            message=(
+                                "Ensemble aggregator ended after non-deliverable "
+                                "output; retrying bounded finalization"
+                            ),
+                        )
+                        continue
                 if self._router_dynamic_selection():
                     degraded_contribution = (
                         "".join(attempt_text_parts)
@@ -14544,6 +14786,7 @@ def _trace_content(text: str, *, max_chars: int = TRACE_CONTENT_MAX_CHARS) -> di
         "text": clipped,
         "chars": len(value),
         "truncated": len(clipped) < len(value),
+        "sha256": _text_sha256(value),
     }
 
 
@@ -14556,9 +14799,7 @@ def _trace_output_content(
     *,
     max_chars: int = TRACE_CONTENT_MAX_CHARS,
 ) -> dict[str, Any]:
-    content = _trace_content(text, max_chars=max_chars)
-    content["sha256"] = _text_sha256(text)
-    return content
+    return _trace_content(text, max_chars=max_chars)
 
 
 def _message_content_text(content: Any) -> str:
@@ -14605,12 +14846,96 @@ def _messages_trace(
             }
         )
     return {
+        "content_binding_schema": TRACE_CONTENT_BINDING_SCHEMA,
         "message_count": len(rows),
         "total_chars": total_chars,
         # The final synthetic user message contains the candidate draft content
         # for the aggregator; keep full rows for small conversations and a
         # stable tail for larger ones.
         "messages": rows if len(rows) <= 4 else [rows[0], *rows[-3:]],
+    }
+
+
+def _aggregator_candidate_input_binding(
+    messages: Sequence[Message],
+    candidates: Sequence[_CandidateResult],
+) -> dict[str, Any]:
+    """Bind selected drafts to the actual synthetic aggregator prompt.
+
+    The normal trace clips large messages.  This compact sidecar is built from
+    the exact outgoing message before clipping, so an external auditor can
+    still verify every selected candidate by display order, full length, and
+    digest without storing the whole prompt twice.
+    """
+
+    if not messages or not candidates:
+        raise ValueError("aggregator candidate binding requires a prompt and candidates")
+    candidate_blocks: list[tuple[_CandidateResult, str, str]] = []
+    for display_index, candidate in enumerate(candidates, start=1):
+        candidate_text = candidate.text.strip()
+        if not candidate_text:
+            raise ValueError("aggregator candidate binding cannot include empty text")
+        candidate_blocks.append(
+            (
+                candidate,
+                candidate_text,
+                "\n".join(
+                    [
+                        f"<CANDIDATE {display_index}>",
+                        wrap_untrusted(
+                            candidate_text,
+                            source=f"ensemble-proposer-{display_index}",
+                        ),
+                        f"</CANDIDATE {display_index}>",
+                    ]
+                ),
+            )
+        )
+    matched_prompts: list[tuple[int, str, list[tuple[int, int]]]] = []
+    for message_index, message in enumerate(messages):
+        prompt_text = _message_content_text(message.content)
+        cursor = 0
+        spans: list[tuple[int, int]] = []
+        for _, _, block in candidate_blocks:
+            block_start = prompt_text.find(block, cursor)
+            if block_start < 0:
+                break
+            block_end = block_start + len(block)
+            spans.append((block_start, block_end))
+            cursor = block_end
+        if len(spans) == len(candidate_blocks):
+            matched_prompts.append((message_index, prompt_text, spans))
+    if len(matched_prompts) != 1:
+        raise ValueError(
+            "selected candidates require one unique aggregator prompt message"
+        )
+    message_index, prompt_text, spans = matched_prompts[0]
+    rows: list[dict[str, Any]] = []
+    for display_index, ((candidate, candidate_text, _), span) in enumerate(
+        zip(candidate_blocks, spans, strict=True),
+        start=1,
+    ):
+        block_start, block_end = span
+        rows.append(
+            {
+                "candidate_index": candidate.index,
+                "sample_index": candidate.sample_index,
+                "display_index": display_index,
+                "normalization": "strip/v1",
+                "source_chars": len(candidate.text),
+                "source_sha256": _text_sha256(candidate.text),
+                "chars": len(candidate_text),
+                "sha256": _text_sha256(candidate_text),
+                "block_start": block_start,
+                "block_end": block_end,
+            }
+        )
+    return {
+        "schema": AGGREGATOR_CANDIDATE_BINDING_SCHEMA,
+        "content_binding_schema": TRACE_CONTENT_BINDING_SCHEMA,
+        "message_index": message_index,
+        "prompt": _trace_content(prompt_text),
+        "candidates": rows,
     }
 
 
