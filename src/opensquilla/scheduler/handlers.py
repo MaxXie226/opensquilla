@@ -482,7 +482,12 @@ def make_static_message_handler(
                     await session_event_emitter(
                         session_key,
                         "sessions.changed",
-                        {"key": session_key, "reason": "cron_static_message"},
+                        {
+                            "key": session_key,
+                            "reason": "cron_static_message",
+                            "taskId": session_key,
+                            "status": "succeeded",
+                        },
                     )
             except Exception:
                 log.warning(

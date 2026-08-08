@@ -445,6 +445,7 @@ import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { looksLikeRawSessionId } from './utils/sidebarConversations'
+import { reminderToastPreview } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
 import type { RpcEventHandler } from '@/lib/rpc'
 import { isMacPlatform } from './utils/browser'
@@ -561,7 +562,10 @@ const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 interface AppCronRunFinishedPayload {
   jobId?: string
   jobName?: string
+  payloadKind?: string
   runId?: string
+  sessionKey?: string
+  summary?: string
   success?: boolean
 }
 
@@ -577,6 +581,26 @@ function handleCronRunFinished(payload: unknown) {
     pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
       tone: 'danger',
       duration: 9_000,
+    })
+    return
+  }
+  const reminder = event.payloadKind === 'reminder'
+    ? reminderToastPreview(event.summary)
+    : ''
+  if (reminder) {
+    const sessionKey = event.sessionKey?.trim() || ''
+    pushToast(t('cronSkills.jobs.toastBackgroundReminder', {
+      name: jobName,
+      reminder,
+    }), {
+      tone: 'ok',
+      duration: 10_000,
+      action: sessionKey
+        ? {
+            label: t('cronSkills.jobs.toastViewReminder'),
+            onClick: () => switchToSession(sessionKey, 'cron.reminder_toast'),
+          }
+        : undefined,
     })
     return
   }

@@ -633,6 +633,7 @@ def test_delivery_sanitizes_reply_directives_across_cron_outputs() -> None:
     assert report.session_status == "skipped"
     assert cm.adapter.sent[0].content == "Here is the scheduled reply"
     assert ws_events[0][2]["summary"] == "Here is the scheduled reply"
+    assert ws_events[0][2]["payloadKind"] == AGENT_TURN_KIND
     assert ws_events[0][2]["runId"] == "run-1"
     assert forward_calls == []
 
@@ -884,7 +885,12 @@ async def test_static_webchat_reminder_delivers_without_turn_runner() -> None:
         (
             result.session_key,
             "sessions.changed",
-            {"key": result.session_key, "reason": "cron_static_message"},
+            {
+                "key": result.session_key,
+                "reason": "cron_static_message",
+                "taskId": result.session_key,
+                "status": "succeeded",
+            },
         )
     ]
     assert forward_calls == [
