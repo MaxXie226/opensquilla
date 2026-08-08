@@ -1614,8 +1614,10 @@ def _billing_result(
             if usage.billed_cost_present
             else None
         )
-        # Keep OpenRouter's historical positive-only billed-cost contract.
-        if amount is not None and amount > 0:
+        # Presence, rather than truthiness, is authoritative. OpenRouter can
+        # explicitly confirm a zero-dollar request; the later BYOK gate still
+        # discards this receipt unless ``is_byok`` is false.
+        if amount is not None:
             amount_nanos = _money_to_nanos(amount)
             if amount_nanos is None:
                 return 0.0, "none", None

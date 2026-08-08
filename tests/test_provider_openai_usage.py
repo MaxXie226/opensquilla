@@ -26,8 +26,9 @@ from opensquilla.provider.openai import (
     _provider_billed_cost,
     _provider_cost_with_byok_evidence,
     _provider_usage_evidence,
-    _sanitize_openrouter_metadata,
     _ProviderBillingAccumulator,
+    _sanitize_openrouter_metadata,
+    _usage_diagnostic_done,
     _usage_fields,
     _UsageSnapshotAccumulator,
 )
@@ -726,3 +727,64 @@ def test_openrouter_positive_usage_cost_produces_usd_receipt() -> None:
     assert receipt.amount_nanos == 12_000_000
     assert receipt.usd_equivalent_nanos == 12_000_000
     assert receipt.fx_native_per_usd_nanos == 1_000_000_000
+
+
+def test_openrouter_explicit_zero_usage_cost_produces_usd_receipt() -> None:
+    usage = _UsageSnapshotAccumulator()
+    usage.update({"cost": 0})
+
+    billed_cost, cost_source, receipt = _billing_result(
+        provider_kind="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        usage=usage,
+        billing=_ProviderBillingAccumulator(),
+        model="synthetic-model",
+    )
+
+    assert billed_cost == 0.0
+    assert cost_source == "provider_billed"
+    assert receipt is not None
+    assert receipt.status == "confirmed"
+    assert receipt.currency == "USD"
+    assert receipt.amount_nanos == 0
+    assert receipt.usd_equivalent_nanos == 0
+
+
+def test_openrouter_missing_usage_cost_does_not_produce_receipt() -> None:
+    usage = _UsageSnapshotAccumulator()
+
+    assert _billing_result(
+        provider_kind="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        usage=usage,
+        billing=_ProviderBillingAccumulator(),
+        model="synthetic-model",
+    ) == (0.0, "none", None)
+
+
+def test_openrouter_error_usage_retains_confirmed_zero_receipt() -> None:
+    usage = _UsageSnapshotAccumulator()
+    usage.update({"prompt_tokens": 5, "completion_tokens": 2, "cost": 0})
+
+    done = _usage_diagnostic_done(
+        provider_kind="openrouter",
+        provider_id="openrouter",
+        requested_model="google/gemini-test",
+        base_url="https://openrouter.ai/api/v1",
+        actual_model="google/gemini-test-versioned",
+        usage=usage,
+        billing=_ProviderBillingAccumulator(),
+        usage_evidence_seen=True,
+        provider_usage={"is_byok": False, "cost": 0},
+        router_metadata={},
+        response_ids=["gen-zero-error"],
+        cache_namespace_sha256="",
+    )
+
+    assert done is not None
+    assert done.stop_reason == "error"
+    assert done.billed_cost == 0.0
+    assert done.cost_source == "provider_billed"
+    assert done.billing_receipt is not None
+    assert done.billing_receipt.status == "confirmed"
+    assert done.billing_receipt.usd_equivalent_nanos == 0
