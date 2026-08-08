@@ -72,6 +72,7 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    make_operational_error,
 )
 
 TRACE_CONTENT_MAX_CHARS = 8_000
@@ -205,6 +206,10 @@ _STRONG_PROGRESS_ACTION_PREFIXES = (
     "i will apply ",
     "i'll work through ",
     "i will work through ",
+    "let me compile ",
+    "i'll also do one final verification pass ",
+    "i will also do one final verification pass ",
+    "i have enough confirmed data from ",
     "starting ",
     "inspecting ",
     "investigating ",
@@ -223,6 +228,9 @@ _STRONG_PROGRESS_ACTION_PREFIXES = (
     "正在核实",
     "正在检查",
     "正在确认",
+    "先核对",
+    "先检查",
+    "先确认",
 )
 _STRONG_PROGRESS_ACTION_EXACT = (
     "let me search",
@@ -239,6 +247,15 @@ _STRONG_PROGRESS_ACTION_EXACT = (
     "implementing",
     "reproducing",
     "creating",
+    # Real WildClaw jigsaw terminal outputs that announce work without
+    # returning either a solved layout or a diagnostic result.
+    "running v3 solver now",
+    "running diagnostic now",
+)
+_UNAMBIGUOUS_PROGRESS_ACTION_PREFIXES = (
+    # Real WildClaw incident: this announces readiness to create artifacts but
+    # still contains neither the artifacts nor any completed result.
+    "i have enough confirmed data from ",
 )
 _AMBIGUOUS_PROGRESS_ACTION_PREFIXES = (
     "pulling ",
@@ -259,6 +276,10 @@ _PROGRESS_SUBSTANTIVE_MARKERS = (
     " found ",
     " confirms ",
     " confirmed ",
+    " created ",
+    " produced ",
+    " saved ",
+    " completed ",
     " answer is ",
     " disabled ",
     "%",
@@ -2257,7 +2278,10 @@ def _visible_answer_is_progress_only(text: str) -> bool:
         return False
     segments = [
         segment.strip().lstrip("-*\u2022 ")
-        for segment in re.split(r"[\r\n]+|[.!?。！？]+", candidate)
+        for segment in re.split(
+            r"[\r\n]+|[!?。！？]+|(?<=\S)\.(?=\s+|$)",
+            candidate,
+        )
         if segment.strip().lstrip("-*\u2022 ")
         and not re.fullmatch(
             r"\[\[[a-z0-9_:-]+\]\]",
@@ -2271,9 +2295,16 @@ def _visible_answer_is_progress_only(text: str) -> bool:
         normalized = (
             segment.casefold().replace("\u2018", "'").replace("\u2019", "'")
         )
-        has_substantive_marker = any(
-            marker in normalized for marker in _PROGRESS_SUBSTANTIVE_MARKERS
+        ignores_confirmed_marker = normalized.startswith(
+            _UNAMBIGUOUS_PROGRESS_ACTION_PREFIXES
         )
+        has_substantive_marker = any(
+            marker in normalized
+            for marker in _PROGRESS_SUBSTANTIVE_MARKERS
+            if not (ignores_confirmed_marker and marker == " confirmed ")
+        )
+        if ignores_confirmed_marker:
+            return not has_substantive_marker
         if (
             normalized in _STRONG_PROGRESS_ACTION_EXACT
             or normalized.startswith(_STRONG_PROGRESS_ACTION_PREFIXES)
@@ -5487,6 +5518,8 @@ class EnsembleProvider:
         self,
         state: _ProposerRecoveryScopeState | None,
         candidates: Sequence[_CandidateResult],
+        *,
+        require_strict_quorum: bool = False,
     ) -> int:
         """Return the current scope's safe upper bound on recovery successes."""
 
@@ -5509,7 +5542,11 @@ class EnsembleProvider:
             tuple[_CandidateResult, EnsembleMemberConfig]
         ] = []
         for candidate in candidates:
-            if candidate.usable_for_aggregation:
+            if (
+                candidate.ok
+                if require_strict_quorum
+                else candidate.usable_for_aggregation
+            ):
                 continue
             member = state.effective_members.get(candidate.index)
             if member is not None:
@@ -6143,6 +6180,33 @@ class EnsembleProvider:
                             }
                         )
                         continue
+                    if (
+                        tools
+                        and self.aggregator_tools
+                        and not _member_model_capabilities(
+                            fallback_member
+                        ).supports_tools
+                    ):
+                        preselected_unstarted_attempts.append(
+                            {
+                                "attempt": 0,
+                                "kind": "model_fallback",
+                                "fallback_index": fallback_index,
+                                "trigger": "member_unavailable",
+                                "request_started": False,
+                                "visible_output_emitted": False,
+                                "stream_closed": True,
+                                "outcome": "tool_capability_unavailable",
+                                "code": "ensemble_tool_recovery_unavailable",
+                                "requested_provider": (
+                                    fallback_member.provider_config.provider
+                                ),
+                                "requested_model": (
+                                    fallback_member.provider_config.model
+                                ),
+                            }
+                        )
+                        continue
                     try:
                         preselected_aggregator_provider = _build_provider(
                             fallback_member.provider_config
@@ -6229,6 +6293,9 @@ class EnsembleProvider:
                     soft_deadline=soft_deadline,
                     soft_deadline_triggered=soft_deadline_triggered,
                     recovery_state=proposer_recovery_state,
+                    require_strict_quorum=(
+                        bool(tools) and self.aggregator_tools
+                    ),
                 )
             finally:
                 progress_queue.put_nowait(None)  # sentinel: proposers finished
@@ -6385,6 +6452,7 @@ class EnsembleProvider:
                 messages=messages,
                 tools=tools,
                 config=config,
+                require_strict_quorum=bool(tools) and self.aggregator_tools,
                 soft_deadline=soft_deadline,
                 soft_deadline_triggered=soft_deadline_triggered,
             )
@@ -6486,7 +6554,67 @@ class EnsembleProvider:
             soft_deadline_triggered.set()
             soft_trace_overrides = _soft_finalization_trace()
         strict_successful = [candidate for candidate in candidates if candidate.ok]
-        dynamic_partial_quorum = recovery_policy_enabled
+        strict_tool_quorum_required = bool(tools) and self.aggregator_tools
+        if (
+            strict_tool_quorum_required
+            and len(strict_successful) < self.min_successful_proposers
+        ):
+            strict_quorum_code = (
+                "ensemble_strict_quorum_required_for_tools"
+            )
+            strict_quorum_reason = (
+                "tool-enabled aggregation requires "
+                f"{self.min_successful_proposers} fully completed proposer "
+                f"draft(s), but only {len(strict_successful)} completed; "
+                "aggregation was not started"
+            )
+            strict_rows = _candidate_usage_rows(
+                candidates,
+                profile=self.profile_name,
+            )
+            strict_missing_count = _candidate_missing_usage_count(candidates)
+            strict_trace = self._trace_payload(
+                candidates,
+                successful_count=len(strict_successful),
+                fallback_used=False,
+                fallback_reason=strict_quorum_reason,
+                final_request_role="none",
+                selected_candidates=strict_successful,
+            )
+            strict_trace["usage_missing_count"] = strict_missing_count
+            strict_trace["proposer_strict_quorum"] = {
+                "schema": "opensquilla.ensemble-strict-proposer-quorum/v1",
+                "required_for_tools": True,
+                "quorum_required": self.min_successful_proposers,
+                "strict_successful_proposers": len(strict_successful),
+                "usable_proposers": len(
+                    _usable_proposer_candidates(candidates)
+                ),
+                "partial_candidate_indexes": [
+                    candidate.index
+                    for candidate in candidates
+                    if candidate.usable_for_aggregation and not candidate.ok
+                ],
+                "aggregator_started": False,
+            }
+            yield _attach_error_request_evidence(
+                ErrorEvent(
+                    message=strict_quorum_reason,
+                    code=strict_quorum_code,
+                    model_usage_breakdown=strict_rows,
+                    usage_missing_count=strict_missing_count,
+                    ensemble_trace=strict_trace,
+                    operational_error=make_operational_error(
+                        strict_quorum_code,
+                        retryable=True,
+                    ),
+                ),
+                strict_trace,
+            )
+            return
+        dynamic_partial_quorum = bool(
+            recovery_policy_enabled and not strict_tool_quorum_required
+        )
         successful = (
             _usable_proposer_candidates(candidates)
             if dynamic_partial_quorum
@@ -6777,6 +6905,32 @@ class EnsembleProvider:
                                 ),
                                 "requested_provider": (fallback_member.provider_config.provider),
                                 "requested_model": fallback_member.provider_config.model,
+                            }
+                        )
+                        continue
+                    if (
+                        aggregator_request_tools
+                        and not _member_model_capabilities(
+                            fallback_member
+                        ).supports_tools
+                    ):
+                        initial_unstarted_attempts.append(
+                            {
+                                "attempt": 0,
+                                "kind": "model_fallback",
+                                "fallback_index": fallback_index,
+                                "trigger": "provider_build_failed",
+                                "request_started": False,
+                                "visible_output_emitted": False,
+                                "stream_closed": True,
+                                "outcome": "tool_capability_unavailable",
+                                "code": "ensemble_tool_recovery_unavailable",
+                                "requested_provider": (
+                                    fallback_member.provider_config.provider
+                                ),
+                                "requested_model": (
+                                    fallback_member.provider_config.model
+                                ),
                             }
                         )
                         continue
@@ -7413,6 +7567,34 @@ class EnsembleProvider:
                             "outcome": "member_unavailable",
                             "code": (fallback_member.unavailable_reason or "member_unavailable"),
                             "requested_provider": fallback_member.provider_config.provider,
+                            "requested_model": fallback_member.provider_config.model,
+                        }
+                    )
+                    continue
+                if (
+                    aggregator_request_tools
+                    and not _member_model_capabilities(
+                        fallback_member
+                    ).supports_tools
+                ):
+                    initial_unstarted_attempts.append(
+                        {
+                            "attempt": 0,
+                            "kind": "model_fallback",
+                            "fallback_index": fallback_index,
+                            "trigger": (
+                                "member_unavailable"
+                                if not self.aggregator.ready
+                                else "provider_build_failed"
+                            ),
+                            "request_started": False,
+                            "visible_output_emitted": False,
+                            "stream_closed": True,
+                            "outcome": "tool_capability_unavailable",
+                            "code": "ensemble_tool_recovery_unavailable",
+                            "requested_provider": (
+                                fallback_member.provider_config.provider
+                            ),
                             "requested_model": fallback_member.provider_config.model,
                         }
                     )
@@ -8540,6 +8722,7 @@ class EnsembleProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | None,
         config: ChatConfig | None,
+        require_strict_quorum: bool = False,
         soft_deadline: float | None = None,
         soft_deadline_triggered: asyncio.Event | None = None,
     ) -> list[_CandidateResult]:
@@ -8549,6 +8732,24 @@ class EnsembleProvider:
             [_candidate_result_snapshot(candidate) for candidate in candidates],
             key=lambda candidate: candidate.index,
         )
+
+        def recovery_quorum_met() -> bool:
+            if require_strict_quorum:
+                return (
+                    sum(1 for candidate in recovered if candidate.ok)
+                    >= self.min_successful_proposers
+                )
+            return _proposer_execution_quorum_met(
+                recovered,
+                self.min_successful_proposers,
+            )
+
+        def slot_recovered(candidate: _CandidateResult) -> bool:
+            return (
+                candidate.ok
+                if require_strict_quorum
+                else candidate.usable_for_aggregation
+            )
         recovery_guard_reason = self._proposer_recovery_plan_guard_reason(
             state
         )
@@ -8595,6 +8796,7 @@ class EnsembleProvider:
             self._current_proposer_recovery_trace = trace
             return recovered
         trace = self._new_proposer_recovery_trace(state)
+        trace["strict_quorum_required_for_tools"] = require_strict_quorum
         self._current_proposer_recovery_trace = trace
         successful_count = sum(1 for candidate in recovered if candidate.ok)
         usable_count = len(_usable_proposer_candidates(recovered))
@@ -8705,10 +8907,7 @@ class EnsembleProvider:
         if not self._router_dynamic_proposer_recovery_enabled():
             self._refresh_proposer_recovery_trace(trace, state, recovered)
             return recovered
-        if _proposer_execution_quorum_met(
-            recovered,
-            self.min_successful_proposers,
-        ):
+        if recovery_quorum_met():
             self._refresh_proposer_recovery_trace(trace, state, recovered)
             return recovered
 
@@ -8735,13 +8934,10 @@ class EnsembleProvider:
         for position, failed in enumerate(list(recovered)):
             # A partial usable draft is quarantined as a failed physical call,
             # but is never replayed, continued, downgraded, or replaced.
-            if failed.usable_for_aggregation:
+            if failed.usable_for_aggregation and not require_strict_quorum:
                 continue
             if (
-                _proposer_execution_quorum_met(
-                    recovered,
-                    self.min_successful_proposers,
-                )
+                recovery_quorum_met()
                 or state.additional_physical_requests_started
                 >= state.max_additional_physical_requests
             ):
@@ -8918,12 +9114,7 @@ class EnsembleProvider:
                     state,
                     self._member_identity(effective_member),
                 )
-                if (
-                    _proposer_execution_quorum_met(
-                        recovered,
-                        self.min_successful_proposers,
-                    )
-                ):
+                if recovery_quorum_met():
                     break
                 continue
             # Scheduler-originated cancellations do not prove that the source
@@ -8936,13 +9127,13 @@ class EnsembleProvider:
                     recovered,
                 )
 
-            if current.usable_for_aggregation:
+            if current.usable_for_aggregation and not require_strict_quorum:
                 # Preserve the partial draft as execution input, but keep its
                 # identity failed/quarantined for the rest of this scope.
                 continue
 
             while (
-                not current.usable_for_aggregation
+                not slot_recovered(current)
                 and state.additional_physical_requests_started
                 < state.max_additional_physical_requests
             ):
@@ -8997,7 +9188,7 @@ class EnsembleProvider:
                         reason="frozen_backup_order",
                     )
                     break
-                if current.usable_for_aggregation:
+                if current.usable_for_aggregation and not require_strict_quorum:
                     break
 
                 backup_failure_kind = self._proposer_failure_kind(
@@ -9090,7 +9281,7 @@ class EnsembleProvider:
                                 ),
                             )
                             break
-                        if current.usable_for_aggregation:
+                        if current.usable_for_aggregation and not require_strict_quorum:
                             break
                         backup_failure_kind = (
                             self._proposer_failure_kind(
@@ -9145,7 +9336,7 @@ class EnsembleProvider:
                                 reason="transient_same_model_retry",
                             )
                             break
-                        if current.usable_for_aggregation:
+                        if current.usable_for_aggregation and not require_strict_quorum:
                             break
                         backup_failure_kind = (
                             self._proposer_failure_kind(
@@ -9162,12 +9353,7 @@ class EnsembleProvider:
                 failure_kind = backup_failure_kind
             if trace.get("terminal_reason"):
                 break
-            if (
-                _proposer_execution_quorum_met(
-                    recovered,
-                    self.min_successful_proposers,
-                )
-            ):
+            if recovery_quorum_met():
                 break
 
         self._refresh_proposer_recovery_trace(trace, state, recovered)
@@ -9183,6 +9369,7 @@ class EnsembleProvider:
         soft_deadline: float | None = None,
         soft_deadline_triggered: asyncio.Event | None = None,
         recovery_state: _ProposerRecoveryScopeState | None = None,
+        require_strict_quorum: bool = False,
     ) -> list[_CandidateResult]:
         tasks: list[asyncio.Task[_CandidateResult]] = []
         task_meta: dict[
@@ -9307,7 +9494,10 @@ class EnsembleProvider:
         cancel_code = ""
         cancel_message = ""
         try:
-            dynamic_partial_quorum = self._router_dynamic_selection()
+            dynamic_partial_quorum = bool(
+                self._router_dynamic_selection()
+                and not require_strict_quorum
+            )
             usable_count = (
                 len(_usable_proposer_candidates(results))
                 if dynamic_partial_quorum
@@ -9336,6 +9526,7 @@ class EnsembleProvider:
                     self._remaining_proposer_recovery_capacity(
                         recovery_state,
                         results,
+                        require_strict_quorum=require_strict_quorum,
                     )
                 )
                 if (
@@ -9417,6 +9608,7 @@ class EnsembleProvider:
                     self._remaining_proposer_recovery_capacity(
                         recovery_state,
                         results,
+                        require_strict_quorum=require_strict_quorum,
                     )
                 )
                 if (
@@ -11094,7 +11286,25 @@ class EnsembleProvider:
                 update={"allow_provider_stream_fallback": False}
             )
         active_messages = list(messages)
-        active_tools = None if initial_fallback_index > 0 else tools
+        tools_required_for_recovery = bool(tools) and self.aggregator_tools
+        initial_fallback_supports_tools = bool(
+            initial_fallback_index > 0
+            and _member_model_capabilities(active_member).supports_tools
+        )
+        initial_tool_recovery_unavailable = bool(
+            tools_required_for_recovery
+            and initial_fallback_index > 0
+            and not initial_fallback_supports_tools
+        )
+        active_tools = (
+            tools
+            if initial_fallback_index == 0 or initial_fallback_supports_tools
+            else None
+        )
+        if initial_fallback_supports_tools:
+            active_config = active_config.model_copy(
+                update={"tool_choice": config.tool_choice}
+            )
         if active_tools is None and active_config.tool_choice is not None:
             active_config = active_config.model_copy(update={"tool_choice": None})
         primary_messages = list(messages)
@@ -11104,10 +11314,7 @@ class EnsembleProvider:
         # as the answer.  Interactive serving keeps its existing streaming
         # behavior and is guided by the prompt instead of buffering short
         # responses until a terminal event arrives.
-        progress_gate_enabled = bool(
-            self._router_dynamic_selection()
-            and recovery_mode == "experiment"
-        )
+        progress_gate_enabled = recovery_mode == "experiment"
 
         def aggregator_visible_stall_kind(text: str) -> str:
             if not progress_gate_enabled:
@@ -11313,6 +11520,7 @@ class EnsembleProvider:
             trigger: str,
             continuation_text: str = "",
             fallback_index: int = 0,
+            preserve_tools: bool = False,
         ) -> bool:
             nonlocal active_member
             nonlocal active_config
@@ -11326,6 +11534,23 @@ class EnsembleProvider:
             nonlocal thinking_fallbacks
 
             if not recovery_budget_available():
+                return False
+            if preserve_tools and (
+                not tools_required_for_recovery
+                or not _member_model_capabilities(member).supports_tools
+            ):
+                append_recovery_attempt(
+                    {
+                        "kind": kind,
+                        "fallback_index": fallback_index,
+                        "trigger": trigger,
+                        "request_started": False,
+                        "outcome": "tool_capability_unavailable",
+                        "code": "ensemble_tool_recovery_unavailable",
+                        "requested_provider": member.provider_config.provider,
+                        "requested_model": member.provider_config.model,
+                    }
+                )
                 return False
             if not member.ready:
                 append_recovery_attempt(
@@ -11363,8 +11588,12 @@ class EnsembleProvider:
             active_fallback_index = fallback_index
             attempt_kind = kind
             attempt_trigger = trigger
-            active_tools = None
-            if continuation_text:
+            active_tools = tools if preserve_tools else None
+            if preserve_tools:
+                # The failed attempt produced no output or tool lifecycle, so
+                # replay the exact original aggregator input and tool schema.
+                active_messages = list(primary_messages)
+            elif continuation_text:
                 active_messages = [
                     *primary_messages,
                     Message(role="assistant", content=continuation_text),
@@ -11399,7 +11628,13 @@ class EnsembleProvider:
                 recovery=True,
                 request_budget_binding=self._member_request_budget_binding(active_member),
                 record_budget_rebound=False,
-            ).model_copy(update={"tool_choice": None})
+            ).model_copy(
+                update={
+                    "tool_choice": (
+                        config.tool_choice if preserve_tools else None
+                    )
+                }
+            )
             if (
                 recovery_mode == "serving"
                 or requires_physical_attempt_evidence(active_member)
@@ -11425,6 +11660,7 @@ class EnsembleProvider:
             *,
             trigger: str,
             continuation_text: str = "",
+            preserve_tools: bool = False,
         ) -> bool:
             nonlocal next_fallback_index
             while next_fallback_index < len(fallback_members):
@@ -11437,9 +11673,42 @@ class EnsembleProvider:
                     trigger=trigger,
                     continuation_text=continuation_text,
                     fallback_index=fallback_index,
+                    preserve_tools=preserve_tools,
                 ):
                     return True
             return False
+
+        def tool_recovery_unavailable_error(
+            error: ErrorEvent,
+            *,
+            reason: str,
+            replay_safe: bool,
+        ) -> ErrorEvent:
+            code = (
+                "ensemble_tool_recovery_unavailable"
+                if replay_safe
+                else "ensemble_tool_recovery_unsafe_after_output"
+            )
+            recovery_trace["tool_recovery"] = {
+                "schema": "opensquilla.ensemble-tool-recovery/v1",
+                "required": True,
+                "available": False,
+                "reason": reason,
+                "tools_preserved": False,
+                "replay_safe": replay_safe,
+            }
+            return replace(
+                error,
+                message=(
+                    "tool-enabled aggregation failed and could not be safely "
+                    f"replayed ({reason}); no tool-disabled recovery was started"
+                ),
+                code=code,
+                operational_error=make_operational_error(
+                    code,
+                    retryable=replay_safe,
+                ),
+            )
 
         if active_fallback_index > 0:
             update_final_request_for_active_attempt()
@@ -12075,6 +12344,9 @@ class EnsembleProvider:
             )
             trace["run_outcome"] = "aggregator_failed"
             trace["delivery_outcome"] = "partial_unusable" if final_text_parts else "no_answer"
+            trace["assembled_output"] = _trace_output_content(
+                "".join(final_text_parts)
+            )
             return _attach_error_request_evidence(
                 replace(
                     event,
@@ -12424,8 +12696,37 @@ class EnsembleProvider:
                 final_request_usage_override=usage_override,
             )
 
-        yield aggregator_progress("aggregator_start")
         attempt = 0
+        if initial_tool_recovery_unavailable:
+            initial_error = tool_recovery_unavailable_error(
+                ErrorEvent(
+                    message="preselected aggregator fallback does not support tools",
+                    code="ensemble_tool_recovery_unavailable",
+                    request_started=False,
+                    physical_request_count=0,
+                ),
+                reason="preselected_fallback_does_not_support_tools",
+                replay_safe=True,
+            )
+            append_recovery_attempt(
+                {
+                    "kind": attempt_kind,
+                    "fallback_index": active_fallback_index,
+                    "trigger": initial_trigger or "member_unavailable",
+                    "request_started": False,
+                    "outcome": "tool_capability_unavailable",
+                    "code": initial_error.code,
+                    "requested_provider": active_member.provider_config.provider,
+                    "requested_model": active_member.provider_config.model,
+                }
+            )
+            yield aggregator_progress(
+                "aggregator_finish",
+                error=initial_error.message,
+            )
+            yield partial_error(initial_error)
+            return
+        yield aggregator_progress("aggregator_start")
         physical_attempts_started = 0
         while True:
             recovery_guard_reason = (
@@ -12580,6 +12881,10 @@ class EnsembleProvider:
                         )
                         if (
                             not content_streamed
+                            and (
+                                not tools_required_for_recovery
+                                or not response_observed
+                            )
                             and active_member.thinking_policy_managed
                             and thinking_fallbacks
                             and _is_thinking_parameter_rejection(
@@ -12592,6 +12897,10 @@ class EnsembleProvider:
                             break
                         if (
                             not content_streamed
+                            and (
+                                not tools_required_for_recovery
+                                or not response_observed
+                            )
                             and attempt < max_transient_retries
                             and not (
                                 recovery_mode == "serving"
@@ -12608,7 +12917,7 @@ class EnsembleProvider:
                         terminal_stream_error = safe_event
                         break
                     elif isinstance(event, TextDeltaEvent):
-                        response_observed = True
+                        response_observed = response_observed or bool(event.text)
                         if event.text:
                             content_streamed = True
                             attempt_text_parts.append(event.text)
@@ -12674,6 +12983,10 @@ class EnsembleProvider:
                 )
                 if (
                     not content_streamed
+                    and (
+                        not tools_required_for_recovery
+                        or not response_observed
+                    )
                     and active_member.thinking_policy_managed
                     and thinking_fallbacks
                     and _is_thinking_parameter_rejection(
@@ -12688,6 +13001,10 @@ class EnsembleProvider:
                     )
                 elif (
                     not content_streamed
+                    and (
+                        not tools_required_for_recovery
+                        or not response_observed
+                    )
                     and attempt < max_transient_retries
                     and not (
                         recovery_mode == "serving"
@@ -12799,6 +13116,54 @@ class EnsembleProvider:
                     return
 
                 stop_reason = str(completed_provider_event.stop_reason or "").strip().lower()
+                terminal_failure_stop_reasons = {
+                    "error",
+                    "failed",
+                    "failure",
+                    "cancelled",
+                    "canceled",
+                    "content_filter",
+                    "content_filtered",
+                    "safety",
+                    "blocked",
+                }
+                if stop_reason in terminal_failure_stop_reasons:
+                    if pending_visible_events:
+                        if aggregator_visible_stall_kind(attempt_visible_text):
+                            del final_text_parts[
+                                assembled_part_count_before_attempt:
+                            ]
+                        else:
+                            for pending_event in pending_visible_events:
+                                yield pending_event
+                        pending_visible_events.clear()
+                    terminal_code = (
+                        "provider_content_filter"
+                        if stop_reason
+                        in {
+                            "content_filter",
+                            "content_filtered",
+                            "safety",
+                            "blocked",
+                        }
+                        else "provider_terminal_error"
+                    )
+                    terminal_error = ErrorEvent(
+                        message=(
+                            "ensemble aggregator provider ended with terminal "
+                            f"finish reason {stop_reason}"
+                        ),
+                        code=terminal_code,
+                        diagnostic_done=completed_provider_event,
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=terminal_error.message,
+                    )
+                    yield partial_error(terminal_error)
+                    return
                 length_capped = stop_reason in {"length", "max_tokens"} or (
                     active_member.thinking_policy_managed is True
                     and stop_reason == "max_output_tokens"
@@ -12890,6 +13255,8 @@ class EnsembleProvider:
                             break
                     activated_same_model = False
                     if (
+                        not tools_required_for_recovery
+                        and
                         same_model_recoveries < 1
                         and recovery_budget_available()
                     ):
@@ -12904,11 +13271,14 @@ class EnsembleProvider:
                             ),
                             fallback_index=active_fallback_index,
                         )
-                    activated = activated_same_model or activate_next_fallback(
-                        trigger=(
-                            "progress_only_terminal"
-                            if progress_only_terminal
-                            else "repetitive_stall_terminal"
+                    activated = activated_same_model or (
+                        not tools_required_for_recovery
+                        and activate_next_fallback(
+                            trigger=(
+                                "progress_only_terminal"
+                                if progress_only_terminal
+                                else "repetitive_stall_terminal"
+                            )
                         )
                     )
                     if activated:
@@ -12932,7 +13302,15 @@ class EnsembleProvider:
                             ),
                         )
                         continue
-                    terminal_stream_error = diagnostic_error
+                    terminal_stream_error = (
+                        tool_recovery_unavailable_error(
+                            diagnostic_error,
+                            reason="progress_output_observed",
+                            replay_safe=False,
+                        )
+                        if tools_required_for_recovery
+                        else diagnostic_error
+                    )
 
                 if not stalled_visible_terminal and pending_visible_events:
                     for pending_event in pending_visible_events:
@@ -12940,8 +13318,24 @@ class EnsembleProvider:
                     pending_visible_events.clear()
 
                 if (
+                    tools_required_for_recovery
+                    and terminal_stream_error is None
+                    and (partial_visible_length or empty_terminal)
+                ):
+                    terminal_stream_error = tool_recovery_unavailable_error(
+                        diagnostic_error,
+                        reason=(
+                            "visible_output_observed"
+                            if partial_visible_length
+                            else "terminal_response_observed"
+                        ),
+                        replay_safe=False,
+                    )
+
+                if (
                     self._router_dynamic_selection()
                     and partial_visible_length
+                    and terminal_stream_error is None
                     and aggregator_visible_answer_looks_usable(
                         "".join(final_text_parts)
                     )
@@ -12960,6 +13354,7 @@ class EnsembleProvider:
 
                 if (
                     partial_visible_length
+                    and terminal_stream_error is None
                     and continuation_count < max_continuations
                     and recovery_budget_available()
                 ):
@@ -12994,7 +13389,11 @@ class EnsembleProvider:
                         message="ensemble aggregator continuation could not be initialized",
                         code="ensemble_aggregator_recovery_unavailable",
                     )
-                elif empty_terminal and recovery_mode != "off":
+                elif (
+                    empty_terminal
+                    and terminal_stream_error is None
+                    and recovery_mode != "off"
+                ):
                     empty_trigger = (
                         "reasoning_only_length"
                         if reasoning_only_length
@@ -13314,6 +13713,29 @@ class EnsembleProvider:
                         ),
                         code="ensemble_aggregator_close_timeout",
                     )
+                safe_tool_recovery = bool(
+                    tools_required_for_recovery
+                    and stream_closed
+                    and not response_observed
+                    and not content_streamed
+                    and not tool_output_streamed
+                )
+                if tools_required_for_recovery and not safe_tool_recovery:
+                    terminal_stream_error = tool_recovery_unavailable_error(
+                        terminal_stream_error,
+                        reason=(
+                            "provider_stream_not_closed"
+                            if not stream_closed
+                            else "provider_output_or_tool_lifecycle_observed"
+                        ),
+                        replay_safe=False,
+                    )
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=terminal_stream_error.message,
+                    )
+                    yield partial_error(terminal_stream_error)
+                    return
                 if (
                     terminal_stall_kind
                     and stream_closed
@@ -13565,7 +13987,8 @@ class EnsembleProvider:
                         recorded_fallback_index=failed_fallback_index,
                     )
                     activated_ranked_fallback = activate_next_fallback(
-                        trigger=pending_error.code or "aggregator_error"
+                        trigger=pending_error.code or "aggregator_error",
+                        preserve_tools=safe_tool_recovery,
                     )
                     activated = activated_ranked_fallback
                     if (
@@ -13588,6 +14011,13 @@ class EnsembleProvider:
                             kind="same_model_recovery",
                             trigger=pending_error.code or "aggregator_error",
                             fallback_index=failed_fallback_index,
+                            preserve_tools=safe_tool_recovery,
+                        )
+                    if tools_required_for_recovery and not activated:
+                        terminal_stream_error = tool_recovery_unavailable_error(
+                            pending_error,
+                            reason="no_tool_capable_recovery_member",
+                            replay_safe=True,
                         )
                     if activated:
                         attempt += 1
@@ -13645,6 +14075,32 @@ class EnsembleProvider:
                     message="ensemble aggregator stream ended before DoneEvent",
                     code="ensemble_aggregator_incomplete",
                 )
+                safe_incomplete_tool_recovery = bool(
+                    tools_required_for_recovery
+                    and stream_closed
+                    and not response_observed
+                    and not content_streamed
+                    and not tool_output_streamed
+                )
+                if (
+                    tools_required_for_recovery
+                    and not safe_incomplete_tool_recovery
+                ):
+                    error = tool_recovery_unavailable_error(
+                        error,
+                        reason=(
+                            "provider_stream_not_closed"
+                            if not stream_closed
+                            else "provider_output_or_tool_lifecycle_observed"
+                        ),
+                        replay_safe=False,
+                    )
+                    yield aggregator_progress(
+                        "aggregator_finish",
+                        error=error.message,
+                    )
+                    yield partial_error(error)
+                    return
                 if (
                     incomplete_stall_kind
                     and stream_closed
@@ -13777,7 +14233,11 @@ class EnsembleProvider:
                             recorded_kind=failed_kind,
                             recorded_fallback_index=failed_fallback_index,
                         )
-                        if activate_next_fallback(trigger="ensemble_aggregator_incomplete"):
+                        activated = activate_next_fallback(
+                            trigger="ensemble_aggregator_incomplete",
+                            preserve_tools=safe_incomplete_tool_recovery,
+                        )
+                        if activated:
                             attempt += 1
                             trace.setdefault("final_request", {})["retry_count"] = attempt
                             yield ProviderHeartbeatEvent(
@@ -13789,6 +14249,12 @@ class EnsembleProvider:
                                 ),
                             )
                             continue
+                    if tools_required_for_recovery:
+                        error = tool_recovery_unavailable_error(
+                            error,
+                            reason="no_tool_capable_recovery_member",
+                            replay_safe=True,
+                        )
                     yield aggregator_progress(
                         "aggregator_finish",
                         error=error.message,

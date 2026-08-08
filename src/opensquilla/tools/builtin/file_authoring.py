@@ -323,7 +323,7 @@ async def _published_response(
                 "Non-empty array of row arrays. Values may be strings, numbers, "
                 "booleans, null, arrays, or objects."
             ),
-            "items": {"type": "array"},
+            "items": {"type": "array", "items": {}},
         },
     },
     required=["rows"],

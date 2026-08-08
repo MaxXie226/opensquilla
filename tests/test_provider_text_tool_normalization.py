@@ -954,7 +954,7 @@ def test_post_native_text_waits_for_duplicate_resolution(
     ] == expected_order
 
 
-@pytest.mark.parametrize("finish_reason", ["length", "content_filter", "error"])
+@pytest.mark.parametrize("finish_reason", ["length"])
 @pytest.mark.parametrize("arguments", [json.dumps({"query": "x"}), "{not-json"])
 def test_unsuccessful_native_finish_never_emits_end_or_done(
     monkeypatch: pytest.MonkeyPatch,
@@ -999,6 +999,59 @@ def test_unsuccessful_native_finish_never_emits_end_or_done(
     assert not any(isinstance(event, DoneEvent) for event in events)
     assert any(
         isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "error_code"),
+    [
+        ("error", "provider_terminal_error"),
+        ("content_filter", "provider_content_filter"),
+    ],
+)
+def test_failed_native_terminal_preserves_failure_code(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+    error_code: str,
+) -> None:
+    body = _raw_sse(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_native",
+                                    "function": {
+                                        "name": "search",
+                                        "arguments": json.dumps({"query": "x"}),
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": finish_reason}]},
+        ]
+    )
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="dashscope",
+        model="qwen3.6-flash",
+        text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=body,
+    )
+
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == error_code
         for event in events
     )
 
@@ -1162,7 +1215,7 @@ def test_two_identical_text_candidates_consume_only_one_native_match(
     assert len(_tool_ends(events)) == 1
 
 
-@pytest.mark.parametrize("finish_reason", ["length", "content_filter", "error"])
+@pytest.mark.parametrize("finish_reason", ["length"])
 def test_unsuccessful_finish_reason_replays_candidate_without_execution(
     monkeypatch: pytest.MonkeyPatch,
     finish_reason: str,
@@ -1181,6 +1234,107 @@ def test_unsuccessful_finish_reason_replays_candidate_without_execution(
         isinstance(event, DoneEvent) and event.stop_reason == finish_reason
         for event in events
     )
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "error_code"),
+    [
+        ("error", "provider_terminal_error"),
+        ("content_filter", "provider_content_filter"),
+    ],
+)
+def test_failed_text_terminal_is_error_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+    error_code: str,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="dashscope",
+        model="qwen3.6-flash",
+        text_chunks=list(_QWEN_CALL),
+        tools=[_SEARCH_TOOL],
+        finish_reason=finish_reason,
+    )
+
+    assert _text(events) == _QWEN_CALL
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == error_code
+        for event in events
+    )
+
+
+def test_failed_stream_terminal_keeps_usage_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _raw_sse(
+        [
+            {
+                "choices": [
+                    {
+                        "delta": {"content": "partial answer"},
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": "error"}]},
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18,
+                },
+            },
+        ]
+    )
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="openai",
+        model="gpt-test",
+        text_chunks=[],
+        tools=[],
+        raw_body=body,
+    )
+
+    assert _text(events) == "partial answer"
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "provider_terminal_error"
+    assert error.diagnostic_done is not None
+    assert error.diagnostic_done.stop_reason == "error"
+    assert error.diagnostic_done.input_tokens == 11
+    assert error.diagnostic_done.output_tokens == 7
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "error_code"),
+    [
+        ("error", "provider_terminal_error"),
+        ("content_filter", "provider_content_filter"),
+    ],
+)
+def test_failed_non_stream_terminal_keeps_usage_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+    error_code: str,
+) -> None:
+    events = _collect_non_stream(
+        monkeypatch,
+        text="partial answer",
+        finish_reason=finish_reason,
+        compat=_plain_profile(),
+        tools=[],
+    )
+
+    assert _text(events) == "partial answer"
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == error_code
+    assert error.diagnostic_done is not None
+    assert error.diagnostic_done.stop_reason == "error"
 
 
 def test_done_sentinel_does_not_authorize_tools_without_finish_reason(

@@ -15,7 +15,7 @@ from opensquilla.cli.agent_cmd import (
     run_agent_command,
     run_agent_once,
 )
-from opensquilla.engine.types import ArtifactEvent, DoneEvent
+from opensquilla.engine.types import ArtifactEvent, DoneEvent, ErrorEvent
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, PermissionsConfig
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.tools.types import CallerKind, InteractionMode
@@ -49,6 +49,14 @@ class _FakeServices:
 
     async def close(self) -> None:
         return None
+
+
+_OPERATIONAL_ERROR = {
+    "schema_version": "opensquilla.operational-error/v1",
+    "code": "ensemble_strict_quorum_required_for_tools",
+    "retryable": True,
+    "terminal": True,
+}
 
 
 def test_benchmark_transcript_preserves_tool_result_execution_status() -> None:
@@ -269,6 +277,155 @@ async def test_run_agent_once_collects_artifact_events(
     assert result.artifacts[0]["download_url"] == "/api/v1/artifacts/art-cli"
 
 
+@pytest.mark.asyncio
+async def test_run_agent_once_preserves_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            return None
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            yield ErrorEvent(
+                message="strict proposer quorum was not met",
+                code="ensemble_strict_quorum_required_for_tools",
+                operational_error=dict(_OPERATIONAL_ERROR),
+                input_tokens=120,
+                output_tokens=30,
+                reasoning_tokens=10,
+                cached_tokens=80,
+                cache_write_tokens=5,
+                cost_usd=0.42,
+                billed_cost=0.42,
+                cost_source="provider_billed",
+                model="actual/model",
+                provider="openrouter",
+                requested_model="requested/model",
+                requested_provider="openrouter",
+                physical_request_count=2,
+                model_usage_breakdown=[
+                    {
+                        "model": "actual/model",
+                        "provider": "openrouter",
+                        "input_tokens": 120,
+                        "output_tokens": 30,
+                        "cached_tokens": 80,
+                        "billed_cost": 0.42,
+                        "cost_source": "provider_billed",
+                    }
+                ],
+            )
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+
+    usage_path = tmp_path / "usage.json"
+    result = await run_agent_once(
+        message="hello",
+        config=GatewayConfig(),
+        usage_path=str(usage_path),
+    )
+
+    assert result.status == "error"
+    assert result.errors == [
+        {
+            "message": "strict proposer quorum was not met",
+            "code": "ensemble_strict_quorum_required_for_tools",
+            "operational_error": _OPERATIONAL_ERROR,
+        }
+    ]
+    assert result.operational_error == _OPERATIONAL_ERROR
+    assert result.usage == {
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "total_tokens": 150,
+        "reasoning_tokens": 10,
+        "cached_tokens": 80,
+        "cache_write_tokens": 5,
+        "cost_usd": 0.42,
+        "billed_cost": 0.42,
+        "cost_source": "provider_billed",
+        "model": "actual/model",
+        "request_count": 2,
+        "model_usage_breakdown": [
+            {
+                "model": "actual/model",
+                "provider": "openrouter",
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cached_tokens": 80,
+                "billed_cost": 0.42,
+                "cost_source": "provider_billed",
+            }
+        ],
+    }
+    assert json.loads(usage_path.read_text()) == result.usage
+
+
+def test_run_agent_command_json_exposes_operational_error_at_top_level(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fake_run_agent_once(**kwargs: Any) -> AgentRunResult:
+        return AgentRunResult(
+            status="error",
+            agent_id="main",
+            session_key="agent:main:main",
+            text="",
+            usage={},
+            errors=[
+                {
+                    "message": "strict proposer quorum was not met",
+                    "code": "ensemble_strict_quorum_required_for_tools",
+                }
+            ],
+            operational_error=dict(_OPERATIONAL_ERROR),
+        )
+
+    monkeypatch.setattr("opensquilla.cli.agent_cmd.run_agent_once", fake_run_agent_once)
+
+    run_agent_command(message="hello", json_output=True)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert payload["errors"]
+    assert payload["operational_error"] == _OPERATIONAL_ERROR
+    assert set(payload["operational_error"]) == {
+        "schema_version",
+        "code",
+        "retryable",
+        "terminal",
+    }
+
+
+def test_run_agent_command_json_omits_unclaimed_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fake_run_agent_once(**kwargs: Any) -> AgentRunResult:
+        return AgentRunResult(
+            status="error",
+            agent_id="main",
+            session_key="agent:main:main",
+            text="",
+            usage={},
+            errors=[{"message": "content blocked", "code": "provider_content_filter"}],
+        )
+
+    monkeypatch.setattr("opensquilla.cli.agent_cmd.run_agent_once", fake_run_agent_once)
+
+    run_agent_command(message="hello", json_output=True)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert payload["errors"]
+    assert "operational_error" not in payload
+
+
 def test_run_agent_command_json_includes_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -303,7 +460,9 @@ def test_run_agent_command_json_includes_artifacts(
 
     run_agent_command(message="hello", json_output=True)
 
-    output_artifact = json.loads(capsys.readouterr().out)["artifacts"][0]
+    payload = json.loads(capsys.readouterr().out)
+    assert "operational_error" not in payload
+    output_artifact = payload["artifacts"][0]
     assert "session_key" not in output_artifact
     assert "sessionKey" not in json.dumps(output_artifact)
     assert output_artifact["download_url"] == "/api/v1/artifacts/art-cli"

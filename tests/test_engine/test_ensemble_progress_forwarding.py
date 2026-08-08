@@ -6,7 +6,9 @@ from typing import Any
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
+from opensquilla.engine.types import DoneEvent as EngineDoneEvent
 from opensquilla.engine.types import EnsembleProgressEvent as EngineEnsembleProgressEvent
+from opensquilla.engine.types import ErrorEvent as EngineErrorEvent
 from opensquilla.engine.types import RunHeartbeatEvent, ToolCall
 from opensquilla.provider import (
     ChatConfig,
@@ -26,6 +28,15 @@ from opensquilla.provider import (
 )
 from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
+)
+from opensquilla.provider.types import (
+    ToolUseDeltaEvent as ProviderToolUseDeltaEvent,
+)
+from opensquilla.provider.types import (
+    ToolUseEndEvent as ProviderToolUseEndEvent,
+)
+from opensquilla.provider.types import (
+    ToolUseStartEvent as ProviderToolUseStartEvent,
 )
 
 
@@ -105,6 +116,180 @@ async def test_agent_forwards_provider_ensemble_progress_as_engine_event() -> No
     assert finish.input_tokens == 10
     assert finish.output_tokens == 5
     assert any(isinstance(event, RunHeartbeatEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_agent_preserves_provider_operational_error_contract() -> None:
+    operational_error = {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_strict_quorum_required_for_tools",
+        "retryable": True,
+        "terminal": True,
+    }
+
+    class _OperationalFailureProvider:
+        provider_name = "ensemble"
+        retry_failed_call_safe = False
+
+        async def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            yield ProviderErrorEvent(
+                message="strict proposer quorum was not met",
+                code="ensemble_strict_quorum_required_for_tools",
+                request_started=True,
+                physical_request_count=2,
+                operational_error=operational_error,
+            )
+
+    events = [event async for event in _agent(_OperationalFailureProvider()).run_turn("hi")]
+
+    error = next(event for event in events if isinstance(event, EngineErrorEvent))
+    assert error.code == "ensemble_strict_quorum_required_for_tools"
+    assert error.request_started is True
+    assert error.physical_request_count == 2
+    assert error.operational_error == operational_error
+
+
+@pytest.mark.asyncio
+async def test_agent_preserves_failed_finish_usage_on_engine_error() -> None:
+    class _FailedFinishProvider:
+        provider_name = "openrouter"
+        retry_failed_call_safe = False
+
+        async def chat(
+            self,
+            messages: Any,
+            tools: Any = None,
+            config: Any = None,
+        ) -> Any:
+            yield ProviderErrorEvent(
+                message="provider ended with finish_reason=error",
+                code="provider_terminal_error",
+                diagnostic_done=ProviderDone(
+                    stop_reason="error",
+                    input_tokens=11,
+                    output_tokens=7,
+                    reasoning_tokens=3,
+                    cached_tokens=5,
+                    billed_cost=0.25,
+                    cost_source="provider_billed",
+                    model="actual/model",
+                    provider="openrouter",
+                    requested_model="requested/model",
+                    requested_provider="openrouter",
+                ),
+                request_started=True,
+                physical_request_count=1,
+            )
+
+    events = [
+        event
+        async for event in _agent(_FailedFinishProvider()).run_turn("hi")
+    ]
+
+    error = next(event for event in events if isinstance(event, EngineErrorEvent))
+    assert error.code == "provider_terminal_error"
+    assert error.input_tokens == 11
+    assert error.output_tokens == 7
+    assert error.reasoning_tokens == 3
+    assert error.cached_tokens == 5
+    assert error.billed_cost == pytest.approx(0.25)
+    assert error.cost_source == "provider_billed"
+    assert error.model == "actual/model"
+    assert error.provider == "openrouter"
+    assert error.model_usage_breakdown
+    usage_done = next(
+        event for event in events if isinstance(event, EngineDoneEvent)
+    )
+    assert usage_done.billed_cost == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_operational_error_wins_during_max_iteration_finalization() -> None:
+    operational_error = {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_strict_quorum_required_for_tools",
+        "retryable": True,
+        "terminal": True,
+    }
+
+    class _FinalizationOperationalProvider:
+        provider_name = "ensemble"
+        retry_failed_call_safe = False
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(
+            self,
+            messages: Any,
+            tools: Any = None,
+            config: Any = None,
+        ) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                yield ProviderToolUseStartEvent(
+                    tool_use_id="call-1",
+                    tool_name="echo",
+                )
+                yield ProviderToolUseDeltaEvent(
+                    tool_use_id="call-1",
+                    json_fragment="{}",
+                )
+                yield ProviderToolUseEndEvent(
+                    tool_use_id="call-1",
+                    tool_name="echo",
+                    arguments={},
+                )
+                yield ProviderDone(
+                    stop_reason="tool_calls",
+                    input_tokens=5,
+                    output_tokens=2,
+                    billed_cost=0.1,
+                    cost_source="provider_billed",
+                    model="actual/model",
+                    provider="openrouter",
+                )
+                return
+            yield ProviderErrorEvent(
+                message="strict proposer quorum was not met",
+                code="ensemble_strict_quorum_required_for_tools",
+                diagnostic_done=ProviderDone(
+                    stop_reason="error",
+                    input_tokens=9,
+                    output_tokens=1,
+                    billed_cost=0.2,
+                    cost_source="provider_billed",
+                    model="actual/model",
+                    provider="openrouter",
+                ),
+                request_started=True,
+                physical_request_count=1,
+                operational_error=operational_error,
+            )
+
+    provider = _FinalizationOperationalProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=1),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo.",
+                input_schema=ToolInputSchema(properties={}, required=[]),
+            )
+        ],
+        tool_handler=_tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hi")]
+
+    error = next(event for event in events if isinstance(event, EngineErrorEvent))
+    assert provider.calls == 2
+    assert error.code == operational_error["code"]
+    assert error.operational_error == operational_error
+    assert error.input_tokens == 14
+    assert error.output_tokens == 3
+    assert error.billed_cost == pytest.approx(0.3)
 
 
 @pytest.mark.asyncio

@@ -120,6 +120,7 @@ _F39_ERROR_EVENT_FIELDS = (
     "ensemble_trace",
     "request_started",
     "physical_request_count",
+    "operational_error",
 )
 
 
@@ -226,6 +227,60 @@ def test_swebench_planning_only_outputs_are_not_deliverable(
         status_only,
         reject_progress_only=True,
     ) is False
+
+
+@pytest.mark.parametrize(
+    "status_only",
+    [
+        (
+            "I will start by listing the files in the workspace to verify the "
+            "presence and size of the video file `recording.mp4`."
+        ),
+        (
+            "I will check the contents of the workspace directory and inspect "
+            "the video file `/tmp_workspace/first_half.mp4` using `ffprobe` to "
+            "understand its duration, resolution, and other properties."
+        ),
+        (
+            "先核对 24 张碎片并检查尺寸，再用边缘匹配同时搜索正确子集、旋转与 "
+            "4×4 位置。"
+        ),
+        (
+            "I have enough confirmed data from six analysis passes to build the "
+            "final deliverables. Let me compile the structured JSON and create "
+            "the promotional PDF with extracted product images. I'll also do one "
+            "final verification pass on the watch lineup (Series 11 vs Ultra 3) "
+            "and exact color names. [[reply_to_current]]"
+        ),
+        "Running v3 solver now",
+        "Running diagnostic now.",
+    ],
+)
+def test_wildclaw_incident_progress_only_outputs_are_not_deliverable(
+    status_only: str,
+) -> None:
+    assert _visible_answer_is_progress_only(status_only) is True
+    assert _visible_answer_looks_usable(
+        status_only,
+        reject_progress_only=True,
+    ) is False
+
+
+def test_wildclaw_completed_artifact_is_not_rejected_as_progress_only() -> None:
+    completed_outputs = (
+        (
+            "Running v3 solver now produced `/tmp_workspace/solved.png` with all "
+            "16 tiles placed. The result is complete and the artifact was saved."
+        ),
+        "I have enough confirmed data from six sources: the result is 42.",
+    )
+
+    for completed in completed_outputs:
+        assert _visible_answer_is_progress_only(completed) is False
+        assert _visible_answer_looks_usable(
+            completed,
+            reject_progress_only=True,
+        ) is True
 
 
 def test_long_repeated_swebench_plan_remains_progress_only() -> None:
@@ -1556,6 +1611,7 @@ async def test_tokenrhythm_b5_strict_quorum_partial_failure_preserves_fallback_r
         aggregator_timeout_seconds=1,
         quorum_grace_seconds=0,
         shuffle_candidates=False,
+        aggregator_tools=False,
     )
 
     events = await _collect(provider)
@@ -2077,6 +2133,7 @@ async def test_ensemble_forwards_uniform_proposer_message_limit_proof(
         all_failed_policy="error",
         min_successful_proposers=1,
         shuffle_candidates=False,
+        aggregator_tools=False,
     )
 
     events = await _collect(provider)
@@ -5157,6 +5214,7 @@ async def test_policy_managed_members_retry_neighbor_after_provider_rejection(
         min_successful_proposers=1,
         all_failed_policy="error",
         shuffle_candidates=False,
+        aggregator_tools=False,
         selection_plan={
             "strategy": "router_dynamic",
             "selected_P": ["fake:p1"],
@@ -5772,6 +5830,7 @@ async def test_policy_managed_aggregator_reasoning_only_recovery_uses_frozen_low
         shuffle_candidates=False,
         aggregator_recovery_mode="experiment",
         aggregator_recovery_top_k=2,
+        aggregator_tools=False,
         selection_plan=selection_plan,
     )
     initial_plan = provider.selection_plan_execution_snapshot()
@@ -6728,6 +6787,7 @@ async def test_ensemble_uses_fallback_when_too_few_proposers_succeed(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=False,
+        aggregator_tools=False,
     )
 
     events = await _collect(provider)
@@ -6946,6 +7006,7 @@ async def test_fallback_stream_without_done_returns_incomplete_error(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=False,
+        aggregator_tools=False,
     )
 
     events = await _collect(provider)
@@ -7017,6 +7078,7 @@ async def test_fallback_error_preserves_nested_partial_usage(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=False,
+        aggregator_tools=False,
     )
 
     events = await _collect(provider)
@@ -7528,7 +7590,21 @@ async def test_aggregator_runtime_failure_with_unproven_close_does_not_fallback(
 
     assert fallback_calls == 0
     error = next(event for event in events if isinstance(event, ErrorEvent))
-    assert error.code == "ensemble_aggregator_close_timeout"
+    assert error.code == "ensemble_tool_recovery_unsafe_after_output"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_tool_recovery_unsafe_after_output",
+        "retryable": False,
+        "terminal": True,
+    }
+    assert error.ensemble_trace["aggregator_recovery"]["tool_recovery"] == {
+        "schema": "opensquilla.ensemble-tool-recovery/v1",
+        "required": True,
+        "available": False,
+        "reason": "provider_stream_not_closed",
+        "tools_preserved": False,
+        "replay_safe": False,
+    }
     release.set()
     await asyncio.wait_for(closed.wait(), timeout=0.5)
 
@@ -7965,7 +8041,13 @@ async def test_aggregator_transient_error_after_content_is_terminal(
     # Replaying after user-visible content would duplicate output downstream.
     assert call_count[0] == 1
     error = next(event for event in events if isinstance(event, ErrorEvent))
-    assert error.code == "429"
+    assert error.code == "ensemble_tool_recovery_unsafe_after_output"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_tool_recovery_unsafe_after_output",
+        "retryable": False,
+        "terminal": True,
+    }
     assert error.request_started is True
     assert error.physical_request_count == 2
     assert error.usage_missing_count == 1
@@ -8366,6 +8448,7 @@ async def test_ensemble_emits_aggregator_finish_before_terminal_error(
         aggregator_timeout_seconds=0.01 if mode == "timeout" else 1,
         aggregator_recovery_mode="off",
         shuffle_candidates=False,
+        aggregator_tools=False,
     )
 
     events = await _collect(provider)
@@ -9027,7 +9110,7 @@ async def test_failed_proposer_does_not_start_grace_before_success_quorum(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quorum_grace_seconds", [0.0, 0.02])
-async def test_unreachable_quorum_cancels_pending_and_uses_fallback(
+async def test_tool_enabled_unreachable_quorum_cancels_pending_and_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     quorum_grace_seconds: float,
 ) -> None:
@@ -9053,6 +9136,8 @@ async def test_unreachable_quorum_cancels_pending_and_uses_fallback(
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
+    fallback_calls = 0
+
     class _FallbackProvider:
         provider_name = "fallback"
 
@@ -9062,6 +9147,9 @@ async def test_unreachable_quorum_cancels_pending_and_uses_fallback(
             tools: list[ToolDefinition] | None = None,
             config: ChatConfig | None = None,
         ) -> AsyncIterator[StreamEvent]:
+            nonlocal fallback_calls
+            fallback_calls += 1
+
             async def _stream() -> AsyncIterator[StreamEvent]:
                 yield TextDeltaEvent(text="single")
                 yield DoneEvent(model="single")
@@ -9092,12 +9180,21 @@ async def test_unreachable_quorum_cancels_pending_and_uses_fallback(
     progress = [event for event in events if isinstance(event, EnsembleProgressEvent)]
     assert len([event for event in progress if event.event_type == "proposer_start"]) == 4
     assert len([event for event in progress if event.event_type == "proposer_finish"]) == 4
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["successful_proposers"] == 0
-    assert done.ensemble_trace["total_candidates"] == 4
-    assert done.ensemble_trace["llm_request_count"] == 5
-    candidates = done.ensemble_trace["candidates"]
+    assert fallback_calls == 0
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_strict_quorum_required_for_tools"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_strict_quorum_required_for_tools",
+        "retryable": True,
+        "terminal": True,
+    }
+    assert error.ensemble_trace is not None
+    assert error.ensemble_trace["successful_proposers"] == 0
+    assert error.ensemble_trace["total_candidates"] == 4
+    assert error.ensemble_trace["llm_request_count"] == 4
+    assert error.ensemble_trace["proposer_strict_quorum"]["aggregator_started"] is False
+    candidates = error.ensemble_trace["candidates"]
     assert [candidate["error_code"] for candidate in candidates[:2]] == [
         "upstream",
         "upstream",
@@ -9127,6 +9224,8 @@ async def test_required_all_quorum_cancels_remaining_after_failure(
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
+    fallback_calls = 0
+
     class _FallbackProvider:
         provider_name = "fallback"
 
@@ -9136,6 +9235,9 @@ async def test_required_all_quorum_cancels_remaining_after_failure(
             tools: list[ToolDefinition] | None = None,
             config: ChatConfig | None = None,
         ) -> AsyncIterator[StreamEvent]:
+            nonlocal fallback_calls
+            fallback_calls += 1
+
             async def _stream() -> AsyncIterator[StreamEvent]:
                 yield TextDeltaEvent(text="single")
                 yield DoneEvent(model="single")
@@ -9162,9 +9264,18 @@ async def test_required_all_quorum_cancels_remaining_after_failure(
     assert slow_gate.is_set() is False
     assert slow_closed.is_set() is True
     assert "agg" not in [call["model"] for call in registry.calls]
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["candidates"][1]["error_code"] == "quorum_unreachable"
+    assert fallback_calls == 0
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_strict_quorum_required_for_tools"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_strict_quorum_required_for_tools",
+        "retryable": True,
+        "terminal": True,
+    }
+    assert error.ensemble_trace is not None
+    assert error.ensemble_trace["candidates"][1]["error_code"] == "quorum_unreachable"
+    assert error.ensemble_trace["proposer_strict_quorum"]["aggregator_started"] is False
 
 
 @pytest.mark.asyncio
@@ -9617,7 +9728,7 @@ async def test_soft_deadline_preserves_quorum_and_cancels_only_stragglers(
 
 
 @pytest.mark.asyncio
-async def test_soft_deadline_below_quorum_fallback_stays_in_finalization_policy(
+async def test_tool_enabled_soft_deadline_below_quorum_fails_closed_before_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     slow_gate = asyncio.Event()
@@ -9662,19 +9773,18 @@ async def test_soft_deadline_below_quorum_fallback_stays_in_finalization_policy(
         )
     ]
 
-    assert [call["model"] for call in registry.calls] == ["p1", "p2", "fallback"]
-    fallback_call = registry.calls[-1]
-    assert fallback_call["tools"] is None
-    assert fallback_call["config"].thinking is False
-    assert fallback_call["config"].tool_choice is None
-    assert fallback_call["config"].ensemble_soft_deadline_seconds == 0
-    assert fallback_call["config"].allow_provider_stream_fallback is False
-    assert "Return a direct final answer now" in str(fallback_call["messages"][-1].content)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["fallback_used"] is True
-    assert done.ensemble_trace["soft_deadline_quorum_met"] is False
-    assert done.ensemble_trace["execution_mode"] == "deadline_preserving_fusion"
+    assert [call["model"] for call in registry.calls] == ["p1", "p2"]
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_strict_quorum_required_for_tools"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_strict_quorum_required_for_tools",
+        "retryable": True,
+        "terminal": True,
+    }
+    assert error.ensemble_trace is not None
+    assert error.ensemble_trace["fallback_used"] is False
+    assert error.ensemble_trace["proposer_strict_quorum"]["aggregator_started"] is False
 
 
 @pytest.mark.asyncio
@@ -10362,6 +10472,7 @@ def _recovery_provider(
     *,
     recovery_mode: Literal["off", "serving", "experiment"],
     fallbacks: list[EnsembleMemberConfig] | None = None,
+    aggregator_tools: bool = True,
 ) -> EnsembleProvider:
     return EnsembleProvider(
         profile_name="aggregator-recovery-test",
@@ -10372,6 +10483,7 @@ def _recovery_provider(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=False,
+        aggregator_tools=aggregator_tools,
         aggregator_recovery_mode=recovery_mode,
         aggregator_recovery_top_k=3,
         aggregator_max_tokens_cap=65_536,
@@ -10426,7 +10538,12 @@ async def test_reasoning_only_length_recovers_same_aggregator_without_thinking_o
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
-    events = await _collect(_recovery_provider(recovery_mode="experiment"))
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="experiment",
+            aggregator_tools=False,
+        )
+    )
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     aggregator_calls = [row for row in registry.calls if row["model"] == "agg"]
@@ -10457,7 +10574,12 @@ async def test_empty_non_length_done_is_structural_and_recovers_same_aggregator(
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
-    events = await _collect(_recovery_provider(recovery_mode="experiment"))
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="experiment",
+            aggregator_tools=False,
+        )
+    )
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert registry.call_counts["agg"] == 2
@@ -10469,6 +10591,231 @@ async def test_empty_non_length_done_is_structural_and_recovers_same_aggregator(
     assert done.ensemble_trace["aggregator_recovery"]["selected_kind"] == (
         "same_model_recovery"
     )
+
+
+@pytest.mark.asyncio
+async def test_safe_preoutput_fallback_preserves_tools_messages_and_tool_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p1": [
+                [TextDeltaEvent(text="draft"), _billed_done("p1", cost=0.1)]
+            ],
+            "agg": [
+                [
+                    ErrorEvent(
+                        message="upstream rejected request",
+                        code="invalid_request",
+                        diagnostic_done=_billed_done("agg", cost=0.3),
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                ]
+            ],
+            "agg2": [
+                [
+                    TextDeltaEvent(text="recovered with tools"),
+                    _billed_done("agg2", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = _recovery_provider(
+        recovery_mode="serving",
+        fallbacks=[_member("agg2")],
+    )
+    request_tools = [_tool()]
+    request_config = ChatConfig(
+        max_tokens=99,
+        thinking=False,
+        tool_choice="required",
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer this")],
+            tools=request_tools,
+            config=request_config,
+        )
+    ]
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    aggregator_calls = [
+        call for call in registry.calls if call["model"] in {"agg", "agg2"}
+    ]
+    assert [call["model"] for call in aggregator_calls] == ["agg", "agg2"]
+    primary_call, fallback_call = aggregator_calls
+    assert fallback_call["messages"] == primary_call["messages"]
+    assert fallback_call["tools"] == primary_call["tools"] == request_tools
+    assert primary_call["config"].tool_choice == "required"
+    assert fallback_call["config"].tool_choice == "required"
+    assert next(
+        event for event in events if isinstance(event, DoneEvent)
+    ).model == "agg2"
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_fails_closed_when_fallback_cannot_use_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p1": [
+                [TextDeltaEvent(text="draft"), _billed_done("p1", cost=0.1)]
+            ],
+            "agg": [
+                [
+                    ErrorEvent(
+                        message="upstream rejected request",
+                        code="invalid_request",
+                        diagnostic_done=_billed_done("agg", cost=0.3),
+                        request_started=True,
+                        physical_request_count=1,
+                    )
+                ]
+            ],
+            "agg2": [
+                [
+                    TextDeltaEvent(text="must not run"),
+                    _billed_done("agg2", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._member_model_capabilities",
+        lambda member: ModelCapabilities(
+            supports_tools=member.provider_config.model != "agg2"
+        ),
+    )
+    provider = _recovery_provider(
+        recovery_mode="serving",
+        fallbacks=[_member("agg2")],
+    )
+
+    events = await _collect(provider)
+
+    [error] = [event for event in events if isinstance(event, ErrorEvent)]
+    assert error.code == "ensemble_tool_recovery_unavailable"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_tool_recovery_unavailable",
+        "retryable": True,
+        "terminal": True,
+    }
+    assert registry.call_counts == {"p1": 1, "agg": 1}
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_progress_output_makes_tool_recovery_unsafe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p1": [
+                [TextDeltaEvent(text="draft"), _billed_done("p1", cost=0.1)]
+            ],
+            "agg": [
+                [
+                    TextDeltaEvent(text="Running diagnostic now."),
+                    ErrorEvent(
+                        message="upstream failed",
+                        code="provider_error",
+                        diagnostic_done=_billed_done("agg", cost=0.3),
+                        request_started=True,
+                        physical_request_count=1,
+                    ),
+                ]
+            ],
+            "agg2": [
+                [
+                    TextDeltaEvent(text="must not run"),
+                    _billed_done("agg2", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = _recovery_provider(
+        recovery_mode="experiment",
+        fallbacks=[_member("agg2")],
+    )
+
+    events = await _collect(provider)
+
+    [error] = [event for event in events if isinstance(event, ErrorEvent)]
+    assert error.code == "ensemble_tool_recovery_unsafe_after_output"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_tool_recovery_unsafe_after_output",
+        "retryable": False,
+        "terminal": True,
+    }
+    assert registry.call_counts == {"p1": 1, "agg": 1}
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_reason", "expected_code"),
+    [
+        ("error", "provider_terminal_error"),
+        ("content_filter", "provider_content_filter"),
+    ],
+)
+async def test_aggregator_failure_finish_reason_never_becomes_done(
+    monkeypatch: pytest.MonkeyPatch,
+    stop_reason: str,
+    expected_code: str,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p1": [
+                [TextDeltaEvent(text="draft"), _billed_done("p1", cost=0.1)]
+            ],
+            "agg": [
+                [
+                    TextDeltaEvent(text="final-looking text"),
+                    _billed_done(
+                        "agg",
+                        cost=0.3,
+                        stop_reason=stop_reason,
+                    ),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="off",
+            aggregator_tools=False,
+        )
+    )
+
+    [error] = [event for event in events if isinstance(event, ErrorEvent)]
+    assert error.code == expected_code
+    assert error.diagnostic_done is not None
+    assert error.operational_error is None
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 def _slot_recovery_plan(
@@ -10795,6 +11142,266 @@ async def test_router_dynamic_quarantines_unclosed_proposer_after_quorum(
 
 
 @pytest.mark.asyncio
+async def test_tool_enabled_partial_quorum_recovers_strict_slot_before_aggregation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "backup": [
+                [
+                    TextDeltaEvent(text="Complete replacement draft."),
+                    _billed_done("backup", cost=0.1),
+                ]
+            ],
+            "agg": [
+                [
+                    TextDeltaEvent(text="Final tool-enabled answer."),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    backups = [_member("backup")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        proposer_recovery_max_additional_calls=1,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            backups,
+            max_additional=1,
+        ),
+    )
+    scope_id = "router-dynamic-tool-strict-quorum-recovery"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=1,
+    )
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="Complete primary draft.",
+                physical_attempt_id="a" * 32,
+            ),
+            _slot_candidate(
+                index=1,
+                model="p1",
+                text="Useful but incomplete primary draft.",
+                error="provider stream ended before DoneEvent",
+                error_code="stream_incomplete",
+                physical_attempt_id="b" * 32,
+            ),
+        ]
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert registry.call_counts == {"backup": 1, "agg": 1}
+    [aggregator_call] = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    assert aggregator_call["tools"] is not None
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace["successful_proposers"] == 2
+    assert (
+        done.ensemble_trace["proposer_recovery"][
+            "strict_quorum_required_for_tools"
+        ]
+        is True
+    )
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_tool_enabled_partial_quorum_exhaustion_is_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "agg": [
+                [
+                    TextDeltaEvent(text="must not run"),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        proposer_recovery_max_additional_calls=0,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=0,
+        ),
+    )
+    scope_id = "router-dynamic-tool-strict-quorum-exhausted"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=0,
+    )
+
+    async def fake_run_proposers(*args: Any, **kwargs: Any) -> list[_CandidateResult]:
+        del args, kwargs
+        return [
+            _slot_candidate(
+                index=0,
+                model="p0",
+                text="Complete primary draft.",
+                physical_attempt_id="a" * 32,
+            ),
+            _slot_candidate(
+                index=1,
+                model="p1",
+                text="Useful but incomplete primary draft.",
+                error="provider stream ended before DoneEvent",
+                error_code="stream_incomplete",
+                physical_attempt_id="b" * 32,
+            ),
+        ]
+
+    monkeypatch.setattr(provider, "_run_proposers", fake_run_proposers)
+
+    events = await _collect(provider)
+
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    [error] = errors
+    assert error.code == "ensemble_strict_quorum_required_for_tools"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_strict_quorum_required_for_tools",
+        "retryable": True,
+        "terminal": True,
+    }
+    assert error.request_started is True
+    assert error.physical_request_count == 2
+    assert error.ensemble_trace is not None
+    assert error.ensemble_trace["proposer_strict_quorum"]["aggregator_started"] is False
+    assert registry.call_counts == {}
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_tool_strict_quorum_scheduler_waits_for_pending_complete_proposer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [
+                    TextDeltaEvent(text="Complete draft zero."),
+                    _billed_done("p0", cost=0.1),
+                ]
+            ),
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(
+                        text="Useful partial draft with concrete evidence."
+                    ),
+                    ErrorEvent(
+                        message="stream ended before completion",
+                        code="stream_incomplete",
+                        diagnostic_done=_billed_done("p1", cost=0.1),
+                        request_started=True,
+                        physical_request_count=1,
+                    ),
+                ]
+            ),
+            "p2": _FakePlan(
+                [
+                    TextDeltaEvent(text="Complete draft two."),
+                    _billed_done("p2", cost=0.1),
+                ],
+                delay=0.05,
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="Final tool-enabled answer."),
+                    _billed_done("agg", cost=0.2),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1"), _member("p2")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_tools=True,
+        aggregator_recovery_mode="experiment",
+        proposer_recovery_max_additional_calls=0,
+        quorum_grace_seconds=0.01,
+        selection_plan=_slot_recovery_plan(
+            proposers,
+            [],
+            max_additional=0,
+        ),
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [call["model"] for call in registry.calls] == [
+        "p0",
+        "p1",
+        "p2",
+        "agg",
+    ]
+    [aggregator_call] = [
+        call for call in registry.calls if call["model"] == "agg"
+    ]
+    assert aggregator_call["tools"] is not None
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace["successful_proposers"] == 2
+    assert "proposer_partial_quorum" not in done.ensemble_trace
+
+
+@pytest.mark.asyncio
 async def test_router_dynamic_initial_evidence_warning_keeps_usable_quorum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10821,7 +11428,7 @@ async def test_router_dynamic_initial_evidence_warning_keeps_usable_quorum(
         min_successful_proposers=2,
         all_failed_policy="error",
         shuffle_candidates=False,
-        aggregator_tools=True,
+        aggregator_tools=False,
         aggregator_recovery_mode="experiment",
         selection_plan=_slot_recovery_plan(
             proposers,
@@ -10918,7 +11525,7 @@ async def test_router_dynamic_uses_partial_unclosed_draft_for_two_draft_quorum(
         min_successful_proposers=2,
         all_failed_policy="error",
         shuffle_candidates=False,
-        aggregator_tools=True,
+        aggregator_tools=False,
         aggregator_recovery_mode="experiment",
         selection_plan=_slot_recovery_plan(
             proposers,
@@ -11214,6 +11821,7 @@ async def test_router_dynamic_usable_aggregator_prefix_is_degraded_without_retry
         min_successful_proposers=2,
         all_failed_policy="error",
         shuffle_candidates=False,
+        aggregator_tools=False,
         aggregator_recovery_mode=recovery_mode,
         aggregator_recovery_top_k=(1 if recovery_mode == "off" else 2),
         selection_plan=selection_plan,
@@ -14571,7 +15179,12 @@ async def test_partial_length_continuation_is_deduplicated_and_billed_once(
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
-    events = await _collect(_recovery_provider(recovery_mode="experiment"))
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="experiment",
+            aggregator_tools=False,
+        )
+    )
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     visible = "".join(event.text for event in events if isinstance(event, TextDeltaEvent))
@@ -14604,6 +15217,46 @@ async def test_partial_length_continuation_is_deduplicated_and_billed_once(
 
 
 @pytest.mark.asyncio
+async def test_tool_enabled_length_output_does_not_start_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p1": [[TextDeltaEvent(text="draft"), _billed_done("p1", cost=0.1)]],
+            "agg": [
+                [
+                    TextDeltaEvent(text="Part A"),
+                    _billed_done("agg", cost=0.3, stop_reason="length"),
+                ],
+                [TextDeltaEvent(text="must not run"), _billed_done("agg", cost=0.2)],
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="experiment",
+            aggregator_tools=True,
+        )
+    )
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_tool_recovery_unsafe_after_output"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_tool_recovery_unsafe_after_output",
+        "retryable": False,
+        "terminal": True,
+    }
+    assert registry.call_counts == {"p1": 1, "agg": 1}
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
 async def test_experiment_recovery_falls_back_to_second_ranked_aggregator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -14625,6 +15278,7 @@ async def test_experiment_recovery_falls_back_to_second_ranked_aggregator(
         _recovery_provider(
             recovery_mode="experiment",
             fallbacks=[_member("agg-top2")],
+            aggregator_tools=False,
         )
     )
 
@@ -14670,6 +15324,7 @@ async def test_experiment_full_continuation_chain_skips_top2_and_finishes_with_t
         _recovery_provider(
             recovery_mode="experiment",
             fallbacks=[unavailable_top2, _member("agg-top3")],
+            aggregator_tools=False,
         )
     )
 
@@ -14724,6 +15379,7 @@ async def test_serving_mode_allows_only_one_substantive_network_recovery(
         _recovery_provider(
             recovery_mode="serving",
             fallbacks=[_member("agg-top2")],
+            aggregator_tools=False,
         )
     )
 
@@ -14852,7 +15508,12 @@ async def test_serving_returns_usable_text_when_provider_errors_after_streaming_
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
-    events = await _collect(_recovery_provider(recovery_mode="serving"))
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="serving",
+            aggregator_tools=False,
+        )
+    )
 
     done_events = [event for event in events if isinstance(event, DoneEvent)]
     assert done_events, [
@@ -14998,6 +15659,75 @@ async def test_unready_primary_and_top2_use_ranked_top3_before_proposers_are_bil
 
 
 @pytest.mark.asyncio
+async def test_unready_primary_skips_toolless_top2_for_tool_capable_top3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p1": [[TextDeltaEvent(text="draft"), _billed_done("p1", cost=0.1)]],
+            "agg-top2": [
+                [TextDeltaEvent(text="must not run"), _billed_done("agg-top2", cost=0.2)]
+            ],
+            "agg-top3": [
+                [TextDeltaEvent(text="top3 final"), _billed_done("agg-top3", cost=0.4)]
+            ],
+        }
+    )
+    built_models: list[str] = []
+
+    def build_provider(config: ProviderConfig) -> Any:
+        built_models.append(config.model)
+        return registry.provider_for(config)
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        build_provider,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._member_model_capabilities",
+        lambda member: ModelCapabilities(
+            supports_tools=member.provider_config.model != "agg-top2"
+        ),
+    )
+    unavailable_primary = replace(
+        _member("agg"),
+        ready=False,
+        unavailable_reason="deployment_unavailable",
+    )
+    provider = EnsembleProvider(
+        profile_name="unready-tool-capability-chain",
+        proposers=[_member("p1")],
+        aggregator=unavailable_primary,
+        aggregator_fallbacks=[_member("agg-top2"), _member("agg-top3")],
+        min_successful_proposers=1,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        aggregator_recovery_mode="experiment",
+        aggregator_recovery_top_k=3,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert "agg-top2" not in built_models
+    assert registry.call_counts == {"p1": 1, "agg-top3": 1}
+    top3_call = next(call for call in registry.calls if call["model"] == "agg-top3")
+    assert top3_call["tools"]
+    assert done.model == "agg-top3"
+    recovery = done.ensemble_trace["aggregator_recovery"]
+    assert recovery["fallback_index"] == 2
+    [skipped] = [
+        attempt
+        for attempt in recovery["attempts"]
+        if attempt.get("requested_model") == "agg-top2"
+    ]
+    assert skipped["outcome"] == "tool_capability_unavailable"
+    assert skipped["code"] == "ensemble_tool_recovery_unavailable"
+    assert skipped["request_started"] is False
+
+
+@pytest.mark.asyncio
 async def test_aggregator_only_unready_primary_uses_ranked_top3(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -15050,6 +15780,56 @@ async def test_aggregator_only_unready_primary_uses_ranked_top3(
 
 
 @pytest.mark.asyncio
+async def test_static_experiment_recovers_progress_only_aggregator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress = (
+        "I have enough confirmed data from six analysis passes to build the "
+        "final deliverables. Let me compile the structured JSON and create the "
+        "promotional PDF with extracted product images."
+    )
+    final_answer = "Created the structured JSON and promotional PDF deliverables."
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="Draft zero."), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="Draft one."), _billed_done("p1", cost=0.1)]],
+            "agg": [
+                [TextDeltaEvent(text=progress), _billed_done("agg", cost=0.2)],
+                [TextDeltaEvent(text=final_answer), _billed_done("agg", cost=0.2)],
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    provider = EnsembleProvider(
+        profile_name="B2/static-experiment",
+        proposers=[_member("p0"), _member("p1")],
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+        aggregator_tools=False,
+        aggregator_recovery_mode="experiment",
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert registry.call_counts == {"p0": 1, "p1": 1, "agg": 2}
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == final_answer
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace["aggregator_recovery"]["selected_kind"] == (
+        "same_model_recovery"
+    )
+
+
+@pytest.mark.asyncio
 async def test_partial_quorum_can_recover_a_progress_only_aggregator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -15074,7 +15854,7 @@ async def test_partial_quorum_can_recover_a_progress_only_aggregator(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=False,
-        aggregator_tools=True,
+        aggregator_tools=False,
         aggregator_recovery_mode="experiment",
         selection_plan=_slot_recovery_plan(proposers, []),
     )
@@ -15180,7 +15960,7 @@ async def test_long_repeated_swebench_plan_is_discarded_before_recovery(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=False,
-        aggregator_tools=True,
+        aggregator_tools=False,
         aggregator_recovery_mode="experiment",
         selection_plan=_slot_recovery_plan(proposers, []),
     )
@@ -15269,7 +16049,7 @@ async def test_repetitive_stall_before_failed_terminal_recovers_without_leaking(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=False,
-        aggregator_tools=True,
+        aggregator_tools=False,
         aggregator_recovery_mode="experiment",
         selection_plan=_slot_recovery_plan(proposers, []),
     )
@@ -15482,7 +16262,7 @@ async def test_router_dynamic_serving_keeps_short_answer_streaming(
 
 
 @pytest.mark.asyncio
-async def test_router_dynamic_progress_only_done_forces_final_then_ranked_backup(
+async def test_tool_enabled_progress_only_done_fails_closed_without_ranked_backup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     progress = (
@@ -15537,46 +16317,51 @@ async def test_router_dynamic_progress_only_done_forces_final_then_ranked_backup
 
     events = await _collect(provider)
 
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_tool_recovery_unsafe_after_output"
+    assert error.operational_error == {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_tool_recovery_unsafe_after_output",
+        "retryable": False,
+        "terminal": True,
+    }
     assert registry.call_counts == {
         "p0": 1,
         "p1": 1,
-        "agg": 2,
-        "agg-backup": 1,
+        "agg": 1,
     }
     aggregator_calls = [
         call
         for call in registry.calls
         if call["model"] in {"agg", "agg-backup"}
     ]
+    assert len(aggregator_calls) == 1
     assert aggregator_calls[0]["tools"] is not None
-    assert all(call["tools"] is None for call in aggregator_calls[1:])
-    assert all(call["config"].tool_choice is None for call in aggregator_calls[1:])
-    assert "output the final answer now" in str(aggregator_calls[1]["messages"][-1].content)
-    trace = done.ensemble_trace
-    assert trace["assembled_output"]["text"] == final_answer
+    trace = error.ensemble_trace
+    assert trace["assembled_output"]["text"] == ""
     assert "".join(
         event.text for event in events if isinstance(event, TextDeltaEvent)
-    ) == final_answer
-    assert done.billed_cost == pytest.approx(1.1)
-    assert trace["physical_request_count"] == 5
+    ) == ""
+    assert sum(
+        float(row.get("billed_cost") or 0.0)
+        for row in error.model_usage_breakdown
+    ) == pytest.approx(0.5)
+    assert error.usage_missing_count == 0
+    assert trace["physical_request_count"] == 3
     recovery = trace["aggregator_recovery"]
-    assert recovery["selected_kind"] == "model_fallback"
     rejected = [
         attempt
         for attempt in recovery["attempts"]
         if attempt.get("content_outcome") == "progress_only"
     ]
-    assert len(rejected) == 2
+    assert len(rejected) == 1
     assert all(attempt["assembled_output_discarded"] is True for attempt in rejected)
     aggregator_attempt_ids = [
         attempt["physical_attempt_id"]
         for attempt in recovery["attempts"]
         if attempt.get("request_started") is True
     ]
-    assert len(aggregator_attempt_ids) == 3
-    assert len(set(aggregator_attempt_ids)) == 3
+    assert len(aggregator_attempt_ids) == 1
     assert provider.end_provider_retry_scope(scope_id)
 
 
@@ -15639,7 +16424,12 @@ async def test_whitespace_only_done_is_not_a_deliverable_final_answer(
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
-    events = await _collect(_recovery_provider(recovery_mode="experiment"))
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="experiment",
+            aggregator_tools=False,
+        )
+    )
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert registry.call_counts["agg"] == 2
@@ -15667,7 +16457,12 @@ async def test_empty_continuation_keeps_existing_prefix_for_recovery(
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
-    events = await _collect(_recovery_provider(recovery_mode="experiment"))
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="experiment",
+            aggregator_tools=False,
+        )
+    )
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     visible = "".join(event.text for event in events if isinstance(event, TextDeltaEvent))
@@ -15710,6 +16505,7 @@ async def test_progress_only_continuation_is_not_exposed_before_recovery(
         proposer_timeout_seconds=1,
         aggregator_timeout_seconds=1,
         shuffle_candidates=False,
+        aggregator_tools=False,
         aggregator_recovery_mode="experiment",
         aggregator_recovery_top_k=3,
         aggregator_max_tokens_cap=65_536,
@@ -15764,7 +16560,12 @@ async def test_experiment_continues_after_provider_error_with_visible_text(
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
 
-    events = await _collect(_recovery_provider(recovery_mode="experiment"))
+    events = await _collect(
+        _recovery_provider(
+            recovery_mode="experiment",
+            aggregator_tools=False,
+        )
+    )
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     visible = "".join(event.text for event in events if isinstance(event, TextDeltaEvent))

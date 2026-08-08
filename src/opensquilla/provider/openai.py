@@ -558,6 +558,99 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
     return value
 
 
+def _find_google_incompatible_array_items(
+    value: Any,
+    *,
+    path: str = "$",
+) -> str | None:
+    """Return the first Google-incompatible array schema below ``value``.
+
+    Gemini's OpenAI-compatible tool boundary requires every array ``items``
+    value to be an object schema.  Empty objects remain valid (``create_csv``
+    uses one for arbitrary scalar cells), while boolean and tuple-form schemas
+    are intentionally rejected by this provider-specific compatibility gate.
+
+    Traverse only JSON Schema-bearing keywords.  Example/default payloads may
+    legitimately contain ordinary data such as ``{"type": "array"}`` and
+    must never be interpreted as nested schemas.
+    """
+
+    if isinstance(value, Mapping):
+        schema_type = value.get("type")
+        is_array = schema_type == "array" or (
+            isinstance(schema_type, list) and "array" in schema_type
+        )
+        if is_array and not isinstance(value.get("items"), Mapping):
+            return path
+        for keyword in (
+            "items",
+            "additionalProperties",
+            "contains",
+            "not",
+            "if",
+            "then",
+            "else",
+            "propertyNames",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+        ):
+            nested = value.get(keyword)
+            if not isinstance(nested, Mapping):
+                continue
+            invalid_path = _find_google_incompatible_array_items(
+                nested,
+                path=f"{path}.{keyword}",
+            )
+            if invalid_path is not None:
+                return invalid_path
+        for keyword in (
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ):
+            schemas = value.get(keyword)
+            if not isinstance(schemas, Mapping):
+                continue
+            for name, nested in schemas.items():
+                if not isinstance(nested, Mapping):
+                    continue
+                invalid_path = _find_google_incompatible_array_items(
+                    nested,
+                    path=f"{path}.{keyword}.{name}",
+                )
+                if invalid_path is not None:
+                    return invalid_path
+        for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+            schemas = value.get(keyword)
+            if not isinstance(schemas, list):
+                continue
+            for index, nested in enumerate(schemas):
+                if not isinstance(nested, Mapping):
+                    continue
+                invalid_path = _find_google_incompatible_array_items(
+                    nested,
+                    path=f"{path}.{keyword}[{index}]",
+                )
+                if invalid_path is not None:
+                    return invalid_path
+    return None
+
+
+def _requires_google_tool_schema_compatibility(
+    *,
+    provider_kind: str,
+    model: str,
+) -> bool:
+    normalized_kind = provider_kind.strip().lower()
+    normalized_model = model.strip().lower()
+    return normalized_kind in {"gemini", "google"} or (
+        normalized_kind == "openrouter" and normalized_model.startswith("google/")
+    )
+
+
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
@@ -2482,6 +2575,22 @@ def _stream_timeout(timeout: float) -> httpx.Timeout:
 
 
 _SUCCESSFUL_TEXT_TOOL_FINISH_REASONS = frozenset({"stop", "tool_calls"})
+_FAILED_TERMINAL_FINISH_REASONS = frozenset(
+    {"error", "failed", "failure", "cancelled", "canceled"}
+)
+
+
+def _terminal_finish_reason_error_code(stop_reason: str) -> str | None:
+    """Map explicit provider failure terminals without reclassifying truncation."""
+
+    normalized = stop_reason.strip().lower()
+    if normalized == "content_filter":
+        return "provider_content_filter"
+    if normalized in _FAILED_TERMINAL_FINISH_REASONS:
+        return "provider_terminal_error"
+    return None
+
+
 _MAX_DEFERRED_NATIVE_EVENTS = 256
 _MAX_DEFERRED_NATIVE_ARGUMENT_CHARS = 256_000
 
@@ -3748,6 +3857,27 @@ class OpenAIProvider:
                 )
                 for t in tools
             ]
+            if _requires_google_tool_schema_compatibility(
+                provider_kind=self._provider_kind,
+                model=self._model,
+            ):
+                for wire_tool in payload["tools"]:
+                    function = wire_tool.get("function", {})
+                    invalid_path = _find_google_incompatible_array_items(
+                        function.get("parameters", {})
+                    )
+                    if invalid_path is not None:
+                        tool_name = str(function.get("name") or "<unnamed>")
+                        yield ErrorEvent(
+                            message=(
+                                f"Tool {tool_name!r} has an array schema at "
+                                f"{invalid_path} without an object 'items' schema"
+                            ),
+                            code="invalid_tool_schema",
+                            request_started=False,
+                            physical_request_count=0,
+                        )
+                        return
             tool_names = [tool.get("function", {}).get("name", "") for tool in payload["tools"]]
             tool_schema_hash = hashlib.sha256(
                 json.dumps(payload["tools"], ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -5210,6 +5340,43 @@ class OpenAIProvider:
                             model=self._model,
                         )
 
+                    terminal_error_code = _terminal_finish_reason_error_code(stop_reason)
+                    if terminal_error_code is not None:
+                        for pending_event in _segment_text_tool_events(
+                            text_tool_normalizer.finish(
+                                successful_text_tool_terminal=False,
+                            ),
+                            provider_kind=self._provider_kind,
+                            model=self._model,
+                        ):
+                            if isinstance(pending_event, TextDeltaEvent):
+                                visible_assistant_text_parts.append(pending_event.text)
+                            yield pending_event
+                        for deferred_event in deferred_native_events:
+                            yield deferred_event
+                        deferred_native_events.clear()
+                        for deferred_event in deferred_post_native_events:
+                            if isinstance(deferred_event, TextDeltaEvent):
+                                visible_assistant_text_parts.append(deferred_event.text)
+                            yield deferred_event
+                        deferred_post_native_events.clear()
+                        trace.record_error(
+                            code=terminal_error_code,
+                            message=(
+                                "Provider returned an explicit failed finish reason: "
+                                f"{stop_reason}"
+                            ),
+                            metadata={"phase": "stream", "cache_shape": cache_shape},
+                        )
+                        yield response_validation_error(
+                            message=(
+                                f"{self._compat.display_name} ended with failed finish "
+                                f"reason {stop_reason!r}"
+                            ),
+                            code=terminal_error_code,
+                        )
+                        return
+
                     if tools_acc.has_calls and not successful_text_tool_terminal:
                         for pending_event in _segment_text_tool_events(
                             text_tool_normalizer.finish(
@@ -6253,6 +6420,35 @@ class OpenAIProvider:
                     f"{self._compat.display_name} response ended without a finish reason"
                 ),
                 code="incomplete_stream",
+            )
+            return
+        terminal_error_code = _terminal_finish_reason_error_code(str(stop_reason))
+        if terminal_error_code is not None:
+            normalized_segments = text_tool_normalizer.finish(
+                successful_text_tool_terminal=False,
+            )
+            for event in _segment_text_tool_events(
+                normalized_segments,
+                provider_kind=self._provider_kind,
+                model=self._model,
+            ):
+                if isinstance(event, TextDeltaEvent):
+                    visible_assistant_text_parts.append(event.text)
+                yield event
+            trace.record_error(
+                code=terminal_error_code,
+                message=(
+                    "Provider returned an explicit failed finish reason: "
+                    f"{stop_reason}"
+                ),
+                metadata={"phase": "non_stream", "cache_shape": cache_shape},
+            )
+            yield non_stream_validation_error(
+                message=(
+                    f"{self._compat.display_name} ended with failed finish reason "
+                    f"{stop_reason!r}"
+                ),
+                code=terminal_error_code,
             )
             return
         if (

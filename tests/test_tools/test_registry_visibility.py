@@ -25,6 +25,25 @@ def _spec(name: str, *, exposed_by_default: bool = True) -> ToolSpec:
     )
 
 
+def test_register_rejects_nested_array_schema_without_items() -> None:
+    registry = ToolRegistry()
+    malformed = ToolSpec(
+        name="malformed_nested_array",
+        description="invalid schema",
+        parameters={
+            "rows": {
+                "type": "array",
+                "items": {"type": "array"},
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"rows\.items"):
+        registry.register(malformed, _handler)
+
+    assert registry.get("malformed_nested_array") is None
+
+
 def test_register_overwrite_warns() -> None:
     registry = ToolRegistry()
     registry.register(_spec("dup"), _handler)

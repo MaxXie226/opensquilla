@@ -18,6 +18,25 @@ if TYPE_CHECKING:
 REASONING_ONLY_LENGTH_STOP_REASONS = frozenset(
     {"length", "max_tokens", "max_output_tokens"}
 )
+OPERATIONAL_ERROR_SCHEMA_VERSION = "opensquilla.operational-error/v1"
+
+
+def make_operational_error(
+    code: str,
+    *,
+    retryable: bool,
+) -> dict[str, Any]:
+    """Build the exact machine-readable terminal error contract."""
+
+    normalized_code = code.strip()
+    if not normalized_code:
+        raise ValueError("operational error code must not be empty")
+    return {
+        "schema_version": OPERATIONAL_ERROR_SCHEMA_VERSION,
+        "code": normalized_code,
+        "retryable": bool(retryable),
+        "terminal": True,
+    }
 
 # ---------------------------------------------------------------------------
 # Stream event dataclasses
@@ -211,6 +230,10 @@ class ErrorEvent:
     # billable request started; fallback wrappers may report counts > 1.
     request_started: bool | None = None
     physical_request_count: int | None = None
+    # Exact terminal contract consumed by automation. Generic provider errors
+    # leave this unset; only callers that deliberately opt into the v1
+    # operational-error protocol may populate it.
+    operational_error: dict[str, Any] | None = None
 
 @dataclass
 class ProviderHeartbeatEvent:

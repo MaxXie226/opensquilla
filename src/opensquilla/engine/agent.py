@@ -5084,6 +5084,85 @@ class Agent:
         turn_ensemble_physical_request_count = 0
         turn_ensemble_usage_missing_count = 0
         terminal_error: ErrorEvent | None = None
+
+        def _terminal_error_usage_fields(
+            provider_error: ProviderErrorEvent | None = None,
+        ) -> dict[str, Any]:
+            """Snapshot all usage observed before a terminal engine error."""
+
+            diagnostic_done = (
+                getattr(provider_error, "diagnostic_done", None)
+                if provider_error is not None
+                else None
+            )
+            error_trace = (
+                getattr(provider_error, "ensemble_trace", None)
+                if provider_error is not None
+                else None
+            )
+            if not isinstance(error_trace, dict) and diagnostic_done is not None:
+                error_trace = getattr(diagnostic_done, "ensemble_trace", None)
+            if not isinstance(error_trace, dict):
+                error_trace = last_ensemble_trace
+            if total_provider_billed_entries and total_unbilled_entries:
+                error_cost_source = "mixed"
+            elif total_provider_billed_entries:
+                error_cost_source = "provider_billed"
+            elif turn_model_usage_breakdown:
+                error_cost_source = "unavailable"
+            else:
+                error_cost_source = "none"
+            return {
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "reasoning_tokens": total_reasoning_tokens,
+                "cached_tokens": total_cached_tokens,
+                "cache_write_tokens": total_cache_write_tokens,
+                "cost_usd": total_billed_cost,
+                "billed_cost": total_billed_cost,
+                "cost_source": error_cost_source,
+                "model": (
+                    last_actual_model
+                    or str(getattr(diagnostic_done, "model", "") or "")
+                ),
+                "provider": (
+                    last_actual_provider
+                    or str(getattr(diagnostic_done, "provider", "") or "")
+                ),
+                "requested_model": (
+                    last_requested_model
+                    or str(
+                        getattr(diagnostic_done, "requested_model", "") or ""
+                    )
+                ),
+                "requested_provider": (
+                    last_requested_provider
+                    or str(
+                        getattr(
+                            diagnostic_done,
+                            "requested_provider",
+                            "",
+                        )
+                        or ""
+                    )
+                ),
+                "model_usage_breakdown": _summarize_model_usage_breakdown(
+                    turn_model_usage_breakdown
+                ),
+                "ensemble_trace": (
+                    dict(error_trace) if isinstance(error_trace, dict) else None
+                ),
+                "usage_missing_count": max(
+                    turn_ensemble_usage_missing_count,
+                    int(
+                        getattr(provider_error, "usage_missing_count", 0)
+                        or 0
+                    )
+                    if provider_error is not None
+                    else 0,
+                ),
+            }
+
         final_text_parts: list[str] = []
         final_reasoning_parts: list[str] = []
         artifact_delivery_final_response_pending = False
@@ -5646,6 +5725,30 @@ class Agent:
                     retry_deadline_error = _provider_retry_deadline_error()
                     if retry_deadline_error is not None:
                         terminal_error = retry_deadline_error
+                        if (
+                            provider_error is not None
+                            and provider_error.operational_error is not None
+                        ):
+                            # A typed operational terminal is authoritative.
+                            # Artifact/max-iteration/post-write finalizers must
+                            # not rewrite its code or downgrade it to a partial
+                            # success, because automation requires exact code
+                            # equality with the v1 envelope.
+                            terminal_error = ErrorEvent(
+                                message=provider_error.message,
+                                code=provider_error.code,
+                                request_started=provider_error.request_started,
+                                physical_request_count=(
+                                    provider_error.physical_request_count
+                                ),
+                                operational_error=dict(
+                                    provider_error.operational_error
+                                ),
+                                **_terminal_error_usage_fields(provider_error),
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
                                 reason=terminal_error.message,
@@ -8482,6 +8585,8 @@ class Agent:
                                     physical_request_count=(
                                         provider_error.physical_request_count
                                     ),
+                                    operational_error=provider_error.operational_error,
+                                    **_terminal_error_usage_fields(provider_error),
                                 )
                                 yield terminal_error
                                 break
@@ -8586,6 +8691,27 @@ class Agent:
                             )
                             _call_attempt += 1
                             continue
+                        if provider_error.operational_error is not None:
+                            # Typed operational failures are authoritative.  They
+                            # must not be converted into artifact-delivery,
+                            # max-iteration, or post-write partial success, and
+                            # the outer code must remain identical to the v1
+                            # envelope consumed by automation.
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=provider_error.message,
+                                code=provider_error.code,
+                                request_started=provider_error.request_started,
+                                physical_request_count=(
+                                    provider_error.physical_request_count
+                                ),
+                                operational_error=dict(
+                                    provider_error.operational_error
+                                ),
+                                **_terminal_error_usage_fields(provider_error),
+                            )
+                            yield terminal_error
+                            break
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
                                 reason=provider_error.message,
@@ -8649,6 +8775,8 @@ class Agent:
                                         f"{provider_error.message}"
                                     ),
                                     code=f"{finalization_reason}_finalization_failed",
+                                    operational_error=provider_error.operational_error,
+                                    **_terminal_error_usage_fields(provider_error),
                                 )
                                 self._write_turn_call_log(
                                     "turn_policy_decision",
@@ -8779,6 +8907,8 @@ class Agent:
                                     physical_request_count=(
                                         provider_error.physical_request_count
                                     ),
+                                    operational_error=provider_error.operational_error,
+                                    **_terminal_error_usage_fields(provider_error),
                                 )
                                 yield terminal_error
                                 break
@@ -9111,6 +9241,8 @@ class Agent:
                                 physical_request_count=(
                                     provider_error.physical_request_count
                                 ),
+                                operational_error=provider_error.operational_error,
+                                **_terminal_error_usage_fields(provider_error),
                             )
                             yield terminal_error
                             break

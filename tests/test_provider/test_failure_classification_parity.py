@@ -47,6 +47,13 @@ _CONTEXT_OVERFLOW_CASES: list[Case] = [
 
 # --- shared pre-pass: policy refusal ---
 _POLICY_REFUSAL_CASES: list[Case] = [
+    (
+        "openrouter",
+        None,
+        "provider_content_filter",
+        "",
+        K.POLICY_REFUSAL,
+    ),
     ("openai", None, "", "violates our content policy", K.POLICY_REFUSAL),
     ("anthropic", None, "", "policy violation detected", K.POLICY_REFUSAL),
     ("ollama", None, "", "safety policy triggered", K.POLICY_REFUSAL),

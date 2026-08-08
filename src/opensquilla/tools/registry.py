@@ -33,6 +33,68 @@ _CHANNEL_HARD_DENY_NON_OWNER = visibility_policy._CHANNEL_HARD_DENY_NON_OWNER
 filter_by_profile = visibility_policy.filter_by_profile
 profile_allows_tool = visibility_policy.profile_allows_tool
 resolve_profile = visibility_policy.resolve_profile
+_SCHEMA_MAP_CHILDREN = (
+    "properties",
+    "$defs",
+    "definitions",
+)
+_SCHEMA_SINGLE_CHILDREN = (
+    "items",
+    "additionalProperties",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+)
+_SCHEMA_SEQUENCE_CHILDREN = ("anyOf", "oneOf", "allOf", "prefixItems")
+
+
+def _array_schema_paths_missing_items(
+    schema: object,
+    *,
+    path: str = "parameters",
+) -> list[str]:
+    """Return every nested array schema that omits an item schema.
+
+    OpenAI-compatible endpoints are not uniform here: Gemini rejects the
+    complete tool list when even one nested array has no ``items`` member.
+    Validate at registration so an invalid built-in cannot turn an otherwise
+    unrelated aggregator request into an upstream HTTP 400.
+    """
+
+    if not isinstance(schema, Mapping):
+        return []
+    schema_type = schema.get("type")
+    is_array = schema_type == "array" or (
+        isinstance(schema_type, (list, tuple)) and "array" in schema_type
+    )
+    missing = [path] if is_array and "items" not in schema else []
+    for key in _SCHEMA_MAP_CHILDREN:
+        value = schema.get(key)
+        if isinstance(value, Mapping):
+            for name, child in value.items():
+                missing.extend(
+                    _array_schema_paths_missing_items(
+                        child,
+                        path=f"{path}.{key}.{name}",
+                    )
+                )
+    for key in _SCHEMA_SINGLE_CHILDREN:
+        missing.extend(
+            _array_schema_paths_missing_items(schema.get(key), path=f"{path}.{key}")
+        )
+    for key in _SCHEMA_SEQUENCE_CHILDREN:
+        value = schema.get(key)
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                missing.extend(
+                    _array_schema_paths_missing_items(
+                        child,
+                        path=f"{path}.{key}[{index}]",
+                    )
+                )
+    return missing
 
 
 class ToolRegistry:
@@ -42,6 +104,19 @@ class ToolRegistry:
         self._tools: dict[str, RegisteredTool] = {}
 
     def register(self, spec: ToolSpec, handler: ToolHandler) -> None:
+        missing_array_items: list[str] = []
+        for parameter_name, parameter_schema in spec.parameters.items():
+            missing_array_items.extend(
+                _array_schema_paths_missing_items(
+                    parameter_schema,
+                    path=f"tool.{spec.name}.parameters.{parameter_name}",
+                )
+            )
+        if missing_array_items:
+            paths = ", ".join(missing_array_items)
+            raise ValueError(
+                f"tool {spec.name!r} has array schema(s) without items: {paths}"
+            )
         if spec.name in self._tools:
             log.warning("registry.tool_overwrite", name=spec.name, source="tools")
         self._tools[spec.name] = RegisteredTool(spec=spec, handler=handler)

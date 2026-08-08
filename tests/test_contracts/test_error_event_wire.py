@@ -25,6 +25,24 @@ NORMALIZED_ERROR_KEYS = frozenset(
         "terminal_reason",
         "error_message",
         "turn_outcome",
+        "request_started",
+        "physical_request_count",
+        "operational_error",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+        "cost_usd",
+        "billed_cost",
+        "cost_source",
+        "model",
+        "provider",
+        "requested_model",
+        "requested_provider",
+        "model_usage_breakdown",
+        "ensemble_trace",
+        "usage_missing_count",
     }
 )
 
@@ -39,6 +57,58 @@ def _synthetic_error_payload() -> dict:
 def test_error_event_dataclass_carries_error_id() -> None:
     payload = _synthetic_error_payload()
     assert payload["error_id"] == "abcd1234"
+
+
+def test_normalized_error_payload_preserves_operational_error_contract() -> None:
+    operational_error = {
+        "schema_version": "opensquilla.operational-error/v1",
+        "code": "ensemble_strict_quorum_required_for_tools",
+        "retryable": True,
+        "terminal": True,
+    }
+    event = ErrorEvent(
+        message="strict proposer quorum was not met",
+        code="ensemble_strict_quorum_required_for_tools",
+        operational_error=operational_error,
+    )
+    payload = asdict(event)
+    payload.pop("kind")
+
+    normalized = _normalize_terminal_event_payload("session.event.error", payload)
+
+    assert normalized["operational_error"] == operational_error
+
+
+def test_normalized_error_payload_preserves_terminal_usage() -> None:
+    event = ErrorEvent(
+        message="provider failed after billing",
+        code="provider_terminal_error",
+        input_tokens=11,
+        output_tokens=7,
+        billed_cost=0.25,
+        cost_usd=0.25,
+        cost_source="provider_billed",
+        model_usage_breakdown=[
+            {
+                "model": "actual/model",
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "billed_cost": 0.25,
+            }
+        ],
+    )
+    payload = asdict(event)
+    payload.pop("kind")
+
+    normalized = _normalize_terminal_event_payload(
+        "session.event.error",
+        payload,
+    )
+
+    assert normalized["input_tokens"] == 11
+    assert normalized["output_tokens"] == 7
+    assert normalized["billed_cost"] == 0.25
+    assert normalized["model_usage_breakdown"] == event.model_usage_breakdown
 
 
 def test_normalized_error_payload_keys_are_frozen() -> None:

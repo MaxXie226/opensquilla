@@ -53,6 +53,15 @@ def _published_material(ctx: ToolContext, result: str) -> tuple[dict[str, object
     return payload["artifact"], path.read_bytes()
 
 
+def test_create_csv_schema_declares_nested_array_items() -> None:
+    from opensquilla.tools.registry import get_default_registry
+
+    spec = get_default_registry().get("create_csv")
+    assert spec is not None
+    rows = spec.spec.parameters["rows"]
+    assert rows["items"] == {"type": "array", "items": {}}
+
+
 @pytest.mark.asyncio
 async def test_create_csv_publishes_channel_artifact(tmp_path: Path) -> None:
     ctx = _channel_artifact_context(tmp_path)

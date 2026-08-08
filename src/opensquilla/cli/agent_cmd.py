@@ -28,7 +28,7 @@ class AgentRunResult:
     session_key: str
     text: str
     usage: dict[str, Any]
-    errors: list[dict[str, str]]
+    errors: list[dict[str, Any]]
     workspace: str | None = None
     workspace_strict: bool = False
     workspace_lockdown: bool = False
@@ -39,6 +39,7 @@ class AgentRunResult:
     usage_path: str | None = None
     artifacts: list[dict[str, Any]] | None = None
     routing: dict[str, Any] | None = None
+    operational_error: dict[str, Any] | None = None
 
 
 def _cli_sender_id() -> str:
@@ -245,9 +246,11 @@ async def run_agent_once(
     session_key = canonicalize_session_key(session_id or f"agent:{agent_id}:main")
 
     text_parts: list[str] = []
-    errors: list[dict[str, str]] = []
+    errors: list[dict[str, Any]] = []
+    operational_error: dict[str, Any] | None = None
     artifacts: list[dict[str, Any]] = []
     done: DoneEvent | None = None
+    terminal_error_event: ErrorEvent | None = None
 
     try:
         await svc.session_manager.get_or_create(session_key, agent_id=agent_id)
@@ -347,12 +350,24 @@ async def run_agent_once(
             if isinstance(event, TextDeltaEvent):
                 text_parts.append(event.text)
             elif isinstance(event, ErrorEvent):
-                errors.append({"message": event.message, "code": event.code})
+                terminal_error_event = event
+                error_payload: dict[str, Any] = {
+                    "message": event.message,
+                    "code": event.code,
+                }
+                if event.operational_error is not None:
+                    operational_error = dict(event.operational_error)
+                    error_payload["operational_error"] = dict(operational_error)
+                errors.append(error_payload)
             elif isinstance(event, ArtifactEvent):
                 artifacts.append(artifact_payload(event))
             elif isinstance(event, DoneEvent):
                 done = event
-        usage = _usage_from_done(done, effective_model)
+        usage = _usage_from_done(
+            done,
+            effective_model,
+            error=terminal_error_event,
+        )
         transcript_usage = _to_transcript_usage(usage)
         if transcript_path:
             transcript = await svc.session_manager.get_transcript(session_key)
@@ -383,6 +398,7 @@ async def run_agent_once(
         usage_path=usage_path,
         artifacts=artifacts,
         routing=_routing_from_done(done),
+        operational_error=operational_error,
     )
 
 
@@ -532,25 +548,56 @@ def _parse_bool(value: str | None) -> bool | None:
     return None
 
 
-def _usage_from_done(done: Any | None, model: str | None) -> dict[str, Any]:
+def _usage_from_done(
+    done: Any | None,
+    model: str | None,
+    *,
+    error: Any | None = None,
+) -> dict[str, Any]:
+    source = done if done is not None else error
     usage = {
-        "input_tokens": done.input_tokens if done else 0,
-        "output_tokens": done.output_tokens if done else 0,
-        "total_tokens": (done.input_tokens + done.output_tokens) if done else 0,
-        "reasoning_tokens": done.reasoning_tokens if done else 0,
-        "cached_tokens": done.cached_tokens if done else 0,
-        "cost_usd": done.cost_usd if done else 0.0,
-        "billed_cost": done.billed_cost if done else 0.0,
-        "model": (done.model or model or "") if done else (model or ""),
-        "request_count": done.iterations if done else 0,
+        "input_tokens": int(getattr(source, "input_tokens", 0) or 0),
+        "output_tokens": int(getattr(source, "output_tokens", 0) or 0),
+        "total_tokens": (
+            int(getattr(source, "input_tokens", 0) or 0)
+            + int(getattr(source, "output_tokens", 0) or 0)
+        ),
+        "reasoning_tokens": int(
+            getattr(source, "reasoning_tokens", 0) or 0
+        ),
+        "cached_tokens": int(getattr(source, "cached_tokens", 0) or 0),
+        "cache_write_tokens": int(
+            getattr(source, "cache_write_tokens", 0) or 0
+        ),
+        "cost_usd": float(getattr(source, "cost_usd", 0.0) or 0.0),
+        "billed_cost": float(
+            getattr(source, "billed_cost", 0.0) or 0.0
+        ),
+        "cost_source": str(
+            getattr(source, "cost_source", "none") or "none"
+        ),
+        "model": (
+            str(getattr(source, "model", "") or model or "")
+            if source is not None
+            else (model or "")
+        ),
+        "request_count": (
+            int(getattr(done, "iterations", 0) or 0)
+            if done is not None
+            else int(getattr(error, "physical_request_count", 0) or 0)
+        ),
     }
-    if done is not None:
-        model_usage_breakdown = getattr(done, "model_usage_breakdown", None)
+    if source is not None:
+        model_usage_breakdown = getattr(
+            source,
+            "model_usage_breakdown",
+            None,
+        )
         if isinstance(model_usage_breakdown, list) and model_usage_breakdown:
             usage["model_usage_breakdown"] = [
                 dict(row) for row in model_usage_breakdown if isinstance(row, dict)
             ]
-        ensemble_trace = getattr(done, "ensemble_trace", None)
+        ensemble_trace = getattr(source, "ensemble_trace", None)
         if isinstance(ensemble_trace, dict) and ensemble_trace:
             usage["ensemble_trace"] = dict(ensemble_trace)
     return usage
@@ -938,6 +985,8 @@ def run_agent_command(
         "usage_path": result.usage_path,
         "artifacts": artifacts,
     }
+    if result.operational_error is not None:
+        payload["operational_error"] = dict(result.operational_error)
     if json_output:
         typer.echo(json.dumps(payload, ensure_ascii=False))
     else:

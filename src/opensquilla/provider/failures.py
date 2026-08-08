@@ -200,6 +200,10 @@ _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
     ),
     FailureMatcher(
         ProviderFailureKind.POLICY_REFUSAL,
+        raw_codes=frozenset({"provider_content_filter"}),
+    ),
+    FailureMatcher(
+        ProviderFailureKind.POLICY_REFUSAL,
         message_substrings=(
             "content policy",
             "policy violation",

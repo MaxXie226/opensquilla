@@ -162,6 +162,28 @@ class ErrorEvent:
     # explicit 0/False proves a local preflight rejection.
     request_started: bool | None = None
     physical_request_count: int | None = None
+    # Exact provider-originated automation contract. Appended for positional
+    # compatibility and preserved verbatim onto gateway/CLI error envelopes.
+    operational_error: dict[str, Any] | None = None
+    # Terminal provider failures may still carry complete billable usage. Keep
+    # the same auditable fields as DoneEvent so CLI/automation does not turn a
+    # failed finish_reason into a zero-cost call merely because no success
+    # event exists.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: float = 0.0
+    billed_cost: float = 0.0
+    cost_source: str = "none"
+    model: str = ""
+    provider: str = ""
+    requested_model: str = ""
+    requested_provider: str = ""
+    model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
+    ensemble_trace: dict[str, Any] | None = None
+    usage_missing_count: int = 0
 
 
 @dataclass
