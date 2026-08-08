@@ -1834,6 +1834,15 @@ def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
     )
 
 
+def _proposer_provider_config(member: EnsembleMemberConfig) -> ProviderConfig:
+    """Return the isolated provider boundary for proposer-side operations."""
+
+    return replace(
+        member.provider_config,
+        replay_provider_state=False,
+    )
+
+
 def _effective_request_cap_source(
     binding: _MemberRequestBudgetBinding | None,
     chat_config: ChatConfig | None,
@@ -5725,7 +5734,7 @@ class EnsembleProvider:
                 member,
             ).model_copy(update=proposer_updates)
             _require_projection(
-                _build_provider(member.provider_config),
+                _build_provider(_proposer_provider_config(member)),
                 member_config,
                 synthetic_messages=additional_messages,
             )
@@ -10190,7 +10199,7 @@ class EnsembleProvider:
             or self._router_dynamic_selection()
         ):
             raw_stream = _provider_events_with_error_boundary(
-                provider_config=member.provider_config,
+                provider_config=_proposer_provider_config(member),
                 messages=messages,
                 tools=tools,
                 chat_config=chat_cfg,
@@ -10200,7 +10209,7 @@ class EnsembleProvider:
                 terminal_observed=lambda: terminal_event_observed,
             )
         else:
-            provider = _build_provider(member.provider_config)
+            provider = _build_provider(_proposer_provider_config(member))
             raw_stream = provider.chat(messages, tools=tools, config=chat_cfg)
             mark_request_started()
 
@@ -17770,7 +17779,6 @@ def build_ensemble_provider_from_config(
         )
         selection_plan["proposer_recovery_policy"] = recovery_policy
     inherited_provider = str(inherited_provider_config.provider or "").strip().lower()
-    inherited_model = str(inherited_provider_config.model or "").strip().lower()
     lineup_members = [
         *proposers,
         *proposer_backups,
@@ -17781,19 +17789,10 @@ def build_ensemble_provider_from_config(
         member.provider_config.provider.strip().lower() != inherited_provider
         for member in lineup_members
     )
-    cross_identity_lineup = any(
-        (
-            member.provider_config.provider.strip().lower(),
-            member.provider_config.model.strip().lower(),
-        )
-        != (inherited_provider, inherited_model)
-        for member in lineup_members
-    )
-    if cross_identity_lineup:
-        # Provider-private state is model-specific even when several models
-        # share the same OpenRouter gateway.  Once any member crosses the
-        # inherited (provider, model) identity, no member or single-provider
-        # fallback may replay private history.
+    if cross_provider_lineup:
+        # Provider-private state is not portable across provider boundaries.
+        # Proposer calls are isolated independently at their physical request
+        # boundary, including same-provider multi-model lineups.
         def without_private_replay(
             member: EnsembleMemberConfig,
         ) -> EnsembleMemberConfig:
@@ -17831,9 +17830,7 @@ def build_ensemble_provider_from_config(
         )
         if callable(disable_selector_replay):
             disable_selector_replay()
-        selection_plan["provider_state_replay"] = (
-            "disabled_cross_provider" if cross_provider_lineup else "disabled_cross_model"
-        )
+        selection_plan["provider_state_replay"] = "disabled_cross_provider"
     request_budget_bindings = (
         _runtime_member_request_budget_bindings(
             config=config,

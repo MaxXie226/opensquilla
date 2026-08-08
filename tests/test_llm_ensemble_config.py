@@ -1199,10 +1199,10 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "aggregator_max_tokens_cap": 65_536,
             "aggregator_visible_answer_reserve_tokens": 8_192,
             "aggregator_candidates": ["openrouter:z-ai/glm-5.2"],
-            "provider_state_replay": "disabled_cross_model",
             "selected_P": [f"openrouter:{model}" for model in expected_proposers],
             "selected_A": "openrouter:z-ai/glm-5.2",
         }
+        assert provider.aggregator.provider_config.replay_provider_state is True
         assert provider.min_successful_proposers == 4
         assert provider.proposer_timeout_seconds == 300.0
         assert provider.aggregator_timeout_seconds == 480.0

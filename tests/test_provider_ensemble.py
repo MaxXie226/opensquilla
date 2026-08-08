@@ -2733,6 +2733,67 @@ async def test_ensemble_runs_proposers_concurrently_and_tools_only_reach_aggrega
 
 
 @pytest.mark.asyncio
+async def test_proposer_calls_isolate_private_state_but_aggregator_keeps_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft"),
+                    DoneEvent(input_tokens=1, output_tokens=1, model="p1"),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final"),
+                    DoneEvent(input_tokens=1, output_tokens=1, model="agg"),
+                ]
+            ),
+        }
+    )
+    built_configs: list[ProviderConfig] = []
+
+    def build_provider(cfg: ProviderConfig) -> _FakeProvider:
+        built_configs.append(cfg)
+        return registry.provider_for(cfg)
+
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", build_provider)
+    provider = EnsembleProvider(
+        profile_name="private-state-boundary",
+        proposers=[
+            EnsembleMemberConfig(
+                provider_config=ProviderConfig(
+                    provider="fake",
+                    model="p1",
+                    replay_provider_state=True,
+                ),
+                label="p1",
+            )
+        ],
+        aggregator=EnsembleMemberConfig(
+            provider_config=ProviderConfig(
+                provider="fake",
+                model="agg",
+                replay_provider_state=True,
+            ),
+            label="agg",
+        ),
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    provider.project_message_count([Message(role="user", content="answer this")])
+    projection_replay = {cfg.model: cfg.replay_provider_state for cfg in built_configs}
+    assert projection_replay == {"p1": False, "agg": True}
+
+    built_configs.clear()
+    await _collect(provider)
+    execution_replay = {cfg.model: cfg.replay_provider_state for cfg in built_configs}
+    assert execution_replay == {"p1": False, "agg": True}
+
+
+@pytest.mark.asyncio
 async def test_ensemble_keeps_fusion_but_does_not_forge_missing_actual_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5002,6 +5063,7 @@ async def test_policy_managed_members_retry_neighbor_after_provider_rejection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: dict[str, list[ChatConfig]] = {"p1": [], "a1": []}
+    built_configs: list[ProviderConfig] = []
 
     class _ThinkingFallbackProvider:
         provider_name = "fake"
@@ -5063,10 +5125,11 @@ async def test_policy_managed_members_retry_neighbor_after_provider_rejection(
                 model=self._cfg.model,
             )
 
-    monkeypatch.setattr(
-        "opensquilla.provider.ensemble._build_provider",
-        lambda cfg: _ThinkingFallbackProvider(cfg),
-    )
+    def build_provider(cfg: ProviderConfig) -> _ThinkingFallbackProvider:
+        built_configs.append(cfg)
+        return _ThinkingFallbackProvider(cfg)
+
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", build_provider)
     proposer = EnsembleMemberConfig(
         provider_config=ProviderConfig(provider="fake", model="p1"),
         label="p1",
@@ -5120,6 +5183,16 @@ async def test_policy_managed_members_retry_neighbor_after_provider_rejection(
         8_192,
         8_192,
     ]
+    assert all(
+        not cfg.replay_provider_state
+        for cfg in built_configs
+        if cfg.model == "p1"
+    )
+    assert all(
+        cfg.replay_provider_state
+        for cfg in built_configs
+        if cfg.model == "a1"
+    )
     plan = provider.selection_plan
     assert plan["thinking_assignment"]["proposers"]["fake:p1"] == "high"
     assert plan["thinking_assignment"]["aggregator"] == "highest"
