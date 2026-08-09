@@ -4862,8 +4862,13 @@ def test_formal_ensemble_recovery_evidence_fails_closed(
     assert expected_reason in reasons
 
 
+@pytest.mark.parametrize(
+    "code",
+    ["ensemble_aggregator_close_timeout", "incomplete_stream"],
+)
 def test_provider_shaped_degraded_aggregator_keeps_failed_physical_audit(
     module,
+    code: str,
 ) -> None:
     final_text = "usable degraded answer"
     trace = _ensemble_trace(
@@ -4874,7 +4879,6 @@ def test_provider_shaped_degraded_aggregator_keeps_failed_physical_audit(
     )
     call = trace["calls"][0]
     recovery = call["aggregator_recovery"]
-    code = "ensemble_aggregator_close_timeout"
     recovery.update(
         {
             "selected_kind": "degraded_delivery",

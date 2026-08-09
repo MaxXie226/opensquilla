@@ -431,6 +431,7 @@ AUDIT_ONLY_ERROR_CODES = frozenset(
 
 DEGRADED_DELIVERY_ERROR_CODES = frozenset(
     {
+        "incomplete_stream",
         "ensemble_aggregator_close_timeout",
         "ensemble_aggregator_timeout",
         "ensemble_aggregator_length_capped",
@@ -4820,6 +4821,7 @@ def aggregator_output_reasons(
 
 _STRUCTURAL_AGGREGATOR_RECOVERY_TRIGGERS = frozenset(
     {
+        "incomplete_stream",
         "provider_build_failed",
         "member_unavailable",
         "reasoning_only_length",
