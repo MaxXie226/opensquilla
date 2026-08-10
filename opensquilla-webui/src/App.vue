@@ -461,6 +461,11 @@ import {
   optionalSessionRpcCallOptions,
 } from './composables/chat/sessionBootstrapAdmission'
 import { markCronFinishNotified } from './utils/cron/notifications'
+import {
+  buildChatSessionTitles,
+  isSensibleChatTitle,
+  provideChatSessionTitles,
+} from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
@@ -595,6 +600,11 @@ const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: 
 // Pending optimistic renames, keyed by session key; cleared after the next list
 // reload returns the backend's canonical title.
 const renameOverrides = ref<Record<string, string>>({})
+
+const chatSessionTitles = computed(() => (
+  buildChatSessionTitles(allSessions.value, renameOverrides.value)
+))
+provideChatSessionTitles(chatSessionTitles)
 
 const brandMarkUrl = computed(() => {
   if (import.meta.env.DEV) return '/opensquilla-mark.png'
@@ -763,18 +773,10 @@ function agentDisplayName(agentId: string): string {
   return agent?.name || (agentId === 'main' ? 'Main Agent' : agentId)
 }
 
-// Raw session keys (agent:…:…) and bare UUIDs must never render in the sidebar.
-const RAW_SESSION_KEY_PATTERN = /\bagent:[a-z0-9_-]+:[a-z0-9_-]+:/i
-const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
-
-function looksLikeRawSessionId(value: string): boolean {
-  return RAW_SESSION_KEY_PATTERN.test(value) || UUID_PATTERN.test(value) || /^(agent|cron):/i.test(value)
-}
-
 function sidebarConversationTitle(item: SessionItem): string {
   for (const candidate of [item.title, item.subtitle, item.groupLabel]) {
     const text = String(candidate || '').trim()
-    if (text && !looksLikeRawSessionId(text)) return text
+    if (isSensibleChatTitle(text)) return text
   }
   return t('shared.sidebar.untitledTask')
 }
