@@ -2611,6 +2611,8 @@
       "toastConnectionRecovered": "Connexion rétablie et état des tâches actualisé",
       "toastConnectionRetry": "La connexion n’est pas encore rétablie. Actualisez bientôt la page.",
       "toastBackgroundComplete": "La tâche « {name} » est terminée. Consultez le résultat dans l’historique.",
+      "toastBackgroundReminder": "Rappel « {name} » : {reminder}",
+      "toastViewReminder": "Voir",
       "toastBackgroundFailed": "La tâche « {name} » a échoué. Utilisez le bouton Réessayer de sa carte.",
       "unnamedTask": "Tâche sans nom",
       "toastDeleted": "Tâche supprimée",
@@ -3672,6 +3674,7 @@
       "compacted": "Contexte compacté",
       "failed": "Échec du compactage",
       "withinBudget": "Contexte dans les limites du budget.",
+      "skipped": "Le compactage du contexte n’a pas été appliqué.",
       "cancelled": "Compactage annulé",
       "requestScoped": "Limité à cette requête ; l’historique de session n’a pas été réécrit"
     },

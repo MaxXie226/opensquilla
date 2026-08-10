@@ -2611,6 +2611,8 @@
       "toastConnectionRecovered": "Conexión restablecida y estado de tareas actualizado",
       "toastConnectionRetry": "La conexión aún no se ha restablecido. Actualiza la página en breve.",
       "toastBackgroundComplete": "La tarea «{name}» terminó. Consulta el resultado en el historial.",
+      "toastBackgroundReminder": "Recordatorio «{name}»: {reminder}",
+      "toastViewReminder": "Ver",
       "toastBackgroundFailed": "La tarea «{name}» falló. Usa el botón Reintentar de su tarjeta.",
       "unnamedTask": "Tarea sin nombre",
       "toastDeleted": "Tarea eliminada",
@@ -3672,6 +3674,7 @@
       "compacted": "Contexto compactado",
       "failed": "Error al compactar",
       "withinBudget": "Contexto dentro del presupuesto.",
+      "skipped": "No se aplicó la compactación del contexto.",
       "cancelled": "Compactación cancelada",
       "requestScoped": "Solo para esta solicitud; no se reescribió el historial de la sesión"
     },
