@@ -141,4 +141,23 @@ describe('CronJobPanel friendly schedule contracts', () => {
 
     expect(form.cron).toBe('30 14 * * *')
   })
+
+  it('supports keyboard focus navigation and Escape in themed selectors', async () => {
+    mountPanel()
+    await nextTick()
+
+    const trigger = document.querySelector<HTMLButtonElement>('#cp-repeat-kind')!
+    trigger.focus()
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    await nextTick()
+    expect(document.activeElement?.textContent).toContain('cronSkills.panel.daily')
+
+    document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    expect(document.activeElement?.textContent).toContain('cronSkills.panel.weekdays')
+    document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    await nextTick()
+
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(trigger)
+  })
 })
