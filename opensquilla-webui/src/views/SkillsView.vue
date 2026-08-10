@@ -165,15 +165,15 @@
       :loading="registryLoading"
       :registry-diagnostics="registryDiagnostics"
       :registry-search-error="registrySearchError"
-      :queue="installQueue"
-      :queue-running="queueRunning"
+      :activities="installActivities"
+      :running-source="runningSource"
       :mutation-blocked="mutationBusy && !queueRunning"
-      :queue-refresh-warning="queueRefreshWarning"
       @close="addSkillOpen = false"
       @search="searchRegistry"
       @install-github="installGithub"
       @install="installSkill"
       @retry="retryQueueItem"
+      @clear-activity="clearInstallActivity"
     />
 
     <SkillDetailDialog
@@ -335,16 +335,17 @@ const {
   registryLoading,
   registryDiagnostics,
   registrySearchError,
-  installQueue,
+  installActivities,
+  runningSource,
   queueRunning,
   mutationBusy,
-  queueRefreshWarning,
   installingDepsId,
   uninstallingName,
   searchRegistry,
   installGithub,
   installSkill,
   retryQueueItem,
+  clearInstallActivity,
   installDeps,
   uninstallSkill,
 } = registry

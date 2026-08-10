@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { watch } from 'vue'
 import {
   githubSkillDisplayName,
   skillRegistryOperationKey,
@@ -135,7 +136,7 @@ describe('useSkillRegistry install state', () => {
       'shadcn',
       'repository',
     ])
-    expect(registry.installQueue.value.map(item => item.displayName)).toEqual([
+    expect(registry.installActivities.value.github.items.map(item => item.displayName)).toEqual([
       'brainstorming',
       'shadcn',
       'shadcn',
@@ -175,9 +176,9 @@ describe('useSkillRegistry install state', () => {
     expect(identifiers).toEqual(lines)
     expect(maxActiveCalls).toBe(1)
     expect(loadData).toHaveBeenCalledOnce()
-    expect(registry.installQueue.value).toHaveLength(15)
-    expect(registry.installQueue.value[2].status).toBe('failed')
-    expect(registry.installQueue.value[3].status).toBe('installed')
+    expect(registry.installActivities.value.github.items).toHaveLength(15)
+    expect(registry.installActivities.value.github.items[2].status).toBe('failed')
+    expect(registry.installActivities.value.github.items[3].status).toBe('installed')
     expect(registry.githubUrl.value).toBe('https://github.com/acme/skill-3')
     expect(registry.queueRunning.value).toBe(false)
   })
@@ -199,6 +200,30 @@ describe('useSkillRegistry install state', () => {
     await Promise.all([first, second])
 
     expect(call).toHaveBeenCalledOnce()
+  })
+
+  it('publishes queue item status changes through the reactive source activity', async () => {
+    let release: ((value: { success: boolean; installed: boolean }) => void) | undefined
+    const pending = new Promise<{ success: boolean; installed: boolean }>((resolve) => {
+      release = resolve
+    })
+    const registry = useSkillRegistry(
+      { call: vi.fn(async () => pending) } as never,
+      vi.fn(async () => true),
+    )
+    const observed: Array<string | undefined> = []
+    watch(
+      () => registry.installActivities.value.clawhub.items[0]?.status,
+      status => observed.push(status),
+      { flush: 'sync' },
+    )
+
+    const installing = registry.installSkill('@acme/reactive', 'clawhub')
+    expect(observed).toEqual(['queued', 'installing'])
+    release?.({ success: true, installed: true })
+    await installing
+
+    expect(observed).toEqual(['queued', 'installing', 'installed'])
   })
 
   it('refuses queue starts while dependency, uninstall, or reload owns the mutation gate', async () => {
@@ -293,11 +318,12 @@ describe('useSkillRegistry install state', () => {
     expect(call.mock.calls[call.mock.calls.length - 1]?.[0]).toBe('skills.install')
   })
 
-  it('keeps terminal results and retries only the selected failed item', async () => {
-    let attempts = 0
-    const call = vi.fn(async () => {
-      attempts += 1
-      return attempts === 1
+  it('keeps terminal results and retries only the selected source item', async () => {
+    const attempts = new Map<string, number>()
+    const call = vi.fn(async (_method: string, params: { identifier: string }) => {
+      const count = (attempts.get(params.identifier) || 0) + 1
+      attempts.set(params.identifier, count)
+      return count === 1
         ? { success: false, message: 'not compatible' }
         : { success: true, unchanged: true, name: 'demo' }
     })
@@ -305,13 +331,100 @@ describe('useSkillRegistry install state', () => {
     const registry = useSkillRegistry({ call } as never, loadData)
 
     await registry.installSkill('@acme/demo', 'clawhub', 'Demo')
-    expect(registry.installQueue.value[0].status).toBe('failed')
+    registry.githubUrl.value = 'https://github.com/acme/demo'
+    await registry.installGithub()
+    const clawHubItem = registry.installActivities.value.clawhub.items[0]
+    const githubItem = registry.installActivities.value.github.items[0]
+    expect(clawHubItem.status).toBe('failed')
+    expect(githubItem.status).toBe('failed')
 
-    await registry.retryQueueItem(registry.installQueue.value[0].id)
+    await registry.retryQueueItem(clawHubItem.id)
 
-    expect(registry.installQueue.value[0].status).toBe('unchanged')
-    expect(registry.installQueue.value[0].displayName).toBe('demo')
+    expect(registry.installActivities.value.clawhub.items[0].status).toBe('unchanged')
+    expect(registry.installActivities.value.clawhub.items[0].displayName).toBe('demo')
+    expect(registry.installActivities.value.github.items[0]).toBe(githubItem)
+    expect(registry.installActivities.value.github.items[0].status).toBe('failed')
     expect(loadData).toHaveBeenCalledOnce()
+  })
+
+  it('retains terminal batches across sources and replaces only the same source', async () => {
+    const call = vi.fn(async (_method: string, params: { identifier: string }) => ({
+      success: true,
+      installed: true,
+      name: params.identifier,
+    }))
+    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true))
+
+    await registry.installSkill('@acme/clawhub-one', 'clawhub', 'ClawHub one')
+    registry.githubUrl.value = 'https://github.com/acme/github-one'
+    await registry.installGithub()
+
+    const githubActivity = registry.installActivities.value.github
+    expect(registry.installActivities.value.clawhub.items.map(item => item.identifier))
+      .toEqual(['@acme/clawhub-one'])
+    expect(githubActivity.items.map(item => item.identifier))
+      .toEqual(['https://github.com/acme/github-one'])
+
+    await registry.installSkill('@acme/clawhub-two', 'clawhub', 'ClawHub two')
+
+    expect(registry.installActivities.value.clawhub.items.map(item => item.identifier))
+      .toEqual(['@acme/clawhub-two'])
+    expect(registry.installActivities.value.github).toBe(githubActivity)
+    expect(registry.installActivities.value.github.items.map(item => item.identifier))
+      .toEqual(['https://github.com/acme/github-one'])
+  })
+
+  it('clears only one terminal activity and blocks every clear while a source runs', async () => {
+    let holdNext = false
+    let release: (() => void) | undefined
+    const pending = new Promise<void>((resolve) => { release = resolve })
+    const call = vi.fn(async () => {
+      if (holdNext) await pending
+      return { success: true, installed: true }
+    })
+    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true))
+
+    await registry.installSkill('@acme/clawhub-one', 'clawhub')
+    registry.githubUrl.value = 'https://github.com/acme/github-one'
+    await registry.installGithub()
+
+    registry.clearInstallActivity('clawhub')
+    expect(registry.installActivities.value.clawhub.items).toEqual([])
+    expect(registry.installActivities.value.github.items).toHaveLength(1)
+
+    holdNext = true
+    const running = registry.installSkill('@acme/clawhub-two', 'clawhub')
+    expect(registry.runningSource.value).toBe('clawhub')
+    expect(registry.installActivities.value.clawhub.items[0].status).toBe('installing')
+
+    registry.clearInstallActivity('clawhub')
+    registry.clearInstallActivity('github')
+    expect(registry.installActivities.value.clawhub.items).toHaveLength(1)
+    expect(registry.installActivities.value.github.items).toHaveLength(1)
+
+    release?.()
+    await running
+    expect(registry.runningSource.value).toBeNull()
+  })
+
+  it('keeps catalog refresh warnings scoped to their source activity', async () => {
+    const call = vi.fn(async () => ({ success: true, installed: true }))
+    const loadData = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+    const registry = useSkillRegistry({ call } as never, loadData)
+
+    await registry.installSkill('@acme/clawhub-one', 'clawhub')
+    const clawHubWarning = registry.installActivities.value.clawhub.refreshWarning
+    expect(clawHubWarning).not.toBe('')
+    expect(registry.installActivities.value.github.refreshWarning).toBe('')
+
+    registry.githubUrl.value = 'https://github.com/acme/github-one'
+    await registry.installGithub()
+
+    expect(registry.installActivities.value.clawhub.refreshWarning).toBe(clawHubWarning)
+    expect(registry.installActivities.value.github.refreshWarning).toBe('')
+    expect(pushToast).toHaveBeenCalledTimes(1)
   })
 
   it('searches ClawHub explicitly and retains source diagnostics', async () => {

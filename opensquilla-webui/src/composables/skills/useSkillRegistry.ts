@@ -59,6 +59,15 @@ export interface SkillInstallQueueItem {
   error?: string
 }
 
+export type SkillInstallSource = 'clawhub' | 'github'
+
+export interface SkillInstallActivity {
+  items: SkillInstallQueueItem[]
+  refreshWarning: string
+}
+
+export type SkillInstallActivities = Record<SkillInstallSource, SkillInstallActivity>
+
 interface SkillInstallRequest {
   identifier: string
   source: string
@@ -140,16 +149,17 @@ export interface SkillRegistry {
   registryDiagnostics: Ref<SkillDiagnostic[]>
   registrySearchError: Ref<string>
   installingId: Ref<string | null>
-  installQueue: Ref<SkillInstallQueueItem[]>
-  queueRunning: Ref<boolean>
+  installActivities: Ref<SkillInstallActivities>
+  runningSource: Ref<SkillInstallSource | null>
+  queueRunning: ComputedRef<boolean>
   mutationBusy: ComputedRef<boolean>
-  queueRefreshWarning: Ref<string>
   installingDepsId: Ref<string | null>
   uninstallingName: Ref<string | null>
   searchRegistry: () => Promise<void>
   installGithub: () => Promise<void>
   installSkill: (identifier: string, source: string, displayName?: string) => Promise<void>
   retryQueueItem: (id: string) => Promise<void>
+  clearInstallActivity: (source: SkillInstallSource) => void
   installDeps: (name: string, installId: string) => Promise<SkillDependencyInstallOutcome>
   uninstallSkill: (name: string) => Promise<boolean>
 }
@@ -168,10 +178,13 @@ export function useSkillRegistry(
   const registryDiagnostics = ref<SkillDiagnostic[]>([])
   const registrySearchError = ref('')
   const installingId = ref<string | null>(null)
-  const installQueue = ref<SkillInstallQueueItem[]>([])
-  const queueRunning = ref(false)
+  const installActivities = ref<SkillInstallActivities>({
+    clawhub: { items: [], refreshWarning: '' },
+    github: { items: [], refreshWarning: '' },
+  })
+  const runningSource = ref<SkillInstallSource | null>(null)
+  const queueRunning = computed(() => runningSource.value !== null)
   const mutationBusy = computed(() => mutationGate.busy.value)
-  const queueRefreshWarning = ref('')
   const installingDepsId = ref<string | null>(null)
   const uninstallingName = ref<string | null>(null)
 
@@ -224,6 +237,10 @@ export function useSkillRegistry(
     }
   }
 
+  function activitySource(source: string): SkillInstallSource {
+    return source === 'github' ? 'github' : 'clawhub'
+  }
+
   function removeSuccessfulGithubLines(items: SkillInstallQueueItem[]) {
     const successful = new Set(
       items
@@ -239,12 +256,16 @@ export function useSkillRegistry(
       .trim()
   }
 
-  async function refreshCatalogAfterBatch(items: SkillInstallQueueItem[]) {
+  async function refreshCatalogAfterBatch(
+    source: SkillInstallSource,
+    items: SkillInstallQueueItem[],
+  ) {
     const changed = items.some(item => item.status === 'installed' || item.status === 'unchanged')
     if (!changed) return
     if (!(await loadData())) {
-      queueRefreshWarning.value = t('cronSkills.skillsView.reloadListFailed')
-      pushToast(queueRefreshWarning.value, { tone: 'warn' })
+      const message = t('cronSkills.skillsView.reloadListFailed')
+      installActivities.value[source].refreshWarning = message
+      pushToast(message, { tone: 'warn' })
     }
   }
 
@@ -277,15 +298,17 @@ export function useSkillRegistry(
     const unique = uniqueRequests(requests)
     if (!unique.length) return
     if (!mutationGate.acquire('install_queue')) return
-    installQueue.value = unique.map(requestToQueueItem)
-    queueRefreshWarning.value = ''
-    queueRunning.value = true
+    const source = activitySource(unique[0].source)
+    const items = unique.map(requestToQueueItem)
+    installActivities.value[source] = { items, refreshWarning: '' }
+    const activityItems = installActivities.value[source].items
+    runningSource.value = source
     try {
-      await processQueueItems(installQueue.value)
-      removeSuccessfulGithubLines(installQueue.value)
-      await refreshCatalogAfterBatch(installQueue.value)
+      await processQueueItems(activityItems)
+      removeSuccessfulGithubLines(activityItems)
+      await refreshCatalogAfterBatch(source, activityItems)
     } finally {
-      queueRunning.value = false
+      runningSource.value = null
       installingId.value = null
       mutationGate.release('install_queue')
     }
@@ -330,20 +353,28 @@ export function useSkillRegistry(
   }
 
   async function retryQueueItem(id: string) {
-    const item = installQueue.value.find(candidate => candidate.id === id)
+    const source = (['clawhub', 'github'] as const).find(candidate =>
+      installActivities.value[candidate].items.some(item => item.id === id))
+    if (!source) return
+    const item = installActivities.value[source].items.find(candidate => candidate.id === id)
     if (!item || item.status !== 'failed') return
     if (!mutationGate.acquire('install_queue')) return
-    queueRefreshWarning.value = ''
-    queueRunning.value = true
+    installActivities.value[source].refreshWarning = ''
+    runningSource.value = source
     try {
       await processQueueItems([item])
       removeSuccessfulGithubLines([item])
-      await refreshCatalogAfterBatch([item])
+      await refreshCatalogAfterBatch(source, [item])
     } finally {
-      queueRunning.value = false
+      runningSource.value = null
       installingId.value = null
       mutationGate.release('install_queue')
     }
+  }
+
+  function clearInstallActivity(source: SkillInstallSource) {
+    if (runningSource.value) return
+    installActivities.value[source] = { items: [], refreshWarning: '' }
   }
 
   async function installDeps(name: string, installId: string): Promise<SkillDependencyInstallOutcome> {
@@ -419,16 +450,17 @@ export function useSkillRegistry(
     registryDiagnostics,
     registrySearchError,
     installingId,
-    installQueue,
+    installActivities,
+    runningSource,
     queueRunning,
     mutationBusy,
-    queueRefreshWarning,
     installingDepsId,
     uninstallingName,
     searchRegistry,
     installGithub,
     installSkill,
     retryQueueItem,
+    clearInstallActivity,
     installDeps,
     uninstallSkill,
   }

@@ -14,6 +14,7 @@ type RpcFrame = {
 
 type SkillGatewayCapture = {
   inFlight: number
+  installAttempts: Record<string, number>
   installIdentifiers: string[]
   installSources: string[]
   listCalls: number
@@ -74,11 +75,17 @@ function catalogPayload() {
   }
 }
 
-function installPayload(identifier: string, index: number) {
+function installPayload(
+  identifier: string,
+  index: number,
+  source: string,
+  attempt: number,
+) {
   const suffix = String(index + 1).padStart(2, '0')
   const immutableRevision = `${suffix}`.repeat(20)
+  const retryableSearchFailure = identifier.includes('synthetic-failure') && attempt === 1
 
-  if (index === FAILED_INDEX) {
+  if (index === FAILED_INDEX || retryableSearchFailure) {
     return {
       success: false,
       unchanged: false,
@@ -87,6 +94,15 @@ function installPayload(identifier: string, index: number) {
       installed: false,
       active: false,
       instruction_usable: false,
+      lifecycle: {
+        install_state: 'missing',
+        load_state: 'not_discovered',
+        selection_state: 'active',
+        compatibility_state: 'instruction_only',
+        readiness_state: 'unknown',
+      },
+      // Deliberately model an older Gateway. The current UI must suppress these
+      // success-only fields for failed operations.
       effectiveFrom: 'next_turn',
       catalogGeneration: 41,
       diagnostics: [{
@@ -101,7 +117,7 @@ function installPayload(identifier: string, index: number) {
         },
       }],
       resolution: {
-        source: 'github',
+        source,
         canonicalIdentifier: identifier,
         publisher: 'synthetic-publisher',
         version: '1.0.0',
@@ -133,7 +149,7 @@ function installPayload(identifier: string, index: number) {
         }]
       : [],
     resolution: {
-      source: 'github',
+      source,
       canonicalIdentifier: identifier,
       publisher: 'synthetic-publisher',
       version: '1.0.0',
@@ -146,6 +162,7 @@ function installPayload(identifier: string, index: number) {
 async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
   const capture: SkillGatewayCapture = {
     inFlight: 0,
+    installAttempts: {},
     installIdentifiers: [],
     installSources: [],
     listCalls: 0,
@@ -200,15 +217,19 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
 
       if (frame.method === 'skills.search') {
         capture.searchParams.push(frame.params || {})
+        const query = String(frame.params?.query || '')
+        const isFailureFixture = query.includes('failure')
         ws.send(response(frame.id, {
           results: [{
-            name: 'synthetic-search-result',
+            name: isFailureFixture ? 'synthetic-search-failure' : 'synthetic-search-result',
             description: 'A synthetic registry result.',
             author: 'Synthetic Publisher',
             version: '1.0.0',
             source: 'clawhub',
             trust_level: 'community',
-            installReference: 'synthetic-publisher/synthetic-search-result@1.0.0',
+            installReference: isFailureFixture
+              ? 'synthetic-publisher/synthetic-failure@1.0.0'
+              : 'synthetic-publisher/synthetic-search-result@1.0.0',
           }],
         }))
         return
@@ -216,15 +237,18 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
 
       if (frame.method === 'skills.install') {
         const identifier = String(frame.params?.identifier || '')
+        const source = String(frame.params?.source || '')
         const index = capture.installIdentifiers.length
         capture.installIdentifiers.push(identifier)
-        capture.installSources.push(String(frame.params?.source || ''))
+        capture.installSources.push(source)
+        const attempt = (capture.installAttempts[identifier] || 0) + 1
+        capture.installAttempts[identifier] = attempt
         capture.inFlight += 1
         capture.maxInFlight = Math.max(capture.maxInFlight, capture.inFlight)
-        const delay = frame.params?.source === 'clawhub' ? 750 : INSTALL_DELAY_MS
+        const delay = source === 'clawhub' ? 750 : INSTALL_DELAY_MS
         setTimeout(() => {
           capture.inFlight -= 1
-          ws.send(response(frame.id, installPayload(identifier, index)))
+          ws.send(response(frame.id, installPayload(identifier, index, source, attempt)))
         }, delay)
         return
       }
@@ -350,7 +374,60 @@ test.describe('Add Skill drawer', () => {
       'synthetic-publisher/synthetic-search-result@1.0.0',
     ])
     expect(capture.installSources).toEqual(['clawhub'])
+    const activity = dialog.locator('.sk-add-queue[data-source="clawhub"]')
+    await expect(activity).toBeVisible()
+    await expect(activity.locator('.sk-add-queue-item[data-status="installed"]'))
+      .toHaveCount(1, { timeout: 5_000 })
     await expect(searchResult.getByRole('button')).toContainText('Installed')
+    await expect(activity.locator('.sk-add-activity-toggle')).toHaveAttribute('aria-expanded', 'false')
+    await expect(activity.locator('.sk-add-queue-item')).toBeHidden()
+    await expect(activity).toContainText('1 / 1 processed')
+    await expect(activity).toContainText('1 installed')
+    await expect(dialog.locator('#skills-add-tab-clawhub .sk-add-source-failures')).toHaveCount(0)
+  })
+
+  test('keeps failed ClawHub activity on its source and clears it after a successful retry', async ({ page }) => {
+    const capture = await installSkillGateway(page)
+    await openSkills(page)
+
+    await page.getByTestId('skills-add-trigger').click()
+    const dialog = page.getByRole('dialog', { name: 'Add Skill' })
+    const clawhubTab = dialog.locator('#skills-add-tab-clawhub')
+    const githubTab = dialog.locator('#skills-add-tab-github')
+    await clawhubTab.click()
+    await dialog.locator('#skills-add-clawhub-query').fill('synthetic failure')
+    await dialog.getByRole('button', { name: 'Search', exact: true }).click()
+    await dialog.locator('.sk-add-result').getByRole('button', { name: 'Install', exact: true }).click()
+
+    const clawhubActivity = dialog.locator('.sk-add-queue[data-source="clawhub"]')
+    const failedItem = clawhubActivity.locator('.sk-add-queue-item[data-status="failed"]')
+    await expect(failedItem).toBeVisible({ timeout: 5_000 })
+    await expect(clawhubActivity.locator('.sk-add-activity-toggle')).toHaveAttribute('aria-expanded', 'true')
+    await expect(failedItem).toContainText('Not installed')
+    await expect(failedItem).not.toContainText('Installed files missing')
+    await expect(failedItem).not.toContainText('Available next turn')
+    await expect(failedItem).not.toContainText('Catalog generation')
+    await expect(clawhubTab.locator('.sk-add-source-failures')).toHaveText('1')
+
+    await githubTab.click()
+    await expect(dialog.locator('.sk-add-queue')).toHaveCount(0)
+    await expect(dialog.locator('.sk-add-queue-item')).toHaveCount(0)
+    await expect(dialog).not.toContainText('Synthetic compatibility failure')
+    await expect(clawhubTab.locator('.sk-add-source-failures')).toHaveText('1')
+
+    await clawhubTab.click()
+    await expect(failedItem).toBeVisible()
+    await failedItem.getByRole('button', { name: 'Retry', exact: true }).click()
+    await expect(clawhubActivity.locator('.sk-add-queue-item[data-status="installing"]')).toBeVisible()
+    await expect.poll(() => capture.installAttempts['synthetic-publisher/synthetic-failure@1.0.0'])
+      .toBe(2)
+    await expect(clawhubActivity.locator('.sk-add-activity-toggle'))
+      .toHaveAttribute('aria-expanded', 'false', { timeout: 5_000 })
+    await expect(clawhubActivity.locator('.sk-add-queue-item[data-status="installed"]')).toBeHidden()
+    await expect(clawhubTab.locator('.sk-add-source-failures')).toHaveCount(0)
+
+    await clawhubActivity.getByRole('button', { name: 'Clear activity', exact: true }).click()
+    await expect(clawhubActivity).toHaveCount(0)
   })
 
   test('installs a deduplicated 15-item batch serially and preserves progress across close', async ({ page }) => {
@@ -373,16 +450,37 @@ test.describe('Add Skill drawer', () => {
 
     await expect.poll(() => capture.installIdentifiers.length).toBeGreaterThan(0)
     await expect(dialog.locator('.sk-add-queue-item')).toHaveCount(15)
+    const githubTab = dialog.locator('#skills-add-tab-github')
+    const clawhubTab = dialog.locator('#skills-add-tab-clawhub')
+    await expect(githubTab.locator('.sk-add-source-status')).toBeVisible()
+    await expect(githubTab).toHaveAccessibleName(/GitHub.*Installing skill/)
+    await expect(dialog.locator('.sk-add-queue').getByRole('button', { name: 'Clear activity' }))
+      .toBeDisabled()
+    await clawhubTab.click()
+    await expect(dialog.locator('.sk-add-queue')).toHaveCount(0)
+    await expect(githubTab.locator('.sk-add-source-status')).toBeVisible()
+    await expect(dialog.locator('#skills-add-clawhub-query')).toBeEnabled()
+    await dialog.locator('#skills-add-clawhub-query').fill('background search')
+    await dialog.getByRole('button', { name: 'Search', exact: true }).click()
+    await expect(dialog.locator('.sk-add-result')).toHaveCount(1)
+    await expect(dialog.locator('.sk-add-result').getByRole('button', { name: 'Install', exact: true }))
+      .toBeDisabled()
     await dialog.getByRole('button', { name: 'Close' }).click()
     await expect(dialog).toHaveCount(0)
 
     await expect.poll(() => capture.installIdentifiers.length).toBeGreaterThanOrEqual(3)
     await trigger.click()
     await expect(dialog).toBeVisible()
-    await expect(dialog.locator('.sk-add-queue-item')).toHaveCount(15)
+    await expect(clawhubTab).toHaveAttribute('aria-selected', 'true')
+    await expect(dialog.locator('.sk-add-queue-item')).toHaveCount(0)
+    await expect(githubTab.locator('.sk-add-source-status')).toBeVisible()
 
     await expect.poll(() => capture.installIdentifiers.length, { timeout: 15_000 }).toBe(15)
     await expect.poll(() => capture.inFlight, { timeout: 15_000 }).toBe(0)
+    await expect(githubTab.locator('.sk-add-source-status')).toHaveCount(0)
+    await expect(githubTab.locator('.sk-add-source-failures')).toHaveText('1')
+    await githubTab.click()
+    await expect(dialog.locator('.sk-add-queue-item')).toHaveCount(15)
     await expect(dialog.locator('.sk-add-queue-item[data-status="queued"]')).toHaveCount(0)
     await expect(dialog.locator('.sk-add-queue-item[data-status="installing"]')).toHaveCount(0)
     await expect(dialog.locator('.sk-add-queue-item[data-status="installed"]')).toHaveCount(13)
@@ -395,6 +493,10 @@ test.describe('Add Skill drawer', () => {
 
     const failed = dialog.locator('.sk-add-queue-item[data-status="failed"]')
     await expect(failed).toContainText('Synthetic compatibility failure')
+    await expect(failed).toContainText('Not installed')
+    await expect(failed).not.toContainText('Installed files missing')
+    await expect(failed).not.toContainText('Available next turn')
+    await expect(failed).not.toContainText('Catalog generation')
     await failed.locator('summary').click()
     await expect(failed).toContainText('DIALECT_FIELD_UNSUPPORTED')
     await expect(failed).toContainText('literal upstream text')
@@ -408,6 +510,10 @@ test.describe('Add Skill drawer', () => {
 
     await expect(dialog.locator('#skills-add-github-input')).toHaveValue(references[FAILED_INDEX])
     await expect(dialog.locator('.sk-add-queue-item').last()).toHaveAttribute('data-status', 'installed')
+    await expect(dialog.locator('.sk-add-queue')).toContainText('15 / 15 processed')
+    await expect(dialog.locator('.sk-add-queue')).toContainText('13 installed')
+    await expect(dialog.locator('.sk-add-queue')).toContainText('1 already current')
+    await expect(dialog.locator('.sk-add-queue')).toContainText('1 failed')
   })
 
   test('uses a full-width drawer at the 390px breakpoint', async ({ page }) => {

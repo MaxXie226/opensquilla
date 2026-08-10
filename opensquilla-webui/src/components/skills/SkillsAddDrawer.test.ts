@@ -3,7 +3,11 @@
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import { afterEach, describe, expect, it } from 'vitest'
 import i18n from '@/i18n'
-import type { SkillInstallQueueItem } from '@/composables/skills/useSkillRegistry'
+import type {
+  SkillInstallActivities,
+  SkillInstallQueueItem,
+  SkillInstallSource,
+} from '@/composables/skills/useSkillRegistry'
 import type { RegistryResult } from '@/types/skills'
 import SkillsAddDrawer from './SkillsAddDrawer.vue'
 
@@ -16,7 +20,8 @@ afterEach(() => {
 
 function mountDrawer(options: {
   queue?: SkillInstallQueueItem[]
-  queueRunning?: boolean
+  activities?: SkillInstallActivities
+  runningSource?: SkillInstallSource | null
   mutationBlocked?: boolean
   results?: RegistryResult[]
 } = {}) {
@@ -24,9 +29,23 @@ function mountDrawer(options: {
   const githubUrl = ref('https://github.com/acme/demo')
   const registryQuery = ref('demo')
   const queue = ref(options.queue || [])
-  const queueRunning = ref(options.queueRunning || false)
+  const queueSource: SkillInstallSource = queue.value[0]?.source === 'clawhub'
+    ? 'clawhub'
+    : 'github'
+  const activities = ref<SkillInstallActivities>(options.activities || {
+    clawhub: {
+      items: queueSource === 'clawhub' ? queue.value : [],
+      refreshWarning: '',
+    },
+    github: {
+      items: queueSource === 'github' ? queue.value : [],
+      refreshWarning: '',
+    },
+  })
+  const runningSource = ref<SkillInstallSource | null>(options.runningSource ?? null)
   const installed: Array<[string, string, string]> = []
   const retried: string[] = []
+  const cleared: SkillInstallSource[] = []
 
   const Root = defineComponent({
     setup() {
@@ -43,10 +62,9 @@ function mountDrawer(options: {
           loading: false,
           registryDiagnostics: [],
           registrySearchError: '',
-          queue: queue.value,
-          queueRunning: queueRunning.value,
+          activities: activities.value,
+          runningSource: runningSource.value,
           mutationBlocked: options.mutationBlocked || false,
-          queueRefreshWarning: '',
           'onUpdate:registryQuery': (value: string) => { registryQuery.value = value },
           'onUpdate:githubUrl': (value: string) => { githubUrl.value = value },
           onClose: () => { open.value = false },
@@ -54,6 +72,10 @@ function mountDrawer(options: {
             installed.push([identifier, source, name])
           },
           onRetry: (id: string) => { retried.push(id) },
+          onClearActivity: (source: SkillInstallSource) => {
+            cleared.push(source)
+            activities.value[source] = { items: [], refreshWarning: '' }
+          },
         }),
       ])
     },
@@ -66,7 +88,17 @@ function mountDrawer(options: {
   app.mount(host)
   apps.push(app)
 
-  return { host, open, githubUrl, queue, queueRunning, installed, retried }
+  return {
+    host,
+    open,
+    githubUrl,
+    queue,
+    activities,
+    runningSource,
+    installed,
+    retried,
+    cleared,
+  }
 }
 
 describe('SkillsAddDrawer', () => {
@@ -108,6 +140,8 @@ describe('SkillsAddDrawer', () => {
     trigger.click()
     await nextTick()
     expect(document.querySelector('.sk-add-queue-item')?.textContent).toContain('legacy-skill')
+    expect((document.querySelector('.sk-add-activity-body') as HTMLElement)?.style.display)
+      .toBe('none')
 
     document.querySelector<HTMLButtonElement>('.sk-add-drawer__close')?.click()
     await nextTick()
@@ -145,7 +179,7 @@ describe('SkillsAddDrawer', () => {
         }],
       },
     }]
-    mountDrawer({ queue, queueRunning: true })
+    mountDrawer({ queue, runningSource: 'github' })
     document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
     await nextTick()
 
@@ -246,7 +280,7 @@ describe('SkillsAddDrawer', () => {
     }]
     const mounted = mountDrawer({
       queue,
-      queueRunning: true,
+      runningSource: 'clawhub',
       results: [{
         name: 'Demo',
         installReference: '@verified/demo',
@@ -267,7 +301,7 @@ describe('SkillsAddDrawer', () => {
 
     mounted.queue.value[0].status = 'failed'
     mounted.queue.value[0].error = 'Manifest rejected'
-    mounted.queueRunning.value = false
+    mounted.runningSource.value = null
     await nextTick()
 
     expect(result.dataset.status).toBe('failed')
@@ -275,5 +309,219 @@ describe('SkillsAddDrawer', () => {
     expect(result.textContent).toContain('Manifest rejected')
     action.click()
     expect(mounted.retried).toEqual([operationKey])
+  })
+
+  it('keeps source activity isolated and exposes inactive failures on the source tab only', async () => {
+    const activities: SkillInstallActivities = {
+      clawhub: {
+        items: [{
+          id: '["clawhub","@acme/failed"]',
+          identifier: '@acme/failed',
+          source: 'clawhub',
+          displayName: 'Claw failure',
+          status: 'failed',
+          error: 'Manifest rejected',
+          result: { success: false, installed: false },
+        }],
+        refreshWarning: '',
+      },
+      github: {
+        items: [{
+          id: '["github","acme/ready"]',
+          identifier: 'acme/ready',
+          source: 'github',
+          displayName: 'GitHub success',
+          status: 'installed',
+          result: { success: true, installed: true },
+        }],
+        refreshWarning: '',
+      },
+    }
+    mountDrawer({ activities })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+
+    const githubActivity = document.querySelector<HTMLElement>('.sk-add-queue[data-source="github"]')!
+    expect(githubActivity.textContent).toContain('GitHub success')
+    expect(githubActivity.textContent).not.toContain('Claw failure')
+    expect(githubActivity.querySelector<HTMLElement>('.sk-add-activity-body')?.style.display)
+      .toBe('none')
+    expect(document.querySelector('#skills-add-tab-clawhub .sk-add-source-failures')?.textContent)
+      .toBe('1')
+
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+    const clawActivity = document.querySelector<HTMLElement>('.sk-add-queue[data-source="clawhub"]')!
+    expect(clawActivity.textContent).toContain('Claw failure')
+    expect(clawActivity.textContent).not.toContain('GitHub success')
+    expect(clawActivity.querySelector<HTMLElement>('.sk-add-activity-body')?.style.display)
+      .not.toBe('none')
+  })
+
+  it('shows background progress on its source tab and keeps read-only search available', async () => {
+    const activities: SkillInstallActivities = {
+      clawhub: { items: [], refreshWarning: '' },
+      github: {
+        items: [{
+          id: '["github","acme/running"]',
+          identifier: 'acme/running',
+          source: 'github',
+          displayName: 'running-skill',
+          status: 'installing',
+        }],
+        refreshWarning: '',
+      },
+    }
+    mountDrawer({ activities, runningSource: 'github' })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    const runningActivity = document.querySelector<HTMLElement>('.sk-add-queue')!
+    expect(runningActivity.querySelector<HTMLElement>('.sk-add-activity-body')?.style.display)
+      .not.toBe('none')
+    expect(runningActivity.querySelector<HTMLButtonElement>('.sk-add-activity-toggle')?.disabled)
+      .toBe(true)
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const githubTab = document.querySelector<HTMLElement>('#skills-add-tab-github')!
+    expect(githubTab.querySelector('.sk-spinner')).not.toBeNull()
+    expect(githubTab.textContent).toContain('Installing running-skill')
+    expect(document.querySelector('.sk-add-queue')).toBeNull()
+    expect(document.querySelector<HTMLInputElement>('#skills-add-clawhub-query')?.disabled)
+      .toBe(false)
+    expect(document.querySelector<HTMLButtonElement>('.sk-add-search-row button')?.disabled)
+      .toBe(false)
+    expect(document.querySelector<HTMLButtonElement>('.sk-add-result button')).toBeNull()
+  })
+
+  it('summarizes terminal outcomes, allows manual disclosure, and clears only terminal activity', async () => {
+    const activities: SkillInstallActivities = {
+      clawhub: { items: [], refreshWarning: '' },
+      github: {
+        items: [{
+          id: '["github","acme/installed"]',
+          identifier: 'acme/installed',
+          source: 'github',
+          displayName: 'installed',
+          status: 'installed',
+        }, {
+          id: '["github","acme/current"]',
+          identifier: 'acme/current',
+          source: 'github',
+          displayName: 'current',
+          status: 'unchanged',
+        }],
+        refreshWarning: '',
+      },
+    }
+    const mounted = mountDrawer({ activities })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+
+    const activity = document.querySelector<HTMLElement>('.sk-add-queue')!
+    expect(activity.textContent).toContain('2 / 2 processed')
+    expect(activity.textContent).toContain('1 installed')
+    expect(activity.textContent).toContain('1 already current')
+    expect(activity.textContent).toContain('0 failed')
+    expect(activity.querySelector<HTMLElement>('.sk-add-activity-body')?.style.display)
+      .toBe('none')
+
+    activity.querySelector<HTMLButtonElement>('.sk-add-activity-toggle')?.click()
+    await nextTick()
+    expect(activity.querySelector<HTMLElement>('.sk-add-activity-body')?.style.display)
+      .not.toBe('none')
+
+    const clear = Array.from(activity.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Clear activity'))!
+    clear.click()
+    await nextTick()
+    expect(mounted.cleared).toEqual(['github'])
+    expect(document.querySelector('.sk-add-queue')).toBeNull()
+  })
+
+  it('renders failed operation truth without misleading lifecycle or publication metadata', async () => {
+    const missingLifecycle = {
+      install_state: 'missing' as const,
+      load_state: 'not_discovered' as const,
+      selection_state: 'active' as const,
+      compatibility_state: 'native' as const,
+      readiness_state: 'unknown' as const,
+    }
+    const activities: SkillInstallActivities = {
+      clawhub: {
+        items: [{
+          id: '["clawhub","@acme/new"]',
+          identifier: '@acme/new',
+          source: 'clawhub',
+          displayName: 'new-skill',
+          status: 'failed',
+          error: 'Security scan blocked installation',
+          result: {
+            success: false,
+            installed: false,
+            effectiveFrom: 'next_turn',
+            catalogGeneration: 0,
+            lifecycle: missingLifecycle,
+            resolution: {
+              publisher: 'acme',
+              version: '1.1.0',
+              immutableRevision: '1.1.0',
+            },
+          },
+        }],
+        refreshWarning: '',
+      },
+      github: { items: [], refreshWarning: '' },
+    }
+    mountDrawer({ activities })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const activity = document.querySelector<HTMLElement>('.sk-add-queue')!
+    expect(activity.textContent).toContain('Not installed')
+    expect(activity.textContent).not.toContain('Installed files missing')
+    expect(activity.textContent).not.toContain('Available next turn')
+    expect(activity.textContent).not.toContain('Catalog generation')
+    expect(Array.from(activity.querySelectorAll('.sk-add-queue-item__meta span'))
+      .filter(node => node.textContent === '1.1.0')).toHaveLength(1)
+  })
+
+  it('reports a preserved installation when a reinstall fails', async () => {
+    const activities: SkillInstallActivities = {
+      clawhub: {
+        items: [{
+          id: '["clawhub","@acme/existing"]',
+          identifier: '@acme/existing',
+          source: 'clawhub',
+          displayName: 'existing-skill',
+          status: 'failed',
+          error: 'Update rejected',
+          result: {
+            success: false,
+            installed: true,
+            lifecycle: {
+              install_state: 'tracked',
+              load_state: 'loaded',
+              selection_state: 'active',
+              compatibility_state: 'instruction_only',
+              readiness_state: 'ready',
+            },
+          },
+        }],
+        refreshWarning: '',
+      },
+      github: { items: [], refreshWarning: '' },
+    }
+    mountDrawer({ activities })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    expect(document.querySelector('.sk-add-queue')?.textContent)
+      .toContain('Existing installation preserved')
+    expect(document.querySelector('.sk-add-queue')?.textContent).toContain('Active')
   })
 })
