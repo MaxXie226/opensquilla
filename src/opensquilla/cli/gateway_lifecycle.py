@@ -779,6 +779,45 @@ class GatewayLifecycleManager:
         return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def active_managed_gateway_url() -> str | None:
+    """Return the active managed Gateway URL for the selected profile.
+
+    ``gateway start`` records its effective runtime target in the profile-local
+    lifecycle file.  That record is authoritative when a one-off ``--port`` or
+    ``--listen`` override differs from the persisted config, but only while the
+    recorded process is still alive and serving a healthy Gateway.
+    """
+
+    lifecycle = GatewayLifecycleManager()
+    record, error = lifecycle._read_pidfile()
+    if error is not None or record is None:
+        return None
+
+    host = record.get("host")
+    if not isinstance(host, str) or not host.strip():
+        return None
+    host = host.strip()
+    try:
+        port = int(record.get("port"))
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 65535:
+        return None
+
+    config_path = record.get("configPath")
+    if not isinstance(config_path, str) or not config_path.strip():
+        config_path = None
+    lifecycle = GatewayLifecycleManager(
+        host=host,
+        port=port,
+        config_path=config_path,
+    )
+    status = lifecycle.status()
+    if status.state != "running" or not status.managed:
+        return None
+    return normalize_gateway_url(f"ws://{_format_url_host(lifecycle.probe_host)}:{port}/ws")
+
+
 def _health_probe_host(host: str) -> str:
     if host == "0.0.0.0":
         return "127.0.0.1"

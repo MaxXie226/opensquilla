@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+
+from opensquilla.cli import gateway_lifecycle
 from opensquilla.cli.gateway_rpc import default_gateway_token, default_gateway_url
 
 
@@ -22,6 +25,79 @@ port = 18790
     )
 
     assert default_gateway_url() == "ws://127.0.0.1:18790/ws"
+
+
+def _write_managed_gateway_record(home, *, port: int = 18792) -> None:
+    target = home / "state" / "gateway" / "gateway.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "host": "127.0.0.1",
+                "port": port,
+                "url": f"http://127.0.0.1:{port}",
+                "healthUrl": f"http://127.0.0.1:{port}/health",
+                "startedAt": "2026-08-10T00:00:00Z",
+                "argv": ["opensquilla", "gateway", "run", "--port", str(port)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_default_gateway_url_prefers_active_profile_managed_target(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    home = tmp_path / "profile"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    config = home / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    _write_managed_gateway_record(home)
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_pid_running",
+        lambda self, pid: True,
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_probe_health",
+        lambda self: True,
+    )
+
+    assert default_gateway_url() == "ws://127.0.0.1:18792/ws"
+
+
+def test_default_gateway_url_ignores_stale_profile_managed_target(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    home = tmp_path / "profile"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    config = home / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    _write_managed_gateway_record(home)
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_pid_running",
+        lambda self, pid: False,
+    )
+
+    assert default_gateway_url() == "ws://127.0.0.1:18791/ws"
+
+
+def test_default_gateway_url_explicit_url_wins_over_profile_managed_target(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_URL", "wss://squilla.example.com/ws")
+    monkeypatch.setattr(
+        gateway_lifecycle,
+        "active_managed_gateway_url",
+        lambda: (_ for _ in ()).throw(AssertionError("managed target must not be read")),
+    )
+
+    assert default_gateway_url() == "wss://squilla.example.com/ws"
 
 
 def test_default_gateway_token_uses_explicit_config_path(tmp_path, monkeypatch) -> None:

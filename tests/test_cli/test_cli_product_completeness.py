@@ -7,6 +7,7 @@ from typing import Any
 
 from typer.testing import CliRunner
 
+from opensquilla.cli import gateway_lifecycle
 from opensquilla.cli.main import app
 
 runner = CliRunner()
@@ -682,6 +683,56 @@ def test_sessions_list_json_filters_client_side(monkeypatch):
     payload = json.loads(result.stdout)
     assert payload["count"] == 1
     assert payload["sessions"][0]["key"] == "a"
+
+
+def test_sessions_list_uses_active_profile_managed_gateway_runtime_port(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake = _install_fake_gateway(monkeypatch)
+    fake.sessions_payload = {
+        "sessions": [{"key": "qa-session", "status": "active"}],
+        "count": 1,
+    }
+    home = tmp_path / "profile"
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_URL", raising=False)
+    config = home / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    lifecycle = home / "state" / "gateway" / "gateway.json"
+    lifecycle.parent.mkdir(parents=True)
+    lifecycle.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "host": "127.0.0.1",
+                "port": 18792,
+                "url": "http://127.0.0.1:18792",
+                "healthUrl": "http://127.0.0.1:18792/health",
+                "startedAt": "2026-08-10T00:00:00Z",
+                "argv": ["opensquilla", "gateway", "run", "--port", "18792"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_pid_running",
+        lambda self, pid: True,
+    )
+    monkeypatch.setattr(
+        gateway_lifecycle.GatewayLifecycleManager,
+        "_probe_health",
+        lambda self: True,
+    )
+
+    result = runner.invoke(app, ["sessions", "list", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert ("connect", "ws://127.0.0.1:18792/ws") in fake.calls
+    assert json.loads(result.stdout)["sessions"][0]["key"] == "qa-session"
 
 
 def test_sessions_show_json_resolves_and_previews(monkeypatch):

@@ -718,8 +718,6 @@ def _target_url_for_doctor(
         return normalize_gateway_url(gateway_url)
     if config_path is not None:
         return gateway_url_from_config(config_path)
-    if implicit_config_path := _implicit_existing_config_path():
-        return gateway_url_from_config(implicit_config_path)
     return default_gateway_url()
 
 def _requested_config_path(

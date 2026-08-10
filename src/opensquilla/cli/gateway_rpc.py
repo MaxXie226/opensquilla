@@ -19,6 +19,13 @@ def default_gateway_url() -> str:
 
     if gateway_url := os.environ.get("OPENSQUILLA_GATEWAY_URL"):
         return normalize_gateway_url(gateway_url)
+    try:
+        from opensquilla.cli.gateway_lifecycle import active_managed_gateway_url
+
+        if managed_gateway_url := active_managed_gateway_url():
+            return managed_gateway_url
+    except Exception:  # noqa: BLE001 - fall back to config-derived target.
+        pass
     if config_path := os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"):
         return gateway_url_from_config(config_path)
     try:
