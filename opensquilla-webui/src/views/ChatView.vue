@@ -1526,6 +1526,7 @@ watch(compactStatus, (status) => {
     state: transcriptCompactionState(status.status),
     durability: status.durability || '',
     ...(status.detail ? { detail: status.detail } : {}),
+    ...(status.reason ? { reason: status.reason } : {}),
   }
   const index = messages.value.findIndex(message => (
     message.role === 'maintenance'
@@ -1697,6 +1698,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   stripGeneratedArtifactMarkers,
   stripTimePrefix,
   isSubagentCompletionMessage,
+  timeTranslator: t,
 })
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
 
