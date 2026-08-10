@@ -1,6 +1,7 @@
 <template>
   <div ref="root" class="cron-select" :class="{ 'is-open': open, 'is-disabled': disabled, 'is-embedded': embedded }">
     <button
+      ref="trigger"
       :id="id"
       type="button"
       class="cron-select__trigger"
@@ -26,7 +27,9 @@
           role="option"
           :aria-selected="option.value === modelValue"
           :disabled="option.disabled"
+          tabindex="-1"
           @click="choose(option.value)"
+          @keydown="onOptionKeydown"
         >
           <span>{{ option.label }}</span>
           <Icon v-if="option.value === modelValue" name="check" :size="15" />
@@ -37,7 +40,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import Icon from '@/components/Icon.vue'
 
 export interface CronSelectOption {
@@ -66,26 +69,70 @@ const emit = defineEmits<{
 }>()
 
 const root = ref<HTMLElement | null>(null)
+const trigger = ref<HTMLButtonElement | null>(null)
 const open = ref(false)
 const selectedLabel = computed(() => props.options.find(option => option.value === props.modelValue)?.label || '')
 
+function optionButtons() {
+  return Array.from(root.value?.querySelectorAll<HTMLButtonElement>('.cron-select__option:not(:disabled)') || [])
+}
+
+function openAndFocus(last = false) {
+  if (props.disabled) return
+  open.value = true
+  void nextTick(() => {
+    const options = optionButtons()
+    const selected = root.value?.querySelector<HTMLButtonElement>('.cron-select__option.is-selected:not(:disabled)')
+    const target = last ? options[options.length - 1] : selected || options[0]
+    target?.focus()
+  })
+}
+
+function closeAndFocus() {
+  open.value = false
+  void nextTick(() => trigger.value?.focus())
+}
+
 function toggle() {
-  if (!props.disabled) open.value = !open.value
+  if (props.disabled) return
+  if (open.value) open.value = false
+  else openAndFocus()
 }
 
 function choose(value: string) {
   emit('update:modelValue', value)
   emit('change', value)
-  open.value = false
+  closeAndFocus()
 }
 
 function onTriggerKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
-    open.value = false
-  } else if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
+    if (!open.value) return
     event.preventDefault()
-    open.value = true
+    event.stopPropagation()
+    closeAndFocus()
+  } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault()
+    if (!open.value) openAndFocus(event.key === 'ArrowUp')
+  } else if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault()
+    if (!open.value) openAndFocus()
   }
+}
+
+function onOptionKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    closeAndFocus()
+    return
+  }
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+  event.preventDefault()
+  const options = optionButtons()
+  const current = options.indexOf(event.currentTarget as HTMLButtonElement)
+  const next = (current + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length
+  options[next]?.focus()
 }
 
 function onDocumentPointerDown(event: PointerEvent) {
