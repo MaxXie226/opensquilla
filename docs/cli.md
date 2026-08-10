@@ -270,10 +270,15 @@ More detail:
 ```sh
 opensquilla skills list
 opensquilla skills search pdf
+opensquilla skills search pdf --json --include-diagnostics
 opensquilla skills view pdf-toolkit
 opensquilla skills install <install-reference> --source <clawhub|github>
+opensquilla skills install <install-reference> --source <clawhub|github> \
+  --force --risk-confirmation <token>
+opensquilla skills update --install-id <install-id>
 opensquilla skills update --all
 opensquilla skills uninstall <skill-name>
+opensquilla skills uninstall --install-id <install-id>
 opensquilla skills doctor [<skill-name-or-install-id>] --json
 opensquilla skills inspect meta-skill-creator
 opensquilla skills meta proposals list
@@ -282,6 +287,9 @@ opensquilla skills meta runs show <run-id>
 opensquilla skills meta runs steps <run-id>
 opensquilla skills meta runs replay <run-id> --dry-run
 ```
+
+`skills search --json` keeps the legacy top-level array for existing clients.
+Add `--include-diagnostics` when a stable results-and-source-diagnostics envelope is needed.
 
 Use `skills inspect` when you want to see the compiled step plan for a
 meta-skill before invoking it.

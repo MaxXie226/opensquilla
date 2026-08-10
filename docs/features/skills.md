@@ -67,16 +67,22 @@ Update one skill or all managed skills:
 
 ```sh
 opensquilla skills update <skill-name>
+opensquilla skills update --install-id <install-id>
 opensquilla skills update --all
 ```
 
-Use `--force` only to acknowledge a scanner verdict for one install or update;
-it does not bypass path, manifest, compatibility, or postflight validation.
+When the heuristic scanner requests confirmation, review the returned findings
+and `confirmationToken`, then retry that exact artifact with both
+`--force --risk-confirmation <confirmation-token>`. The token is bound to the
+resolved source revision and fetched content; a changed artifact requires a new
+review. Confirmation does not bypass archive, path, digest, transaction, or
+postflight validation.
 
 Remove a managed skill:
 
 ```sh
 opensquilla skills uninstall <skill-name>
+opensquilla skills uninstall --install-id <install-id>
 ```
 
 OpenSquilla currently supports single-root, instruction-first Community Skills
@@ -91,18 +97,30 @@ install results become observable to agent turns from the next turn because the
 current turn keeps a pinned catalog. Offline CLI installs are only validated for
 the next Gateway start; activation and readiness are evaluated at that start.
 
+Community package identity, the safe managed-directory key, and the runtime
+frontmatter `name` are tracked separately. A package can therefore retain an
+ecosystem-native runtime name without using that value as a filesystem path.
+When multiple packages expose the same runtime name, exact mutations use the
+install identity; ambiguous name-only mutations fail without changing either
+installation.
+
 This is not full Claude Skills or OpenClaw Skills execution compatibility.
 Direct `/skill` commands, argument substitution, scoped tool permissions, hooks,
 context forks, plugin/MCP activation, and executable sandbox materialization are
-not supported by Community installation. A Skill that declares `allowed-tools`
-is installed with limited compatibility: OpenSquilla does not grant that
-preapproval, keeps the normal tool approval policy, and reports
-`TOOL_PREAPPROVAL_IGNORED` through Doctor. Fields that change control flow or
-activate executable integrations, such as hooks, context forks, agents,
-plugin/MCP activation, and command entrypoints, remain blocking instead of being
-silently ignored. Claude-style ``!`command` `` dynamic context is also retained
-as instruction text rather than executed while loading; Doctor reports
+not activated by Community installation. Community manifests are projected into
+an instruction-only runtime profile: instruction text and safe invocation
+metadata remain usable, while unsupported control-flow or executable fields are
+kept inert and reported as compatibility diagnostics. A Skill that declares
+`allowed-tools` does not receive that preapproval; OpenSquilla keeps the normal
+tool approval policy and reports `TOOL_PREAPPROVAL_IGNORED` through Doctor.
+Claude-style ``!`command` `` dynamic context is retained as instruction text
+rather than executed while loading; Doctor reports
 `DYNAMIC_CONTEXT_UNSUPPORTED` and marks the installation as degraded.
+
+The Web UI installs GitHub references serially, with at most 10 unique references
+per batch. Ordinary item failures do not roll back successful items or stop later
+items. A GitHub rate-limit response pauses the remaining references as not
+attempted and keeps them in the input for a later batch.
 
 ## Manage Skill Sources
 

@@ -13,7 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   RPC and CLI add read-only Doctor diagnostics, agent installs return lifecycle
   diagnostics, and the Web UI displays lifecycle and selection state. The
   compatibility claim is intentionally limited to single-root,
-  instruction-first Skills; unsupported execution dialects remain explicit.
+  instruction-first Skills; unsupported execution dialects remain inert and
+  explicit. Source package, managed storage, and runtime names are tracked
+  separately, dangerous scanner confirmations are bound to the reviewed
+  artifact, and GitHub batches are serial, capped at 10 references, and pause
+  remaining work when the source reports a rate limit.
 - Official TokenRhythm HTTPS API requests can now include the optional
   `X-OpenSquilla-Install-Id` header by default. It carries the existing
   pseudonymous, cross-session installation identifier without exposing raw
