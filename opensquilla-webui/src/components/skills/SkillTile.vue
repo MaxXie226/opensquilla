@@ -25,6 +25,7 @@ const props = defineProps<{
   meta?: boolean
   source?: string
   trustLevel?: string
+  lifecycleLabel?: string
   statusDotClass?: string
   statusDotTitle?: string
 }>()
@@ -69,7 +70,7 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
       <span class="sk-tile__name" :title="name">{{ name }}</span>
       <span class="sk-tile__desc">{{ desc }}</span>
       <span
-        v-if="variant === 'registry' && (source || trustLevel)"
+        v-if="variant === 'registry' && (source || trustLevel || lifecycleLabel)"
         class="sk-tile__registry-meta"
       >
         <span v-if="source" class="sk-tile__source">{{ source }}</span>
@@ -78,7 +79,12 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
           class="sk-tile__trust"
           :class="{ 'is-trusted': trustLevel === 'trusted' || trustLevel === 'builtin' }"
         >{{ trustLevel }}</span>
+        <span v-if="lifecycleLabel" class="sk-tile__lifecycle">{{ lifecycleLabel }}</span>
       </span>
+      <span
+        v-if="variant === 'installed' && lifecycleLabel"
+        class="sk-tile__lifecycle sk-tile__lifecycle--installed"
+      >{{ lifecycleLabel }}</span>
     </span>
 
     <span class="sk-tile__action">
@@ -196,7 +202,8 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
   margin-top: 4px;
 }
 .sk-tile__source,
-.sk-tile__trust {
+.sk-tile__trust,
+.sk-tile__lifecycle {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text-dim);
@@ -204,6 +211,15 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
   font-size: 11px;
   line-height: 18px;
   padding: 0 6px;
+}
+.sk-tile__lifecycle--installed {
+  align-self: flex-start;
+  margin-top: 2px;
+  width: fit-content;
+}
+.sk-tile__lifecycle {
+  border-color: color-mix(in srgb, var(--info) 38%, var(--border));
+  color: var(--info);
 }
 .sk-tile__trust {
   border-color: color-mix(in srgb, var(--warn) 40%, var(--border));

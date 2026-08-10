@@ -2,7 +2,12 @@ import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { useRpcStore } from '@/stores/rpc'
 import { useToasts } from '@/composables/useToasts'
-import type { RegistryResult, SkillDependencyInstallOutcome } from '@/types/skills'
+import type {
+  RegistryResult,
+  SkillDependencyInstallOutcome,
+  SkillDiagnostic,
+  SkillLifecycle,
+} from '@/types/skills'
 
 interface RegistrySearchData {
   results?: RegistryResult[]
@@ -12,11 +17,23 @@ interface InstallResult {
   success: boolean
   name?: string
   message?: string
+  installed?: boolean
+  active?: boolean
+  instruction_usable?: boolean
+  installId?: string
+  lifecycle?: SkillLifecycle
+  diagnostics?: SkillDiagnostic[]
+  rollbackPerformed?: boolean
+  effectiveFrom?: 'next_turn' | 'next_start' | string
   missing_still?: {
     bins?: string[]
     env?: string[]
     env_any?: string[][]
   }
+}
+
+export function skillRegistryOperationKey(identifier: string, source: string): string {
+  return JSON.stringify([source || 'clawhub', identifier])
 }
 
 export interface SkillRegistry {
@@ -68,33 +85,44 @@ export function useSkillRegistry(
     void installSkill(url, 'github')
   }
 
-  function markRegistryResultInstalled(identifier: string, source: string, installedName?: string) {
+  function markRegistryResultOutcome(
+    identifier: string,
+    source: string,
+    installResult: InstallResult,
+  ) {
     const installSource = source || 'clawhub'
-    registryResults.value = registryResults.value.map((result) => {
-      const resultSource = result.source || 'clawhub'
-      const resultIdentifier = result.identifier || result.name
+    registryResults.value = registryResults.value.map((registryResult) => {
+      const resultSource = registryResult.source || 'clawhub'
+      const resultIdentifier = registryResult.installReference
+        || registryResult.identifier
+        || registryResult.name
       const sameSource = resultSource === installSource
       const sameIdentifier =
         resultIdentifier === identifier ||
-        result.identifier === identifier ||
-        result.name === identifier
-      const sameInstalledName = !!installedName && result.name === installedName
+        registryResult.identifier === identifier
 
-      if (!sameSource || (!sameIdentifier && !sameInstalledName)) return result
-      return { ...result, installed: true }
+      if (!sameSource || !sameIdentifier) return registryResult
+      return {
+        ...registryResult,
+        installed: installResult.installed ?? installResult.success,
+        lifecycle: installResult.lifecycle,
+        instruction_usable: installResult.instruction_usable,
+        diagnostics: installResult.diagnostics,
+      }
     })
   }
 
   async function installSkill(identifier: string, source: string) {
-    installingId.value = identifier
+    installingId.value = skillRegistryOperationKey(identifier, source)
     try {
       const res = await rpc.call<InstallResult>('skills.install', { identifier, source })
       if (res.success) {
-        markRegistryResultInstalled(identifier, source, res.name)
+        markRegistryResultOutcome(identifier, source, res)
         if (!(await loadData())) {
           pushToast(t('cronSkills.skillsView.reloadListFailed'), { tone: 'warn' })
         }
       } else {
+        markRegistryResultOutcome(identifier, source, res)
         pushToast(res.message || t('cronSkills.registry.installFailed'), { tone: 'danger' })
       }
     } catch (err) {

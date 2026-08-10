@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { useSkillRegistry } from './useSkillRegistry'
+import { skillRegistryOperationKey, useSkillRegistry } from './useSkillRegistry'
 
 const pushToast = vi.hoisted(() => vi.fn())
 
@@ -16,7 +16,27 @@ describe('useSkillRegistry install state', () => {
   it('marks the matching community result installed after a successful install', async () => {
     const call = vi.fn(async (method: string) => {
       if (method === 'skills.install') {
-        return { success: true, name: 'Development Coding Agent', message: 'installed' }
+        return {
+          success: true,
+          name: 'Development Coding Agent',
+          message: 'installed',
+          installed: true,
+          instruction_usable: false,
+          lifecycle: {
+            install_state: 'tracked',
+            load_state: 'loaded',
+            selection_state: 'shadowed',
+            compatibility_state: 'degraded',
+            readiness_state: 'ready',
+          },
+          diagnostics: [{
+            code: 'TOOL_PREAPPROVAL_IGNORED',
+            severity: 'warning',
+            phase: 'compatibility',
+            blocking: false,
+            message: 'Scoped tool pre-approval is not applied.',
+          }],
+        }
       }
       throw new Error(`Unexpected RPC method: ${method}`)
     })
@@ -28,26 +48,38 @@ describe('useSkillRegistry install state', () => {
         name: 'Development Coding Agent',
         description: 'Enhanced coding agent',
         identifier: 'development-coding-agent',
+        installReference: '@alice/development-coding-agent',
         source: 'clawhub',
         installed: false,
       },
       {
-        name: 'Other Skill',
-        identifier: 'other-skill',
+        name: 'Development Coding Agent',
+        identifier: 'development-coding-agent',
+        installReference: '@bob/development-coding-agent',
         source: 'clawhub',
         installed: false,
       },
     ]
 
-    await registry.installSkill('development-coding-agent', 'clawhub')
+    await registry.installSkill('@alice/development-coding-agent', 'clawhub')
 
     expect(call).toHaveBeenCalledWith('skills.install', {
-      identifier: 'development-coding-agent',
+      identifier: '@alice/development-coding-agent',
       source: 'clawhub',
     })
     expect(loadData).toHaveBeenCalledOnce()
     expect(registry.registryResults.value.map(result => result.installed)).toEqual([true, false])
+    expect(registry.registryResults.value[0].instruction_usable).toBe(false)
+    expect(registry.registryResults.value[0].lifecycle?.selection_state).toBe('shadowed')
+    expect(registry.registryResults.value[0].diagnostics?.[0].code)
+      .toBe('TOOL_PREAPPROVAL_IGNORED')
+    expect(registry.registryResults.value[1].lifecycle).toBeUndefined()
     expect(registry.installingId.value).toBeNull()
+  })
+
+  it('keeps in-flight identity distinct across community sources', () => {
+    expect(skillRegistryOperationKey('demo', 'clawhub'))
+      .not.toBe(skillRegistryOperationKey('demo', 'github'))
   })
 
   it('warns when installation succeeds but the catalog list cannot refresh', async () => {

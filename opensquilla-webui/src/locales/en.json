@@ -2889,6 +2889,15 @@
       "installed": "Installed",
       "installFailed": "Install failed",
       "uninstallFailed": "Uninstall failed",
+      "stateActive": "Installed and active",
+      "stateDegraded": "Installed with limited compatibility",
+      "stateNeedsSetup": "Installed; setup required",
+      "stateShadowed": "Installed but shadowed",
+      "stateDisabled": "Installed but disabled",
+      "stateHidden": "Installed; hidden from the model catalog",
+      "stateNextStart": "Validated for next start",
+      "stateRejected": "Rejected as incompatible",
+      "stateRestored": "Failed; previous version restored",
       "toastSearchFailed": "Search failed: {error}"
     },
     "skills": {

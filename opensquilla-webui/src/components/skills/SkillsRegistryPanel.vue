@@ -54,14 +54,15 @@
         <div class="sk-grid sk-tile-grid">
           <SkillTile
             v-for="row in resultRows"
-            :key="row.installId"
+            :key="row.operationKey"
             variant="registry"
             :name="row.name"
             :description="row.description"
             :source="row.source"
             :trust-level="row.trustLevel"
             :installed="row.installed"
-            :busy="installingId === row.installId"
+            :lifecycle-label="row.lifecycleLabel"
+            :busy="installingId === row.operationKey"
             @install="emit('install', String(row.installId), String(row.installSource))"
           />
         </div>
@@ -75,6 +76,8 @@ import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import SkillTile from '@/components/skills/SkillTile.vue'
+import { skillRegistryOperationKey } from '@/composables/skills/useSkillRegistry'
+import { skillLifecycleLabel } from '@/composables/skills/useSkillsCatalog'
 import type { RegistryResult } from '@/types/skills'
 
 const { t } = useI18n()
@@ -96,15 +99,32 @@ const emit = defineEmits<{
 }>()
 
 const resultRows = computed(() =>
-  props.results.map(r => ({
-    name: r.name,
-    description: (r.description || '').slice(0, 120),
-    source: r.source || '',
-    trustLevel: r.trust_level || 'community',
-    installed: !!r.installed,
-    installId: r.identifier || r.name,
-    installSource: r.source || 'clawhub',
-  })),
+  props.results.map(r => {
+    const lifecycle = r.lifecycle
+    const showLifecycleWithoutInstall = lifecycle
+      && (
+        lifecycle.load_state === 'rejected'
+        || lifecycle.load_state === 'serving_previous'
+        || lifecycle.load_state === 'validated_offline'
+        || lifecycle.compatibility_state === 'unsupported'
+      )
+    const lifecycleLabel = lifecycle && (r.installed || showLifecycleWithoutInstall)
+      ? skillLifecycleLabel({ name: r.name, lifecycle })
+      : ''
+    const installId = r.installReference || r.install_reference || r.identifier || r.name
+    const installSource = r.source || 'clawhub'
+    return {
+      name: r.name,
+      description: (r.description || '').slice(0, 120),
+      source: r.source || '',
+      trustLevel: r.trust_level || 'community',
+      installed: !!r.installed,
+      lifecycleLabel,
+      installId,
+      installSource,
+      operationKey: skillRegistryOperationKey(installId, installSource),
+    }
+  }),
 )
 </script>
 

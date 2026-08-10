@@ -2889,6 +2889,15 @@
       "installed": "已安装",
       "installFailed": "安装失败",
       "uninstallFailed": "卸载失败",
+      "stateActive": "已安装并生效",
+      "stateDegraded": "已安装；兼容性受限",
+      "stateNeedsSetup": "已安装；需要配置",
+      "stateShadowed": "已安装但被高优先级版本遮蔽",
+      "stateDisabled": "已安装但已禁用",
+      "stateHidden": "已安装；不向模型目录展示",
+      "stateNextStart": "已验证；下次启动生效",
+      "stateRejected": "因不兼容被拒绝",
+      "stateRestored": "失败；已恢复上一版本",
       "toastSearchFailed": "搜索失败：{error}"
     },
     "skills": {

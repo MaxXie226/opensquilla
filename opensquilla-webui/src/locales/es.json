@@ -2838,6 +2838,15 @@
       "installed": "Instalada",
       "installFailed": "Error al instalar",
       "uninstallFailed": "Error al desinstalar",
+      "stateActive": "Instalada y activa",
+      "stateDegraded": "Instalada con compatibilidad limitada",
+      "stateNeedsSetup": "Instalada; requiere configuración",
+      "stateShadowed": "Instalada pero eclipsada",
+      "stateDisabled": "Instalada pero deshabilitada",
+      "stateHidden": "Instalada; oculta del catálogo de modelos",
+      "stateNextStart": "Validada para el próximo inicio",
+      "stateRejected": "Rechazada por incompatibilidad",
+      "stateRestored": "Falló; se restauró la versión anterior",
       "toastSearchFailed": "Error al buscar: {error}"
     },
     "skills": {

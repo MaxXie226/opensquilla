@@ -9,13 +9,14 @@
     <div class="sk-grid sk-tile-grid">
       <SkillTile
         v-for="skill in skills"
-        :key="skill.name"
+        :key="skillCatalogKey(skill)"
         variant="installed"
         :name="skill.name"
         :description="skill.description"
         :description-zh="skill.description_zh"
         :emoji="skill.emoji"
         :meta="meta"
+        :lifecycle-label="skillLifecycleLabel(skill)"
         :status-dot-class="skillStatusDotClass(skill)"
         :status-dot-title="skillStatusDotTitle(skill)"
         @open="emit('open', skill)"
@@ -31,6 +32,8 @@ import type { Skill } from '@/types/skills'
 import {
   skillStatusDotClass,
   skillStatusDotTitle,
+  skillLifecycleLabel,
+  skillCatalogKey,
 } from '@/composables/skills/useSkillsCatalog'
 
 defineProps<{
