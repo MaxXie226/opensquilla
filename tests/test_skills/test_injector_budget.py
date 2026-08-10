@@ -86,7 +86,7 @@ def test_inject_full_truncates_long_descriptions() -> None:
 def test_prompt_renderers_hide_locations_by_default_with_explicit_opt_in() -> None:
     skill = _skill("portable")
     skill.path = Path("/synthetic/host/skills/portable/SKILL.md")
-    skill.file_path = "/synthetic/host/skills/portable/SKILL.md"
+    skill.file_path = str(skill.path)
 
     injector = SkillInjector()
     assert "<location>" not in injector.inject_full("", [skill])
