@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from opensquilla.skills.hub.contracts import (
+    DiagnosticPhase,
+    DiagnosticSeverity,
     SkillCompatibilityState,
+    SkillDiagnostic,
     SkillInstallState,
     SkillLifecycle,
     SkillLoadState,
@@ -18,7 +21,7 @@ from opensquilla.skills.hub.contracts import (
 from opensquilla.skills.hub.installer import InstallResult
 from opensquilla.skills.hub.lockfile import LockEntry, Lockfile, compute_tree_sha256
 from opensquilla.skills.hub.management import SkillManagementService
-from opensquilla.skills.hub.router import SourceRouter
+from opensquilla.skills.hub.router import SourceRouter, SourceSearchReport
 from opensquilla.skills.hub.scanner import ScanFinding, ScanResult
 from opensquilla.skills.hub.source import SkillMeta
 from opensquilla.skills.injector import SkillInjector
@@ -51,10 +54,16 @@ async def _skill_install_community(
     identifier: str,
     source: str = "clawhub",
     force: bool = False,
+    risk_confirmation: str = "",
 ) -> str:
     registered = get_default_registry().get("skill_install_community")
     assert registered is not None
-    return await registered.handler(identifier=identifier, source=source, force=force)
+    return await registered.handler(
+        identifier=identifier,
+        source=source,
+        force=force,
+        risk_confirmation=risk_confirmation,
+    )
 
 
 @pytest.fixture()
@@ -425,6 +434,61 @@ async def test_skill_search_community_returns_hub_results_with_installed_flag(
 
 
 @pytest.mark.asyncio
+async def test_skill_search_community_returns_partial_results_with_diagnostics(
+    skill_loader: SkillLoader,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diagnostic = SkillDiagnostic(
+        code="SOURCE_RATE_LIMITED",
+        severity=DiagnosticSeverity.ERROR,
+        phase=DiagnosticPhase.SOURCE,
+        message="The source rate-limited this search.",
+        blocking=True,
+        details={"source": "limited", "retryAfter": "60"},
+    )
+
+    class PartialRouter:
+        async def search_with_diagnostics(
+            self,
+            query: str,
+            limit: int = 20,
+            source_id: str | None = None,
+        ) -> SourceSearchReport:
+            assert (query, limit, source_id) == ("plot", 5, None)
+            return SourceSearchReport(
+                results=(
+                    SkillMeta(
+                        name="plotter",
+                        source_id="healthy",
+                        identifier="plotter",
+                    ),
+                ),
+                diagnostics=(diagnostic,),
+                searched_sources=("healthy", "limited"),
+                successful_sources=("healthy",),
+            )
+
+    monkeypatch.setattr(
+        skill_tools_module,
+        "get_default_skill_router",
+        lambda: PartialRouter(),
+    )
+    monkeypatch.setattr(
+        skill_tools_module,
+        "installed_skill_lockfile",
+        lambda: Lockfile(),
+    )
+
+    payload = json.loads(await _skill_search_community("plot", source="all", limit=5))
+
+    assert payload["status"] == "partial"
+    assert [row["name"] for row in payload["results"]] == ["plotter"]
+    assert payload["diagnostics"] == [diagnostic.to_dict()]
+    assert payload["partial"] is True
+    assert payload["allSourcesUnavailable"] is False
+
+
+@pytest.mark.asyncio
 async def test_agent_search_uses_injected_management_router_and_lockfile(
     skill_loader: SkillLoader,
     tmp_path: Path,
@@ -521,6 +585,75 @@ async def test_skill_install_community_uses_loader_managed_dir_and_marks_catalog
 
 
 @pytest.mark.asyncio
+async def test_skill_install_community_rejects_unsupported_replace_source_without_call(
+    skill_loader: SkillLoader,
+) -> None:
+    class LegacyInstaller:
+        calls = 0
+
+        async def install(
+            self,
+            identifier: str,
+            source_id: str,
+            force: bool = False,
+        ) -> InstallResult:
+            self.calls += 1
+            return InstallResult(success=True, name=identifier)
+
+    installer = LegacyInstaller()
+    skill_tools_module.create_skill_tools(
+        skill_loader,
+        management_service=installer,  # type: ignore[arg-type]
+    )
+    registered = get_default_registry().get("skill_install_community")
+    assert registered is not None
+
+    payload = json.loads(
+        await registered.handler(
+            identifier="plotter",
+            source="clawhub",
+            replace_source=True,
+        )
+    )
+
+    assert payload["success"] is False
+    assert payload["diagnostics"][0]["code"] == "INSTALLER_CAPABILITY_UNSUPPORTED"
+    assert installer.calls == 0
+    assert skill_loader._dirty is False
+
+
+@pytest.mark.asyncio
+async def test_skill_install_community_does_not_retry_builder_internal_type_error(
+    skill_loader: SkillLoader,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def failing_builder(
+        *,
+        managed_dir: Path | None = None,
+        loader: SkillLoader | None = None,
+        offline: bool = False,
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        raise TypeError("builder failed internally")
+
+    monkeypatch.setattr(
+        skill_tools_module,
+        "build_default_skill_installer",
+        failing_builder,
+    )
+    skill_tools_module.create_skill_tools(skill_loader)
+
+    with pytest.raises(TypeError, match="builder failed internally"):
+        await _skill_install_community("plotter")
+
+    assert calls == 1
+    assert skill_loader._dirty is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("selection", "readiness"),
     [
@@ -614,6 +747,86 @@ async def test_skill_install_community_scan_failure_keeps_catalog_clean(
     assert payload["scan_findings"][0]["category"] == "prompt_injection"
     assert skill_loader._dirty is False
     assert skill_loader.snapshot() is snapshot
+
+
+@pytest.mark.asyncio
+async def test_skill_install_community_forwards_exact_scanner_confirmation(
+    skill_loader: SkillLoader,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, bool, str]] = []
+
+    class FakeInstaller:
+        async def install(
+            self,
+            identifier: str,
+            source_id: str,
+            force: bool = False,
+            *,
+            risk_confirmation: str = "",
+        ) -> InstallResult:
+            calls.append((identifier, source_id, force, risk_confirmation))
+            return InstallResult(
+                success=True,
+                name=identifier,
+                message="reviewed artifact installed",
+            )
+
+    monkeypatch.setattr(
+        skill_tools_module,
+        "build_default_skill_installer",
+        lambda *, managed_dir=None: FakeInstaller(),
+    )
+
+    payload = json.loads(
+        await _skill_install_community(
+            "reviewed",
+            force=True,
+            risk_confirmation="exact-artifact-token",
+        )
+    )
+
+    assert payload["success"] is True
+    assert calls == [
+        ("reviewed", "clawhub", True, "exact-artifact-token")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_skill_install_community_rejects_force_only_legacy_installer(
+    skill_loader: SkillLoader,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    class LegacyInstaller:
+        async def install(
+            self,
+            identifier: str,
+            source_id: str,
+            force: bool = False,
+        ) -> InstallResult:
+            nonlocal called
+            called = True
+            return InstallResult(success=True, name=identifier)
+
+    monkeypatch.setattr(
+        skill_tools_module,
+        "build_default_skill_installer",
+        lambda *, managed_dir=None: LegacyInstaller(),
+    )
+
+    payload = json.loads(
+        await _skill_install_community(
+            "reviewed",
+            force=True,
+            risk_confirmation="exact-artifact-token",
+        )
+    )
+
+    assert called is False
+    assert payload["success"] is False
+    assert "riskConfirmation" in payload["message"]
 
 
 @pytest.mark.asyncio

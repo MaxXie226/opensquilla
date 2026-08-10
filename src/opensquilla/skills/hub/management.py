@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import os
 import re
 import shutil
 import time
+import unicodedata
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import ExitStack, asynccontextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -41,6 +43,7 @@ from opensquilla.skills.hub.contracts import (
 from opensquilla.skills.hub.lockfile import (
     LockEntry,
     Lockfile,
+    LockfileIdentityAmbiguousError,
     LockfileMutationBlockedError,
     compute_sha256,
     compute_tree_sha256,
@@ -88,6 +91,14 @@ _MAX_BUNDLE_DEPTH = 32
 _DEGRADED_CAPABILITIES_KEY = "degraded_capabilities"
 _SCOPED_TOOL_PERMISSIONS_CAPABILITY = "scoped_tool_permissions"
 _DYNAMIC_CONTEXT_CAPABILITY = "dynamic_context"
+_UNSUPPORTED_EXECUTION_CAPABILITY = "unsupported_execution_fields"
+_DEGRADED_COMPATIBILITY_CODES = frozenset(
+    {
+        "DIALECT_FIELD_UNSUPPORTED",
+        "DYNAMIC_CONTEXT_UNSUPPORTED",
+        "TOOL_PREAPPROVAL_IGNORED",
+    }
+)
 _RESERVED_COMPONENTS = frozenset(
     {
         ".git",
@@ -542,19 +553,21 @@ def _normalize_legacy_manifest(
     resolution: SourceResolution,
     source_id: str,
 ) -> tuple[Path, bool]:
-    allow_clawhub_legacy = source_id == "clawhub"
+    allow_community_legacy = source_id in {"clawhub", "github"}
     manifests = [
         child
         for child in candidate_dir.iterdir()
         if child.is_file()
         and (
             child.name.casefold() in {"skill.md", "skills.md"}
-            if allow_clawhub_legacy
+            if allow_community_legacy
             else child.name == "SKILL.md"
         )
     ]
     if len(manifests) != 1:
-        expected = "SKILL.md/skill.md/skills.md" if allow_clawhub_legacy else "SKILL.md"
+        expected = (
+            "SKILL.md/skill.md/skills.md" if allow_community_legacy else "SKILL.md"
+        )
         raise ValueError(f"bundle must contain exactly one root {expected}")
     manifest = manifests[0]
     raw = manifest.read_bytes()
@@ -568,7 +581,7 @@ def _normalize_legacy_manifest(
 
     match = _FRONTMATTER_RE.match(text)
     changed = raw.startswith(b"\xef\xbb\xbf") or (
-        allow_clawhub_legacy and manifest.name != "SKILL.md"
+        allow_community_legacy and manifest.name != "SKILL.md"
     )
     if match is None:
         first_line = next(
@@ -580,7 +593,7 @@ def _normalize_legacy_manifest(
                 "FRONTMATTER_INVALID",
                 "SKILL.md frontmatter is missing its closing delimiter",
             )
-        if not allow_clawhub_legacy:
+        if not allow_community_legacy:
             raise _CandidateManifestError(
                 "FRONTMATTER_INVALID",
                 "SKILL.md must contain YAML frontmatter",
@@ -595,45 +608,39 @@ def _normalize_legacy_manifest(
             raise _CandidateManifestError("FRONTMATTER_INVALID", str(exc)) from exc
         frontmatter = dict(loaded)
 
-    if "name" not in frontmatter and allow_clawhub_legacy:
-        frontmatter["name"] = _derive_slug(bundle, resolution)
+    raw_name = frontmatter.get("name")
+    if allow_community_legacy and (
+        not isinstance(raw_name, str) or not raw_name.strip()
+    ):
+        fallback_name = _derive_slug(bundle, resolution)
+        if not fallback_name:
+            raise _CandidateManifestError(
+                "NAME_INVALID",
+                "SKILL.md has no usable runtime name or source fallback",
+            )
+        frontmatter["name"] = fallback_name
         changed = True
-    if "description" not in frontmatter and allow_clawhub_legacy:
+    raw_description = frontmatter.get("description")
+    if allow_community_legacy and (
+        not isinstance(raw_description, str) or not raw_description.strip()
+    ):
         meta = bundle.meta or getattr(resolution, "meta", None)
         registry_description = str(getattr(meta, "description", "") or "").strip()
-        frontmatter["description"] = registry_description or _first_body_paragraph(body)
+        body_description = _first_body_paragraph(body)
+        frontmatter["description"] = (
+            registry_description
+            or body_description
+            or f"Community Skill {frontmatter['name']}"
+        )
         changed = True
 
-    name = frontmatter.get("name")
-    if allow_clawhub_legacy and isinstance(name, str):
-        canonical_slug = _derive_slug(bundle, resolution)
-        if (
-            name != canonical_slug
-            and name.casefold() == canonical_slug.casefold()
-            and _SAFE_NAME_RE.fullmatch(canonical_slug)
-        ):
-            # Some registry packages use a title-cased display name in their
-            # legacy manifest. The owner-qualified registry slug is already
-            # the exact package identity, so a case-only rewrite is bounded
-            # and cannot silently rename the Skill to a different package.
-            frontmatter["name"] = canonical_slug
-            name = canonical_slug
-            changed = True
-    if name is not None and (
-        not isinstance(name, str) or not _SAFE_NAME_RE.fullmatch(name)
-    ):
-        raise _CandidateManifestError("NAME_INVALID", f"invalid skill name: {name!r}")
-    final_dir = candidate_dir.with_name(name) if isinstance(name, str) else candidate_dir
-    if final_dir != candidate_dir:
-        if path_is_occupied(final_dir):
-            raise ValueError(f"staging collision for Skill {name!r}")
-        os.replace(candidate_dir, final_dir)
-        manifest = final_dir / manifest.name
-    else:
-        final_dir = candidate_dir
+    # Runtime names are catalog identifiers, not filesystem components. Keep
+    # the upstream value verbatim and let the manifest compiler decide whether
+    # it is usable; the installed directory is derived independently below.
+    final_dir = candidate_dir
 
     canonical_manifest = final_dir / "SKILL.md"
-    if allow_clawhub_legacy and manifest.name != canonical_manifest.name:
+    if allow_community_legacy and manifest.name != canonical_manifest.name:
         if manifest.name.casefold() == canonical_manifest.name.casefold():
             # A case-only replace is a no-op on Windows and can leave the
             # directory entry spelled ``skill.md``. Rename through a unique
@@ -728,6 +735,22 @@ def _manifest_diagnostics(
     return diagnostics
 
 
+def _retarget_candidate_diagnostics(
+    diagnostics: list[SkillDiagnostic],
+    *,
+    candidate_dir: Path,
+    target: Path,
+) -> None:
+    candidate_manifest = str(
+        candidate_dir.with_name(candidate_dir.name) / "SKILL.md"
+    )
+    displayed_candidate = str(target.parent / candidate_dir.name / "SKILL.md")
+    final_manifest = str(target / "SKILL.md")
+    for index, diagnostic in enumerate(diagnostics):
+        if diagnostic.path in {candidate_manifest, displayed_candidate}:
+            diagnostics[index] = replace(diagnostic, path=final_manifest)
+
+
 def _degraded_capabilities_from_diagnostics(
     diagnostics: Iterable[SkillDiagnostic],
 ) -> list[str]:
@@ -736,6 +759,8 @@ def _degraded_capabilities_from_diagnostics(
         capabilities.add(_SCOPED_TOOL_PERMISSIONS_CAPABILITY)
     if any(item.code == "DYNAMIC_CONTEXT_UNSUPPORTED" for item in diagnostics):
         capabilities.add(_DYNAMIC_CONTEXT_CAPABILITY)
+    if any(item.code == "DIALECT_FIELD_UNSUPPORTED" for item in diagnostics):
+        capabilities.add(_UNSUPPORTED_EXECUTION_CAPABILITY)
     return sorted(capabilities)
 
 
@@ -743,9 +768,11 @@ def _entry_compatibility(entry: LockEntry | None) -> SkillCompatibilityState:
     if entry is None:
         return SkillCompatibilityState.INSTRUCTION_ONLY
     raw = entry.extra.get(_DEGRADED_CAPABILITIES_KEY, [])
-    if isinstance(raw, list) and _SCOPED_TOOL_PERMISSIONS_CAPABILITY in {
-        str(item) for item in raw
-    }:
+    if isinstance(raw, list) and {
+        _SCOPED_TOOL_PERMISSIONS_CAPABILITY,
+        _DYNAMIC_CONTEXT_CAPABILITY,
+        _UNSUPPORTED_EXECUTION_CAPABILITY,
+    }.intersection({str(item) for item in raw}):
         return SkillCompatibilityState.DEGRADED
     return SkillCompatibilityState.INSTRUCTION_ONLY
 
@@ -799,15 +826,27 @@ def _resolution_package_identity(
             )
     if not package and source_id == "clawhub":
         package = resolution.canonical_identifier
-        revision = str(resolution.revision or resolution.version).strip()
-        if revision and package.endswith(f"@{revision}"):
-            package = package[: -(len(revision) + 1)]
+        for resolved_value in (resolution.version, resolution.revision):
+            revision = str(resolved_value or "").strip()
+            if revision and package.endswith(f"@{revision}"):
+                package = package[: -(len(revision) + 1)]
+                break
     if not package:
         package = requested_identifier.strip()
     return f"{source_id}:{package}" if package else ""
 
 
 def _entry_package_identity(entry: LockEntry) -> str:
+    if entry.source == "clawhub":
+        for identifier in (
+            entry.source_package_id,
+            entry.resolved_identifier,
+            entry.requested_identifier,
+            entry.identifier,
+        ):
+            package = _qualified_clawhub_package_identity(identifier)
+            if package:
+                return package
     if entry.source_package_id:
         if entry.source == "github":
             from opensquilla.skills.hub.github import package_identifier_for
@@ -832,27 +871,162 @@ def _entry_package_identity(entry: LockEntry) -> str:
         # normalized instead of misclassifying it as another package.
         if entry.source:
             return ""
-    if entry.source == "clawhub" and entry.resolved_identifier:
-        package = entry.resolved_identifier
-        revision = entry.resolved_revision or entry.resolved_version
-        if revision and package.endswith(f"@{revision}"):
-            package = package[: -(len(revision) + 1)]
-        return f"clawhub:{package}"
     requested = entry.requested_identifier or entry.identifier
     return f"{entry.source}:{requested}" if entry.source and requested else ""
+
+
+def _entry_relative_path(storage_key: str, entry: LockEntry) -> str:
+    """Return one safe direct-child path for a tracked entry.
+
+    Existing v1/v2 entries keep their recorded path. New entries use a
+    source-derived storage key and never derive a path from ``manifest_name``.
+    """
+
+    relative = entry.relative_path or entry.directory_name or storage_key
+    if (
+        not _SAFE_TRACKED_NAME_RE.fullmatch(relative)
+        or relative in {".", ".."}
+        or relative.endswith(".")
+    ):
+        raise ValueError(f"Tracked Skill path is unsafe: {relative!r}")
+    try:
+        portable = normalize_relative_path(relative)
+    except ValueError as exc:
+        raise ValueError(
+            f"Tracked Skill path is not portable on all supported platforms: {relative!r}"
+        ) from exc
+    if len(portable.parts) != 1:
+        raise ValueError(f"Tracked Skill path is not a direct child: {relative!r}")
+    return relative
+
+
+def _entry_target(managed_dir: Path, storage_key: str, entry: LockEntry) -> Path:
+    return managed_dir / _entry_relative_path(storage_key, entry)
+
+
+def _path_identity(path: Path) -> str:
+    try:
+        return os.path.normcase(str(path.resolve(strict=False)))
+    except (OSError, ValueError):
+        return os.path.normcase(str(path.absolute()))
+
+
+def _portable_install_base(
+    *,
+    source_id: str,
+    source_package_id: str,
+    resolution: SourceResolution,
+    bundle: SkillBundle,
+) -> str:
+    """Derive a portable storage component from immutable source identity."""
+
+    package = source_package_id.removeprefix(f"{source_id}:")
+    candidate = ""
+    if source_id == "clawhub":
+        package_without_revision = package.rsplit("@", 1)[0] if package.count("@") > 1 else package
+        candidate = package_without_revision.rsplit("/", 1)[-1]
+    elif source_id == "github":
+        skill_path = str(getattr(resolution, "skill_path", "") or "").strip("/")
+        candidate = skill_path.rsplit("/", 1)[-1] if skill_path else ""
+    if not candidate:
+        candidate = _derive_slug(bundle, resolution)
+    if not candidate:
+        candidate = "skill"
+    normalized = re.sub(r"[^a-z0-9]+", "-", candidate.casefold()).strip("-")
+    normalized = re.sub(r"-{2,}", "-", normalized)
+    if not normalized:
+        normalized = "skill"
+    normalized = normalized[:64].rstrip("-") or "skill"
+    try:
+        portable = normalize_relative_path(normalized)
+    except ValueError:
+        portable = PurePosixPath()
+    if not _SAFE_NAME_RE.fullmatch(normalized) or len(portable.parts) != 1:
+        digest = hashlib.sha256(source_package_id.encode("utf-8")).hexdigest()[:12]
+        normalized = f"skill-{digest}"
+    return normalized
+
+
+def _installed_package_matches(
+    lockfile: Lockfile,
+    *,
+    source_id: str,
+    source_package_id: str,
+    requested_identifier: str,
+) -> list[tuple[str, LockEntry]]:
+    """Find tracked copies of one package independently of runtime names."""
+
+    if not source_package_id:
+        return []
+    matches: list[tuple[str, LockEntry]] = []
+    for storage_key, entry in lockfile.installed.items():
+        if entry.source != source_id:
+            continue
+        if _entry_package_identity(entry) == source_package_id or (
+            source_id == "clawhub"
+            and _is_legacy_clawhub_package_upgrade(
+                entry,
+                source_package_id,
+                requested_identifier=requested_identifier,
+            )
+        ):
+            matches.append((storage_key, entry))
+    return matches
+
+
+def _allocate_install_key(
+    lockfile: Lockfile,
+    *,
+    managed_dir: Path,
+    preferred: str,
+    source_package_id: str,
+) -> str:
+    """Allocate a deterministic safe direct-child key for a new package."""
+
+    def collision_key(value: str) -> str:
+        return unicodedata.normalize("NFC", value).rstrip(" .").casefold()
+
+    occupied_keys: set[str] = set()
+    for storage_key, entry in lockfile.installed.items():
+        relative = entry.relative_path or entry.directory_name or storage_key
+        occupied_keys.add(collision_key(relative))
+    try:
+        for child in managed_dir.iterdir():
+            if not child.name.startswith("."):
+                occupied_keys.add(collision_key(child.name))
+    except FileNotFoundError:
+        pass
+
+    def available(candidate: str) -> bool:
+        candidate_key = collision_key(candidate)
+        return candidate_key not in occupied_keys and not path_is_occupied(
+            managed_dir / candidate
+        )
+
+    if lockfile.get(preferred) is None and available(preferred):
+        return preferred
+    digest = hashlib.sha256(source_package_id.encode("utf-8")).hexdigest()[:10]
+    suffix = f"-{digest}"
+    candidate = f"{preferred[: 64 - len(suffix)].rstrip('-')}{suffix}"
+    if lockfile.get(candidate) is None and available(candidate):
+        return candidate
+    raise RuntimeError(
+        f"Source-derived Skill path is already occupied: {managed_dir / candidate}"
+    )
 
 
 def _is_legacy_clawhub_package_upgrade(
     entry: LockEntry,
     new_package_identity: str,
+    *,
+    requested_identifier: str,
 ) -> bool:
     """Recognize the bounded v1 bare-slug → owner-qualified migration.
 
-    Old lockfiles could only record a ClawHub slug.  A modern immutable
-    resolution additionally binds that slug to its publisher.  Treat this as
-    the same package only during an update and only when the canonical package
-    keeps the exact legacy slug; every other identity change still requires an
-    explicit source replacement.
+    Old lockfiles could only record a ClawHub slug. A bare-slug retry asks the
+    registry to resolve that same legacy identity, so its immutable hand-off
+    can safely supply the missing publisher. An owner-qualified request cannot
+    claim an ownerless v1 row merely because its slug happens to match.
     """
 
     if entry.source != "clawhub" or entry.source_package_id:
@@ -865,7 +1039,92 @@ def _is_legacy_clawhub_package_upgrade(
         return False
     qualified = new_package_identity[len(prefix) :]
     owner, separator, slug = qualified.partition("/")
-    return bool(owner and separator and slug == legacy)
+    return bool(
+        owner
+        and separator
+        and slug == legacy
+        and requested_identifier.strip() == legacy
+    )
+
+
+def _ambiguous_legacy_clawhub_matches(
+    lockfile: Lockfile,
+    *,
+    source_package_id: str,
+) -> list[tuple[str, LockEntry]]:
+    """Return ownerless v1 rows whose slug collides with a qualified package."""
+
+    prefix = "clawhub:@"
+    if not source_package_id.startswith(prefix):
+        return []
+    qualified = source_package_id[len(prefix) :]
+    owner, separator, slug = qualified.partition("/")
+    if not owner or not separator or not slug:
+        return []
+    matches: list[tuple[str, LockEntry]] = []
+    for storage_key, entry in lockfile.installed.items():
+        if entry.source != "clawhub" or entry.source_package_id:
+            continue
+        # Any persisted qualified resolution already proves an owner and is
+        # therefore either an exact package match or a distinct package.
+        if _qualified_clawhub_package_identity(entry.resolved_identifier):
+            continue
+        legacy = (entry.requested_identifier or entry.identifier).strip()
+        if (
+            legacy
+            and not any(separator in legacy for separator in ("/", "@", ":"))
+            and legacy == slug
+        ):
+            matches.append((storage_key, entry))
+    return matches
+
+
+def _qualified_clawhub_package_identity(identifier: str) -> str:
+    """Normalize one owner-qualified ClawHub identifier without its version."""
+
+    value = identifier.strip().removeprefix("clawhub:")
+    if not value.startswith("@") or "/" not in value:
+        return ""
+    owner, slug = value[1:].split("/", 1)
+    if "@" in slug:
+        slug = slug.rsplit("@", 1)[0]
+    if not owner or not slug or "/" in slug:
+        return ""
+    return f"clawhub:@{owner.casefold()}/{slug.casefold()}"
+
+
+def _risk_confirmation_details(
+    *,
+    source_id: str,
+    resolution: SourceResolution,
+    artifact_digest: str,
+    tree_digest: str,
+) -> dict[str, Any]:
+    """Build a deterministic acknowledgement bound to one fetched artifact."""
+
+    resolved_identifier = str(
+        getattr(resolution, "canonical_identifier", "")
+        or getattr(resolution, "requested_identifier", "")
+    ).strip()
+    immutable_revision = str(getattr(resolution, "revision", "") or "").strip()
+    fields = (
+        "skill-scan-confirmation-v1",
+        source_id,
+        resolved_identifier,
+        immutable_revision,
+        artifact_digest,
+        tree_digest,
+    )
+    token = hashlib.sha256("\x00".join(fields).encode("utf-8")).hexdigest()
+    return {
+        "confirmationVersion": "skill-scan-confirmation-v1",
+        "confirmationToken": token,
+        "source": source_id,
+        "resolvedIdentifier": resolved_identifier,
+        "immutableRevision": immutable_revision,
+        "artifactDigest": artifact_digest,
+        "treeDigest": tree_digest,
+    }
 
 
 def _update_precondition(entry: LockEntry) -> tuple[str, str, str, str, str]:
@@ -901,6 +1160,9 @@ class SkillManagementService:
         self._mutation_lock = mutation_lock or mutation_lock_for(managed_dir)
         self._offline = offline or loader is None
         self._recovery_required_diagnostics: tuple[SkillDiagnostic, ...] = ()
+        bind_lockfile = getattr(loader, "bind_managed_lockfile", None)
+        if callable(bind_lockfile):
+            bind_lockfile(lockfile_path)
         self._observe_recovery(list(startup_recovery_diagnostics))
 
     @property
@@ -948,6 +1210,51 @@ class SkillManagementService:
         self._observe_recovery(diagnostics)
         return diagnostics
 
+    def _resolve_install_key(
+        self,
+        lockfile: Lockfile,
+        name: str = "",
+        *,
+        install_id: str = "",
+    ) -> str | None:
+        """Resolve v2 identities plus the bounded v1 runtime-name gap.
+
+        Historical entries did not persist ``manifest_name`` or ``install_id``.
+        For those records only, map a unique Doctor runtime name back through
+        the candidate's exact managed path. The storage key remains the mutation
+        identity and duplicate runtime names still fail closed.
+        """
+
+        resolved = lockfile.resolve_key(name, install_id=install_id)
+        if resolved is not None or install_id or not name:
+            return resolved
+
+        from opensquilla.skills.hub.doctor import SkillDoctor
+
+        report = SkillDoctor(
+            managed_dir=self._managed_dir,
+            lockfile_path=self._lockfile_path,
+            loader=self._loader,
+        ).doctor()
+        runtime_paths = {
+            _path_identity(Path(item.path))
+            for item in report.skills
+            if item.name == name and item.path
+        }
+        matches: list[str] = []
+        for storage_key, entry in lockfile.installed.items():
+            if entry.manifest_name or entry.install_id:
+                continue
+            try:
+                target = _entry_target(self._managed_dir, storage_key, entry)
+            except ValueError:
+                continue
+            if _path_identity(target) in runtime_paths:
+                matches.append(storage_key)
+        if len(matches) > 1:
+            raise LockfileIdentityAmbiguousError(name, matches)
+        return matches[0] if matches else None
+
     def _observe_recovery(self, diagnostics: list[SkillDiagnostic]) -> None:
         blocking = tuple(item for item in diagnostics if item.blocking)
         if blocking:
@@ -966,9 +1273,15 @@ class SkillManagementService:
         message = "Managed Skill store requires recovery before mutation"
         if name:
             lockfile = Lockfile.load(self._lockfile_path)
-            if not lockfile.mutation_blocked and lockfile.get(name) is not None:
+            try:
+                storage_key = (
+                    None if lockfile.mutation_blocked else lockfile.resolve_key(name)
+                )
+            except LockfileIdentityAmbiguousError:
+                storage_key = None
+            if storage_key is not None:
                 return self._failure_for_current_install(
-                    name=name,
+                    name=storage_key,
                     message=message,
                     diagnostics=diagnostics,
                 )
@@ -1582,10 +1895,37 @@ class SkillManagementService:
     ) -> InstallResult:
         """Report a failed operation without erasing the existing install truth."""
 
-        target = self._managed_dir / name
-        present = target.is_dir() and not target.is_symlink()
         lockfile = Lockfile.load(self._lockfile_path)
         entry = None if lockfile.mutation_blocked else lockfile.get(name)
+        try:
+            target = (
+                _entry_target(self._managed_dir, name, entry)
+                if entry is not None
+                else self._managed_dir / name
+            )
+        except ValueError as exc:
+            diagnostics.append(
+                _diagnostic(
+                    "STORE_PATH_UNSAFE",
+                    str(exc),
+                    phase=DiagnosticPhase.STORE,
+                    blocking=True,
+                    hint="Repair or restore the tracked lock entry before mutation.",
+                )
+            )
+            return self._failure(
+                name=entry.manifest_name if entry is not None else name,
+                message=str(exc),
+                diagnostics=diagnostics,
+                resolution=resolution,
+                scan=scan,
+                installed=False,
+                tracked=entry is not None,
+                present=False,
+                install_id=entry.install_id if entry is not None else "",
+                compatibility=_entry_compatibility(entry),
+            )
+        present = target.is_dir() and not target.is_symlink()
         tracked = entry is not None
         drifted = False
         if tracked and present and entry is not None:
@@ -1604,8 +1944,15 @@ class SkillManagementService:
                 target,
                 diagnostics,
             )
+        display_name = (
+            previous_spec.name
+            if previous_spec is not None
+            else entry.manifest_name
+            if entry is not None and entry.manifest_name
+            else name
+        )
         return self._failure(
-            name=name,
+            name=display_name,
             message=message,
             diagnostics=diagnostics,
             resolution=resolution,
@@ -1629,6 +1976,7 @@ class SkillManagementService:
         force: bool = False,
         *,
         replace_source: bool = False,
+        risk_confirmation: str = "",
     ) -> InstallResult:
         """Resolve, validate, commit, live-reload, and postflight one Skill."""
 
@@ -1637,6 +1985,7 @@ class SkillManagementService:
             source_id=source_id,
             force=force,
             replace_source=replace_source,
+            risk_confirmation=risk_confirmation,
             update_name=None,
         )
 
@@ -1647,6 +1996,7 @@ class SkillManagementService:
         source_id: str,
         force: bool,
         replace_source: bool,
+        risk_confirmation: str,
         update_name: str | None,
         expected_update: tuple[str, str, str, str, str] | None = None,
     ) -> InstallResult:
@@ -1673,14 +2023,22 @@ class SkillManagementService:
                     resolution=resolution,
                     scan=scan,
                 )
-            if fallback_name:
-                current_lock = Lockfile.load(self._lockfile_path)
-                if (
-                    not current_lock.mutation_blocked
-                    and current_lock.get(fallback_name) is not None
-                ):
+            current_lock = Lockfile.load(self._lockfile_path)
+            if not current_lock.mutation_blocked:
+                requested_matches = [
+                    storage_key
+                    for storage_key, entry in current_lock.installed.items()
+                    if entry.source == source_id
+                    and identifier
+                    in {
+                        entry.requested_identifier,
+                        entry.identifier,
+                        entry.resolved_identifier,
+                    }
+                ]
+                if len(requested_matches) == 1:
                     return self._failure_for_current_install(
-                        name=fallback_name,
+                        name=requested_matches[0],
                         message=message,
                         diagnostics=diagnostics,
                         resolution=resolution,
@@ -1726,11 +2084,10 @@ class SkillManagementService:
                 resolution=resolution,
                 source_id=source_id,
             )
-            expected_name = update_name or _derive_slug(bundle, resolution)
             validation = validate_hub_candidate(
                 candidate_dir,
                 layer=SkillLayer.MANAGED,
-                expected_name=expected_name or None,
+                expected_name=None,
             )
             compatibility_diagnostics = _manifest_diagnostics(
                 validation.compatibility_diagnostics,
@@ -1740,7 +2097,10 @@ class SkillManagementService:
                 ),
             )
             diagnostics.extend(compatibility_diagnostics)
-            if compatibility_diagnostics:
+            if any(
+                item.code in _DEGRADED_COMPATIBILITY_CODES
+                for item in compatibility_diagnostics
+            ):
                 candidate_compatibility = SkillCompatibilityState.DEGRADED
             if not validation.ok or validation.spec is None:
                 diagnostics.extend(_manifest_diagnostics(validation.diagnostics))
@@ -1752,21 +2112,6 @@ class SkillManagementService:
                 return result
             spec = validation.spec
             name = spec.name
-            if update_name is not None and name != update_name:
-                diagnostics.append(
-                    _diagnostic(
-                        "UPDATE_NAME_CHANGED",
-                        f"Update resolved Skill name {name!r}, expected {update_name!r}",
-                        phase=DiagnosticPhase.MANIFEST,
-                        blocking=True,
-                    )
-                )
-                result = fail_before_mutation(
-                    fallback_name=update_name,
-                    message=diagnostics[-1].message,
-                )
-                cleanup_pre_journal_reservation()
-                return result
             installed_tree = compute_tree_sha256(candidate_dir)
             legacy_tree = compute_sha256(candidate_dir)
             manifest_digest = hashlib.sha256(
@@ -1778,23 +2123,43 @@ class SkillManagementService:
                 identifier,
             )
             scan_result = scan_skill_bundle(_candidate_files(candidate_dir))
-            if scan_result.verdict == "dangerous" and not force:
+            risk_confirmation_details: dict[str, Any] = {}
+            risk_acknowledged = False
+            if scan_result.verdict == "dangerous":
+                risk_confirmation_details = _risk_confirmation_details(
+                    source_id=source_id,
+                    resolution=resolution,
+                    artifact_digest=artifact_digest,
+                    tree_digest=installed_tree,
+                )
+                expected_confirmation = str(
+                    risk_confirmation_details["confirmationToken"]
+                )
+                risk_acknowledged = bool(
+                    force
+                    and risk_confirmation
+                    and hmac.compare_digest(risk_confirmation, expected_confirmation)
+                )
+            risk_confirmation_pending = bool(
+                scan_result.verdict == "dangerous" and not risk_acknowledged
+            )
+
+            def reject_unconfirmed_risk() -> None:
                 diagnostics.append(
                     _diagnostic(
-                        "SECURITY_SCAN_BLOCKED",
+                        "SCAN_CONFIRMATION_REQUIRED",
                         f"Security scan found {len(scan_result.findings)} blocking finding(s)",
                         phase=DiagnosticPhase.SECURITY,
                         blocking=True,
-                        hint="Review the findings; use force only to accept this scanner verdict.",
+                        hint=(
+                            "Review the heuristic findings, then retry with force=true and "
+                            "the exact confirmation token returned for this artifact."
+                        ),
+                        details=risk_confirmation_details,
                     )
                 )
-                result = fail_before_mutation(
-                    fallback_name=name,
-                    message=diagnostics[-1].message,
-                    scan=scan_result,
-                )
-                cleanup_pre_journal_reservation()
-                return result
+                raise RuntimeError(diagnostics[-1].message)
+
             if normalized:
                 diagnostics.append(
                     _diagnostic(
@@ -1839,8 +2204,15 @@ class SkillManagementService:
             shutil.rmtree(transaction_root, ignore_errors=True)
             return result
 
-        target = self._managed_dir / name
-        rollback = rollback_root(self._managed_dir) / transaction_id / name
+        preferred_storage_key = _portable_install_base(
+            source_id=source_id,
+            source_package_id=source_package_id,
+            resolution=resolution,
+            bundle=bundle,
+        )
+        storage_key = update_name or preferred_storage_key
+        target = self._managed_dir / storage_key
+        rollback = rollback_root(self._managed_dir) / transaction_id / storage_key
         journal: SkillTransactionJournal | None = None
         old_snapshot: Any | None = None
         old_entry: LockEntry | None = None
@@ -1872,14 +2244,142 @@ class SkillManagementService:
                         self._lockfile_path,
                         lockfile.diagnostics,
                     )
-                old_entry = lockfile.get(name)
+                if update_name is not None:
+                    storage_key = update_name
+                    old_entry = lockfile.get(storage_key)
+                else:
+                    package_matches = _installed_package_matches(
+                        lockfile,
+                        source_id=source_id,
+                        source_package_id=source_package_id,
+                        requested_identifier=identifier,
+                    )
+                    if len(package_matches) > 1:
+                        package_keys = [item[0] for item in package_matches]
+                        message = (
+                            "Multiple tracked installs claim the same source package; "
+                            "repair or uninstall the duplicate records before installing"
+                        )
+                        diagnostics.append(
+                            _diagnostic(
+                                "AMBIGUOUS_PACKAGE",
+                                message,
+                                phase=DiagnosticPhase.LOCK,
+                                blocking=True,
+                                hint=(
+                                    "Select each duplicate by installId and remove all but "
+                                    "the intended install."
+                                ),
+                                details={
+                                    "sourcePackageId": source_package_id,
+                                    "storageKeys": package_keys,
+                                },
+                            )
+                        )
+                        raise RuntimeError(message)
+                    if package_matches:
+                        storage_key, old_entry = package_matches[0]
+                    else:
+                        if source_id == "clawhub":
+                            ambiguous_legacy_matches = _ambiguous_legacy_clawhub_matches(
+                                lockfile,
+                                source_package_id=source_package_id,
+                            )
+                            if ambiguous_legacy_matches:
+                                message = (
+                                    "An owner-qualified ClawHub package cannot claim an "
+                                    "ownerless v1 install with the same slug"
+                                )
+                                diagnostics.append(
+                                    _diagnostic(
+                                        "AMBIGUOUS_PACKAGE_OWNER",
+                                        message,
+                                        phase=DiagnosticPhase.LOCK,
+                                        blocking=True,
+                                        hint=(
+                                            "Update the legacy install by its stored bare "
+                                            "slug to bind its publisher, or uninstall it "
+                                            "before installing this exact package."
+                                        ),
+                                        details={
+                                            "sourcePackageId": source_package_id,
+                                            "storageKeys": [
+                                                storage_key
+                                                for storage_key, _entry in (
+                                                    ambiguous_legacy_matches
+                                                )
+                                            ],
+                                        },
+                                    )
+                                )
+                                raise RuntimeError(message)
+                        if replace_source:
+                            replacement_keys = lockfile.keys_for_manifest_name(name)
+                            if len(replacement_keys) > 1:
+                                message = (
+                                    f"Skill name {name!r} matches multiple installs; "
+                                    "replaceSource requires an exact install identity"
+                                )
+                                diagnostics.append(
+                                    _diagnostic(
+                                        "AMBIGUOUS_INSTALL",
+                                        message,
+                                        phase=DiagnosticPhase.LOCK,
+                                        blocking=True,
+                                        hint=(
+                                            "Update or uninstall the intended install by "
+                                            "installId before replacing its source."
+                                        ),
+                                        details={"storageKeys": replacement_keys},
+                                    )
+                                )
+                                raise RuntimeError(message)
+                            if replacement_keys:
+                                storage_key = replacement_keys[0]
+                                old_entry = lockfile.get(storage_key)
+                                continue_allocation = False
+                            else:
+                                continue_allocation = True
+                        else:
+                            continue_allocation = True
+                        if continue_allocation:
+                            storage_key = _allocate_install_key(
+                                lockfile,
+                                managed_dir=self._managed_dir,
+                                preferred=preferred_storage_key,
+                                source_package_id=source_package_id,
+                            )
+                            old_entry = None
+                try:
+                    target = (
+                        _entry_target(self._managed_dir, storage_key, old_entry)
+                        if old_entry is not None
+                        else self._managed_dir / storage_key
+                    )
+                except ValueError as exc:
+                    diagnostics.append(
+                        _diagnostic(
+                            "STORE_PATH_UNSAFE",
+                            str(exc),
+                            phase=DiagnosticPhase.STORE,
+                            blocking=True,
+                            hint="Repair or restore the tracked lock entry before mutation.",
+                        )
+                    )
+                    raise RuntimeError(str(exc)) from exc
+                _retarget_candidate_diagnostics(
+                    diagnostics,
+                    candidate_dir=candidate_dir,
+                    target=target,
+                )
+                rollback = rollback_root(self._managed_dir) / transaction_id / target.name
                 if update_name is not None and (
                     old_entry is None
                     or expected_update is None
                     or _update_precondition(old_entry) != expected_update
                 ):
                     message = (
-                        f"Tracked state for {update_name!r} changed while its update "
+                            f"Tracked state for {update_name!r} changed while its update "
                         "artifact was being fetched"
                     )
                     diagnostics.append(
@@ -1906,12 +2406,10 @@ class SkillManagementService:
                             f"Local drift detected for {name!r}; update/install was not applied"
                         )
                     old_package_id = _entry_package_identity(old_entry)
-                    legacy_clawhub_upgrade = bool(
-                        update_name is not None
-                        and _is_legacy_clawhub_package_upgrade(
-                            old_entry,
-                            source_package_id,
-                        )
+                    legacy_clawhub_upgrade = _is_legacy_clawhub_package_upgrade(
+                        old_entry,
+                        source_package_id,
+                        requested_identifier=identifier,
                     )
                     replacing_package = bool(
                         (old_entry.source and old_entry.source != source_id)
@@ -1945,6 +2443,18 @@ class SkillManagementService:
                         and old_entry.artifact_sha256 != artifact_digest
                     )
                     tree_changed = bool(prior_tree and prior_tree != installed_tree)
+                    risk_override_reusable = bool(
+                        risk_confirmation_pending
+                        and old_entry.accepted_risk_override
+                        and same_immutable_package_revision
+                        and prior_tree
+                        and prior_tree == installed_tree
+                        and old_entry.artifact_sha256
+                        and artifact_digest
+                        and old_entry.artifact_sha256 == artifact_digest
+                    )
+                    if risk_confirmation_pending and not risk_override_reusable:
+                        reject_unconfirmed_risk()
                     if same_immutable_package_revision and (
                         tree_changed or artifact_changed
                     ):
@@ -2034,6 +2544,8 @@ class SkillManagementService:
                             ),
                         )
                 else:
+                    if risk_confirmation_pending:
+                        reject_unconfirmed_risk()
                     installed_count = sum(
                         1
                         for child in self._managed_dir.iterdir()
@@ -2053,11 +2565,19 @@ class SkillManagementService:
                     generation = int(getattr(old_snapshot, "generation", 0) or 0)
 
                 ensure_safe_transaction_roots(self._managed_dir)
+                staged_for_publish = transaction_root / target.name
+                if candidate_dir != staged_for_publish:
+                    if path_is_occupied(staged_for_publish):
+                        raise RuntimeError(
+                            f"Staging path is already occupied: {staged_for_publish}"
+                        )
+                    os.replace(candidate_dir, staged_for_publish)
+                    candidate_dir = staged_for_publish
                 rollback.parent.mkdir(parents=True, exist_ok=True)
                 journal = SkillTransactionJournal.prepare(
                     operation="update" if old_entry else "install",
                     managed_dir=self._managed_dir,
-                    name=name,
+                    name=target.name,
                     target=target,
                     staging=candidate_dir,
                     rollback=rollback,
@@ -2118,7 +2638,7 @@ class SkillManagementService:
                     if degraded_capabilities:
                         entry_extra[_DEGRADED_CAPABILITIES_KEY] = degraded_capabilities
                     lockfile.add(
-                        name,
+                        storage_key,
                         LockEntry(
                             source=source_id,
                             identifier=identifier,
@@ -2144,8 +2664,8 @@ class SkillManagementService:
                             scan_findings=[vars(item) for item in scan_result.findings],
                             install_id=install_id,
                             manifest_name=name,
-                            directory_name=name,
-                            relative_path=name,
+                            directory_name=target.name,
+                            relative_path=target.name,
                             requested_identifier=identifier,
                             resolved_identifier=str(
                                 getattr(resolution, "canonical_identifier", "") or identifier
@@ -2164,12 +2684,10 @@ class SkillManagementService:
                                 for path in target.rglob("*")
                                 if path.is_file()
                             ),
-                            parser_version="community-strict-v1",
+                            parser_version="community-instruction-v1",
                             dialect="instruction-first",
                             source_package_id=source_package_id,
-                            accepted_risk_override=bool(
-                                force and scan_result.verdict == "dangerous"
-                            ),
+                            accepted_risk_override=risk_acknowledged,
                             extra=entry_extra,
                         ),
                     )
@@ -2329,11 +2847,12 @@ class SkillManagementService:
                         restore(old_snapshot, reason="skill.management.rollback")
                     elif old_snapshot is not None:
                         try:
-                            await asyncio.to_thread(
-                                self._loader.reload,
-                                force=True,
-                                reason="skill.management.rollback",
-                            )
+                            async with self._mutation_lock:
+                                await _run_postflight_worker(
+                                    self._loader.reload,
+                                    force=True,
+                                    reason="skill.management.rollback",
+                                )
                         except Exception:
                             diagnostics.append(
                                 _diagnostic(
@@ -2392,7 +2911,9 @@ class SkillManagementService:
         self,
         name: str | None = None,
         *,
+        install_id: str = "",
         force: bool = False,
+        risk_confirmation: str = "",
     ) -> list[InstallResult]:
         """Update one or all installs from their original immutable source."""
 
@@ -2409,17 +2930,57 @@ class SkillManagementService:
                     diagnostics=diagnostic,
                 )
             ]
-        skill_names: list[str] = (
-            [name] if name is not None else list(lockfile.installed)
-        )
+        if name is not None or install_id:
+            try:
+                resolved_key = self._resolve_install_key(
+                    lockfile,
+                    name or "",
+                    install_id=install_id,
+                )
+            except LockfileIdentityAmbiguousError as exc:
+                return [
+                    self._failure(
+                        name=name or "",
+                        message=str(exc),
+                        diagnostics=[
+                            _diagnostic(
+                                "AMBIGUOUS_INSTALL",
+                                str(exc),
+                                phase=DiagnosticPhase.LOCK,
+                                blocking=True,
+                                hint="Retry with the exact installId.",
+                                details={"storageKeys": list(exc.candidates)},
+                            )
+                        ],
+                    )
+                ]
+            if resolved_key is None:
+                selector = install_id or name or ""
+                return [
+                    self._failure(
+                        name=name or "",
+                        message=f"Skill install {selector!r} is not tracked",
+                        diagnostics=[
+                            _diagnostic(
+                                "INSTALL_NOT_TRACKED",
+                                f"Skill install {selector!r} is not tracked",
+                                phase=DiagnosticPhase.LOCK,
+                                blocking=True,
+                            )
+                        ],
+                    )
+                ]
+            storage_keys = [resolved_key]
+        else:
+            storage_keys = list(lockfile.installed)
         results: list[InstallResult] = []
-        for skill_name in skill_names:
+        for storage_key in storage_keys:
             current_lockfile = Lockfile.load(self._lockfile_path)
             if current_lockfile.mutation_blocked:
                 diagnostics = list(current_lockfile.diagnostics)
                 results.append(
                     self._failure(
-                        name=skill_name or "",
+                        name=storage_key,
                         message=(
                             diagnostics[0].message
                             if diagnostics
@@ -2429,16 +2990,16 @@ class SkillManagementService:
                     )
                 )
                 continue
-            entry = current_lockfile.get(skill_name)
+            entry = current_lockfile.get(storage_key)
             if entry is None:
                 results.append(
                     self._failure_for_current_install(
-                        name=skill_name,
+                        name=storage_key,
                         message="Not in lockfile",
                         diagnostics=[
                             _diagnostic(
                                 "INSTALL_NOT_TRACKED",
-                                f"Skill {skill_name!r} is not tracked",
+                                f"Skill install {storage_key!r} is not tracked",
                                 phase=DiagnosticPhase.LOCK,
                                 blocking=True,
                             )
@@ -2446,12 +3007,22 @@ class SkillManagementService:
                     )
                 )
                 continue
-            target = self._managed_dir / skill_name
+            try:
+                target = _entry_target(self._managed_dir, storage_key, entry)
+            except ValueError as exc:
+                results.append(
+                    self._failure_for_current_install(
+                        name=storage_key,
+                        message=str(exc),
+                        diagnostics=[],
+                    )
+                )
+                continue
             expected = entry.tree_sha256 or entry.sha256
             if not target.is_dir() or target.is_symlink():
                 results.append(
                     self._failure_for_current_install(
-                        name=skill_name,
+                        name=storage_key,
                         message="Tracked Skill directory is missing",
                         diagnostics=[
                             _diagnostic(
@@ -2467,12 +3038,12 @@ class SkillManagementService:
             if expected and _installed_digest(target, entry) != expected:
                 results.append(
                     self._failure_for_current_install(
-                        name=skill_name,
+                        name=storage_key,
                         message="Local drift must be resolved before update",
                         diagnostics=[
                             _diagnostic(
                                 "LOCAL_DRIFT",
-                                f"Tracked files for {skill_name!r} differ from the lockfile",
+                                f"Tracked files for {storage_key!r} differ from the lockfile",
                                 phase=DiagnosticPhase.STORE,
                                 blocking=True,
                             )
@@ -2490,7 +3061,8 @@ class SkillManagementService:
                     source_id=entry.source,
                     force=force,
                     replace_source=False,
-                    update_name=skill_name,
+                    risk_confirmation=risk_confirmation,
+                    update_name=storage_key,
                     expected_update=_update_precondition(entry),
                 )
             )
@@ -2498,36 +3070,35 @@ class SkillManagementService:
 
     async def uninstall(
         self,
-        name: str,
+        name: str = "",
         *,
+        install_id: str = "",
         allow_drift: bool = False,
     ) -> InstallResult:
         """Transactionally remove a tracked Skill and reload the live catalog."""
 
         if self._recovery_required_diagnostics:
-            return self._recovery_required_result(name)
+            return self._recovery_required_result(install_id or name)
 
-        if (
-            not isinstance(name, str)
-            or not _SAFE_TRACKED_NAME_RE.fullmatch(name)
-            or name.endswith(".")
-        ):
+        if not isinstance(name, str) or not isinstance(install_id, str) or not (name or install_id):
             return self._failure(
                 name=name,
-                message=f"Invalid skill name: {name}",
+                message="A Skill name or installId is required",
                 diagnostics=[
                     _diagnostic(
-                        "INVALID_NAME",
-                        f"Invalid skill name: {name}",
-                        phase=DiagnosticPhase.MANIFEST,
+                        "INSTALL_ID_REQUIRED",
+                        "A Skill name or installId is required",
+                        phase=DiagnosticPhase.LOCK,
                         blocking=True,
                     )
                 ],
             )
-        target = self._managed_dir / name
         transaction_id = uuid.uuid4().hex
-        rollback = rollback_root(self._managed_dir) / transaction_id / name
-        staging = staging_root(self._managed_dir) / transaction_id / name
+        storage_key = ""
+        display_name = name
+        target = self._managed_dir / "_unresolved"
+        rollback = rollback_root(self._managed_dir) / transaction_id / "_unresolved"
+        staging = staging_root(self._managed_dir) / transaction_id / "_unresolved"
         diagnostics: list[SkillDiagnostic] = []
         old_snapshot: Any | None = None
         journal: SkillTransactionJournal | None = None
@@ -2560,9 +3131,48 @@ class SkillManagementService:
                         self._lockfile_path,
                         lockfile.diagnostics,
                     )
-                entry = lockfile.get(name)
+                try:
+                    resolved_key = self._resolve_install_key(
+                        lockfile,
+                        name,
+                        install_id=install_id,
+                    )
+                except LockfileIdentityAmbiguousError as exc:
+                    diagnostics.append(
+                        _diagnostic(
+                            "AMBIGUOUS_INSTALL",
+                            str(exc),
+                            phase=DiagnosticPhase.LOCK,
+                            blocking=True,
+                            hint="Retry with the exact installId.",
+                            details={"storageKeys": list(exc.candidates)},
+                        )
+                    )
+                    raise RuntimeError(str(exc)) from exc
+                if resolved_key is None:
+                    raise RuntimeError(
+                        f"Skill install {(install_id or name)!r} is not tracked"
+                    )
+                storage_key = resolved_key
+                entry = lockfile.get(storage_key)
                 if entry is None:
-                    raise RuntimeError(f"Skill {name!r} is not tracked")
+                    raise RuntimeError(f"Skill install {storage_key!r} is not tracked")
+                display_name = entry.manifest_name or storage_key
+                try:
+                    target = _entry_target(self._managed_dir, storage_key, entry)
+                except ValueError as exc:
+                    diagnostics.append(
+                        _diagnostic(
+                            "STORE_PATH_UNSAFE",
+                            str(exc),
+                            phase=DiagnosticPhase.STORE,
+                            blocking=True,
+                            hint="Repair or restore the tracked lock entry before mutation.",
+                        )
+                    )
+                    raise RuntimeError(str(exc)) from exc
+                rollback = rollback_root(self._managed_dir) / transaction_id / target.name
+                staging = staging_root(self._managed_dir) / transaction_id / target.name
                 if not target.is_dir() or target.is_symlink():
                     raise RuntimeError(f"Tracked Skill directory is missing or unsafe: {target}")
                 expected = entry.tree_sha256 or entry.sha256
@@ -2581,7 +3191,7 @@ class SkillManagementService:
                 journal = SkillTransactionJournal.prepare(
                     operation="uninstall",
                     managed_dir=self._managed_dir,
-                    name=name,
+                    name=target.name,
                     target=target,
                     staging=staging,
                     rollback=rollback,
@@ -2617,7 +3227,7 @@ class SkillManagementService:
                     fsync_directory(rollback.parent)
                     fsync_directory(rollback.parent.parent)
                     journal.advance("old_moved", self._journal_path)
-                    lockfile.remove(name)
+                    lockfile.remove(storage_key)
                     lockfile.save(self._lockfile_path)
                     fsync_directory(self._lockfile_path.parent)
                     journal.advance("lock_written", self._journal_path)
@@ -2643,8 +3253,8 @@ class SkillManagementService:
                 )
                 success_result = InstallResult(
                     success=True,
-                    name=name,
-                    message=f"Uninstalled {name!r}",
+                    name=display_name,
+                    message=f"Uninstalled {display_name!r}",
                     installed=False,
                     active=False,
                     instruction_usable=False,
@@ -2735,11 +3345,12 @@ class SkillManagementService:
                     restore(old_snapshot, reason="skill.management.uninstall.rollback")
                 elif old_snapshot is not None:
                     try:
-                        rollback_reload = await asyncio.to_thread(
-                            self._loader.reload,
-                            force=True,
-                            reason="skill.management.uninstall.rollback",
-                        )
+                        async with self._mutation_lock:
+                            rollback_reload = await _run_postflight_worker(
+                                self._loader.reload,
+                                force=True,
+                                reason="skill.management.uninstall.rollback",
+                            )
                         reload_payload = rollback_reload.to_dict()
                     except Exception:
                         diagnostics.append(
@@ -2754,7 +3365,7 @@ class SkillManagementService:
                             )
                         )
                 previous_spec, selected, generation, _ = self._snapshot_state(
-                    name,
+                    display_name,
                     target,
                     diagnostics,
                 )
@@ -2794,7 +3405,7 @@ class SkillManagementService:
             if not isinstance(exc, Exception):
                 raise
             return self._failure(
-                name=name,
+                name=display_name,
                 message=str(exc) or type(exc).__name__,
                 diagnostics=diagnostics,
                 installed=present,

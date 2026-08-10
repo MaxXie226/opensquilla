@@ -19,6 +19,7 @@ import structlog
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.skills.manifest import (
     MAX_SKILL_FILE_BYTES,
+    SkillCompileProfile,
     _string_list,
     _validated_skill_name,
     compile_skill_manifest,
@@ -45,8 +46,9 @@ MAX_SKILLS_PER_SOURCE = 200  # per layer cap
 # instead of silently losing new fields. v12 uses nanosecond mtimes and stores
 # the versioned catalog metadata used by hot reload. v13 adds description_zh;
 # v14 adds stable instance identities, full-tree digests, and the complete
-# candidate/shadow view.
-_SNAPSHOT_SCHEMA_VERSION = 14
+# candidate/shadow view. v15 records the managed lock profile so Community
+# instruction projection can never be restored from a stale trusted snapshot.
+_SNAPSHOT_SCHEMA_VERSION = 15
 _SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({_SNAPSHOT_SCHEMA_VERSION})
 _COMPAT_PROBE_INTERVAL_SECONDS = 0.250
 
@@ -257,6 +259,7 @@ class _CatalogPublicationBarrier:
                     loader._publication_barrier_snapshot = None
             self._entered = False
 
+
 def _snapshot_provenance(raw: object) -> SkillProvenance:
     if not isinstance(raw, dict):
         return SkillProvenance()
@@ -365,6 +368,7 @@ class SkillLoader:
         project_agents_dir: Path | None = None,
         extra_dirs: list[Path] | None = None,
         snapshot_path: Path | None = None,
+        lockfile_path: Path | None = None,
     ) -> None:
         self._bundled_dir = bundled_dir
         self._workspace_dir = workspace_dir
@@ -372,6 +376,11 @@ class SkillLoader:
         self._personal_agents_dir = personal_agents_dir
         self._project_agents_dir = project_agents_dir
         self._extra_dirs = extra_dirs or []
+        self._lockfile_path = (
+            lockfile_path
+            if lockfile_path is not None
+            else default_opensquilla_home() / "skills-lock.json"
+        )
         self._snapshot_path = (
             snapshot_path or default_opensquilla_home() / "cache" / "skills_snapshot.json"
         )
@@ -413,6 +422,23 @@ class SkillLoader:
         """Public accessor for managed Community-installed skills."""
         return self._managed_dir
 
+    def bind_managed_lockfile(self, path: Path) -> None:
+        """Bind the authoritative lock used to classify managed artifacts.
+
+        Custom composition roots may keep their lock outside the default
+        profile home. The management service calls this before publishing a
+        transaction so tracked Community artifacts receive the same projection
+        in production and embedded/test configurations.
+        """
+
+        with self._refresh_lock:
+            if self._lockfile_path == path:
+                return
+            self._lockfile_path = path
+            if self._initialized:
+                self._dirty = True
+                self._dirty_reason = "skill.management.lockfile-bound"
+
     def invalidate_cache(self) -> None:
         """Compatibility alias: make the next access rebuild the catalog."""
         self.mark_dirty("invalidate_cache")
@@ -436,15 +462,14 @@ class SkillLoader:
             baseline = self._publication_barrier_snapshot or self._catalog
             if self._managed_recovery_candidates is None:
                 self._managed_recovery_candidates = tuple(
-                    skill
-                    for skill in baseline.candidates
-                    if skill.layer is SkillLayer.MANAGED
+                    skill for skill in baseline.candidates if skill.layer is SkillLayer.MANAGED
                 )
                 managed_paths = {
                     skill.file_path
                     for skill in self._managed_recovery_candidates
                     if skill.file_path
                 }
+                managed_paths.add(os.path.abspath(self._lockfile_path))
                 self._managed_recovery_digests = {
                     path: digest
                     for path, digest in baseline.source_digests.items()
@@ -486,9 +511,7 @@ class SkillLoader:
         with self._refresh_lock:
             self._catalog = snapshot
             self._cached = list(snapshot.skills)
-            self._initialized = bool(
-                snapshot.generation or snapshot.manifest or snapshot.skills
-            )
+            self._initialized = bool(snapshot.generation or snapshot.manifest or snapshot.skills)
             self._dirty = False
             self._dirty_reason = ""
             self._refresh_epoch += 1
@@ -565,10 +588,7 @@ class SkillLoader:
         """Build a manifest of all SKILL.md files with mtime and size."""
         manifest: Manifest = dict(self._managed_recovery_manifest)
         for dir_path, layer in self._get_layer_dirs():
-            if (
-                layer is SkillLayer.MANAGED
-                and self._managed_recovery_candidates is not None
-            ):
+            if layer is SkillLayer.MANAGED and self._managed_recovery_candidates is not None:
                 continue
             if not dir_path.exists():
                 continue
@@ -582,6 +602,24 @@ class SkillLoader:
                             "size": stat.st_size,
                             "tree_state": compute_tree_state(skill_dir),
                         }
+        if (
+            self._managed_dir is not None
+            and self._managed_recovery_candidates is None
+        ):
+            try:
+                lock_bytes = self._lockfile_path.read_bytes()
+            except FileNotFoundError:
+                pass
+            else:
+                manifest[os.path.abspath(self._lockfile_path)] = {
+                    # Transaction rollback may atomically restore identical lock
+                    # bytes with a new mtime. Catalog identity follows content,
+                    # not publication metadata, so that recovery is generation
+                    # neutral while real lock/profile changes still invalidate.
+                    "mtime_ns": 0,
+                    "size": len(lock_bytes),
+                    "tree_state": hashlib.sha256(lock_bytes).hexdigest(),
+                }
         return manifest
 
     def save_snapshot(self) -> None:
@@ -781,11 +819,7 @@ class SkillLoader:
                     ),
                     preference_keys=_string_list(s.get("preference_keys", [])),
                     policy_tags=_string_list(s.get("policy_tags", [])),
-                    entrypoint=(
-                        s["entrypoint"]
-                        if isinstance(s.get("entrypoint"), dict)
-                        else None
-                    ),
+                    entrypoint=(s["entrypoint"] if isinstance(s.get("entrypoint"), dict) else None),
                 )
             )
         return skills
@@ -867,8 +901,10 @@ class SkillLoader:
             # A force reload may only share another force reload: otherwise a
             # concurrent lightweight probe could swallow its full-rescan
             # guarantee when content changed without a manifest delta.
-            if verifier is None and observed_epoch != self._refresh_epoch and (
-                not force or self._last_refresh_was_force
+            if (
+                verifier is None
+                and observed_epoch != self._refresh_epoch
+                and (not force or self._last_refresh_was_force)
             ):
                 return self._last_refresh_result
             result = self._refresh_impl(
@@ -893,11 +929,7 @@ class SkillLoader:
         with self._refresh_lock:
             self._last_probe_at = time.monotonic()
             old = self._catalog
-            if (
-                self._initialized
-                and observed_generation != old.generation
-                and not self._dirty
-            ):
+            if self._initialized and observed_generation != old.generation and not self._dirty:
                 return self._last_refresh_result
             if self._mutation_depth and verifier is None:
                 return self._unchanged_result(
@@ -931,9 +963,7 @@ class SkillLoader:
                                 key="candidates",
                             )
                         )
-                        active_instance_ids = {
-                            skill.instance_id for skill in disk_skills
-                        }
+                        active_instance_ids = {skill.instance_id for skill in disk_skills}
                         disk_shadowed = tuple(
                             skill
                             for skill in disk_candidates
@@ -941,18 +971,12 @@ class SkillLoader:
                         )
                         disk_digests = {
                             str(path): str(digest)
-                            for path, digest in dict(
-                                disk_data.get("source_digests", {})
-                            ).items()
+                            for path, digest in dict(disk_data.get("source_digests", {})).items()
                         }
                         disk_errors = self._restore_snapshot_errors(disk_data)
                         disk_diagnostics = self._restore_snapshot_errors(
                             disk_data,
-                            key=(
-                                "diagnostics"
-                                if "diagnostics" in disk_data
-                                else "errors"
-                            ),
+                            key=("diagnostics" if "diagnostics" in disk_data else "errors"),
                         )
                         after = self._build_manifest()
                         if after == manifest:
@@ -990,12 +1014,8 @@ class SkillLoader:
                     break
                 manifest = after
                 if attempt == 1:
-                    unstable_error = OSError(
-                        "skill sources changed during both catalog scans"
-                    )
-                    return self._failed_refresh(
-                        old, effective_reason, unstable_error, started
-                    )
+                    unstable_error = OSError("skill sources changed during both catalog scans")
+                    return self._failed_refresh(old, effective_reason, unstable_error, started)
             else:  # pragma: no cover - loop always breaks or returns
                 raise AssertionError("unreachable catalog rebuild state")
 
@@ -1053,6 +1073,79 @@ class SkillLoader:
                 initial=not self._initialized,
             )
 
+    def _managed_compile_profiles(
+        self,
+    ) -> tuple[dict[str, SkillCompileProfile], tuple[str, ...]]:
+        """Resolve trusted lock records to exact managed directories.
+
+        The managed layer also contains user-accepted local Meta Skills, so the
+        layer itself is not a Community trust signal. Only a supported parser
+        profile in a structurally valid lockfile, bound to an exact direct child
+        of the configured managed root, activates instruction projection.
+        """
+
+        if self._managed_dir is None:
+            return {}, ()
+        from opensquilla.skills.hub.lockfile import Lockfile
+
+        lockfile = Lockfile.load(
+            self._lockfile_path,
+            managed_dir=self._managed_dir,
+        )
+        if lockfile.mutation_blocked:
+            if structlog.is_configured():
+                log.warning(
+                    "skill_catalog.managed_profile_unavailable",
+                    lockfile=str(self._lockfile_path),
+                    diagnostics=[item.to_dict() for item in lockfile.diagnostics],
+                )
+            return {}, tuple(item.message for item in lockfile.diagnostics)
+        try:
+            root = self._managed_dir.resolve(strict=False)
+        except (OSError, ValueError):
+            return {}, ("Managed Skill root could not be resolved safely",)
+
+        profiles: dict[str, SkillCompileProfile] = {}
+        path_errors: list[str] = []
+        for lock_name, entry in lockfile.installed.items():
+            # v2 records use an explicit relative path. Historical records are
+            # keyed by their managed direct-child directory; their absolute
+            # ``path`` value may still point at an old profile after a move.
+            # Keep the persisted storage key authoritative so loader, Doctor,
+            # update, and uninstall all resolve the same bytes.
+            relative = entry.relative_path or entry.directory_name or lock_name
+            relative_path = Path(relative)
+            target: Path | None = None
+            if (
+                not relative_path.is_absolute()
+                and len(relative_path.parts) == 1
+                and relative_path.name not in {"", ".", ".."}
+            ):
+                target = root / relative_path
+            else:
+                path_errors.append(
+                    f"Tracked Skill {lock_name!r} has no usable managed path"
+                )
+            if target is None:
+                continue
+            try:
+                resolved_target = target.resolve(strict=False)
+            except (OSError, ValueError):
+                path_errors.append(
+                    f"Tracked Skill {lock_name!r} path could not be resolved safely"
+                )
+                continue
+            if resolved_target.parent != root:
+                path_errors.append(
+                    f"Tracked Skill {lock_name!r} escapes the managed root"
+                )
+                continue
+            # A lock entry is itself the Community trust marker. Parser
+            # versions describe how it was produced; unknown, future, or empty
+            # values must never upgrade third-party bytes to trusted execution.
+            profiles[str(resolved_target)] = SkillCompileProfile.COMMUNITY_INSTRUCTION
+        return profiles, tuple(path_errors)
+
     def _build_catalog(
         self, old: SkillCatalogSnapshot
     ) -> tuple[
@@ -1084,24 +1177,38 @@ class SkillLoader:
             candidates.pop(existing_index)
             candidate_indexes.clear()
             candidate_indexes.update(
-                (candidate.instance_id, index)
-                for index, candidate in enumerate(candidates)
+                (candidate.instance_id, index) for index, candidate in enumerate(candidates)
             )
 
         old_by_path = {skill.file_path: skill for skill in old.skills if skill.file_path}
+        managed_profiles, managed_profile_errors = self._managed_compile_profiles()
+        old_managed_candidates = tuple(
+            skill for skill in old.candidates if skill.layer is SkillLayer.MANAGED
+        )
         for dir_path, layer in self._get_layer_dirs():
-            if (
-                layer is SkillLayer.MANAGED
-                and self._managed_recovery_candidates is not None
-            ):
+            if layer is SkillLayer.MANAGED and self._managed_recovery_candidates is not None:
                 for frozen_spec in self._managed_recovery_candidates:
                     record_candidate(frozen_spec)
                     merged[frozen_spec.name] = frozen_spec
-                    old_digest = self._managed_recovery_digests.get(
-                        frozen_spec.file_path
-                    )
+                    old_digest = self._managed_recovery_digests.get(frozen_spec.file_path)
                     if old_digest:
                         digests[frozen_spec.file_path] = old_digest
+                continue
+            if layer is SkillLayer.MANAGED and managed_profile_errors:
+                for frozen_spec in old_managed_candidates:
+                    record_candidate(frozen_spec)
+                    merged[frozen_spec.name] = frozen_spec
+                    old_digest = old.source_digests.get(frozen_spec.file_path)
+                    if old_digest:
+                        digests[frozen_spec.file_path] = old_digest
+                errors.append(
+                    SkillLoadError(
+                        name="managed",
+                        path=str(self._lockfile_path),
+                        message="; ".join(managed_profile_errors),
+                        kept_previous=bool(old_managed_candidates),
+                    )
+                )
                 continue
             if not dir_path.exists():
                 continue
@@ -1176,9 +1283,7 @@ class SkillLoader:
                             SkillLoadError(
                                 name=previous.name if previous else skill_dir.name,
                                 path=file_path,
-                                message=(
-                                    f"SKILL.md exceeds {MAX_SKILL_FILE_BYTES} bytes"
-                                ),
+                                message=(f"SKILL.md exceeds {MAX_SKILL_FILE_BYTES} bytes"),
                                 kept_previous=previous is not None,
                             )
                         )
@@ -1199,6 +1304,11 @@ class SkillLoader:
                         layer,
                         root=dir_path,
                         skill_bytes=skill_bytes,
+                        profile=(
+                            managed_profiles.get(str(skill_dir.resolve(strict=False)))
+                            if layer is SkillLayer.MANAGED
+                            else None
+                        ),
                     )
                     if spec is None:
                         errors.append(
@@ -1262,9 +1372,7 @@ class SkillLoader:
             del self._build_local.skills
 
         active_instance_ids = {spec.instance_id for spec in merged.values()}
-        shadowed = [
-            spec for spec in candidates if spec.instance_id not in active_instance_ids
-        ]
+        shadowed = [spec for spec in candidates if spec.instance_id not in active_instance_ids]
         return list(merged.values()), digests, errors, candidates, shadowed
 
     @staticmethod
@@ -1319,9 +1427,7 @@ class SkillLoader:
             self._write_snapshot(catalog)
         except (OSError, TypeError, ValueError):
             if structlog.is_configured():
-                log.debug(
-                    "skill_catalog.snapshot_write_failed", path=str(self._snapshot_path)
-                )
+                log.debug("skill_catalog.snapshot_write_failed", path=str(self._snapshot_path))
         added, removed, modified = diff
         elapsed_ms = round((time.monotonic() - started) * 1000, 3)
         # An unconfigured structlog PrintLogger writes to stdout. Standalone
@@ -1402,6 +1508,7 @@ class SkillLoader:
         root: Path | None = None,
         *,
         skill_bytes: bytes | None = None,
+        profile: SkillCompileProfile | None = None,
     ) -> SkillSpec | None:
         """Load a single skill from its directory."""
         # Symlink containment: reject skills that escape the layer root
@@ -1440,6 +1547,7 @@ class SkillLoader:
                 skill_dir,
                 layer,
                 skill_bytes=normalized_bytes,
+                profile=profile or SkillCompileProfile.TRUSTED,
             )
             skill.tree_digest = compute_tree_sha256(skill_dir)
             return skill

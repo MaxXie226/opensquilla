@@ -386,6 +386,12 @@ class ClawHubSource(SkillSource):
                 self._registry_descriptions[identifier] = meta.description
             else:
                 self._registry_descriptions.pop(identifier, None)
+        if items and not results:
+            log.warning("clawhub.search_all_rows_invalid", row_count=len(items))
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="ClawHub",
+            )
         return results[:limit]
 
     async def resolve(self, identifier: str) -> SourceResolution | None:

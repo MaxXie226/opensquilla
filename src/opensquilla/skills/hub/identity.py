@@ -45,6 +45,19 @@ def _entry_identifiers(entry: LockEntry) -> set[str]:
     }
 
 
+def _entry_clawhub_package_identity(entry: LockEntry) -> str:
+    for identifier in (
+        entry.source_package_id,
+        entry.resolved_identifier,
+        entry.requested_identifier,
+        entry.identifier,
+    ):
+        package = _clawhub_package_identifier(identifier.removeprefix("clawhub:"))
+        if package:
+            return package
+    return ""
+
+
 def is_skill_meta_installed(meta: SkillMeta, lockfile: Lockfile) -> bool:
     """Match a registry row to a lock entry without using its display name.
 
@@ -68,11 +81,22 @@ def is_skill_meta_installed(meta: SkillMeta, lockfile: Lockfile) -> bool:
                 package = package_identifier_for(entry_package.removeprefix("github:"))
                 if package:
                     entry_package = f"github:{package}"
+            elif entry.source == "clawhub":
+                entry_package = _entry_clawhub_package_identity(entry)
             if entry_package == row_package:
                 return True
             # Two explicit but different package identities must never fall
             # back to a same-name or coincidentally similar identifier match.
             continue
+        if row_package and entry.source == "clawhub":
+            entry_package = _entry_clawhub_package_identity(entry)
+            if entry_package == row_package:
+                return True
+            # An ownerless v1 bare slug does not prove which publisher-owned
+            # registry row it belongs to. Do not mark every same-slug owner as
+            # installed; a subsequent bare-slug update can bind the identity.
+            if entry_package:
+                continue
         if row_identifiers & _entry_identifiers(entry):
             return True
     return False

@@ -9,6 +9,7 @@ from opensquilla.skills.hub.archive import DEFAULT_ARCHIVE_LIMITS
 from opensquilla.skills.hub.github import GitHubSource
 from opensquilla.skills.hub.management import SkillManagementService
 from opensquilla.skills.hub.router import SourceRouter
+from opensquilla.skills.hub.source import SkillSourceFetchError
 
 _COMMIT = "a" * 40
 
@@ -74,6 +75,80 @@ class _AsyncClient:
             rel_path = url.split(marker, 1)[1]
             return _Response(content=self.raw_payloads[rel_path])
         raise AssertionError(f"unexpected URL: {url}")
+
+
+@pytest.mark.asyncio
+async def test_search_returns_exact_github_skill_references(monkeypatch) -> None:
+    import httpx
+
+    async def search_get(
+        _client: _AsyncClient,
+        _url: str,
+        **_kwargs: Any,
+    ) -> _Response:
+        return _Response(
+            json_data={
+                "items": [
+                    {
+                        "path": "skills/demo/SKILL.md",
+                        "repository": {
+                            "full_name": "acme/skillpack",
+                            "description": "Demo Skill",
+                            "html_url": "https://github.com/acme/skillpack",
+                        },
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    monkeypatch.setattr(_AsyncClient, "get", search_get)
+
+    results = await GitHubSource().search("demo")
+
+    assert [(row.name, row.canonical_identifier) for row in results] == [
+        ("demo", "acme/skillpack:skills/demo/SKILL.md")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_code"),
+    [
+        (429, "SOURCE_RATE_LIMITED"),
+        ("transport", "SOURCE_TRANSPORT_FAILED"),
+        ("invalid-json", "SOURCE_INVALID_RESPONSE"),
+        ("all-malformed", "SOURCE_INVALID_RESPONSE"),
+    ],
+)
+async def test_search_failures_surface_stable_diagnostics(
+    monkeypatch,
+    outcome: int | str,
+    expected_code: str,
+) -> None:
+    import httpx
+
+    async def search_get(
+        _client: _AsyncClient,
+        _url: str,
+        **_kwargs: Any,
+    ) -> _Response:
+        if outcome == "transport":
+            raise OSError("simulated DNS failure")
+        if outcome == "invalid-json":
+            return _InvalidJsonResponse()
+        if outcome == "all-malformed":
+            return _Response(json_data={"items": [{"path": "SKILL.md"}]})
+        assert isinstance(outcome, int)
+        return _Response(status_code=outcome)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    monkeypatch.setattr(_AsyncClient, "get", search_get)
+
+    with pytest.raises(SkillSourceFetchError) as raised:
+        await GitHubSource().search("demo")
+
+    assert [item.code for item in raised.value.diagnostics] == [expected_code]
 
 
 @pytest.mark.asyncio

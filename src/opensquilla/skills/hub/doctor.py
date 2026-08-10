@@ -23,6 +23,7 @@ from opensquilla.skills.eligibility import (
     EligibilityReport,
     diagnose_eligibility,
 )
+from opensquilla.skills.hub.archive import normalize_relative_path
 from opensquilla.skills.hub.contracts import (
     DiagnosticPhase,
     DiagnosticSeverity,
@@ -43,7 +44,7 @@ from opensquilla.skills.hub.lockfile import (
 )
 from opensquilla.skills.hub.source import SourceResolution
 from opensquilla.skills.hub.transaction import inspect_pending_skill_transaction
-from opensquilla.skills.manifest import compile_skill_manifest
+from opensquilla.skills.manifest import SkillCompileProfile, compile_skill_manifest
 from opensquilla.skills.types import SkillLayer, SkillSpec
 
 if TYPE_CHECKING:
@@ -68,6 +69,7 @@ _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _DEGRADED_CAPABILITIES_KEY = "degraded_capabilities"
 _SCOPED_TOOL_PERMISSIONS_CAPABILITY = "scoped_tool_permissions"
 _DYNAMIC_CONTEXT_CAPABILITY = "dynamic_context"
+_UNSUPPORTED_EXECUTION_CAPABILITY = "unsupported_execution_fields"
 
 
 def _diagnostic(
@@ -274,7 +276,10 @@ class SkillDoctor:
                     hint="The lockfile is created after the first managed installation.",
                 )
             )
-        lockfile = Lockfile.load(self._lockfile_path)
+        lockfile = Lockfile.load(
+            self._lockfile_path,
+            managed_dir=self._managed_dir,
+        )
         global_diagnostics.extend(lockfile.diagnostics)
         if self._journal_path is not None:
             global_diagnostics.extend(
@@ -416,21 +421,32 @@ class SkillDoctor:
             return None, diagnostics
 
         path = self._managed_dir / relative
-        # A v1 absolute path is useful only when it still identifies the same
-        # direct child of the injected managed root.  Portable v2 fields always
-        # win, so relocating a profile does not create false missing installs.
+        # The v1 writer keyed every managed directory by the lock entry name.
+        # Treat that key as authoritative too: a stale absolute path may point
+        # at an old profile, while a mismatched current-root child could belong
+        # to a different install.
         if not entry.relative_path and not entry.directory_name and entry.path:
             legacy = Path(entry.path)
-            if _direct_child_of(legacy, self._managed_dir):
-                path = legacy
-            elif legacy.is_absolute():
+            if _path_key(legacy) != _path_key(path):
+                outside_current_root = legacy.is_absolute() and not _direct_child_of(
+                    legacy,
+                    self._managed_dir,
+                )
                 diagnostics.append(
                     _diagnostic(
-                        "LEGACY_PATH_RELOCATED",
+                        (
+                            "LEGACY_PATH_RELOCATED"
+                            if outside_current_root
+                            else "LEGACY_PATH_MISMATCH"
+                        ),
                         DiagnosticSeverity.INFO,
                         DiagnosticPhase.LOCK,
-                        "Ignored a legacy absolute path outside the configured managed root",
-                        details={"name": name},
+                        (
+                            "Ignored a legacy absolute path outside the configured managed root"
+                            if outside_current_root
+                            else "Ignored a legacy path that does not match its storage key"
+                        ),
+                        details={"name": name, "legacyPath": str(legacy)},
                     )
                 )
 
@@ -656,7 +672,11 @@ class SkillDoctor:
 
     def _observe_catalog(self, record: _StoreRecord, *, exists: bool) -> _CatalogObservation:
         path = record.path
-        offline_spec = _compile_offline(path) if exists and path is not None else None
+        offline_spec = (
+            _compile_offline(path, tracked=record.entry is not None)
+            if exists and path is not None
+            else None
+        )
         if self._loader is None:
             if offline_spec is None:
                 offline_diagnostics: tuple[SkillDiagnostic, ...] = ()
@@ -864,6 +884,12 @@ def _safe_single_directory(value: str) -> str | None:
     path = PurePosixPath(normalized)
     if len(path.parts) != 1 or path.parts[0] in {".", ".."} or path.parts[0].startswith("."):
         return None
+    try:
+        portable = normalize_relative_path(path.as_posix())
+    except ValueError:
+        return None
+    if len(portable.parts) != 1:
+        return None
     return path.parts[0]
 
 
@@ -903,11 +929,19 @@ def _loader_error_matches(error: object, *, path: Path | None, name: str) -> boo
     return str(getattr(error, "name", "") or "") in {name, "catalog"}
 
 
-def _compile_offline(path: Path | None) -> SkillSpec | None:
+def _compile_offline(path: Path | None, *, tracked: bool) -> SkillSpec | None:
     if path is None:
         return None
     try:
-        return compile_skill_manifest(path, SkillLayer.MANAGED)
+        return compile_skill_manifest(
+            path,
+            SkillLayer.MANAGED,
+            profile=(
+                SkillCompileProfile.COMMUNITY_INSTRUCTION
+                if tracked
+                else SkillCompileProfile.TRUSTED
+            ),
+        )
     except (OSError, UnicodeError, TypeError, ValueError):
         return None
 
@@ -1024,7 +1058,11 @@ def _compatibility_observation(
         if isinstance(raw_capabilities, list):
             degraded_capabilities = {str(item) for item in raw_capabilities}
     if degraded_capabilities.intersection(
-        {_DYNAMIC_CONTEXT_CAPABILITY, _SCOPED_TOOL_PERMISSIONS_CAPABILITY}
+        {
+            _DYNAMIC_CONTEXT_CAPABILITY,
+            _SCOPED_TOOL_PERMISSIONS_CAPABILITY,
+            _UNSUPPORTED_EXECUTION_CAPABILITY,
+        }
     ):
         compatibility = SkillCompatibilityState.DEGRADED
     if _SCOPED_TOOL_PERMISSIONS_CAPABILITY in degraded_capabilities:
@@ -1043,6 +1081,17 @@ def _compatibility_observation(
                     "The Skill instructions remain usable; matching tools still "
                     "require the normal approval flow."
                 ),
+            )
+        )
+    if _UNSUPPORTED_EXECUTION_CAPABILITY in degraded_capabilities:
+        diagnostics.append(
+            _diagnostic(
+                "DIALECT_FIELD_UNSUPPORTED",
+                DiagnosticSeverity.WARNING,
+                DiagnosticPhase.COMPATIBILITY,
+                "Unsupported host execution fields were ignored during installation",
+                path=path,
+                hint="The portable instruction body remains available.",
             )
         )
     if _DYNAMIC_CONTEXT_CAPABILITY in degraded_capabilities:

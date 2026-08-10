@@ -3,18 +3,115 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, replace
 from typing import cast
 
 import structlog
 
+from opensquilla.skills.hub.contracts import DiagnosticPhase, SkillDiagnostic
 from opensquilla.skills.hub.source import (
     SkillBundle,
     SkillMeta,
     SkillSource,
+    SkillSourceFetchError,
     SourceResolution,
+    source_invalid_response_error,
 )
 
 log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class SourceSearchReport:
+    """Truthful aggregate outcome used beside the list-returning compatibility API."""
+
+    results: tuple[SkillMeta, ...] = ()
+    diagnostics: tuple[SkillDiagnostic, ...] = ()
+    searched_sources: tuple[str, ...] = ()
+    successful_sources: tuple[str, ...] = ()
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.diagnostics and self.successful_sources)
+
+    @property
+    def all_sources_unavailable(self) -> bool:
+        return bool(self.diagnostics and not self.successful_sources)
+
+
+def _source_diagnostics(
+    exc: SkillSourceFetchError,
+    source_id: str,
+) -> tuple[SkillDiagnostic, ...]:
+    return tuple(
+        replace(
+            diagnostic,
+            details={**diagnostic.details, "source": source_id},
+        )
+        for diagnostic in exc.diagnostics
+    )
+
+
+def _invalid_source_diagnostics(source_id: str) -> tuple[SkillDiagnostic, ...]:
+    exc = source_invalid_response_error(
+        phase=DiagnosticPhase.SOURCE,
+        source_name=source_id,
+    )
+    return _source_diagnostics(exc, source_id)
+
+
+async def search_router_with_diagnostics(
+    router: object,
+    query: str,
+    *,
+    limit: int = 20,
+    source_id: str | None = None,
+) -> SourceSearchReport:
+    """Use the aggregate contract while retaining legacy injected routers."""
+
+    detailed_search = getattr(router, "search_with_diagnostics", None)
+    diagnostic_source = source_id or "skill-source-router"
+    try:
+        if callable(detailed_search):
+            report = await detailed_search(query, limit=limit, source_id=source_id)
+            if isinstance(report, SourceSearchReport):
+                return report
+            return SourceSearchReport(
+                diagnostics=_invalid_source_diagnostics(diagnostic_source),
+                searched_sources=(diagnostic_source,),
+            )
+
+        legacy_search = getattr(router, "search")
+        results = await legacy_search(query, limit=limit, source_id=source_id)
+    except SkillSourceFetchError as exc:
+        return SourceSearchReport(
+            diagnostics=_source_diagnostics(exc, diagnostic_source),
+            searched_sources=(diagnostic_source,),
+        )
+    except Exception as exc:
+        log.warning(
+            "router.legacy_search_failed",
+            source_id=diagnostic_source,
+            error=str(exc),
+        )
+        return SourceSearchReport(
+            diagnostics=_invalid_source_diagnostics(diagnostic_source),
+            searched_sources=(diagnostic_source,),
+        )
+
+    if not isinstance(results, list) or any(not isinstance(row, SkillMeta) for row in results):
+        return SourceSearchReport(
+            diagnostics=_invalid_source_diagnostics(diagnostic_source),
+            searched_sources=(diagnostic_source,),
+        )
+    successful_sources = tuple(
+        dict.fromkeys(row.source_id for row in results if row.source_id)
+    ) or (diagnostic_source,)
+    return SourceSearchReport(
+        results=tuple(results),
+        searched_sources=(diagnostic_source,),
+        successful_sources=successful_sources,
+    )
 
 
 class SourceRouter:
@@ -38,7 +135,11 @@ class SourceRouter:
     async def search(
         self, query: str, limit: int = 20, source_id: str | None = None
     ) -> list[SkillMeta]:
-        """Search across all sources (or a specific one). Returns merged results."""
+        """Compatibility search returning only results.
+
+        Truth-aware callers should use :meth:`search_with_diagnostics`. A
+        source-specific call retains the historical exception behavior.
+        """
         if source_id:
             src = self._sources.get(source_id)
             if src is None:
@@ -47,26 +148,76 @@ class SourceRouter:
             self._fill_source_ids(results, source_id)
             return self._deduplicate(results, limit)
 
-        # Search all sources in parallel
-        sources = list(self._sources.values())
-        tasks = [src.search(query, limit=limit) for src in sources]
-        if not tasks:
-            return []
+        report = await self.search_with_diagnostics(query, limit=limit)
+        return list(report.results)
 
+    async def search_with_diagnostics(
+        self,
+        query: str,
+        limit: int = 20,
+        source_id: str | None = None,
+    ) -> SourceSearchReport:
+        """Search sources without confusing source failure with zero results."""
+
+        if source_id:
+            source = self._sources.get(source_id)
+            if source is None:
+                return SourceSearchReport(
+                    diagnostics=_invalid_source_diagnostics(source_id),
+                    searched_sources=(source_id,),
+                )
+            sources = [source]
+        else:
+            sources = list(self._sources.values())
+
+        searched_sources = tuple(source.source_id for source in sources)
+        if not sources:
+            return SourceSearchReport(searched_sources=searched_sources)
+
+        tasks = [src.search(query, limit=limit) for src in sources]
         all_results: list[SkillMeta] = []
+        diagnostics: list[SkillDiagnostic] = []
+        successful_sources: list[str] = []
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         for source, result_list in zip(sources, gathered, strict=True):
-            if isinstance(result_list, list):
-                self._fill_source_ids(result_list, source.source_id)
-                all_results.extend(result_list)
-            else:
+            if isinstance(result_list, SkillSourceFetchError):
+                diagnostics.extend(_source_diagnostics(result_list, source.source_id))
                 log.warning(
                     "router.search_source_failed",
                     source_id=source.source_id,
                     error=str(result_list),
                 )
+                continue
+            if isinstance(result_list, asyncio.CancelledError):
+                raise result_list
+            if isinstance(result_list, BaseException):
+                diagnostics.extend(_invalid_source_diagnostics(source.source_id))
+                log.warning(
+                    "router.search_source_failed",
+                    source_id=source.source_id,
+                    error=str(result_list),
+                )
+                continue
+            if not isinstance(result_list, list) or any(
+                not isinstance(result, SkillMeta) for result in result_list
+            ):
+                diagnostics.extend(_invalid_source_diagnostics(source.source_id))
+                log.warning(
+                    "router.search_source_invalid_response",
+                    source_id=source.source_id,
+                )
+                continue
 
-        return self._deduplicate(all_results, limit)
+            successful_sources.append(source.source_id)
+            self._fill_source_ids(result_list, source.source_id)
+            all_results.extend(result_list)
+
+        return SourceSearchReport(
+            results=tuple(self._deduplicate(all_results, limit)),
+            diagnostics=tuple(diagnostics),
+            searched_sources=searched_sources,
+            successful_sources=tuple(successful_sources),
+        )
 
     @staticmethod
     def _fill_source_ids(results: list[SkillMeta], source_id: str) -> None:

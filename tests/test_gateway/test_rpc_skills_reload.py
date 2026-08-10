@@ -333,7 +333,7 @@ async def test_skill_mutation_rpc_preserves_boolean_flag_values(
         managed_dir=tmp_path / "managed",
         snapshot_path=tmp_path / "snapshot.json",
     )
-    captured: dict[str, bool] = {}
+    captured: dict[str, bool | str] = {}
 
     installer = rpc_skills.SkillManagementService(
         router=SourceRouter([]),
@@ -349,17 +349,33 @@ async def test_skill_mutation_rpc_preserves_boolean_flag_values(
         *,
         force: bool,
         replace_source: bool,
+        risk_confirmation: str,
     ):
         captured["force"] = force
         captured["replace_source"] = replace_source
+        captured["install_risk_confirmation"] = risk_confirmation
         return SimpleNamespace(success=True, name="demo", message="installed")
 
-    async def _uninstall(_name: str, *, allow_drift: bool):
+    async def _uninstall(
+        _name: str,
+        *,
+        install_id: str,
+        allow_drift: bool,
+    ):
+        assert install_id == ""
         captured["allow_drift"] = allow_drift
         return SimpleNamespace(success=True, name="demo", message="uninstalled")
 
-    async def _update(_name: str, *, force: bool):
+    async def _update(
+        _name: str | None,
+        *,
+        install_id: str,
+        force: bool,
+        risk_confirmation: str,
+    ):
+        assert install_id == ""
         captured["update_force"] = force
+        captured["update_risk_confirmation"] = risk_confirmation
         return [SimpleNamespace(success=True, name="demo", message="updated")]
 
     monkeypatch.setattr(installer, "install", _install)
@@ -369,7 +385,12 @@ async def test_skill_mutation_rpc_preserves_boolean_flag_values(
     ctx = RpcContext(conn_id="test", skill_loader=loader)
 
     install_payload = await rpc_skills._handle_skills_install(
-        {"identifier": "demo", "force": False, "replaceSource": True},
+        {
+            "identifier": "demo",
+            "force": False,
+            "replaceSource": True,
+            "riskConfirmation": "install-confirmation",
+        },
         ctx,
     )
     uninstall_payload = await rpc_skills._handle_skills_uninstall(
@@ -377,19 +398,211 @@ async def test_skill_mutation_rpc_preserves_boolean_flag_values(
         ctx,
     )
     update_payload = await rpc_skills._handle_skills_update(
-        {"name": "demo", "force": True},
+        {"name": "demo", "force": True, "risk_confirmation": "update-confirmation"},
         ctx,
     )
 
     assert captured == {
         "force": False,
         "replace_source": True,
+        "install_risk_confirmation": "install-confirmation",
         "allow_drift": False,
         "update_force": True,
+        "update_risk_confirmation": "update-confirmation",
     }
     assert install_payload["success"] is True
     assert uninstall_payload["success"] is True
     assert update_payload["results"][0]["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_skill_installer_rejects_replace_source_without_mutating(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = SkillLoader(
+        managed_dir=tmp_path / "managed",
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+
+    class LegacyInstaller:
+        calls = 0
+
+        async def install(
+            self,
+            _identifier: str,
+            _source_id: str,
+            force: bool = False,
+        ) -> InstallResult:
+            self.calls += 1
+            return InstallResult(success=True, name="demo")
+
+    installer = LegacyInstaller()
+    monkeypatch.setattr(rpc_skills, "_management_service", lambda _ctx: installer)
+
+    payload = await rpc_skills._handle_skills_install(
+        {"identifier": "demo", "replaceSource": True},
+        RpcContext(conn_id="test", skill_loader=loader),
+    )
+
+    assert payload["success"] is False
+    assert payload["diagnostics"][0]["code"] == "INSTALLER_CAPABILITY_UNSUPPORTED"
+    assert payload["diagnostics"][0]["details"] == {
+        "operation": "install",
+        "capability": "replaceSource",
+    }
+    assert installer.calls == 0
+    assert loader._dirty is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_skill_installer_cannot_use_unbound_force_override(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = SkillLoader(
+        managed_dir=tmp_path / "managed",
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+
+    class LegacyInstaller:
+        calls = 0
+
+        async def install(
+            self,
+            _identifier: str,
+            _source_id: str,
+            force: bool = False,
+        ) -> InstallResult:
+            self.calls += 1
+            return InstallResult(success=True, name="demo")
+
+    installer = LegacyInstaller()
+    monkeypatch.setattr(rpc_skills, "_management_service", lambda _ctx: installer)
+
+    payload = await rpc_skills._handle_skills_install(
+        {"identifier": "demo", "force": True},
+        RpcContext(conn_id="test", skill_loader=loader),
+    )
+
+    assert payload["success"] is False
+    assert payload["diagnostics"][0]["details"] == {
+        "operation": "install",
+        "capability": "riskConfirmation",
+    }
+    assert installer.calls == 0
+    assert loader._dirty is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_skill_installer_internal_type_error_is_not_retried(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = SkillLoader(
+        managed_dir=tmp_path / "managed",
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+
+    class LegacyInstaller:
+        calls = 0
+
+        async def install(
+            self,
+            _identifier: str,
+            _source_id: str,
+            force: bool = False,
+        ) -> InstallResult:
+            self.calls += 1
+            raise TypeError("installer failed after mutation began")
+
+    installer = LegacyInstaller()
+    monkeypatch.setattr(rpc_skills, "_management_service", lambda _ctx: installer)
+
+    with pytest.raises(TypeError, match="after mutation began"):
+        await rpc_skills._handle_skills_install(
+            {"identifier": "demo"},
+            RpcContext(conn_id="test", skill_loader=loader),
+        )
+
+    assert installer.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_skill_installer_builder_internal_type_error_is_not_retried(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = SkillLoader(
+        managed_dir=tmp_path / "managed",
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+    calls = 0
+
+    def failing_builder(
+        *,
+        managed_dir=None,
+        loader=None,
+        journal_path=None,
+        offline=None,
+    ):
+        nonlocal calls
+        calls += 1
+        raise TypeError("builder failed internally")
+
+    monkeypatch.setattr(rpc_skills, "build_default_skill_installer", failing_builder)
+
+    with pytest.raises(TypeError, match="builder failed internally"):
+        await rpc_skills._handle_skills_install(
+            {"identifier": "demo"},
+            RpcContext(conn_id="test", skill_loader=loader),
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["update", "uninstall"])
+async def test_legacy_skill_installer_rejects_exact_identity_without_mutating(
+    operation: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = SkillLoader(
+        managed_dir=tmp_path / "managed",
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+
+    class LegacyInstaller:
+        calls = 0
+
+        async def update(self, _name: str | None = None) -> list[InstallResult]:
+            self.calls += 1
+            return []
+
+        async def uninstall(self, _name: str) -> InstallResult:
+            self.calls += 1
+            return InstallResult(success=True, name="demo")
+
+    installer = LegacyInstaller()
+    monkeypatch.setattr(rpc_skills, "_management_service", lambda _ctx: installer)
+    ctx = RpcContext(conn_id="test", skill_loader=loader)
+
+    if operation == "update":
+        payload = await rpc_skills._handle_skills_update(
+            {"installId": "install-1"},
+            ctx,
+        )
+    else:
+        payload = await rpc_skills._handle_skills_uninstall(
+            {"installId": "install-1"},
+            ctx,
+        )
+
+    assert payload["success"] is False
+    assert payload["diagnostics"][0]["code"] == "INSTALLER_CAPABILITY_UNSUPPORTED"
+    assert payload["diagnostics"][0]["details"]["capability"] == "installId"
+    assert installer.calls == 0
 
 
 @pytest.mark.asyncio
@@ -410,8 +623,16 @@ async def test_skills_update_noop_preserves_success_on_wire(
         journal_path=tmp_path / "skill-transaction.json",
     )
 
-    async def _update(_name: str, *, force: bool):
+    async def _update(
+        _name: str | None,
+        *,
+        install_id: str,
+        force: bool,
+        risk_confirmation: str,
+    ):
+        assert install_id == ""
         assert force is False
+        assert risk_confirmation == ""
         return [
             InstallResult(
                 True,

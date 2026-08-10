@@ -9,6 +9,7 @@ from opensquilla.gateway.rpc import RpcContext
 from opensquilla.skills.hub.contracts import DiagnosticPhase
 from opensquilla.skills.hub.lockfile import LockEntry, Lockfile, compute_tree_sha256
 from opensquilla.skills.hub.management import SkillManagementService
+from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.source import SkillMeta, SkillSourceFetchError
 from opensquilla.skills.loader import SkillLoader
 
@@ -198,9 +199,50 @@ async def test_registry_search_preserves_results_container_with_source_diagnosti
             "path": "",
             "field_name": "",
             "hint": "Check network connectivity, then retry.",
-            "details": {},
+            "details": {"source": "clawhub"},
         }
     ]
+    assert response["partial"] is False
+    assert response["allSourcesUnavailable"] is True
+
+
+@pytest.mark.asyncio
+async def test_registry_search_returns_partial_results_with_source_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HealthySource:
+        source_id = "healthy"
+
+        async def search(self, query, limit=20):
+            return [SkillMeta(name="Plotter", identifier="plotter")]
+
+    class LimitedSource:
+        source_id = "limited"
+
+        async def search(self, query, limit=20):
+            raise SkillSourceFetchError.diagnostic(
+                "SOURCE_RATE_LIMITED",
+                "The source rate-limited this search.",
+                phase=DiagnosticPhase.SOURCE,
+                details={"retryAfter": "45"},
+            )
+
+    monkeypatch.setattr(rpc_skills, "installed_skill_lockfile", lambda: Lockfile())
+    ctx = RpcContext(conn_id="test")
+    ctx._skill_router = SourceRouter(  # type: ignore[attr-defined]
+        [HealthySource(), LimitedSource()]  # type: ignore[list-item]
+    )
+
+    response = await rpc_skills._handle_skills_search({"query": "plot"}, ctx)
+
+    assert [row["name"] for row in response["results"]] == ["Plotter"]
+    assert response["diagnostics"][0]["code"] == "SOURCE_RATE_LIMITED"
+    assert response["diagnostics"][0]["details"] == {
+        "source": "limited",
+        "retryAfter": "45",
+    }
+    assert response["partial"] is True
+    assert response["allSourcesUnavailable"] is False
 
 
 @pytest.mark.asyncio

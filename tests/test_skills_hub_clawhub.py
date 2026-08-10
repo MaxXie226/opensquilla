@@ -10,6 +10,7 @@ import pytest
 
 from opensquilla.skills.hub.clawhub import ClawHubSource
 from opensquilla.skills.hub.github import GitHubSource
+from opensquilla.skills.hub.lockfile import Lockfile
 from opensquilla.skills.hub.management import SkillManagementService
 from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.source import (
@@ -173,6 +174,29 @@ async def test_search_empty_results_are_not_reported_as_source_failure(monkeypat
     results = await ClawHubSource(base_url="https://hub.test").search("missing")
 
     assert results == []
+
+
+@pytest.mark.asyncio
+async def test_search_all_malformed_rows_are_not_reported_as_zero_results(monkeypatch) -> None:
+    _mock_httpx(
+        monkeypatch,
+        {
+            "https://hub.test/api/v1/search": _Response(
+                json_data={
+                    "results": [
+                        {"slug": "missing-publisher"},
+                        {"installRef": "not-an-install-reference"},
+                        "not-an-object",
+                    ]
+                }
+            )
+        },
+    )
+
+    with pytest.raises(SkillSourceFetchError) as raised:
+        await ClawHubSource(base_url="https://hub.test").search("weather")
+
+    assert [item.code for item in raised.value.diagnostics] == ["SOURCE_INVALID_RESPONSE"]
 
 
 @pytest.mark.asyncio
@@ -412,6 +436,60 @@ async def test_github_handoff_registry_description_allows_empty_legacy_body(
 
 
 @pytest.mark.asyncio
+async def test_github_handoff_legacy_runtime_name_binds_to_registry_package_slug(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _mock_httpx(
+        monkeypatch,
+        {
+            "https://hub.test/api/v1/skills/metro-home-pro/install": _Response(
+                json_data={
+                    "ok": True,
+                    "slug": "metro-home-pro",
+                    "ownerHandle": "alice",
+                    "installKind": "github",
+                    "github": {
+                        "repo": "acme/skills",
+                        "path": "skills/metro-home",
+                        "commit": _COMMIT,
+                        "contentHash": "tree-content-hash",
+                        "sourceUrl": (
+                            "https://github.com/acme/skills/tree/"
+                            f"{_COMMIT}/skills/metro-home"
+                        ),
+                    },
+                }
+            )
+        },
+    )
+    source = ClawHubSource(
+        base_url="https://hub.test",
+        github_source=_StaticGitHubSource(
+            "---\nname: metro_home\n"
+            "description: Synthetic legacy runtime name.\n"
+            "---\nInstructions.\n"
+        ),
+    )
+
+    result = await _offline_service(tmp_path, source).install(
+        "@alice/metro-home-pro",
+        "clawhub",
+    )
+
+    assert result.success is True
+    assert result.name == "metro_home"
+    assert result.resolution is not None
+    assert result.resolution.package_identifier == "@alice/metro-home-pro"
+    assert result.resolution.skill_path == "skills/metro-home"
+    assert _installed_frontmatter(tmp_path, "metro-home-pro")["name"] == "metro_home"
+    assert not (tmp_path / "managed" / "metro_home").exists()
+    entry = Lockfile.load(tmp_path / "skills-lock.json").get("metro-home-pro")
+    assert entry is not None
+    assert entry.manifest_name == "metro_home"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("manifest_name", ["skill.md", "skills.md"])
 async def test_real_github_handoff_normalizes_legacy_manifest_name(
     monkeypatch,
@@ -596,7 +674,7 @@ async def test_archive_body_is_description_fallback_without_registry_metadata(
 
 
 @pytest.mark.asyncio
-async def test_archive_without_registry_or_body_description_is_rejected(
+async def test_archive_without_registry_or_body_description_uses_safe_fallback(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -625,9 +703,10 @@ async def test_archive_without_registry_or_body_description_is_rejected(
         ClawHubSource(base_url="https://hub.test"),
     ).install("@alice/weather", "clawhub")
 
-    assert result.success is False
-    assert any(item.code == "DESCRIPTION_INVALID" for item in result.diagnostics)
-    assert not (tmp_path / "managed" / "weather").exists()
+    assert result.success is True
+    assert _installed_frontmatter(tmp_path, "weather")["description"] == (
+        "Community Skill weather"
+    )
 
 
 @pytest.mark.asyncio

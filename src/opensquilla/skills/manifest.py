@@ -1,9 +1,9 @@
-"""Shared SKILL.md parser/compiler and strict Community candidate validation.
+"""Shared SKILL.md parser/compiler and Community candidate validation.
 
-The runtime loader deliberately uses the tolerant compiler in this module so
-existing local, bundled, and managed skills keep their historical behaviour.
-Only newly downloaded Community candidates should pass through
-``validate_hub_candidate`` before they are published into a managed layer.
+Trusted local and bundled skills deliberately retain the historical tolerant
+compiler. Community artifacts use an instruction-only projection: portable
+instructions and dependency declarations survive, while host-specific
+execution extensions remain inert and are reported as compatibility advice.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
@@ -32,11 +33,12 @@ MAX_STANDARD_SKILL_DESCRIPTION_LENGTH = 1_024
 _MAX_STRICT_YAML_NESTING = 64
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
-_STANDARD_SKILL_NAME_RE = re.compile(r"^[a-z0-9-]+$")
 _INLINE_DYNAMIC_CONTEXT_RE = re.compile(r"(?<!\\)!`[^`\r\n]+`")
 _FENCED_DYNAMIC_CONTEXT_RE = re.compile(r"(?m)^[ \t]*```![ \t]*\r?$")
 _UNSUPPORTED_DIALECT_FIELDS = frozenset(
     {
+        "always",
+        "triggers",
         "hooks",
         "agent",
         "plugin",
@@ -57,9 +59,25 @@ _UNSUPPORTED_DIALECT_FIELDS = frozenset(
         "commandargmode",
         "entrypoint",
         "composition",
+        "requires-tools",
+        "fallback-for-toolsets",
+        "meta-priority",
+        "final-text-mode",
+        "request-template",
+        "output-contract",
+        "eval-prompts",
+        "preference-keys",
+        "policy-tags",
     }
 )
 _DEGRADED_DIALECT_FIELDS = frozenset({"allowed-tools", "allowedtools"})
+
+
+class SkillCompileProfile(StrEnum):
+    """Select the trust boundary used while compiling one manifest."""
+
+    TRUSTED = "trusted"
+    COMMUNITY_INSTRUCTION = "community-instruction-v1"
 
 
 @dataclass(frozen=True)
@@ -158,6 +176,162 @@ def _string_list(value: object) -> list[str]:
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
+
+
+def _explicit_bool(value: object, *, default: bool) -> bool:
+    """Parse the boolean spellings accepted by common Skill frontmatter.
+
+    ``bool("false")`` is true in Python and previously enabled optional Skill
+    capabilities accidentally. Community projection must never use truthiness
+    for values that control catalog visibility or invocation.
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+    return default
+
+
+def _is_explicit_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value in {0, 1}
+    return isinstance(value, str) and value.strip().casefold() in {
+        "true",
+        "yes",
+        "on",
+        "1",
+        "false",
+        "no",
+        "off",
+        "0",
+    }
+
+
+def _community_string_list(value: object) -> list[str]:
+    """Return only non-empty strings from an untrusted list declaration."""
+
+    if isinstance(value, str):
+        item = value.strip()
+        return [item] if item else []
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _community_platform_mapping(frontmatter: dict) -> dict[object, object]:
+    """Resolve the same metadata namespaces as trusted manifests, defensively."""
+
+    raw_meta = frontmatter.get("metadata", {})
+    if not isinstance(raw_meta, dict):
+        return {}
+    base_meta = raw_meta.get(
+        "platform",
+        raw_meta.get("openclaw", raw_meta.get("clawdbot", raw_meta)),
+    )
+    merged = dict(base_meta) if isinstance(base_meta, dict) else {}
+    opensquilla_meta = raw_meta.get("opensquilla")
+    if isinstance(opensquilla_meta, dict):
+        # Community projection imports only descriptive/dependency metadata.
+        # Execution and policy fields (always, risk, capabilities, etc.) do not
+        # cross this trust boundary.
+        for key in (
+            "emoji",
+            "skillKey",
+            "primaryEnv",
+            "homepage",
+            "os",
+            "requires",
+            "install",
+        ):
+            if key in opensquilla_meta:
+                merged[key] = opensquilla_meta[key]
+    return merged
+
+
+def _community_install_specs(raw: object) -> list[SkillInstallSpec]:
+    """Project dependency hints without admitting command-shaped extensions."""
+
+    if not isinstance(raw, list):
+        return []
+    projected: list[SkillInstallSpec] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        def text(field: str) -> str:
+            value = item.get(field, "")
+            return value.strip() if isinstance(value, str) else ""
+
+        kind = text("kind").casefold()
+        if kind not in {"brew", "node", "npm", "go", "uv", "download", "toolchain"}:
+            continue
+        # Normalize the common npm spelling to the executor's node kind. The
+        # eventual dependency mutation still applies its own strict allowlist.
+        if kind == "npm":
+            kind = "node"
+        projected.append(
+            SkillInstallSpec(
+                kind=kind,
+                id=text("id"),
+                label=text("label"),
+                bins=_community_string_list(item.get("bins", [])),
+                os=_community_string_list(item.get("os", [])),
+                formula=text("formula"),
+                package=text("package"),
+                module=text("module"),
+                url=text("url"),
+            )
+        )
+    return projected
+
+
+def resolve_community_skill_metadata(frontmatter: dict) -> SkillPlatformMeta | None:
+    """Extract inert metadata needed for readiness and explicit dependency setup."""
+
+    raw_meta = _community_platform_mapping(frontmatter)
+    if not raw_meta:
+        return None
+    raw_requires = raw_meta.get("requires")
+    requires = None
+    if isinstance(raw_requires, dict):
+        bins_value = raw_requires.get("bins")
+        if bins_value is None:
+            bins_value = raw_requires.get("commands", [])
+        requires = SkillRequires(
+            bins=_community_string_list(bins_value),
+            any_bins=_community_string_list(raw_requires.get("anyBins", [])),
+            env=_community_string_list(raw_requires.get("env", [])),
+            env_any=_community_string_list(raw_requires.get("envAny", [])),
+            config=_community_string_list(raw_requires.get("config", [])),
+        )
+
+    def text(field: str) -> str:
+        value = raw_meta.get(field, "")
+        return value.strip() if isinstance(value, str) else ""
+
+    return SkillPlatformMeta(
+        emoji=text("emoji"),
+        skill_key=text("skillKey"),
+        primary_env=text("primaryEnv"),
+        homepage=text("homepage"),
+        always=None,
+        os=_community_string_list(raw_meta.get("os", [])),
+        requires=requires,
+        install=_community_install_specs(raw_meta.get("install", [])),
+        # Community-declared risk/capabilities are advisory upstream values,
+        # not authority to activate local execution paths.
+        risk_level="",
+        capabilities=[],
+    )
 
 
 def _validated_skill_name(value: object) -> str:
@@ -287,11 +461,10 @@ def resolve_skill_metadata(frontmatter: dict) -> SkillPlatformMeta | None:
         requires=requires,
         install=install_specs,
         risk_level=str(
-            raw_meta.get("risk")
-            or raw_meta.get("risk_level")
-            or raw_meta.get("riskLevel")
-            or ""
-        ).strip().lower(),
+            raw_meta.get("risk") or raw_meta.get("risk_level") or raw_meta.get("riskLevel") or ""
+        )
+        .strip()
+        .lower(),
         capabilities=_string_list(raw_meta.get("capabilities", [])),
     )
 
@@ -318,17 +491,81 @@ def skill_instance_id(*, layer: SkillLayer, file_path: str) -> str:
     return f"{layer.value}:{digest}"
 
 
+def _compile_community_instruction_manifest(
+    skill_dir: Path,
+    layer: SkillLayer,
+    frontmatter: dict,
+    body: str,
+) -> SkillSpec:
+    """Project an untrusted Community manifest onto inert instruction semantics."""
+
+    raw_name = _validated_skill_name(frontmatter.get("name"))
+    name = raw_name.strip()
+    raw_description = frontmatter.get("description", "")
+    description = raw_description if isinstance(raw_description, str) else ""
+    raw_description_zh = frontmatter.get("description_zh", "")
+    description_zh = raw_description_zh if isinstance(raw_description_zh, str) else ""
+    metadata = resolve_community_skill_metadata(frontmatter)
+    provenance = resolve_skill_provenance(frontmatter)
+    homepage_raw = frontmatter.get("homepage", "")
+    homepage = homepage_raw.strip() if isinstance(homepage_raw, str) else ""
+    if not homepage and metadata is not None:
+        homepage = metadata.homepage
+
+    file_path = os.path.abspath(skill_dir / "SKILL.md")
+    return SkillSpec(
+        name=name,
+        description=description,
+        description_zh=description_zh,
+        layer=layer,
+        # Third-party Skills cannot become ambient/always-on prompt content.
+        always=False,
+        triggers=[],
+        content=body,
+        path=skill_dir,
+        metadata=metadata,
+        provenance=provenance,
+        user_invocable=_explicit_bool(
+            frontmatter.get("user-invocable", True),
+            default=True,
+        ),
+        disable_model_invocation=_explicit_bool(
+            frontmatter.get("disable-model-invocation", False),
+            default=False,
+        ),
+        homepage=homepage,
+        file_path=file_path,
+        base_dir=str(skill_dir.resolve()),
+        # All OpenSquilla-native execution and meta-orchestration fields are
+        # deliberately empty at this trust boundary.
+        requires_tools=[],
+        fallback_for_toolsets=[],
+        kind="skill",
+        meta_priority=0,
+        composition_raw=None,
+        final_text_mode="auto",
+        request_template={},
+        output_contract={},
+        eval_prompts=[],
+        preference_keys=[],
+        policy_tags=[],
+        entrypoint=None,
+        instance_id=skill_instance_id(layer=layer, file_path=file_path),
+    )
+
+
 def compile_skill_manifest(
     skill_dir: Path,
     layer: SkillLayer,
     *,
     skill_bytes: bytes | None = None,
+    profile: SkillCompileProfile = SkillCompileProfile.TRUSTED,
 ) -> SkillSpec:
-    """Compile one SKILL.md into a runtime spec using tolerant semantics.
+    """Compile one SKILL.md using the requested trust-boundary profile.
 
-    This function intentionally does not enforce the Agent Skills naming
-    profile.  Existing local layers may contain legacy uppercase names or
-    loosely typed optional fields and must continue to load after upgrade.
+    The default intentionally preserves historical tolerant semantics for
+    trusted local layers. ``COMMUNITY_INSTRUCTION`` uses strict, unambiguous
+    YAML parsing and strips every host-executable extension.
     """
 
     skill_file = skill_dir / "SKILL.md"
@@ -339,9 +576,20 @@ def compile_skill_manifest(
         raise ValueError(f"SKILL.md exceeds {MAX_SKILL_FILE_BYTES} bytes")
 
     text = skill_bytes.decode("utf-8")
-    frontmatter, body = parse_skill_frontmatter(text)
+    if profile is SkillCompileProfile.COMMUNITY_INSTRUCTION:
+        frontmatter, body = _parse_skill_frontmatter_strict(text)
+    else:
+        frontmatter, body = parse_skill_frontmatter(text)
     if not frontmatter or "name" not in frontmatter:
         raise ValueError("SKILL.md has no usable frontmatter name")
+
+    if profile is SkillCompileProfile.COMMUNITY_INSTRUCTION:
+        return _compile_community_instruction_manifest(
+            skill_dir,
+            layer,
+            frontmatter,
+            body,
+        )
 
     name = _validated_skill_name(frontmatter["name"])
     description = frontmatter.get("description", "")
@@ -391,13 +639,9 @@ def compile_skill_manifest(
         str(final_text_mode_raw).strip() if final_text_mode_raw else "auto"
     ) or "auto"
     request_template_raw = frontmatter.get("request_template")
-    request_template = (
-        dict(request_template_raw) if isinstance(request_template_raw, dict) else {}
-    )
+    request_template = dict(request_template_raw) if isinstance(request_template_raw, dict) else {}
     output_contract_raw = frontmatter.get("output_contract")
-    output_contract = (
-        dict(output_contract_raw) if isinstance(output_contract_raw, dict) else {}
-    )
+    output_contract = dict(output_contract_raw) if isinstance(output_contract_raw, dict) else {}
     eval_prompts_raw = frontmatter.get("eval_prompts")
     eval_prompts = (
         [dict(item) for item in eval_prompts_raw if isinstance(item, dict)]
@@ -542,8 +786,7 @@ def _validate_platform_metadata_mapping(
 
     installs = metadata.get("install")
     if installs is not None and (
-        not isinstance(installs, list)
-        or any(not isinstance(item, dict) for item in installs)
+        not isinstance(installs, list) or any(not isinstance(item, dict) for item in installs)
     ):
         diagnostics.append(
             _diagnostic(
@@ -585,11 +828,11 @@ def _validate_known_manifest_types(
     diagnostics: list[dict[str, str]] = []
 
     for field in ("user-invocable", "disable-model-invocation", "always"):
-        if field in frontmatter and not isinstance(frontmatter[field], bool):
+        if field in frontmatter and not _is_explicit_bool(frontmatter[field]):
             diagnostics.append(
                 _diagnostic(
                     "FIELD_TYPE_INVALID",
-                    f"{field} must be a boolean",
+                    f"{field} has no recognized boolean value and will use its default",
                     path=path,
                     field=field,
                 )
@@ -755,7 +998,7 @@ def _validate_unsupported_dialect_fields(
                     "DIALECT_FIELD_UNSUPPORTED",
                     (
                         f"{field} changes dialect-specific execution semantics "
-                        "and is not supported for Hub installation"
+                        "and will be ignored by the instruction-only Community loader"
                     ),
                     path=path,
                     field=field,
@@ -848,10 +1091,7 @@ def _validate_degraded_body_features(
     *,
     path: Path,
 ) -> list[dict[str, str]]:
-    if not (
-        _INLINE_DYNAMIC_CONTEXT_RE.search(body)
-        or _FENCED_DYNAMIC_CONTEXT_RE.search(body)
-    ):
+    if not (_INLINE_DYNAMIC_CONTEXT_RE.search(body) or _FENCED_DYNAMIC_CONTEXT_RE.search(body)):
         return []
     return [
         _diagnostic(
@@ -870,17 +1110,19 @@ def validate_hub_candidate(
     skill_dir: Path,
     *,
     expected_name: str | None = None,
+    allowed_legacy_name: str | None = None,
     layer: SkillLayer = SkillLayer.MANAGED,
 ) -> SkillManifestValidation:
-    """Strictly validate a freshly downloaded Hub candidate before commit.
+    """Validate and project a freshly downloaded Community candidate.
 
-    The strict profile follows the portable Agent Skills core: a canonical
-    lowercase-hyphenated name of at most 64 characters, a non-empty string
-    description of at most 1024 characters, and directory/name alignment.
-    Unknown descriptive extension keys remain allowed. Dialect-specific fields
-    that change execution, tool, agent, plugin, or MCP semantics are rejected
-    rather than silently ignored.
+    The artifact boundary remains strict about bytes, paths, and unambiguous
+    YAML. Authoring-profile differences are compatibility observations: source,
+    storage, and runtime names may differ, and unsupported host extensions are
+    inert rather than installation blockers. ``allowed_legacy_name`` remains an
+    accepted no-op parameter for callers from the previous compatibility shim.
     """
+
+    del allowed_legacy_name, expected_name
 
     skill_file = skill_dir / "SKILL.md"
     diagnostics: list[dict[str, str]] = []
@@ -929,9 +1171,7 @@ def validate_hub_candidate(
     except OSError as exc:
         return SkillManifestValidation(
             spec=None,
-            diagnostics=(
-                _diagnostic("MANIFEST_READ_FAILED", str(exc), path=skill_file),
-            ),
+            diagnostics=(_diagnostic("MANIFEST_READ_FAILED", str(exc), path=skill_file),),
         )
     if len(skill_bytes) > MAX_SKILL_FILE_BYTES:
         return SkillManifestValidation(
@@ -949,9 +1189,7 @@ def validate_hub_candidate(
     except UnicodeDecodeError as exc:
         return SkillManifestValidation(
             spec=None,
-            diagnostics=(
-                _diagnostic("MANIFEST_NOT_UTF8", str(exc), path=skill_file),
-            ),
+            diagnostics=(_diagnostic("MANIFEST_NOT_UTF8", str(exc), path=skill_file),),
         )
 
     try:
@@ -959,13 +1197,11 @@ def validate_hub_candidate(
     except ValueError as exc:
         return SkillManifestValidation(
             spec=None,
-            diagnostics=(
-                _diagnostic("FRONTMATTER_INVALID", str(exc), path=skill_file),
-            ),
+            diagnostics=(_diagnostic("FRONTMATTER_INVALID", str(exc), path=skill_file),),
         )
 
     raw_name = frontmatter.get("name")
-    if not isinstance(raw_name, str) or not raw_name:
+    if not isinstance(raw_name, str) or not raw_name.strip():
         diagnostics.append(
             _diagnostic(
                 "NAME_INVALID",
@@ -974,66 +1210,6 @@ def validate_hub_candidate(
                 field="name",
             )
         )
-        name = ""
-    else:
-        name = raw_name
-        if len(name) > MAX_STANDARD_SKILL_NAME_LENGTH:
-            diagnostics.append(
-                _diagnostic(
-                    "NAME_INVALID",
-                    (
-                        "name exceeds "
-                        f"{MAX_STANDARD_SKILL_NAME_LENGTH} characters ({len(name)})"
-                    ),
-                    path=skill_file,
-                    field="name",
-                )
-            )
-        if not _STANDARD_SKILL_NAME_RE.fullmatch(name):
-            diagnostics.append(
-                _diagnostic(
-                    "NAME_INVALID",
-                    "name must contain only lowercase a-z, 0-9, and hyphens",
-                    path=skill_file,
-                    field="name",
-                )
-            )
-        if name.startswith("-") or name.endswith("-"):
-            diagnostics.append(
-                _diagnostic(
-                    "NAME_INVALID",
-                    "name must not start or end with a hyphen",
-                    path=skill_file,
-                    field="name",
-                )
-            )
-        if "--" in name:
-            diagnostics.append(
-                _diagnostic(
-                    "NAME_INVALID",
-                    "name must not contain consecutive hyphens",
-                    path=skill_file,
-                    field="name",
-                )
-            )
-        if skill_dir.name != name:
-            diagnostics.append(
-                _diagnostic(
-                    "NAME_DIRECTORY_MISMATCH",
-                    f"frontmatter name {name!r} must match directory {skill_dir.name!r}",
-                    path=skill_file,
-                    field="name",
-                )
-            )
-        if expected_name is not None and expected_name != name:
-            diagnostics.append(
-                _diagnostic(
-                    "NAME_SOURCE_MISMATCH",
-                    f"frontmatter name {name!r} does not match source name {expected_name!r}",
-                    path=skill_file,
-                    field="name",
-                )
-            )
 
     description = frontmatter.get("description")
     if not isinstance(description, str) or not description.strip():
@@ -1045,29 +1221,18 @@ def validate_hub_candidate(
                 field="description",
             )
         )
-    elif len(description) > MAX_STANDARD_SKILL_DESCRIPTION_LENGTH:
-        diagnostics.append(
-            _diagnostic(
-                "DESCRIPTION_INVALID",
-                (
-                    "description exceeds "
-                    f"{MAX_STANDARD_SKILL_DESCRIPTION_LENGTH} characters "
-                    f"({len(description)})"
-                ),
-                path=skill_file,
-                field="description",
-            )
-        )
-
-    diagnostics.extend(_validate_unsupported_dialect_fields(frontmatter, path=skill_file))
-    compatibility_diagnostics = _validate_degraded_dialect_fields(
-        frontmatter,
-        path=skill_file,
+    compatibility_diagnostics: list[dict[str, str]] = []
+    compatibility_diagnostics.extend(
+        _validate_unsupported_dialect_fields(frontmatter, path=skill_file)
     )
     compatibility_diagnostics.extend(
-        _validate_degraded_body_features(body, path=skill_file)
+        _validate_degraded_dialect_fields(
+            frontmatter,
+            path=skill_file,
+        )
     )
-    diagnostics.extend(_validate_known_manifest_types(frontmatter, path=skill_file))
+    compatibility_diagnostics.extend(_validate_degraded_body_features(body, path=skill_file))
+    compatibility_diagnostics.extend(_validate_known_manifest_types(frontmatter, path=skill_file))
     if diagnostics:
         return SkillManifestValidation(
             spec=None,
@@ -1076,13 +1241,16 @@ def validate_hub_candidate(
         )
 
     try:
-        spec = compile_skill_manifest(skill_dir, layer, skill_bytes=skill_bytes)
+        spec = compile_skill_manifest(
+            skill_dir,
+            layer,
+            skill_bytes=skill_bytes,
+            profile=SkillCompileProfile.COMMUNITY_INSTRUCTION,
+        )
     except (OSError, UnicodeDecodeError, TypeError, ValueError) as exc:
         return SkillManifestValidation(
             spec=None,
-            diagnostics=(
-                _diagnostic("MANIFEST_COMPILE_FAILED", str(exc), path=skill_file),
-            ),
+            diagnostics=(_diagnostic("MANIFEST_COMPILE_FAILED", str(exc), path=skill_file),),
         )
     return SkillManifestValidation(
         spec=spec,
@@ -1092,10 +1260,12 @@ def validate_hub_candidate(
 
 __all__ = [
     "MAX_SKILL_FILE_BYTES",
+    "SkillCompileProfile",
     "SkillManifestValidation",
     "compile_skill_manifest",
     "parse_skill_frontmatter",
     "resolve_skill_metadata",
+    "resolve_community_skill_metadata",
     "resolve_skill_provenance",
     "skill_instance_id",
     "validate_hub_candidate",

@@ -21,7 +21,13 @@ from opensquilla.skills.hub.defaults import (
     installed_skill_lockfile,
 )
 from opensquilla.skills.hub.identity import is_skill_meta_installed
+from opensquilla.skills.hub.installer import (
+    supported_keyword_arguments,
+    supports_keyword_argument,
+    unsupported_installer_result,
+)
 from opensquilla.skills.hub.management import SkillManagementService
+from opensquilla.skills.hub.router import search_router_with_diagnostics
 from opensquilla.skills.types import SkillInstallSpec, SkillLayer, SkillSpec
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
@@ -156,19 +162,29 @@ def _managed_resource_manifest(
     lockfile = Lockfile.load(selected_lockfile)
     if lockfile.mutation_blocked:
         return ()
-    entry = lockfile.get(str(getattr(skill, "name", "") or ""))
-    if entry is None or not entry.parser_version:
-        return None
     target = Path(str(getattr(skill, "base_dir", "") or ""))
-    if entry.relative_path and entry.relative_path == target.name:
-        recorded = target
-    else:
-        recorded = Path(entry.path) if entry.path else target
     try:
-        if recorded.resolve(strict=False) != target.resolve(strict=False):
-            return ()
+        target_key = target.resolve(strict=False)
     except (OSError, ValueError):
         return ()
+    matches = []
+    for storage_key, entry in lockfile.installed.items():
+        relative = entry.relative_path or entry.directory_name or storage_key
+        recorded = target.parent / relative
+        if not entry.relative_path and not entry.directory_name and entry.path:
+            recorded = Path(entry.path)
+            if not recorded.is_absolute():
+                recorded = target.parent / recorded
+        try:
+            if recorded.resolve(strict=False) == target_key:
+                matches.append(entry)
+        except (OSError, ValueError):
+            continue
+    if len(matches) != 1:
+        return () if matches else None
+    entry = matches[0]
+    if not entry.parser_version:
+        return None
     raw_files = entry.extra.get("files", [])
     if not isinstance(raw_files, list):
         return ()
@@ -528,21 +544,32 @@ def create_skill_tools(
         if source_id in {"all", "*"}:
             source_id = None
         router = injected_skill_router or get_default_skill_router()
-        results = await router.search(clean_query, limit=result_limit, source_id=source_id)
+        report = await search_router_with_diagnostics(
+            router,
+            clean_query,
+            limit=result_limit,
+            source_id=source_id,
+        )
         if resource_lockfile_path is not None:
             from opensquilla.skills.hub.lockfile import Lockfile
 
             installed = Lockfile.load(resource_lockfile_path)
         else:
             installed = installed_skill_lockfile()
-        return json.dumps(
-            {
-                "status": "ok",
-                "query": clean_query,
-                "source": source_id or "all",
-                "results": [_community_result_to_dict(row, installed) for row in results],
-            }
-        )
+        payload: dict[str, Any] = {
+            "status": "ok",
+            "query": clean_query,
+            "source": source_id or "all",
+            "results": [
+                _community_result_to_dict(row, installed) for row in report.results
+            ],
+        }
+        if report.diagnostics:
+            payload["diagnostics"] = [item.to_dict() for item in report.diagnostics]
+            payload["partial"] = report.partial
+            payload["allSourcesUnavailable"] = report.all_sources_unavailable
+            payload["status"] = "partial" if report.partial else "unavailable"
+        return json.dumps(payload)
 
     @tool(
         name="skill_install_community",
@@ -567,9 +594,18 @@ def create_skill_tools(
             "force": {
                 "type": "boolean",
                 "description": (
-                    "Override a dangerous security scan only after the user explicitly asks."
+                    "Acknowledge a dangerous security scan only after the user explicitly asks."
                 ),
                 "default": False,
+            },
+            "risk_confirmation": {
+                "type": "string",
+                "description": (
+                    "Exact confirmationToken returned by the prior "
+                    "SCAN_CONFIRMATION_REQUIRED diagnostic. It is valid only for "
+                    "that resolved artifact."
+                ),
+                "default": "",
             },
             "replace_source": {
                 "type": "boolean",
@@ -587,6 +623,7 @@ def create_skill_tools(
         identifier: str,
         source: str = "clawhub",
         force: bool = False,
+        risk_confirmation: str = "",
         replace_source: bool = False,
     ) -> str:
         if _loader is None:
@@ -596,37 +633,74 @@ def create_skill_tools(
         clean_identifier = str(identifier or "").strip()
         if not clean_identifier:
             raise ToolError("identifier must not be empty")
+        if not isinstance(risk_confirmation, str):
+            raise ToolError("risk_confirmation must be a string")
+        clean_risk_confirmation = risk_confirmation.strip()
+        if clean_risk_confirmation and not force:
+            raise ToolError("risk_confirmation requires force=true")
         source_id = str(source or "clawhub").strip() or "clawhub"
 
         installer: Any = management_service
         if installer is None:
-            try:
-                installer = build_default_skill_installer(
-                    managed_dir=_loader.managed_dir,
-                    loader=_loader,
-                    offline=False,
-                )
-            except TypeError:
-                installer = build_default_skill_installer(managed_dir=_loader.managed_dir)
+            builder_kwargs = {
+                "managed_dir": _loader.managed_dir,
+                **supported_keyword_arguments(
+                    build_default_skill_installer,
+                    {"loader": _loader, "offline": False},
+                ),
+            }
+            installer = build_default_skill_installer(**builder_kwargs)
         if isinstance(installer, SkillManagementService):
             result = await installer.install(
                 clean_identifier,
                 source_id,
                 force=force,
                 replace_source=replace_source,
+                risk_confirmation=clean_risk_confirmation,
             )
         else:
-            try:
-                with _loader.mutation_guard(reason="tool.skill_install_community"):
-                    result = await installer.install(
-                        clean_identifier,
-                        source_id,
-                        force=force,
-                    )
-                    if not result.success:
-                        raise _NoCatalogMutationError(result)
-            except _NoCatalogMutationError as exc:
-                result = exc.result
+            install = installer.install
+            if replace_source and not supports_keyword_argument(install, "replace_source"):
+                result = unsupported_installer_result(
+                    operation="install",
+                    capability="replaceSource",
+                    name=clean_identifier,
+                )
+            elif force and not supports_keyword_argument(install, "force"):
+                result = unsupported_installer_result(
+                    operation="install",
+                    capability="force",
+                    name=clean_identifier,
+                )
+            elif force and (
+                not clean_risk_confirmation
+                or not supports_keyword_argument(install, "risk_confirmation")
+            ):
+                result = unsupported_installer_result(
+                    operation="install",
+                    capability="riskConfirmation",
+                    name=clean_identifier,
+                )
+            else:
+                install_kwargs = supported_keyword_arguments(
+                    install,
+                    {
+                        "force": force,
+                        "replace_source": replace_source,
+                        "risk_confirmation": clean_risk_confirmation,
+                    },
+                )
+                try:
+                    with _loader.mutation_guard(reason="tool.skill_install_community"):
+                        result = await install(
+                            clean_identifier,
+                            source_id,
+                            **install_kwargs,
+                        )
+                        if not result.success:
+                            raise _NoCatalogMutationError(result)
+                except _NoCatalogMutationError as exc:
+                    result = exc.result
 
         serializer = getattr(result, "to_dict", None)
         payload: dict[str, Any] = dict(serializer()) if callable(serializer) else {}

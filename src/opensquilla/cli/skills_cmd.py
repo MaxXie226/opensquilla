@@ -10,6 +10,7 @@ from typing import Any
 import typer
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from opensquilla.cli.gateway_rpc import (
     default_gateway_token,
@@ -19,6 +20,7 @@ from opensquilla.cli.gateway_rpc import (
 )
 from opensquilla.cli.output import emit_error, print_json
 from opensquilla.cli.ui import ACCENT, console
+from opensquilla.skills.hub.router import search_router_with_diagnostics
 
 skills_app = typer.Typer(help="Skill management - list, search, install, uninstall.")
 
@@ -33,6 +35,34 @@ def _install_result_payload(result: Any) -> dict[str, Any]:
     if scan is None:
         payload.pop("scan", None)
     return payload
+
+
+def _risk_confirmation_token(payload: dict[str, Any]) -> str:
+    diagnostics = payload.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        return ""
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        if diagnostic.get("code") != "SCAN_CONFIRMATION_REQUIRED":
+            continue
+        details = diagnostic.get("details")
+        if not isinstance(details, dict):
+            return ""
+        token = details.get("confirmationToken")
+        return token.strip() if isinstance(token, str) else ""
+    return ""
+
+
+def _print_risk_confirmation_hint(payload: dict[str, Any], *, name: str = "") -> None:
+    token = _risk_confirmation_token(payload)
+    if not token:
+        return
+    target = f" for {name!r}" if name else ""
+    console.print(
+        "[yellow]Review the scanner findings, then retry"
+        f"{target} with --force --risk-confirmation {token}[/]"
+    )
 
 
 async def _try_gateway_skill_mutation(
@@ -129,6 +159,7 @@ def _emit_skill_mutation_result(
         return
 
     console.print(f"[red]Failed:[/] {message or name}")
+    _print_risk_confirmation_hint(payload, name=name)
     raise typer.Exit(1)
 
 
@@ -559,32 +590,64 @@ def skills_list(
 def skills_search(
     query: str = typer.Argument(..., help="Search query"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    include_diagnostics: bool = typer.Option(
+        False,
+        "--include-diagnostics",
+        help="With --json, wrap results and source diagnostics in an object",
+    ),
 ) -> None:
     """Search for skills across Community sources."""
+
+    if include_diagnostics and not json_output:
+        raise typer.BadParameter("--include-diagnostics requires --json")
 
     async def _search() -> None:
         from opensquilla.skills.hub.defaults import get_default_skill_router
 
         router = get_default_skill_router()
-        results = await router.search(query, limit=20)
+        report = await search_router_with_diagnostics(router, query, limit=20)
+        results = report.results
 
         if json_output:
-            print_json([asdict(result) for result in results])
+            rows = [asdict(result) for result in results]
+            if not include_diagnostics:
+                print_json(rows)
+                return
+            print_json(
+                {
+                    "results": rows,
+                    "diagnostics": [item.to_dict() for item in report.diagnostics],
+                    "partial": report.partial,
+                    "allSourcesUnavailable": report.all_sources_unavailable,
+                }
+            )
             return
 
-        if not results:
+        if not results and not report.diagnostics:
             console.print(f"[dim]No results for '{query}'[/]")
             return
 
-        table = Table(title=f"Search: {query}")
-        table.add_column("Name", style=ACCENT)
-        table.add_column("Source")
-        table.add_column("Trust")
-        table.add_column("Description")
+        if results:
+            table = Table(title=f"Search: {query}")
+            table.add_column("Name", style=ACCENT)
+            table.add_column("Source")
+            table.add_column("Trust")
+            table.add_column("Description")
 
-        for r in results:
-            table.add_row(r.name, r.source_id, r.trust_level, r.description[:60])
-        console.print(table)
+            for r in results:
+                table.add_row(r.name, r.source_id, r.trust_level, r.description[:60])
+            console.print(table)
+
+        for diagnostic in report.diagnostics:
+            line = Text()
+            line.append(f"{diagnostic.code}: ", style="yellow" if results else "red")
+            line.append(diagnostic.message)
+            retry_after = diagnostic.details.get("retryAfter")
+            if isinstance(retry_after, (str, int)) and str(retry_after):
+                line.append(f" Retry after: {str(retry_after)[:80]}.")
+            console.print(line)
+            if diagnostic.hint:
+                console.print(Text(diagnostic.hint, style="dim"))
 
     asyncio.run(_search())
 
@@ -629,22 +692,42 @@ def skills_view(
 @skills_app.command("update")
 def skills_update(
     name: str | None = typer.Argument(None, help="Skill name to update"),
+    install_id: str = typer.Option(
+        "",
+        "--install-id",
+        help="Exact managed install identity to update",
+    ),
     all_skills: bool = typer.Option(False, "--all", help="Update all managed skills"),
     force: bool = typer.Option(
         False,
         "--force",
         help="Accept a dangerous scanner verdict for this update only",
     ),
+    risk_confirmation: str = typer.Option(
+        "",
+        "--risk-confirmation",
+        help="Exact confirmationToken returned for the reviewed update artifact",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Update one managed skill, or all managed skills."""
-    if bool(name) == all_skills:
-        raise typer.BadParameter("provide exactly one of NAME or --all")
+    if sum((bool(name), bool(install_id), all_skills)) != 1:
+        raise typer.BadParameter("provide exactly one of NAME, --install-id, or --all")
+    if risk_confirmation and not force:
+        raise typer.BadParameter("--risk-confirmation requires --force")
 
     async def _update() -> dict[str, Any]:
-        params: dict[str, Any] = {} if all_skills else {"name": name}
+        params: dict[str, Any] = (
+            {}
+            if all_skills
+            else {"installId": install_id}
+            if install_id
+            else {"name": name}
+        )
         if force:
             params["force"] = True
+        if risk_confirmation:
+            params["riskConfirmation"] = risk_confirmation
         payload = await _try_gateway_skill_mutation(
             "skills.update",
             params,
@@ -655,14 +738,52 @@ def skills_update(
 
         from opensquilla.paths import default_opensquilla_home
         from opensquilla.profile_operation_lock import ProfileOperationLock
+        from opensquilla.skills.hub.installer import (
+            supported_keyword_arguments,
+            supports_keyword_argument,
+            unsupported_installer_result,
+        )
 
         profile_home = default_opensquilla_home()
         with ProfileOperationLock(profile_home):
             service, _ = _offline_management_service()
             _recover_offline_management_service(service)
-            offline_results = await service.update(
-                None if all_skills else name,
-                force=force,
+            update = service.update
+            if install_id and not supports_keyword_argument(update, "install_id"):
+                unsupported = unsupported_installer_result(
+                    operation="update",
+                    capability="installId",
+                    name=str(name or ""),
+                    install_id=install_id,
+                )
+                return {**_install_result_payload(unsupported), "results": []}
+            if force and not supports_keyword_argument(update, "force"):
+                unsupported = unsupported_installer_result(
+                    operation="update",
+                    capability="force",
+                    name=str(name or ""),
+                    install_id=install_id,
+                )
+                return {**_install_result_payload(unsupported), "results": []}
+            if force and not supports_keyword_argument(update, "risk_confirmation"):
+                unsupported = unsupported_installer_result(
+                    operation="update",
+                    capability="riskConfirmation",
+                    name=str(name or ""),
+                    install_id=install_id,
+                )
+                return {**_install_result_payload(unsupported), "results": []}
+            update_kwargs = supported_keyword_arguments(
+                update,
+                {
+                    "install_id": install_id,
+                    "force": force,
+                    "risk_confirmation": risk_confirmation,
+                },
+            )
+            offline_results = await update(
+                None if all_skills or install_id else name,
+                **update_kwargs,
             )
         return {
             "results": [_install_result_payload(result) for result in offline_results],
@@ -703,6 +824,12 @@ def skills_update(
         message = payload.get("message") if isinstance(payload, dict) else None
         if message:
             console.print(str(message))
+        for row in results:
+            if isinstance(row, dict):
+                _print_risk_confirmation_hint(
+                    row,
+                    name=str(row.get("name") or name or install_id),
+                )
     if failures or top_level_failure:
         raise typer.Exit(1)
 
@@ -772,6 +899,11 @@ def skills_install(
         "-f",
         help="Accept a dangerous scanner verdict; path, schema, and postflight checks still apply",
     ),
+    risk_confirmation: str = typer.Option(
+        "",
+        "--risk-confirmation",
+        help="Exact confirmationToken returned for the reviewed install artifact",
+    ),
     replace_source: bool = typer.Option(
         False,
         "--replace-source",
@@ -781,6 +913,9 @@ def skills_install(
 ) -> None:
     """Install a skill from a Community source."""
 
+    if risk_confirmation and not force:
+        raise typer.BadParameter("--risk-confirmation requires --force")
+
     async def _install() -> None:
         rpc_params: dict[str, Any] = {
             "identifier": identifier,
@@ -789,6 +924,8 @@ def skills_install(
         }
         if replace_source:
             rpc_params["replaceSource"] = True
+        if risk_confirmation:
+            rpc_params["riskConfirmation"] = risk_confirmation
         payload = await _try_gateway_skill_mutation(
             "skills.install",
             rpc_params,
@@ -805,6 +942,11 @@ def skills_install(
 
         from opensquilla.paths import default_opensquilla_home
         from opensquilla.profile_operation_lock import ProfileOperationLock
+        from opensquilla.skills.hub.installer import (
+            supported_keyword_arguments,
+            supports_keyword_argument,
+            unsupported_installer_result,
+        )
 
         profile_home = default_opensquilla_home()
 
@@ -813,15 +955,39 @@ def skills_install(
         with ProfileOperationLock(profile_home):
             installer, _ = _offline_management_service()
             _recover_offline_management_service(installer)
-            try:
-                result = await installer.install(
+            install = installer.install
+            if replace_source and not supports_keyword_argument(install, "replace_source"):
+                result = unsupported_installer_result(
+                    operation="install",
+                    capability="replaceSource",
+                    name=identifier,
+                )
+            elif force and not supports_keyword_argument(install, "force"):
+                result = unsupported_installer_result(
+                    operation="install",
+                    capability="force",
+                    name=identifier,
+                )
+            elif force and not supports_keyword_argument(install, "risk_confirmation"):
+                result = unsupported_installer_result(
+                    operation="install",
+                    capability="riskConfirmation",
+                    name=identifier,
+                )
+            else:
+                install_kwargs = supported_keyword_arguments(
+                    install,
+                    {
+                        "force": force,
+                        "replace_source": replace_source,
+                        "risk_confirmation": risk_confirmation,
+                    },
+                )
+                result = await install(
                     identifier,
                     source,
-                    force=force,
-                    replace_source=replace_source,
+                    **install_kwargs,
                 )
-            except TypeError:
-                result = await installer.install(identifier, source, force=force)
 
         if json_output:
             print_json(_install_result_payload(result))
@@ -840,6 +1006,10 @@ def skills_install(
                 )
         else:
             console.print(f"[red]Failed:[/] {result.message}")
+            _print_risk_confirmation_hint(
+                _install_result_payload(result),
+                name=identifier,
+            )
             raise typer.Exit(1)
 
     asyncio.run(_install())
@@ -847,7 +1017,12 @@ def skills_install(
 
 @skills_app.command("uninstall")
 def skills_uninstall(
-    name: str = typer.Argument(..., help="Skill name to remove"),
+    name: str | None = typer.Argument(None, help="Skill name to remove"),
+    install_id: str = typer.Option(
+        "",
+        "--install-id",
+        help="Exact managed install identity to remove",
+    ),
     allow_drift: bool = typer.Option(
         False,
         "--allow-drift",
@@ -856,9 +1031,13 @@ def skills_uninstall(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Uninstall a managed skill."""
+    if bool(name) == bool(install_id):
+        raise typer.BadParameter("provide exactly one of NAME or --install-id")
 
     async def _uninstall() -> None:
-        rpc_params: dict[str, Any] = {"name": name}
+        rpc_params: dict[str, Any] = (
+            {"installId": install_id} if install_id else {"name": name}
+        )
         if allow_drift:
             rpc_params["allowDrift"] = True
         payload = await _try_gateway_skill_mutation(
@@ -871,21 +1050,44 @@ def skills_uninstall(
                 payload,
                 json_output=json_output,
                 success_label="Uninstalled",
-                fallback_name=name,
+                fallback_name=name or install_id,
             )
             return
 
         from opensquilla.paths import default_opensquilla_home
         from opensquilla.profile_operation_lock import ProfileOperationLock
+        from opensquilla.skills.hub.installer import (
+            supported_keyword_arguments,
+            supports_keyword_argument,
+            unsupported_installer_result,
+        )
 
         profile_home = default_opensquilla_home()
         with ProfileOperationLock(profile_home):
             installer, _ = _offline_management_service()
             _recover_offline_management_service(installer)
-            try:
-                result = await installer.uninstall(name, allow_drift=allow_drift)
-            except TypeError:
-                result = await installer.uninstall(name)
+            uninstall = installer.uninstall
+            if install_id and not supports_keyword_argument(uninstall, "install_id"):
+                result = unsupported_installer_result(
+                    operation="uninstall",
+                    capability="installId",
+                    name=name or "",
+                    install_id=install_id,
+                )
+            elif allow_drift and not supports_keyword_argument(uninstall, "allow_drift"):
+                result = unsupported_installer_result(
+                    operation="uninstall",
+                    capability="allowDrift",
+                    name=name or "",
+                    install_id=install_id,
+                )
+            else:
+                uninstall_kwargs = supported_keyword_arguments(
+                    uninstall,
+                    {"install_id": install_id, "allow_drift": allow_drift},
+                )
+                uninstall_name = "" if install_id else name or ""
+                result = await uninstall(uninstall_name, **uninstall_kwargs)
 
         if json_output:
             print_json(_install_result_payload(result))

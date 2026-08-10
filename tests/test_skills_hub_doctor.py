@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -16,13 +17,54 @@ from opensquilla.skills.hub.contracts import (
     SkillSelectionState,
 )
 from opensquilla.skills.hub.doctor import SkillDoctor, doctor
-from opensquilla.skills.hub.lockfile import LockEntry, Lockfile, compute_tree_sha256
+from opensquilla.skills.hub.lockfile import (
+    LockEntry,
+    Lockfile,
+    compute_sha256,
+    compute_tree_sha256,
+)
 from opensquilla.skills.hub.transaction import (
     SkillTransactionJournal,
     rollback_root,
     staging_root,
 )
 from opensquilla.skills.loader import SkillLoader
+
+_V1_WRITER_ENTRY_FIELDS = {
+    "source",
+    "identifier",
+    "version",
+    "installed_at",
+    "path",
+    "sha256",
+    "license",
+    "upstream_url",
+    "source_trust",
+    "scan_verdict",
+    "scan_strategy",
+    "scan_findings",
+}
+
+
+def _rewrite_v2_with_v1_field_filter(path: Path) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(
+        json.dumps(
+            {
+                "version": payload["version"],
+                "installed": {
+                    storage_key: {
+                        key: value
+                        for key, value in entry.items()
+                        if key in _V1_WRITER_ENTRY_FIELDS
+                    }
+                    for storage_key, entry in payload["installed"].items()
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _write_skill(
@@ -124,6 +166,74 @@ def test_doctor_reports_ignored_tool_preapproval_as_usable_degradation(
     )
     assert dynamic_diagnostic.blocking is False
     assert dynamic_diagnostic.field_name == "body.dynamic-context"
+
+
+def test_doctor_reports_v2_identity_loss_without_disabling_instruction_projection(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "managed"
+    storage_key = "package-storage"
+    runtime_name = "runtime-demo"
+    skill_dir = managed / storage_key
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {runtime_name}\n"
+        "description: Synthetic rollback Doctor fixture\n"
+        "---\n"
+        "Portable instructions.\n",
+        encoding="utf-8",
+    )
+    digest = compute_tree_sha256(skill_dir)
+    legacy_digest = compute_sha256(skill_dir)
+    lock_path = tmp_path / "skills-lock.json"
+    Lockfile(
+        installed={
+            storage_key: LockEntry(
+                source="clawhub",
+                identifier="demo",
+                path=str(skill_dir),
+                sha256=legacy_digest,
+                tree_sha256=digest,
+                install_id="install-demo",
+                manifest_name=runtime_name,
+                relative_path=storage_key,
+                requested_identifier="demo",
+                resolved_identifier="@verified-owner/demo@2.0.0",
+                resolved_revision="2.0.0",
+                source_package_id="clawhub:@verified-owner/demo",
+                parser_version="community-instruction-v1",
+                dialect="instruction-first",
+            )
+        }
+    ).save(lock_path)
+    _rewrite_v2_with_v1_field_filter(lock_path)
+
+    report = doctor(
+        managed_dir=managed,
+        lockfile_path=lock_path,
+        eligibility_context=EligibilityContext(os_name="linux"),
+    )
+
+    compatibility = next(
+        item
+        for item in report.diagnostics
+        if item.code == "LOCKFILE_IDENTITY_METADATA_LOST"
+    )
+    assert compatibility.severity is DiagnosticSeverity.WARNING
+    assert compatibility.blocking is False
+    assert report.ok is True
+    assert len(report.skills) == 1
+    item = report.skills[0]
+    assert item.name == runtime_name
+    assert item.install_id == ""
+    assert item.path == str(skill_dir)
+    assert item.lifecycle.install_state is SkillInstallState.TRACKED
+    assert item.lifecycle.load_state is SkillLoadState.VALIDATED_OFFLINE
+    assert item.lifecycle.compatibility_state is SkillCompatibilityState.INSTRUCTION_ONLY
+    assert item.resolution is not None
+    assert item.resolution.requested_identifier == "demo"
+    assert item.resolution.canonical_identifier == "demo"
 
 
 @pytest.mark.parametrize(
@@ -471,6 +581,36 @@ def test_doctor_never_follows_absolute_lockfile_target(tmp_path: Path) -> None:
         diagnostic.code for diagnostic in item.diagnostics
     }
     assert report.ok is False
+
+
+def test_doctor_v1_path_cannot_redirect_a_storage_key_to_another_child(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "managed"
+    expected = _write_skill(managed, name="storage-a")
+    other = _write_skill(managed, name="storage-b")
+    lock_path = tmp_path / "skills-lock.json"
+    Lockfile(
+        installed={
+            "storage-a": LockEntry(
+                source="clawhub",
+                identifier="storage-a",
+                path=str(other),
+                sha256=compute_tree_sha256(expected),
+            )
+        }
+    ).save(lock_path)
+
+    report = SkillDoctor(
+        managed_dir=managed,
+        lockfile_path=lock_path,
+    ).doctor()
+
+    tracked = next(item for item in report.skills if item.installed)
+    assert tracked.path == str(expected)
+    assert any(
+        item.code == "LEGACY_PATH_MISMATCH" for item in tracked.diagnostics
+    )
 
 
 def test_offline_doctor_reports_pending_journal_without_recovering_it(

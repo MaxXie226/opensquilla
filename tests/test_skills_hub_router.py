@@ -4,8 +4,14 @@ from typing import Any
 
 import pytest
 
+from opensquilla.skills.hub.contracts import DiagnosticPhase
 from opensquilla.skills.hub.router import SourceRouter
-from opensquilla.skills.hub.source import SkillBundle, SkillMeta, SourceResolution
+from opensquilla.skills.hub.source import (
+    SkillBundle,
+    SkillMeta,
+    SkillSourceFetchError,
+    SourceResolution,
+)
 
 
 class _SearchSource:
@@ -53,6 +59,72 @@ async def test_same_identifier_from_different_sources_is_not_collapsed() -> None
         ("clawhub", "demo"),
         ("github", "demo"),
     ]
+
+
+class _FailingSearchSource(_SearchSource):
+    def __init__(self, source_id: str, code: str) -> None:
+        super().__init__(source_id, [])
+        self.code = code
+
+    async def search(self, query: str, limit: int = 20) -> list[SkillMeta]:
+        raise SkillSourceFetchError.diagnostic(
+            self.code,
+            f"{self.source_id} search failed.",
+            phase=DiagnosticPhase.SOURCE,
+            details={"retryAfter": "30"} if self.code == "SOURCE_RATE_LIMITED" else {},
+        )
+
+
+class _MalformedSearchSource(_SearchSource):
+    async def search(self, query: str, limit: int = 20) -> list[SkillMeta]:
+        return {"results": "not-a-list"}  # type: ignore[return-value]
+
+
+@pytest.mark.asyncio
+async def test_search_report_keeps_partial_results_and_source_diagnostics() -> None:
+    router = SourceRouter(
+        [
+            _SearchSource("healthy", [SkillMeta(name="Demo", identifier="demo")]),
+            _FailingSearchSource("limited", "SOURCE_RATE_LIMITED"),
+        ]  # type: ignore[arg-type]
+    )
+
+    report = await router.search_with_diagnostics("demo")
+
+    assert [(row.source_id, row.identifier) for row in report.results] == [
+        ("healthy", "demo")
+    ]
+    assert [item.code for item in report.diagnostics] == ["SOURCE_RATE_LIMITED"]
+    assert report.diagnostics[0].details == {"source": "limited", "retryAfter": "30"}
+    assert report.successful_sources == ("healthy",)
+    assert report.partial is True
+    assert report.all_sources_unavailable is False
+
+
+@pytest.mark.asyncio
+async def test_search_report_distinguishes_all_failed_sources_from_valid_zero_results() -> None:
+    failed = SourceRouter(
+        [
+            _FailingSearchSource("limited", "SOURCE_RATE_LIMITED"),
+            _MalformedSearchSource("malformed", []),
+        ]  # type: ignore[arg-type]
+    )
+
+    failed_report = await failed.search_with_diagnostics("demo")
+    empty_report = await SourceRouter(
+        [_SearchSource("healthy-empty", [])]  # type: ignore[list-item]
+    ).search_with_diagnostics("demo")
+
+    assert failed_report.results == ()
+    assert [item.code for item in failed_report.diagnostics] == [
+        "SOURCE_RATE_LIMITED",
+        "SOURCE_INVALID_RESPONSE",
+    ]
+    assert failed_report.all_sources_unavailable is True
+    assert empty_report.results == ()
+    assert empty_report.diagnostics == ()
+    assert empty_report.successful_sources == ("healthy-empty",)
+    assert empty_report.all_sources_unavailable is False
 
 
 class _LegacyFetchOnlySource:

@@ -757,6 +757,151 @@ metadata:
     assert skills_filter._elig_ctx.env_cache == {}
 
 
+@pytest.mark.asyncio
+async def test_rpc_skills_deps_install_uses_exact_shadowed_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    managed = tmp_path / "managed"
+    for directory, action in (("first", "first-action"), ("second", "second-action")):
+        _write_skill(
+            managed,
+            directory,
+            f"""---
+name: shared-runtime
+description: {directory} package
+metadata:
+  opensquilla:
+    install:
+      - id: {action}
+        kind: uv
+        package: {directory}-package
+---
+Instructions.
+""",
+        )
+    lockfile = Lockfile()
+    for directory, install_identity in (("first", "install-first"), ("second", "install-second")):
+        target = managed / directory
+        lockfile.add(
+            directory,
+            LockEntry(
+                source="github",
+                identifier=f"acme/{directory}:skills/{directory}",
+                install_id=install_identity,
+                manifest_name="shared-runtime",
+                directory_name=directory,
+                relative_path=directory,
+                path=str(target),
+                sha256=compute_sha256(target),
+                parser_version="community-instruction-v1",
+                dialect="instruction-first",
+            ),
+        )
+    lockfile.save(tmp_path / "skills-lock.json")
+    loader = SkillLoader(managed_dir=managed, snapshot_path=tmp_path / "snapshot.json")
+    loader.reload(force=True, reason="test.exact-deps")
+    ctx = RpcContext(conn_id="test", skill_loader=loader)
+    observed: list[str] = []
+
+    async def fake_install_deps(specs: list[object]) -> list[DepResult]:
+        observed.append(str(getattr(specs[0], "id", "")))
+        return [DepResult(kind="uv", identifier="second-action", success=True)]
+
+    monkeypatch.setattr(rpc_skills, "install_deps", fake_install_deps)
+
+    result = await rpc_skills._handle_skills_deps_install(
+        {
+            "name": "shared-runtime",
+            "installId": "install-second",
+            "install_id": "second-action",
+        },
+        ctx,
+    )
+
+    assert result["success"] is True
+    assert observed == ["second-action"]
+
+    current = Lockfile.load(tmp_path / "skills-lock.json")
+    current.add(
+        "missing",
+        LockEntry(
+            source="github",
+            install_id="install-missing",
+            manifest_name="shared-runtime",
+            relative_path="missing",
+            parser_version="community-instruction-v1",
+        ),
+    )
+    current.save(tmp_path / "skills-lock.json")
+    with pytest.raises(KeyError, match="not loaded"):
+        await rpc_skills._handle_skills_deps_install(
+            {
+                "name": "shared-runtime",
+                "installId": "install-missing",
+                "install_id": "first-action",
+            },
+            ctx,
+        )
+    assert observed == ["second-action"]
+
+
+@pytest.mark.asyncio
+async def test_exact_rpc_identity_rejects_duplicate_install_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    managed = tmp_path / "managed"
+    _write_needs_key_skill(managed)
+    _write_skill(
+        managed,
+        "other-skill",
+        """---
+name: other-skill
+description: Other duplicate identity fixture.
+metadata:
+  opensquilla:
+    install:
+      - id: helper
+        kind: uv
+        label: Install helper
+        package: other-helper
+---
+Body.
+""",
+    )
+    Lockfile(
+        installed={
+            name: LockEntry(
+                source="github",
+                identifier=f"owner/repo:{name}",
+                relative_path=name,
+                directory_name=name,
+                manifest_name=name,
+                install_id="duplicate-install",
+                tree_sha256=compute_sha256(managed / name),
+            )
+            for name in ("needs-key", "other-skill")
+        }
+    ).save(tmp_path / "skills-lock.json")
+    loader = SkillLoader(managed_dir=managed, snapshot_path=tmp_path / "snapshot.json")
+    loader.reload(force=True, reason="test.duplicate-install-id")
+    ctx = RpcContext(conn_id="test", skill_loader=loader)
+
+    with pytest.raises(KeyError, match="identity is ambiguous"):
+        await rpc_skills._handle_skills_get(
+            {"installId": "duplicate-install"},
+            ctx,
+        )
+    with pytest.raises(KeyError, match="identity is ambiguous"):
+        await rpc_skills._handle_skills_deps_install(
+            {"installId": "duplicate-install", "install_id": "helper"},
+            ctx,
+        )
+
+
 def test_skill_payload_rolls_up_meta_subskill_requirements() -> None:
     python_skill = SkillSpec(
         name="docx",

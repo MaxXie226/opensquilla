@@ -93,7 +93,7 @@ def test_prompt_renderers_hide_locations_by_default_with_explicit_opt_in() -> No
     assert "<location>" not in injector.inject_compact("", [skill])
     assert "<location>" not in build_skills_prompt([skill])
 
-    expected = "<location>/synthetic/host/skills/portable/SKILL.md</location>"
+    expected = f"<location>{skill.path}</location>"
     assert expected in injector.inject_full("", [skill], include_location=True)
     assert expected in injector.inject_compact("", [skill], include_location=True)
     assert expected in build_skills_prompt([skill], include_location=True)

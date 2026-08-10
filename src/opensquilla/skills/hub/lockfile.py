@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from opensquilla.skills.hub.archive import normalize_relative_path
 from opensquilla.skills.hub.contracts import (
     DiagnosticPhase,
     DiagnosticSeverity,
@@ -50,6 +51,27 @@ _INTEGER_ENTRY_FIELDS = ("file_count", "total_bytes")
 _KNOWN_ENTRY_FIELDS = frozenset(
     (*_STRING_ENTRY_FIELDS, *_INTEGER_ENTRY_FIELDS, "accepted_risk_override", "scan_findings")
 )
+_V2_ONLY_ENTRY_FIELDS = frozenset(
+    {
+        "install_id",
+        "manifest_name",
+        "directory_name",
+        "relative_path",
+        "requested_identifier",
+        "resolved_identifier",
+        "resolved_version",
+        "resolved_revision",
+        "artifact_sha256",
+        "tree_sha256",
+        "file_count",
+        "total_bytes",
+        "parser_version",
+        "dialect",
+        "source_package_id",
+        "accepted_risk_override",
+    }
+)
+_DEGRADED_IDENTITY_MARKER = "_opensquilla_identity_metadata_lost"
 
 
 class LockfileMutationBlockedError(RuntimeError):
@@ -62,9 +84,20 @@ class LockfileMutationBlockedError(RuntimeError):
         super().__init__(f"Skill lockfile mutation blocked for {self.path}: {detail}")
 
 
+class LockfileIdentityAmbiguousError(LookupError):
+    """Raised when a legacy runtime-name selector matches multiple installs."""
+
+    def __init__(self, selector: str, candidates: list[str]) -> None:
+        self.selector = selector
+        self.candidates = tuple(candidates)
+        super().__init__(
+            f"Skill name {selector!r} matches multiple installs; use installId"
+        )
+
+
 @dataclass
 class LockEntry:
-    """A single installed Skill entry in the name-keyed v2 lockfile.
+    """A single installed Skill entry in the storage-keyed v2 lockfile.
 
     The original v1 fields remain first-class.  New source-resolution and
     validation fields are additive and default safely so existing installers can
@@ -107,6 +140,11 @@ class LockEntry:
     # destroyed by this version when its core schema is still understood.
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
+    # Runtime-only guard for a schema-v2 entry that passed through the legacy
+    # field-filtering writer. The persisted marker in ``extra`` keeps the guard
+    # active after safe derived fields have been reconstructed and saved.
+    identity_metadata_degraded: bool = field(default=False, repr=False, compare=False)
+
     def to_dict(self) -> dict[str, Any]:
         payload = dict(self.extra)
         for field_name in _STRING_ENTRY_FIELDS:
@@ -123,7 +161,7 @@ class LockEntry:
 
 @dataclass
 class Lockfile:
-    """Name-keyed Skill lockfile with explicit load diagnostics.
+    """Storage-keyed Skill lockfile with explicit load diagnostics.
 
     A malformed or unsupported file is readable as a diagnostic object but all
     mutation methods fail closed.  This prevents callers from silently replacing
@@ -143,7 +181,7 @@ class Lockfile:
     source_path: str = field(default="", repr=False)
 
     @staticmethod
-    def load(path: Path) -> Lockfile:
+    def load(path: Path, *, managed_dir: Path | None = None) -> Lockfile:
         """Read v2, v1, or the historical top-level ``skills`` shape.
 
         Missing files are valid empty v2 lockfiles. Parse, shape, I/O, and future
@@ -211,10 +249,55 @@ class Lockfile:
             historical=historical,
         )
         entries: dict[str, LockEntry] = {}
+        degraded_storage_keys: list[str] = []
+        recovered_runtime_names: dict[str, str] = {}
         for name, raw_entry in normalized.items():
             entry = _parse_entry(name, raw_entry, path=path, diagnostics=diagnostics)
             if entry is not None:
+                degraded = (
+                    loaded_version == LOCKFILE_SCHEMA_VERSION
+                    and _is_v2_identity_degraded(raw_entry, entry)
+                )
+                if degraded:
+                    entry.identity_metadata_degraded = True
+                    entry.extra[_DEGRADED_IDENTITY_MARKER] = True
+                    recovered_name = _recover_derived_identity(
+                        storage_key=name,
+                        entry=entry,
+                        lockfile_path=path,
+                        managed_dir=managed_dir,
+                    )
+                    degraded_storage_keys.append(name)
+                    if recovered_name:
+                        recovered_runtime_names[name] = recovered_name
                 entries[name] = entry
+
+        if degraded_storage_keys:
+            diagnostics.append(
+                _diagnostic(
+                    "LOCKFILE_IDENTITY_METADATA_LOST",
+                    (
+                        "Schema-v2 Skill identity metadata was removed by an older "
+                        "lockfile writer"
+                    ),
+                    path,
+                    blocking=False,
+                    severity=DiagnosticSeverity.WARNING,
+                    hint=(
+                        "Keep this OpenSquilla version active, then update or reinstall "
+                        "each affected Skill to restore exact source and install identity; "
+                        "restore skills-lock.json.bak first if exact installId selection is "
+                        "required."
+                    ),
+                    details={
+                        "storageKeys": degraded_storage_keys,
+                        "recoveredRuntimeNames": recovered_runtime_names,
+                    },
+                )
+            )
+
+        _validate_store_paths(entries, path=path, diagnostics=diagnostics)
+        _validate_install_ids(entries, path=path, diagnostics=diagnostics)
 
         mutation_blocked = mutation_blocked or any(item.blocking for item in diagnostics)
         extra = {
@@ -286,19 +369,93 @@ class Lockfile:
         self.loaded_version = LOCKFILE_SCHEMA_VERSION
         self.source_path = str(path)
 
-    def add(self, name: str, entry: LockEntry) -> None:
+    def add(self, storage_key: str, entry: LockEntry) -> None:
         self._ensure_mutable(self.source_path or "<memory>")
-        self.installed[name] = entry
+        self.installed[storage_key] = entry
 
-    def remove(self, name: str) -> bool:
+    def remove(self, storage_key: str) -> bool:
         self._ensure_mutable(self.source_path or "<memory>")
-        if name in self.installed:
-            del self.installed[name]
+        if storage_key in self.installed:
+            del self.installed[storage_key]
             return True
         return False
 
-    def get(self, name: str) -> LockEntry | None:
-        return self.installed.get(name)
+    def get(self, storage_key: str) -> LockEntry | None:
+        """Return an entry by its exact persisted storage key."""
+
+        return self.installed.get(storage_key)
+
+    def find_by_install_id(self, install_id: str) -> tuple[str, LockEntry] | None:
+        """Resolve one exact install identity without consulting runtime names."""
+
+        if not install_id:
+            return None
+        matches = [
+            (storage_key, entry)
+            for storage_key, entry in self.installed.items()
+            if entry.install_id == install_id
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def keys_for_manifest_name(self, name: str) -> list[str]:
+        """Return every storage key whose runtime manifest name matches ``name``."""
+
+        return [
+            storage_key
+            for storage_key, entry in self.installed.items()
+            if entry.manifest_name == name
+            or (
+                not entry.manifest_name
+                and not entry.identity_metadata_degraded
+                and storage_key == name
+            )
+        ]
+
+    def resolve_key(
+        self,
+        selector: str = "",
+        *,
+        install_id: str = "",
+    ) -> str | None:
+        """Resolve exact install id, storage key, or one unambiguous runtime name.
+
+        Runtime-name lookup is authoritative for public name selectors and
+        fails closed when two packages expose the same name. A v1 storage key
+        remains a compatibility selector only while that entry has no recorded
+        ``manifest_name`` and no runtime-name collision exists.
+        """
+
+        if install_id:
+            match = self.find_by_install_id(install_id)
+            if match is None:
+                return None
+            storage_key, _entry = match
+            if selector:
+                entry = self.installed[storage_key]
+                runtime_name = entry.manifest_name or storage_key
+                legacy_storage_selector = (
+                    not entry.manifest_name
+                    and not entry.identity_metadata_degraded
+                    and selector == storage_key
+                    and not self.keys_for_manifest_name(selector)
+                )
+                if selector != runtime_name and not legacy_storage_selector:
+                    return None
+            return storage_key
+        if not selector:
+            return None
+        matches = self.keys_for_manifest_name(selector)
+        legacy_exact = self.installed.get(selector)
+        if (
+            legacy_exact is not None
+            and not legacy_exact.manifest_name
+            and not legacy_exact.identity_metadata_degraded
+            and selector not in matches
+        ):
+            matches.append(selector)
+        if len(matches) > 1:
+            raise LockfileIdentityAmbiguousError(selector, matches)
+        return matches[0] if matches else None
 
     def _ensure_mutable(self, path: Path | str) -> None:
         if self.mutation_blocked:
@@ -326,7 +483,7 @@ def _source_index_extensions(raw: object) -> dict[tuple[str, str], dict[str, Any
             extra = {
                 key: value
                 for key, value in raw_target.items()
-                if key not in {"name", "install_id"}
+                if key not in {"name", "manifest_name", "storage_key", "install_id"}
             }
             if extra:
                 extensions[(source_id, identifier)] = extra
@@ -338,8 +495,8 @@ def _build_source_index(
     extensions: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, dict[str, dict[str, Any]]]:
     index: dict[str, dict[str, dict[str, Any]]] = {}
-    for name in sorted(installed):
-        entry = installed[name]
+    for storage_key in sorted(installed):
+        entry = installed[storage_key]
         source_id = entry.source
         identifier = (
             entry.resolved_identifier or entry.identifier or entry.requested_identifier
@@ -348,11 +505,17 @@ def _build_source_index(
             continue
         source_entries = index.setdefault(source_id, {})
         if identifier in source_entries:
-            # The name-keyed record remains authoritative. Management services
+            # The storage-keyed record remains authoritative. Management services
             # prevent new collisions; old collisions resolve deterministically.
             continue
         target = dict(extensions.get((source_id, identifier), {}))
-        target["name"] = name
+        # ``name`` was the storage-key pointer in the original v2 index. Keep
+        # that meaning for older readers and expose the runtime name additively.
+        target["name"] = storage_key
+        target["manifest_name"] = entry.manifest_name or (
+            "" if entry.identity_metadata_degraded else storage_key
+        )
+        target["storage_key"] = storage_key
         target["install_id"] = entry.install_id
         source_entries[identifier] = target
     return index
@@ -554,6 +717,161 @@ def _parse_entry(
     return LockEntry(**values)
 
 
+def _is_v2_identity_degraded(raw: object, entry: LockEntry) -> bool:
+    """Detect a v2 row rewritten by the v1 field-filtering serializer."""
+
+    if entry.extra.get(_DEGRADED_IDENTITY_MARKER) is True:
+        return True
+    if not isinstance(raw, dict):
+        return True
+    return not any(field_name in raw for field_name in _V2_ONLY_ENTRY_FIELDS)
+
+
+def _recover_derived_identity(
+    *,
+    storage_key: str,
+    entry: LockEntry,
+    lockfile_path: Path,
+    managed_dir: Path | None,
+) -> str:
+    """Recover only path/runtime fields provable from the managed tree.
+
+    Exact install ids, immutable revisions, and publisher-qualified package
+    identities are deliberately left empty. Those values cannot be derived
+    from local bytes after an older writer removed them.
+    """
+
+    try:
+        portable = normalize_relative_path(storage_key)
+    except ValueError:
+        return ""
+    if len(portable.parts) != 1:
+        return ""
+
+    entry.directory_name = storage_key
+    entry.relative_path = storage_key
+
+    root = managed_dir
+    if root is None and lockfile_path.name == "skills-lock.json":
+        root = lockfile_path.parent / "skills"
+    if root is None:
+        return ""
+
+    target = root / storage_key
+    manifest = target / "SKILL.md"
+    try:
+        resolved_root = root.resolve(strict=False)
+        resolved_target = target.resolve(strict=False)
+        if (
+            resolved_target.parent != resolved_root
+            or target.is_symlink()
+            or manifest.is_symlink()
+            or not manifest.is_file()
+        ):
+            return ""
+        from opensquilla.skills.manifest import (
+            SkillCompileProfile,
+            compile_skill_manifest,
+        )
+        from opensquilla.skills.types import SkillLayer
+
+        spec = compile_skill_manifest(
+            target,
+            SkillLayer.MANAGED,
+            profile=SkillCompileProfile.COMMUNITY_INSTRUCTION,
+        )
+    except (OSError, UnicodeError, TypeError, ValueError):
+        return ""
+    entry.manifest_name = spec.name
+    return spec.name
+
+
+def _validate_store_paths(
+    entries: dict[str, LockEntry],
+    *,
+    path: Path,
+    diagnostics: list[SkillDiagnostic],
+) -> None:
+    """Fail closed when persisted installs alias one portable store child."""
+
+    seen: dict[tuple[str, ...], tuple[str, str]] = {}
+    for storage_key, entry in entries.items():
+        relative = entry.relative_path or entry.directory_name or storage_key
+        try:
+            portable = normalize_relative_path(relative)
+        except ValueError as exc:
+            diagnostics.append(
+                _diagnostic(
+                    "LOCKFILE_STORE_PATH_UNSAFE",
+                    f"Installed entry {storage_key!r} has an unsafe store path: {exc}",
+                    path,
+                    blocking=True,
+                    field_name=f"installed.{storage_key}.relative_path",
+                )
+            )
+            continue
+        if len(portable.parts) != 1:
+            diagnostics.append(
+                _diagnostic(
+                    "LOCKFILE_STORE_PATH_UNSAFE",
+                    f"Installed entry {storage_key!r} is not a direct managed-root child",
+                    path,
+                    blocking=True,
+                    field_name=f"installed.{storage_key}.relative_path",
+                )
+            )
+            continue
+        collision_key = tuple(part.casefold() for part in portable.parts)
+        previous = seen.get(collision_key)
+        if previous is not None:
+            previous_key, previous_path = previous
+            diagnostics.append(
+                _diagnostic(
+                    "LOCKFILE_STORE_PATH_COLLISION",
+                    (
+                        f"Installed entries {previous_key!r} and {storage_key!r} "
+                        f"alias the portable store path {previous_path!r}/{relative!r}"
+                    ),
+                    path,
+                    blocking=True,
+                    field_name=f"installed.{storage_key}.relative_path",
+                )
+            )
+            continue
+        seen[collision_key] = (storage_key, relative)
+
+
+def _validate_install_ids(
+    entries: dict[str, LockEntry],
+    *,
+    path: Path,
+    diagnostics: list[SkillDiagnostic],
+) -> None:
+    """Fail closed when an allegedly exact install identity is not unique."""
+
+    seen: dict[str, str] = {}
+    for storage_key, entry in entries.items():
+        install_id = entry.install_id
+        if not install_id:
+            continue
+        previous_key = seen.get(install_id)
+        if previous_key is not None:
+            diagnostics.append(
+                _diagnostic(
+                    "LOCKFILE_INSTALL_ID_COLLISION",
+                    (
+                        f"Installed entries {previous_key!r} and {storage_key!r} "
+                        f"share install id {install_id!r}"
+                    ),
+                    path,
+                    blocking=True,
+                    field_name=f"installed.{storage_key}.install_id",
+                )
+            )
+            continue
+        seen[install_id] = storage_key
+
+
 def _blocked_lockfile(path: Path, code: str, message: str) -> Lockfile:
     diagnostic = _diagnostic(code, message, path, blocking=True)
     return Lockfile(
@@ -569,18 +887,21 @@ def _diagnostic(
     path: Path,
     *,
     blocking: bool,
+    severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
     field_name: str = "",
     hint: str = "Repair or restore the lockfile before changing installed skills.",
+    details: dict[str, Any] | None = None,
 ) -> SkillDiagnostic:
     return SkillDiagnostic(
         code=code,
-        severity=DiagnosticSeverity.ERROR,
+        severity=severity,
         phase=DiagnosticPhase.LOCK,
         message=message,
         blocking=blocking,
         path=str(path),
         field_name=field_name,
         hint=hint,
+        details=dict(details or {}),
     )
 
 
@@ -642,6 +963,7 @@ __all__ = [
     "LOCKFILE_SCHEMA_VERSION",
     "LockEntry",
     "Lockfile",
+    "LockfileIdentityAmbiguousError",
     "LockfileMutationBlockedError",
     "compute_sha256",
     "compute_tree_sha256",

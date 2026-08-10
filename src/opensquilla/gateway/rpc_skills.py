@@ -6,7 +6,7 @@ import asyncio
 import os
 import shutil
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -39,12 +39,17 @@ from opensquilla.skills.hub.defaults import (
 from opensquilla.skills.hub.deps import install_deps
 from opensquilla.skills.hub.doctor import SkillDoctor
 from opensquilla.skills.hub.identity import is_skill_meta_installed
+from opensquilla.skills.hub.installer import (
+    supported_keyword_arguments,
+    supports_keyword_argument,
+    unsupported_installer_result,
+)
 from opensquilla.skills.hub.management import (
     SkillManagementService,
     committed_store_read_guard,
     lifecycle_for_candidate,
 )
-from opensquilla.skills.hub.source import SkillSourceFetchError
+from opensquilla.skills.hub.router import search_router_with_diagnostics
 from opensquilla.skills.hub.transaction import journal_path_for_state
 from opensquilla.skills.loader import PinnedSkillLoader, SkillLoader
 from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
@@ -179,17 +184,12 @@ def _management_service(ctx: RpcContext) -> Any | None:
     managed_dir = _loader_managed_dir(ctx)
     if loader is None or managed_dir is None:
         return None
-    try:
-        return _get_default_installer(
-            managed_dir=managed_dir,
-            loader=loader,
-            journal_path=_journal_path(ctx, managed_dir),
-            offline=False,
-        )
-    except TypeError:
-        # One-cycle compatibility for extension/test builders implementing the
-        # historical ``managed_dir``-only factory contract.
-        return _get_default_installer(managed_dir=managed_dir)
+    return _get_default_installer(
+        managed_dir=managed_dir,
+        loader=loader,
+        journal_path=_journal_path(ctx, managed_dir),
+        offline=False,
+    )
 
 
 def _management_lockfile_path(ctx: RpcContext) -> Path:
@@ -604,6 +604,15 @@ def _candidate_by_path(candidates: tuple[Any, ...], path: str) -> Any | None:
     )
 
 
+def _doctor_item_by_install_id(items: Iterable[Any], install_id: str) -> Any | None:
+    """Resolve an exact Doctor identity without choosing among corrupt duplicates."""
+
+    matches = [item for item in items if item.install_id == install_id]
+    if len(matches) > 1:
+        raise KeyError(f"Skill install identity is ambiguous: {install_id}")
+    return matches[0] if matches else None
+
+
 def _exact_identity_param(params: dict[str, Any], camel: str, snake: str) -> str:
     """Read one optional exact-identity string from either wire spelling."""
 
@@ -929,10 +938,7 @@ async def _read_skills_get(params: dict | None, ctx: RpcContext) -> dict[str, An
             loader=cast(SkillLoader, PinnedSkillLoader(snapshot, loader)),
             eligibility_context=_eligibility_context(ctx),
         ).doctor(install_id)
-        doctor_item = next(
-            (item for item in doctor_report.skills if item.install_id == install_id),
-            None,
-        )
+        doctor_item = _doctor_item_by_install_id(doctor_report.skills, install_id)
         if doctor_item is None:
             raise KeyError(f"Skill install not found: {install_id}")
         skill = _candidate_by_path(candidates, doctor_item.path)
@@ -1101,12 +1107,14 @@ async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[st
     source_id = params.get("source")
     if source_id is not None and not isinstance(source_id, str):
         source_id = None
-    search_diagnostics: list[dict[str, Any]] = []
-    try:
-        results = await router.search(query, limit=limit, source_id=source_id)
-    except SkillSourceFetchError as exc:
-        results = []
-        search_diagnostics = [item.to_dict() for item in exc.diagnostics]
+    report = await search_router_with_diagnostics(
+        router,
+        query,
+        limit=limit,
+        source_id=source_id,
+    )
+    results = report.results
+    search_diagnostics = [item.to_dict() for item in report.diagnostics]
     injected_lockfile = getattr(management_service, "lockfile_path", None)
     if injected_lockfile:
         from opensquilla.skills.hub.lockfile import Lockfile
@@ -1114,7 +1122,7 @@ async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[st
         installed = Lockfile.load(Path(injected_lockfile))
     else:
         installed = installed_skill_lockfile()
-    payload = {
+    payload: dict[str, Any] = {
         "results": [
             {
                 "name": r.name,
@@ -1132,6 +1140,8 @@ async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[st
     }
     if search_diagnostics:
         payload["diagnostics"] = search_diagnostics
+        payload["partial"] = report.partial
+        payload["allSourcesUnavailable"] = report.all_sources_unavailable
     return payload
 
 
@@ -1181,18 +1191,62 @@ async def _handle_skills_install(params: dict | None, ctx: RpcContext) -> dict[s
     source_id = params.get("source", "clawhub")
     force = _boolean_param(params, "force")
     replace_source = _boolean_param(params, "replaceSource")
-    if isinstance(installer, SkillManagementService):
-        result = await installer.install(
-            identifier,
-            source_id,
-            force=force,
-            replace_source=replace_source,
+    risk_confirmation = _exact_identity_param(
+        params,
+        "riskConfirmation",
+        "risk_confirmation",
+    )
+    install = installer.install
+    if replace_source and not supports_keyword_argument(install, "replace_source"):
+        return _install_result_to_dict(
+            unsupported_installer_result(
+                operation="install",
+                capability="replaceSource",
+                name=str(identifier),
+            )
         )
+    if force and not supports_keyword_argument(install, "force"):
+        return _install_result_to_dict(
+            unsupported_installer_result(
+                operation="install",
+                capability="force",
+                name=str(identifier),
+            )
+        )
+    if risk_confirmation and not supports_keyword_argument(install, "risk_confirmation"):
+        return _install_result_to_dict(
+            unsupported_installer_result(
+                operation="install",
+                capability="riskConfirmation",
+                name=str(identifier),
+            )
+        )
+    if not isinstance(installer, SkillManagementService) and force and (
+        not risk_confirmation
+        or not supports_keyword_argument(install, "risk_confirmation")
+    ):
+        return _install_result_to_dict(
+            unsupported_installer_result(
+                operation="install",
+                capability="riskConfirmation",
+                name=str(identifier),
+            )
+        )
+    install_kwargs = supported_keyword_arguments(
+        install,
+        {
+            "force": force,
+            "replace_source": replace_source,
+            "risk_confirmation": risk_confirmation,
+        },
+    )
+    if isinstance(installer, SkillManagementService):
+        result = await install(identifier, source_id, **install_kwargs)
     else:
         result = await _run_catalog_mutation(
             loader,
             reason="rpc.skills.install",
-            operation=lambda: installer.install(identifier, source_id, force=force),
+            operation=lambda: install(identifier, source_id, **install_kwargs),
             did_change=lambda value: bool(value.success),
         )
     return _install_result_to_dict(result)
@@ -1219,19 +1273,56 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
         return {"success": False, "message": "No skill installer configured"}
 
     name = (params or {}).get("name")
+    install_id = _exact_identity_param(params or {}, "installId", "install_id")
     force = _boolean_param(params or {}, "force")
+    risk_confirmation = _exact_identity_param(
+        params or {},
+        "riskConfirmation",
+        "risk_confirmation",
+    )
     try:
+        update = installer.update
+        requested_capabilities = (
+            ("install_id", "installId", bool(install_id)),
+            ("force", "force", force),
+            ("risk_confirmation", "riskConfirmation", bool(risk_confirmation)),
+        )
+        for keyword, capability, required in requested_capabilities:
+            if not required or supports_keyword_argument(update, keyword):
+                continue
+            unsupported = unsupported_installer_result(
+                operation="update",
+                capability=capability,
+                name=str(name or ""),
+                install_id=install_id,
+            )
+            return {**_install_result_to_dict(unsupported), "results": []}
+        if not isinstance(installer, SkillManagementService) and force and (
+            not risk_confirmation
+            or not supports_keyword_argument(update, "risk_confirmation")
+        ):
+            unsupported = unsupported_installer_result(
+                operation="update",
+                capability="riskConfirmation",
+                name=str(name or ""),
+                install_id=install_id,
+            )
+            return {**_install_result_to_dict(unsupported), "results": []}
+        update_kwargs = supported_keyword_arguments(
+            update,
+            {
+                "install_id": install_id,
+                "force": force,
+                "risk_confirmation": risk_confirmation,
+            },
+        )
         if isinstance(installer, SkillManagementService):
-            results = await installer.update(name, force=force)
+            results = await update(name, **update_kwargs)
         else:
             results = await _run_catalog_mutation(
                 loader,
                 reason="rpc.skills.update",
-                operation=(
-                    (lambda: installer.update(name, force=True))
-                    if force
-                    else (lambda: installer.update(name))
-                ),
+                operation=lambda: update(name, **update_kwargs),
                 did_change=lambda values: any(value.success for value in values),
             )
     except OSError as exc:
@@ -1248,9 +1339,13 @@ async def _handle_skills_update(params: dict | None, ctx: RpcContext) -> dict[st
 @_d.method("skills.uninstall", scope="operator.admin")
 async def _handle_skills_uninstall(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Uninstall a managed skill."""
-    if not isinstance(params, dict) or "name" not in params:
-        raise ValueError("params.name is required")
-    recovery_failure = _recovery_required_payload(ctx, name=str(params["name"]))
+    if not isinstance(params, dict):
+        raise ValueError("params.name or params.installId is required")
+    install_id = _exact_identity_param(params, "installId", "install_id")
+    if "name" not in params and not install_id:
+        raise ValueError("params.name or params.installId is required")
+    name = str(params.get("name") or "")
+    recovery_failure = _recovery_required_payload(ctx, name=name)
     if recovery_failure is not None:
         return recovery_failure
 
@@ -1262,14 +1357,38 @@ async def _handle_skills_uninstall(params: dict | None, ctx: RpcContext) -> dict
     allow_drift = _boolean_param(params, "allowDrift")
     if isinstance(installer, SkillManagementService):
         result = await installer.uninstall(
-            params["name"],
+            name,
+            install_id=install_id,
             allow_drift=allow_drift,
         )
     else:
+        uninstall = installer.uninstall
+        if install_id and not supports_keyword_argument(uninstall, "install_id"):
+            return _install_result_to_dict(
+                unsupported_installer_result(
+                    operation="uninstall",
+                    capability="installId",
+                    name=name,
+                    install_id=install_id,
+                )
+            )
+        if allow_drift and not supports_keyword_argument(uninstall, "allow_drift"):
+            return _install_result_to_dict(
+                unsupported_installer_result(
+                    operation="uninstall",
+                    capability="allowDrift",
+                    name=name,
+                    install_id=install_id,
+                )
+            )
+        uninstall_kwargs = supported_keyword_arguments(
+            uninstall,
+            {"install_id": install_id, "allow_drift": allow_drift},
+        )
         result = await _run_catalog_mutation(
             loader,
             reason="rpc.skills.uninstall",
-            operation=lambda: installer.uninstall(params["name"]),
+            operation=lambda: uninstall(name, **uninstall_kwargs),
             did_change=lambda value: bool(value.success),
         )
     return _install_result_to_dict(result)
@@ -1346,21 +1465,63 @@ async def _handle_skills_deps_install(params: dict | None, ctx: RpcContext) -> d
     """
     if not isinstance(params, dict):
         raise ValueError("params must be a dict")
-    if "name" not in params:
-        raise ValueError("params.name is required")
+    exact_install_id = _exact_identity_param(params, "installId", "skill_install_id")
+    instance_id = _exact_identity_param(params, "instanceId", "instance_id")
+    if "name" not in params and not exact_install_id and not instance_id:
+        raise ValueError("params.name, params.installId, or params.instanceId is required")
     if "install_id" not in params:
         raise ValueError("params.install_id is required")
 
-    name = params["name"]
+    name = str(params.get("name") or "")
     install_id = params["install_id"]
     loader = _get_loader(ctx)
     if loader is None:
         raise KeyError("No skill loader available")
-    skill = loader.get_by_name(name)
-    if skill is None or not is_skill_available_live(name):
+    snapshot = await _catalog_snapshot(loader, reason="rpc.skills.deps.install")
+    candidates = tuple(getattr(snapshot, "candidates", snapshot.skills))
+    skill = None
+    doctor_item = None
+    if exact_install_id:
+        if loader.managed_dir is None:
+            raise KeyError(f"Skill install not found: {exact_install_id}")
+        doctor_report = SkillDoctor(
+            managed_dir=loader.managed_dir,
+            lockfile_path=_management_lockfile_path(ctx),
+            loader=cast(SkillLoader, PinnedSkillLoader(snapshot, loader)),
+            eligibility_context=_eligibility_context(ctx),
+        ).doctor(exact_install_id)
+        doctor_item = _doctor_item_by_install_id(
+            doctor_report.skills,
+            exact_install_id,
+        )
+        if doctor_item is None:
+            raise KeyError(f"Skill install not found: {exact_install_id}")
+        skill = _candidate_by_path(candidates, doctor_item.path)
+    if instance_id:
+        instance_candidate = next(
+            (
+                candidate
+                for candidate in candidates
+                if getattr(candidate, "instance_id", "") == instance_id
+            ),
+            None,
+        )
+        if instance_candidate is None:
+            raise KeyError(f"Skill instance not found: {instance_id}")
+        if skill is not None and skill is not instance_candidate:
+            raise KeyError("Skill installId and instanceId do not identify the same candidate")
+        skill = instance_candidate
+    if skill is None and not exact_install_id and not instance_id:
+        skill = next((item for item in snapshot.skills if item.name == name), None)
+    elif skill is None:
+        raise KeyError("Exact Skill install is not loaded in the current catalog")
+    if skill is not None and name and skill.name != name:
+        raise KeyError(f"Skill identity does not match name: {name}")
+    resolved_name = skill.name if skill is not None else name
+    if skill is None or not is_skill_available_live(resolved_name):
         # Coding-mode-gated skills are reported as not-found so they cannot be
         # resolved or have deps installed while the toggle is OFF (codex review).
-        raise KeyError(f"Skill not found: {name}")
+        raise KeyError(f"Skill not found: {resolved_name}")
 
     specs = skill.metadata.install if skill.metadata else []
     spec = next((s for s in specs if s.id == install_id), None)
@@ -1374,7 +1535,10 @@ async def _handle_skills_deps_install(params: dict | None, ctx: RpcContext) -> d
             f"{ctx_eligible.os_name} (requires: {', '.join(spec.os)})"
         )
 
-    async with _deps_lock_for(name, install_id):
+    dependency_lock_identity = str(
+        exact_install_id or getattr(skill, "instance_id", "") or resolved_name
+    )
+    async with _deps_lock_for(dependency_lock_identity, str(install_id)):
         results = await install_deps([spec])
         r = results[0]
         if r.success:
@@ -1406,11 +1570,15 @@ def _get_default_router():
 
 
 def _get_default_installer(*, managed_dir=None, loader=None, journal_path=None, offline=None):
-    kwargs: dict[str, Any] = {"managed_dir": managed_dir}
-    if loader is not None:
-        kwargs["loader"] = loader
-    if journal_path is not None:
-        kwargs["journal_path"] = journal_path
-    if offline is not None:
-        kwargs["offline"] = offline
+    kwargs = {
+        "managed_dir": managed_dir,
+        **supported_keyword_arguments(
+            build_default_skill_installer,
+            {
+                "loader": loader,
+                "journal_path": journal_path,
+                "offline": offline,
+            },
+        ),
+    }
     return build_default_skill_installer(**kwargs)

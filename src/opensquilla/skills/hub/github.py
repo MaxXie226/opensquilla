@@ -398,31 +398,71 @@ class GitHubSource(SkillSource):
                     params={"q": search_query, "per_page": min(limit, 30)},
                     headers=self._headers(),
                 )
-                resp.raise_for_status()
-                data = resp.json()
         except Exception as exc:
             log.warning("github.search_failed", error=str(exc))
-            return []
+            raise source_transport_error(
+                exc,
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
+            ) from exc
 
-        results = []
-        for item in data.get("items", []):
+        raise_for_source_http_status(
+            resp,
+            phase=DiagnosticPhase.SOURCE,
+            source_name="GitHub",
+        )
+        try:
+            data = resp.json()
+        except (TypeError, ValueError) as exc:
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
+            ) from exc
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
+            )
+
+        items = data["items"]
+        results: list[SkillMeta] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             repo = item.get("repository", {})
-            full_name = repo.get("full_name", "")
-            path = item.get("path", "")
+            if not isinstance(repo, dict):
+                continue
+            full_name = str(repo.get("full_name") or "")
+            repository_parts = full_name.split("/", 1)
+            if len(repository_parts) != 2 or not _valid_repository(*repository_parts):
+                continue
+            path = str(item.get("path") or "").strip("/")
+            path_parts = path.split("/")
+            if (
+                not path
+                or path_parts[-1] != _MANIFEST_NAME
+                or any(part in {"", ".", ".."} for part in path_parts)
+            ):
+                continue
             # Extract the skill name from the parent directory of a SKILL.md path.
             parts = path.rsplit("/", 2)
-            skill_name = parts[-2] if len(parts) >= 2 else full_name
+            skill_name = parts[-2] if len(parts) >= 2 else repository_parts[1]
 
             results.append(
                 SkillMeta(
                     name=skill_name,
-                    description=repo.get("description", ""),
+                    description=str(repo.get("description") or ""),
                     source_id=self.source_id,
                     trust_level=self.trust_level,
                     identifier=f"{full_name}:{path}",
-                    homepage=repo.get("html_url", ""),
+                    homepage=str(repo.get("html_url") or ""),
                     canonical_identifier=f"{full_name}:{path}",
                 )
+            )
+        if items and not results:
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="GitHub",
             )
         return results[:limit]
 
