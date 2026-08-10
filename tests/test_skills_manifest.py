@@ -398,6 +398,29 @@ def test_dynamic_shell_context_is_a_nonblocking_degradation(
     )
 
 
+def test_fenced_dynamic_shell_context_is_detected_with_crlf(tmp_path: Path) -> None:
+    skill_dir = _write_skill(
+        tmp_path,
+        "dynamic-context-skill",
+        body="```!\nnode --version\nnpm --version\n```",
+    )
+    manifest = skill_dir / "SKILL.md"
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text(
+        text.replace("\n", "\r\n"),
+        encoding="utf-8",
+        newline="",
+    )
+
+    validation = validate_hub_candidate(skill_dir)
+
+    assert validation.ok is True
+    assert any(
+        item["code"] == "DYNAMIC_CONTEXT_UNSUPPORTED"
+        for item in validation.compatibility_diagnostics
+    )
+
+
 @pytest.mark.parametrize(
     ("namespace", "field", "value"),
     [

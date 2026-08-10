@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import stat
 import zipfile
 from pathlib import Path
 from typing import Any, ClassVar
@@ -25,7 +26,10 @@ def _zip(entries: dict[str, bytes]) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
         for path, content in entries.items():
-            archive.writestr(path, content)
+            info = zipfile.ZipInfo(path)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            archive.writestr(info, content)
     return output.getvalue()
 
 

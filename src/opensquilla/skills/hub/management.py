@@ -619,8 +619,18 @@ def _normalize_legacy_manifest(
         final_dir = candidate_dir
 
     canonical_manifest = final_dir / "SKILL.md"
-    if allow_clawhub_legacy and manifest != canonical_manifest:
-        os.replace(manifest, canonical_manifest)
+    if allow_clawhub_legacy and manifest.name != canonical_manifest.name:
+        if manifest.name.casefold() == canonical_manifest.name.casefold():
+            # A case-only replace is a no-op on Windows and can leave the
+            # directory entry spelled ``skill.md``. Rename through a unique
+            # sibling so the production loader sees the canonical filename.
+            intermediate_manifest = final_dir / (
+                f".opensquilla-manifest-{uuid.uuid4().hex}.tmp"
+            )
+            os.replace(manifest, intermediate_manifest)
+            os.replace(intermediate_manifest, canonical_manifest)
+        else:
+            os.replace(manifest, canonical_manifest)
         manifest = canonical_manifest
     if changed:
         rendered = yaml.safe_dump(

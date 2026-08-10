@@ -34,7 +34,7 @@ _MAX_STRICT_YAML_NESTING = 64
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 _STANDARD_SKILL_NAME_RE = re.compile(r"^[a-z0-9-]+$")
 _INLINE_DYNAMIC_CONTEXT_RE = re.compile(r"(?<!\\)!`[^`\r\n]+`")
-_FENCED_DYNAMIC_CONTEXT_RE = re.compile(r"(?m)^[ \t]*```![ \t]*$")
+_FENCED_DYNAMIC_CONTEXT_RE = re.compile(r"(?m)^[ \t]*```![ \t]*\r?$")
 _UNSUPPORTED_DIALECT_FIELDS = frozenset(
     {
         "hooks",

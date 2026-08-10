@@ -280,7 +280,7 @@ def _gateway_skill_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         file_path = str(row.get("filePath") or row.get("file_path") or "")
         base_dir = str(row.get("baseDir") or row.get("base_dir") or "")
         if not base_dir and file_path:
-            base_dir = str(Path(file_path).parent)
+            base_dir = _wire_parent_path(file_path)
         provenance_raw = row.get("provenance")
         provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
         eligible = bool(row.get("eligible", False))
@@ -321,6 +321,19 @@ def _gateway_skill_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _wire_parent_path(file_path: str) -> str:
+    """Derive a parent without rewriting Gateway path separators for this host."""
+
+    separator_index = max(file_path.rfind("/"), file_path.rfind("\\"))
+    if separator_index < 0:
+        return "."
+    if separator_index == 0:
+        return file_path[0]
+    if separator_index == 2 and file_path[1:2] == ":":
+        return file_path[:3]
+    return file_path[:separator_index]
 
 
 class _OfflineSkillListBlockedError(RuntimeError):

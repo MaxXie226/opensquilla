@@ -118,6 +118,34 @@ def test_skills_list_prefers_live_gateway_and_preserves_json_list_container(
     assert _GatewayClient.called_params == {}
 
 
+@pytest.mark.parametrize(
+    ("file_path", "expected_base_dir"),
+    [
+        ("/synthetic/live-demo/SKILL.md", "/synthetic/live-demo"),
+        (r"C:\synthetic\live-demo\SKILL.md", r"C:\synthetic\live-demo"),
+    ],
+)
+def test_gateway_skill_rows_preserve_wire_path_separator_style(
+    file_path: str,
+    expected_base_dir: str,
+) -> None:
+    rows = skills_cmd._gateway_skill_rows(
+        {
+            "skills": [
+                {
+                    "name": "live-demo",
+                    "eligible": True,
+                    "file_path": file_path,
+                }
+            ]
+        }
+    )
+
+    assert rows[0]["filePath"] == file_path
+    assert rows[0]["baseDir"] == expected_base_dir
+    assert rows[0]["path"] == expected_base_dir
+
+
 def test_offline_skills_list_marks_rows_validated_for_next_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
