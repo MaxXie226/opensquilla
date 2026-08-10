@@ -923,7 +923,7 @@ async def test_static_reminder_delivery_failure_fails_job_by_default() -> None:
         ),
     )
     handler = make_static_message_handler(
-        DeliveryChain(channel_manager_ref=lambda: _FakeChannelManager()),
+        DeliveryChain(channel_manager_ref=_FakeChannelManager),
         session_manager_ref=lambda: session_manager,
         session_event_emitter=lambda *args: _record_async(session_events, args),
     )
@@ -974,7 +974,7 @@ async def test_static_reminder_best_effort_delivery_failure_does_not_fail_job() 
         ),
     )
     handler = make_static_message_handler(
-        DeliveryChain(channel_manager_ref=lambda: _FakeChannelManager()),
+        DeliveryChain(channel_manager_ref=_FakeChannelManager),
         session_manager_ref=lambda: session_manager,
         session_event_emitter=lambda *args: _record_async(session_events, args),
     )
