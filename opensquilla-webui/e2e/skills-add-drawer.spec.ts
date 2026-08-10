@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
 const CONTROL_URL = '/control/skills'
-const INSTALL_DELAY_MS = 70
+const INSTALL_DELAY_MS = 120
 const FAILED_INDEX = 4
 const UNCHANGED_INDEX = 7
 
@@ -221,10 +221,11 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
         capture.installSources.push(String(frame.params?.source || ''))
         capture.inFlight += 1
         capture.maxInFlight = Math.max(capture.maxInFlight, capture.inFlight)
+        const delay = frame.params?.source === 'clawhub' ? 750 : INSTALL_DELAY_MS
         setTimeout(() => {
           capture.inFlight -= 1
           ws.send(response(frame.id, installPayload(identifier, index)))
-        }, INSTALL_DELAY_MS)
+        }, delay)
         return
       }
 
@@ -337,12 +338,19 @@ test.describe('Add Skill drawer', () => {
       source: 'clawhub',
     }])
 
-    await dialog.locator('.sk-add-result').getByRole('button', { name: 'Install', exact: true }).click()
+    const searchResult = dialog.locator('.sk-add-result')
+    const searchResultAction = searchResult.getByRole('button', { name: 'Install', exact: true })
+    await searchResultAction.click()
+    await expect(searchResult).toHaveAttribute('data-status', 'installing')
+    await expect(searchResult.getByRole('button')).toHaveAttribute('aria-busy', 'true')
+    await expect(searchResult.getByRole('button')).toContainText('Installing')
+    await expect(dialog.locator('.sk-add-queue-item[data-status="installing"]')).toHaveCount(1)
     await expect.poll(() => capture.installIdentifiers.length).toBe(1)
     expect(capture.installIdentifiers).toEqual([
       'synthetic-publisher/synthetic-search-result@1.0.0',
     ])
     expect(capture.installSources).toEqual(['clawhub'])
+    await expect(searchResult.getByRole('button')).toContainText('Installed')
   })
 
   test('installs a deduplicated 15-item batch serially and preserves progress across close', async ({ page }) => {

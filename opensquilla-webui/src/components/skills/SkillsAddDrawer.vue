@@ -211,7 +211,12 @@
                 <span>{{ t('cronSkills.registry.searching') }}</span>
               </div>
               <div v-else-if="results.length" class="sk-add-results">
-                <article v-for="row in resultRows" :key="row.operationKey" class="sk-add-result">
+                <article
+                  v-for="row in resultRows"
+                  :key="row.operationKey"
+                  class="sk-add-result"
+                  :data-status="row.queueStatus || undefined"
+                >
                   <div class="sk-add-result__body">
                     <strong>{{ row.name }}</strong>
                     <p>{{ row.description }}</p>
@@ -224,15 +229,25 @@
                         {{ row.lifecycleLabel }}
                       </span>
                     </div>
+                    <p
+                      v-if="row.queueStatus === 'failed' && row.queueError"
+                      class="sk-add-result__error"
+                      role="status"
+                    >{{ row.queueError }}</p>
                   </div>
                   <button
                     class="btn btn--sm"
-                    :class="row.installed ? 'btn--ghost' : 'btn--primary'"
+                    :class="[
+                      row.installed || row.queueStatus === 'failed' ? 'btn--ghost' : 'btn--primary',
+                      { 'sk-add-result__action--busy': row.queueStatus === 'installing' },
+                    ]"
                     type="button"
-                    :disabled="row.installed || queueRunning || mutationBlocked"
-                    @click="emit('install', row.installId, row.installSource, row.name)"
+                    :disabled="row.installed || queueRunning || mutationBlocked || row.queueStatus === 'queued'"
+                    :aria-busy="row.queueStatus === 'installing'"
+                    @click="handleResultAction(row)"
                   >
-                    {{ row.installed ? t('cronSkills.registry.installed') : t('cronSkills.registry.install') }}
+                    <span v-if="row.queueStatus === 'installing'" class="sk-spinner" />
+                    <span>{{ resultActionLabel(row) }}</span>
                   </button>
                 </article>
               </div>
@@ -341,6 +356,8 @@ const resultRows = computed(() => props.results.map((result) => {
     || result.identifier
     || result.name
   const installSource = result.source || 'clawhub'
+  const operationKey = skillRegistryOperationKey(installId, installSource)
+  const queueItem = props.queue.find(item => item.id === operationKey)
   return {
     name: result.name,
     description: (result.description || '').slice(0, 180),
@@ -353,9 +370,28 @@ const resultRows = computed(() => props.results.map((result) => {
     lifecycleTone: presentation?.tone || 'neutral',
     installId,
     installSource,
-    operationKey: skillRegistryOperationKey(installId, installSource),
+    operationKey,
+    queueStatus: queueItem?.status,
+    queueError: queueItem?.error || '',
   }
 }))
+
+type ResultRow = (typeof resultRows.value)[number]
+
+function resultActionLabel(row: ResultRow): string {
+  if (row.installed) return t('cronSkills.registry.installed')
+  if (row.queueStatus === 'failed') return t('cronSkills.registry.retry')
+  if (row.queueStatus) return t(`cronSkills.registry.queueStatus.${row.queueStatus}`)
+  return t('cronSkills.registry.install')
+}
+
+function handleResultAction(row: ResultRow) {
+  if (row.queueStatus === 'failed') {
+    emit('retry', row.operationKey)
+    return
+  }
+  emit('install', row.installId, row.installSource, row.name)
+}
 
 const queueRows = computed(() => props.queue.map((item) => {
   const lifecycle = item.result?.lifecycle
@@ -670,6 +706,25 @@ function effectiveFromLabel(value: string | undefined): string {
   overflow: hidden;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.sk-add-result__body .sk-add-result__error {
+  color: var(--danger);
+  font-size: 11px;
+  -webkit-line-clamp: 1;
+}
+
+.sk-add-result[data-status="installing"] {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+}
+
+.sk-add-result[data-status="failed"] {
+  background: color-mix(in srgb, var(--danger) 5%, var(--bg));
+  border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+}
+
+.sk-add-result__action--busy {
+  opacity: 1;
 }
 
 .sk-add-result__meta,

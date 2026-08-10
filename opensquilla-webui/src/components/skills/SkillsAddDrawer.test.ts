@@ -26,6 +26,7 @@ function mountDrawer(options: {
   const queue = ref(options.queue || [])
   const queueRunning = ref(options.queueRunning || false)
   const installed: Array<[string, string, string]> = []
+  const retried: string[] = []
 
   const Root = defineComponent({
     setup() {
@@ -52,6 +53,7 @@ function mountDrawer(options: {
           onInstall: (identifier: string, source: string, name: string) => {
             installed.push([identifier, source, name])
           },
+          onRetry: (id: string) => { retried.push(id) },
         }),
       ])
     },
@@ -64,7 +66,7 @@ function mountDrawer(options: {
   app.mount(host)
   apps.push(app)
 
-  return { host, open, githubUrl, queue, queueRunning, installed }
+  return { host, open, githubUrl, queue, queueRunning, installed, retried }
 }
 
 describe('SkillsAddDrawer', () => {
@@ -231,5 +233,47 @@ describe('SkillsAddDrawer', () => {
     const results = document.querySelector<HTMLElement>('.sk-add-results')!
     expect(activity.compareDocumentPosition(results) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy()
+  })
+
+  it('shows the active queue state on the clicked search result and retries failures in place', async () => {
+    const operationKey = '["clawhub","@verified/demo"]'
+    const queue: SkillInstallQueueItem[] = [{
+      id: operationKey,
+      identifier: '@verified/demo',
+      source: 'clawhub',
+      displayName: 'Demo',
+      status: 'installing',
+    }]
+    const mounted = mountDrawer({
+      queue,
+      queueRunning: true,
+      results: [{
+        name: 'Demo',
+        installReference: '@verified/demo',
+        source: 'clawhub',
+      }],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const result = document.querySelector<HTMLElement>('.sk-add-result')!
+    const action = result.querySelector<HTMLButtonElement>('button')!
+    expect(result.dataset.status).toBe('installing')
+    expect(action.textContent).toContain('Installing')
+    expect(action.getAttribute('aria-busy')).toBe('true')
+    expect(action.querySelector('.sk-spinner')).not.toBeNull()
+
+    mounted.queue.value[0].status = 'failed'
+    mounted.queue.value[0].error = 'Manifest rejected'
+    mounted.queueRunning.value = false
+    await nextTick()
+
+    expect(result.dataset.status).toBe('failed')
+    expect(action.textContent).toContain('Retry')
+    expect(result.textContent).toContain('Manifest rejected')
+    action.click()
+    expect(mounted.retried).toEqual([operationKey])
   })
 })
