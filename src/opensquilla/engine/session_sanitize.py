@@ -376,12 +376,12 @@ def recoverable_tool_result_reference(content: str) -> tuple[str, str] | None:
         return None
     if payload.get("result_truncated") is not True or not payload.get("retrieve_hint"):
         return None
-    handle = payload.get("tool_result_handle")
-    sha256 = payload.get("tool_result_sha256")
-    if not isinstance(handle, str) or not isinstance(sha256, str):
+    payload_handle = payload.get("tool_result_handle")
+    payload_sha256 = payload.get("tool_result_sha256")
+    if not isinstance(payload_handle, str) or not isinstance(payload_sha256, str):
         return None
-    handle = handle.strip()
-    sha256 = sha256.strip()
+    handle = payload_handle.strip()
+    sha256 = payload_sha256.strip()
     if not _TOOL_RESULT_HANDLE_RE.fullmatch(handle):
         return None
     if not _TOOL_RESULT_SHA256_RE.fullmatch(sha256):

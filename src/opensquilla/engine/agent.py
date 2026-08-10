@@ -3929,7 +3929,7 @@ class Agent:
             if capabilities is not None
             else None
         )
-        handler_tools = getattr(
+        handler_tools: frozenset[str] = getattr(
             self._raw_tool_handler,
             "_opensquilla_available_tools",
             frozenset(),
