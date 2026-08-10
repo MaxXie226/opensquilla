@@ -53,6 +53,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   ignore them; external decoders using `additionalProperties: false` must allow
   the new additive fields before upgrading.
 
+### Removed
+
+- Removed the in-repository `opensquilla swebench` CLI, optional dependency,
+  Python namespace, and bundled skill. Benchmark recipes and evidence now live
+  in the external experiment ledger and handoff runner; `opensquilla agent` and
+  Coding Mode are unchanged. Existing local benchmark artifacts are left
+  untouched and are no longer managed by OpenSquilla.
+
 ### Security
 
 - Community Skill ingestion now fails closed on unsafe archive paths and links,
