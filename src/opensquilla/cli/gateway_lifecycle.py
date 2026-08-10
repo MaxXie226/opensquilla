@@ -166,6 +166,14 @@ class GatewayLifecycleResult:
         return payload
 
 
+@dataclass(frozen=True)
+class ManagedGatewayTarget:
+    """Connection target recorded for a profile-managed Gateway."""
+
+    url: str
+    config_path: str | None = None
+
+
 class GatewayLifecycleManager:
     def __init__(
         self,
@@ -779,13 +787,15 @@ class GatewayLifecycleManager:
         return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def active_managed_gateway_url() -> str | None:
-    """Return the active managed Gateway URL for the selected profile.
+def active_managed_gateway_target() -> ManagedGatewayTarget | None:
+    """Return the active managed Gateway target for the selected profile.
 
     ``gateway start`` records its effective runtime target in the profile-local
     lifecycle file.  That record is authoritative when a one-off ``--port`` or
-    ``--listen`` override differs from the persisted config, but only while the
-    recorded process is still alive and serving a healthy Gateway.
+    ``--listen`` override differs from the persisted config while the recorded
+    process is still alive.  An unhealthy managed process remains authoritative
+    so callers fail against the selected profile instead of silently falling
+    back to another Gateway.
     """
 
     lifecycle = GatewayLifecycleManager()
@@ -797,9 +807,12 @@ def active_managed_gateway_url() -> str | None:
     if not isinstance(host, str) or not host.strip():
         return None
     host = host.strip()
+    raw_port = record.get("port")
+    if not isinstance(raw_port, (str, int)) or isinstance(raw_port, bool):
+        return None
     try:
-        port = int(record.get("port"))
-    except (TypeError, ValueError):
+        port = int(raw_port)
+    except ValueError:
         return None
     if not 1 <= port <= 65535:
         return None
@@ -813,9 +826,17 @@ def active_managed_gateway_url() -> str | None:
         config_path=config_path,
     )
     status = lifecycle.status()
-    if status.state != "running" or not status.managed:
+    if status.state not in {"running", "unhealthy"} or not status.managed:
         return None
-    return normalize_gateway_url(f"ws://{_format_url_host(lifecycle.probe_host)}:{port}/ws")
+    url = normalize_gateway_url(f"ws://{_format_url_host(lifecycle.probe_host)}:{port}/ws")
+    return ManagedGatewayTarget(url=url, config_path=config_path)
+
+
+def active_managed_gateway_url() -> str | None:
+    """Return the active managed Gateway URL for the selected profile."""
+
+    target = active_managed_gateway_target()
+    return target.url if target is not None else None
 
 
 def _health_probe_host(host: str) -> str:
