@@ -329,6 +329,55 @@ async def test_offline_install_normalizes_legacy_manifest_without_claiming_activ
 
 
 @pytest.mark.asyncio
+async def test_clawhub_case_only_manifest_name_uses_canonical_registry_slug(
+    tmp_path: Path,
+) -> None:
+    source = FakeClawHubSource(
+        {
+            "SKILL.md": (
+                "---\nname: House\n"
+                "description: Maintain and improve a home.\n"
+                "---\nCommunity instructions.\n"
+            )
+        }
+    )
+
+    result = await _service(tmp_path, source).install("house", "clawhub")
+
+    assert result.success is True
+    assert result.name == "house"
+    assert result.lifecycle is not None
+    assert result.lifecycle.load_state.value == "validated_offline"
+    assert any(item.code == "LEGACY_MANIFEST_NORMALIZED" for item in result.diagnostics)
+    manifest = tmp_path / "managed" / "house" / "SKILL.md"
+    assert "name: house\n" in manifest.read_text(encoding="utf-8")
+    managed_names = {path.name for path in (tmp_path / "managed").iterdir()}
+    assert "house" in managed_names
+    assert "House" not in managed_names
+
+
+@pytest.mark.asyncio
+async def test_clawhub_does_not_rewrite_a_different_explicit_manifest_name(
+    tmp_path: Path,
+) -> None:
+    source = FakeClawHubSource(
+        {
+            "SKILL.md": (
+                "---\nname: another-house\n"
+                "description: Different package identity.\n"
+                "---\nCommunity instructions.\n"
+            )
+        }
+    )
+
+    result = await _service(tmp_path, source).install("house", "clawhub")
+
+    assert result.success is False
+    assert any(item.code == "NAME_SOURCE_MISMATCH" for item in result.diagnostics)
+    assert not (tmp_path / "managed" / "another-house").exists()
+
+
+@pytest.mark.asyncio
 async def test_missing_journal_with_nonempty_rollback_blocks_offline_mutation(
     tmp_path: Path,
 ) -> None:

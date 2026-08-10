@@ -605,6 +605,20 @@ def _normalize_legacy_manifest(
         changed = True
 
     name = frontmatter.get("name")
+    if allow_clawhub_legacy and isinstance(name, str):
+        canonical_slug = _derive_slug(bundle, resolution)
+        if (
+            name != canonical_slug
+            and name.casefold() == canonical_slug.casefold()
+            and _SAFE_NAME_RE.fullmatch(canonical_slug)
+        ):
+            # Some registry packages use a title-cased display name in their
+            # legacy manifest. The owner-qualified registry slug is already
+            # the exact package identity, so a case-only rewrite is bounded
+            # and cannot silently rename the Skill to a different package.
+            frontmatter["name"] = canonical_slug
+            name = canonical_slug
+            changed = True
     if name is not None and (
         not isinstance(name, str) or not _SAFE_NAME_RE.fullmatch(name)
     ):
