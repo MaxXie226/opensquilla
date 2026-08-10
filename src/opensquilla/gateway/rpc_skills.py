@@ -273,7 +273,7 @@ def _recovery_required_payload(
         "reload": {},
         "rollbackPerformed": False,
         "catalogGeneration": 0,
-        "effectiveFrom": "next_turn",
+        "effectiveFrom": "",
     }
 
 

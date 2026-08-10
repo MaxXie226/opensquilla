@@ -289,6 +289,7 @@ async def test_skills_doctor_preserves_startup_recovery_failure_without_loader(
     for mutation in (install, update, uninstall):
         assert mutation["success"] is False
         assert mutation["message"] == "Managed Skill store requires recovery before mutation"
+        assert mutation["effectiveFrom"] == ""
         assert [item["code"] for item in mutation["diagnostics"]] == [
             "RECOVERY_REQUIRED"
         ]
@@ -365,6 +366,7 @@ async def test_runtime_management_recovery_failure_reaches_doctor_and_blocks_rpc
         assert mutation["installId"] == "install-demo"
         assert mutation["lifecycle"]["install_state"] == "tracked"
         assert mutation["lifecycle"]["load_state"] == "loaded"
+        assert mutation["effectiveFrom"] == ""
         assert [item["code"] for item in mutation["diagnostics"]] == [
             "RECOVERY_REQUIRED"
         ]

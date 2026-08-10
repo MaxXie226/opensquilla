@@ -565,6 +565,47 @@ async def test_source_fetch_diagnostic_is_preserved_without_generic_fetch_maskin
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("online", [False, True], ids=["offline", "online"])
+async def test_failed_install_has_no_effective_catalog_visibility(
+    tmp_path: Path,
+    online: bool,
+) -> None:
+    managed = tmp_path / "managed"
+    loader = SkillLoader(managed_dir=managed) if online else None
+    source = FakeImmutableSource(
+        {
+            "SKILL.md": (
+                "---\nname: rejected-skill\n"
+                "description: candidate with unsupported execution semantics\n"
+                "hooks: {}\n---\nInstructions.\n"
+            )
+        }
+    )
+    service = _service(tmp_path, source, loader=loader)
+
+    result = await service.install("rejected-skill", "fake")
+
+    assert result.success is False
+    assert result.installed is False
+    assert result.effective_from == ""
+    assert result.to_dict()["effectiveFrom"] == ""
+    assert any(item.code == "DIALECT_FIELD_UNSUPPORTED" for item in result.diagnostics)
+
+    source.files = {
+        "SKILL.md": (
+            "---\nname: rejected-skill\n"
+            "description: portable instruction-only candidate\n"
+            "---\nInstructions.\n"
+        )
+    }
+    source.revision = "b" * 40
+    installed = await service.install("rejected-skill", "fake")
+
+    assert installed.success is True
+    assert installed.effective_from == ("next_turn" if online else "next_start")
+
+
+@pytest.mark.asyncio
 async def test_one_cycle_fetch_only_clawhub_source_shim_remains_installable(
     tmp_path: Path,
 ) -> None:
@@ -1304,6 +1345,10 @@ async def test_update_candidate_failure_preserves_current_lifecycle_truth(
     assert result.lifecycle is not None
     assert result.lifecycle.install_state.value == "tracked"
     assert result.lifecycle.load_state.value == "loaded"
+    assert result.install_id == installed.install_id
+    assert result.path == installed.path
+    assert result.effective_from == ""
+    assert result.to_dict()["effectiveFrom"] == ""
     assert loader.snapshot().generation == generation
     assert "Current instructions." in (
         managed / "example-skill" / "SKILL.md"

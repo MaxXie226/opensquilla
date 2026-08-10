@@ -1568,7 +1568,7 @@ class SkillManagementService:
             reload=reload_payload or {},
             rollback_performed=rollback_performed,
             catalog_generation=generation,
-            effective_from="next_start" if self._offline else "next_turn",
+            effective_from="",
         )
 
     def _failure_for_current_install(
