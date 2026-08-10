@@ -731,6 +731,10 @@ import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
 import {
+  resolveChatHeaderTitle,
+  useChatSessionTitles,
+} from '@/composables/chat/useChatSessionTitles'
+import {
   createChatMetaDraftRecovery,
   listServerMetaDrafts,
   queryServerMetaDrafts,
@@ -744,7 +748,6 @@ import type { ShareExportTheme } from '@/composables/chat/useChatShareExport'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
 import {
   fmtTok,
-  truncate,
   useChatRenderedMessages,
 } from '@/composables/chat/useChatRenderedMessages'
 import { useChatRouterDecisionRuntime } from '@/composables/chat/useChatRouterDecisionRuntime'
@@ -3222,14 +3225,18 @@ function setCollaborationMode(mode: CollaborationMode) {
   void chatPlans.setMode(mode)
 }
 
+const sessionTitles = useChatSessionTitles()
 const currentChatTitle = computed(() => {
-  const firstUser = messages.value.find(msg => msg.role === 'user' && stripTimePrefix(msg.text || '').trim())
-  if (firstUser) {
-    return truncate(stripTimePrefix(firstUser.text).replace(/\s+/g, ' ').trim(), 28)
-  }
-  const suffix = sessionKey.value.split(':').pop() || ''
-  if (!suffix || suffix === 'default') return t('chat.newChat')
-  return t('chat.chatWithSuffix', { suffix })
+  return resolveChatHeaderTitle(
+    sessionKey.value,
+    sessionTitles.value,
+    messages.value,
+    stripTimePrefix,
+    {
+      newChat: t('chat.newChat'),
+      chatWithSuffix: suffix => t('chat.chatWithSuffix', { suffix }),
+    },
+  )
 })
 
 const chatMarkdownExport = useChatMarkdownExport({
