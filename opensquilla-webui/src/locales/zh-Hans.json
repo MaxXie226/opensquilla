@@ -2662,6 +2662,8 @@
       "toastConnectionRecovered": "连接已恢复，任务状态已自动刷新",
       "toastConnectionRetry": "连接尚未恢复，请稍后刷新页面",
       "toastBackgroundComplete": "任务“{name}”已完成，可在运行历史中查看结果",
+      "toastBackgroundReminder": "提醒“{name}”：{reminder}",
+      "toastViewReminder": "查看",
       "toastBackgroundFailed": "任务“{name}”运行失败，请点击卡片上的重试按钮",
       "unnamedTask": "未命名任务",
       "toastDeleted": "任务已删除",
@@ -3708,6 +3710,21 @@
       "editWhileStreaming": "等待当前回复完成后再编辑",
       "attachmentNeedsAttention": "附件需处理",
       "fixAttachmentBeforeSteer": "请先编辑这条消息，重试或移除失败的附件后再发送",
+      "steerUnavailable": {
+        "attachment": "暂无法引导：带附件的消息只支持下一轮发送。消息仍在排队。",
+        "deliveryInProgress": "暂无法引导：另一条排队消息正在投递，请等待其完成。",
+        "steeringInProgress": "暂无法引导：这条消息正在应用到当前任务。",
+        "gatewayUnsupported": "暂无法引导：当前网关不支持同轮引导。消息仍在排队。",
+        "ensemble": "暂无法引导：模型集成任务只支持下一轮跟进。消息仍在排队。",
+        "taskType": "暂无法引导：此类任务只支持下一轮跟进。消息仍在排队。",
+        "queueOnly": "暂无法引导：当前任务只支持下一轮跟进。消息仍在排队。",
+        "noActiveTurn": "暂无法引导：当前没有可引导的活动任务。消息仍在排队。",
+        "turnClosing": "暂无法引导：当前任务正在结束。消息仍在排队。",
+        "capabilityPending": "暂无法引导：当前任务的引导能力尚未同步。消息仍在排队。",
+        "taskMismatch": "暂无法引导：活动任务标识尚未同步。消息仍在排队。",
+        "textUnsupported": "暂无法引导：当前任务不接受文本引导。消息仍在排队。",
+        "generic": "当前任务暂不支持同轮引导。消息仍在排队。"
+      },
       "clearQueue": "清空队列",
       "removeMessage": "移除待发送消息 {index}"
     },
@@ -3785,6 +3802,7 @@
       "compacted": "上下文已整理",
       "failed": "上下文整理失败",
       "withinBudget": "无需整理，上下文空间充足",
+      "skipped": "未能应用上下文整理",
       "cancelled": "上下文整理已取消",
       "requestScoped": "仅对本次请求生效；会话历史未被重写"
     },

@@ -2611,6 +2611,8 @@
       "toastConnectionRecovered": "Verbindung wiederhergestellt und Aufgabenstatus aktualisiert",
       "toastConnectionRetry": "Verbindung noch nicht wiederhergestellt. Bitte die Seite später aktualisieren.",
       "toastBackgroundComplete": "Aufgabe „{name}“ abgeschlossen. Das Ergebnis ist im Ausführungsverlauf verfügbar.",
+      "toastBackgroundReminder": "Erinnerung „{name}“: {reminder}",
+      "toastViewReminder": "Ansehen",
       "toastBackgroundFailed": "Aufgabe „{name}“ fehlgeschlagen. Bitte die Schaltfläche zum erneuten Versuch verwenden.",
       "unnamedTask": "Unbenannte Aufgabe",
       "toastDeleted": "Job gelöscht",
@@ -3655,6 +3657,21 @@
       "editWhileStreaming": "Warten Sie, bis die aktuelle Antwort fertig ist, bevor Sie bearbeiten",
       "attachmentNeedsAttention": "Anhang prüfen",
       "fixAttachmentBeforeSteer": "Bearbeite diese Nachricht und wiederhole den fehlgeschlagenen Anhang oder entferne ihn, bevor du sendest",
+      "steerUnavailable": {
+        "attachment": "Lenken nicht verfügbar: Nachrichten mit Anhängen können nur als Folgenachrichten gesendet werden. Die Nachricht bleibt in der Warteschlange.",
+        "deliveryInProgress": "Lenken nicht verfügbar: Eine andere Nachricht aus der Warteschlange wird gerade zugestellt. Warten Sie, bis dies abgeschlossen ist.",
+        "steeringInProgress": "Lenken nicht verfügbar: Diese Nachricht wird bereits auf den aktuellen Durchlauf angewendet.",
+        "gatewayUnsupported": "Lenken nicht verfügbar: Dieses Gateway unterstützt kein Lenken im aktuellen Durchlauf. Die Nachricht bleibt in der Warteschlange.",
+        "ensemble": "Lenken nicht verfügbar: Ensemble-Durchläufe akzeptieren nur Folgenachrichten. Die Nachricht bleibt in der Warteschlange.",
+        "taskType": "Lenken nicht verfügbar: Dieser Aufgabentyp akzeptiert nur Folgenachrichten. Die Nachricht bleibt in der Warteschlange.",
+        "queueOnly": "Lenken nicht verfügbar: Die aktuelle Aufgabe akzeptiert nur Folgenachrichten. Die Nachricht bleibt in der Warteschlange.",
+        "noActiveTurn": "Lenken nicht verfügbar: Es gibt keinen aktiven Durchlauf zum Lenken. Die Nachricht bleibt in der Warteschlange.",
+        "turnClosing": "Lenken nicht verfügbar: Der aktuelle Durchlauf wird gerade beendet. Die Nachricht bleibt in der Warteschlange.",
+        "capabilityPending": "Lenken nicht verfügbar: Die Lenkfähigkeit der aktuellen Aufgabe wurde noch nicht synchronisiert. Die Nachricht bleibt in der Warteschlange.",
+        "taskMismatch": "Lenken nicht verfügbar: Die Kennung der aktiven Aufgabe wurde noch nicht synchronisiert. Die Nachricht bleibt in der Warteschlange.",
+        "textUnsupported": "Lenken nicht verfügbar: Die aktuelle Aufgabe akzeptiert keine Textanweisungen. Die Nachricht bleibt in der Warteschlange.",
+        "generic": "Lenken ist für die aktuelle Aufgabe nicht verfügbar. Die Nachricht bleibt in der Warteschlange."
+      },
       "clearQueue": "Warteschlange leeren",
       "removeMessage": "Ausstehende Nachricht {index} entfernen"
     },
@@ -3732,6 +3749,7 @@
       "compacted": "Kontext verdichtet",
       "failed": "Verdichtung fehlgeschlagen",
       "withinBudget": "Kontext innerhalb des Budgets.",
+      "skipped": "Die Kontextverdichtung wurde nicht angewendet.",
       "cancelled": "Verdichtung abgebrochen",
       "requestScoped": "Nur für diese Anfrage; der Sitzungsverlauf wurde nicht neu geschrieben"
     },

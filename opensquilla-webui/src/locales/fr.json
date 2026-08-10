@@ -2611,6 +2611,8 @@
       "toastConnectionRecovered": "Connexion rétablie et état des tâches actualisé",
       "toastConnectionRetry": "La connexion n’est pas encore rétablie. Actualisez bientôt la page.",
       "toastBackgroundComplete": "La tâche « {name} » est terminée. Consultez le résultat dans l’historique.",
+      "toastBackgroundReminder": "Rappel « {name} » : {reminder}",
+      "toastViewReminder": "Voir",
       "toastBackgroundFailed": "La tâche « {name} » a échoué. Utilisez le bouton Réessayer de sa carte.",
       "unnamedTask": "Tâche sans nom",
       "toastDeleted": "Tâche supprimée",
@@ -3655,6 +3657,21 @@
       "editWhileStreaming": "Attendez la fin de la réponse en cours avant de modifier",
       "attachmentNeedsAttention": "Pièce jointe à vérifier",
       "fixAttachmentBeforeSteer": "Modifiez ce message, puis réessayez ou supprimez la pièce jointe en échec avant l'envoi",
+      "steerUnavailable": {
+        "attachment": "Réorientation indisponible : les messages avec pièces jointes ne peuvent être envoyés que comme messages de suivi. Le message reste en file d'attente.",
+        "deliveryInProgress": "Réorientation indisponible : un autre message de la file est en cours d'envoi. Attendez qu'il soit terminé.",
+        "steeringInProgress": "Réorientation indisponible : ce message est déjà en cours d'application au tour actuel.",
+        "gatewayUnsupported": "Réorientation indisponible : cette passerelle ne prend pas en charge la réorientation dans le même tour. Le message reste en file d'attente.",
+        "ensemble": "Réorientation indisponible : les exécutions d'ensemble n'acceptent que les messages de suivi. Le message reste en file d'attente.",
+        "taskType": "Réorientation indisponible : ce type de tâche n'accepte que les messages de suivi. Le message reste en file d'attente.",
+        "queueOnly": "Réorientation indisponible : la tâche actuelle n'accepte que les messages de suivi. Le message reste en file d'attente.",
+        "noActiveTurn": "Réorientation indisponible : aucun tour actif ne peut être réorienté. Le message reste en file d'attente.",
+        "turnClosing": "Réorientation indisponible : le tour actuel est en cours de finalisation. Le message reste en file d'attente.",
+        "capabilityPending": "Réorientation indisponible : la capacité de réorientation de la tâche actuelle n'est pas encore synchronisée. Le message reste en file d'attente.",
+        "taskMismatch": "Réorientation indisponible : l'identité de la tâche active n'est pas encore synchronisée. Le message reste en file d'attente.",
+        "textUnsupported": "Réorientation indisponible : la tâche actuelle n'accepte pas les instructions textuelles. Le message reste en file d'attente.",
+        "generic": "La réorientation n'est pas disponible pour la tâche actuelle. Le message reste en file d'attente."
+      },
       "clearQueue": "Vider la file",
       "removeMessage": "Supprimer le message en attente {index}"
     },
@@ -3732,6 +3749,7 @@
       "compacted": "Contexte compacté",
       "failed": "Échec du compactage",
       "withinBudget": "Contexte dans les limites du budget.",
+      "skipped": "Le compactage du contexte n’a pas été appliqué.",
       "cancelled": "Compactage annulé",
       "requestScoped": "Limité à cette requête ; l’historique de session n’a pas été réécrit"
     },
