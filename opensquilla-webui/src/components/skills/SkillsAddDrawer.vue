@@ -58,6 +58,69 @@
             </div>
 
             <section
+              v-if="queueRows.length"
+              ref="queueRef"
+              class="sk-add-queue"
+              aria-live="polite"
+            >
+              <div class="sk-add-section-title">
+                <h3>{{ t('cronSkills.registry.queueTitle') }}</h3>
+                <span>{{ queueSummary }}</span>
+              </div>
+              <div v-if="queueRefreshWarning" class="sk-add-callout sk-add-callout--warning" role="status">
+                {{ queueRefreshWarning }}
+              </div>
+              <article
+                v-for="item in queueRows"
+                :key="item.id"
+                class="sk-add-queue-item"
+                :data-status="item.status"
+              >
+                <span class="sk-add-queue-item__icon" aria-hidden="true">
+                  <span v-if="item.status === 'installing'" class="sk-spinner" />
+                  <Icon v-else-if="item.status === 'installed' || item.status === 'unchanged'" name="check" :size="18" />
+                  <Icon v-else-if="item.status === 'failed'" name="info" :size="18" />
+                  <Icon v-else name="clock" :size="18" />
+                </span>
+                <div class="sk-add-queue-item__body">
+                  <div class="sk-add-queue-item__head">
+                    <strong>{{ item.displayName }}</strong>
+                    <span>{{ t(`cronSkills.registry.queueStatus.${item.status}`) }}</span>
+                  </div>
+                  <code :title="item.identifier">{{ item.identifier }}</code>
+                  <p v-if="item.error" class="sk-add-queue-item__error">{{ item.error }}</p>
+                  <div v-if="item.resultMeta.length" class="sk-add-queue-item__meta">
+                    <span v-for="meta in item.resultMeta" :key="meta">{{ meta }}</span>
+                  </div>
+                  <span
+                    v-if="item.lifecycleLabel"
+                    class="sk-add-lifecycle"
+                    :data-tone="item.lifecycleTone"
+                  >{{ item.lifecycleLabel }}</span>
+                  <details v-if="item.diagnostics.length" class="sk-add-diagnostics">
+                    <summary>{{ t('cronSkills.registry.diagnostics', { count: item.diagnostics.length }) }}</summary>
+                    <div v-for="diagnostic in item.diagnostics" :key="`${diagnostic.phase}:${diagnostic.code}`">
+                      <strong>{{ diagnostic.code }}</strong>
+                      <p>{{ diagnostic.message }}</p>
+                      <p v-if="diagnostic.hint">{{ diagnostic.hint }}</p>
+                      <pre v-if="hasDiagnosticDetails(diagnostic.details)">{{ diagnosticDetails(diagnostic.details || {}) }}</pre>
+                    </div>
+                  </details>
+                  <button
+                    v-if="item.status === 'failed'"
+                    class="btn btn--ghost btn--sm sk-add-retry"
+                    type="button"
+                    :disabled="queueRunning || mutationBlocked"
+                    @click="emit('retry', item.id)"
+                  >
+                    <Icon name="refresh" :size="14" />
+                    <span>{{ t('cronSkills.registry.retry') }}</span>
+                  </button>
+                </div>
+              </article>
+            </section>
+
+            <section
               v-if="sourceMode === 'github'"
               id="skills-add-panel-github"
               class="sk-add-source-panel"
@@ -179,63 +242,6 @@
               </div>
             </section>
 
-            <section v-if="queueRows.length" class="sk-add-queue" aria-live="polite">
-              <div class="sk-add-section-title">
-                <h3>{{ t('cronSkills.registry.queueTitle') }}</h3>
-                <span>{{ queueSummary }}</span>
-              </div>
-              <div v-if="queueRefreshWarning" class="sk-add-callout sk-add-callout--warning" role="status">
-                {{ queueRefreshWarning }}
-              </div>
-              <article
-                v-for="item in queueRows"
-                :key="item.id"
-                class="sk-add-queue-item"
-                :data-status="item.status"
-              >
-                <span class="sk-add-queue-item__icon" aria-hidden="true">
-                  <span v-if="item.status === 'installing'" class="sk-spinner" />
-                  <Icon v-else-if="item.status === 'installed' || item.status === 'unchanged'" name="check" :size="18" />
-                  <Icon v-else-if="item.status === 'failed'" name="info" :size="18" />
-                  <Icon v-else name="clock" :size="18" />
-                </span>
-                <div class="sk-add-queue-item__body">
-                  <div class="sk-add-queue-item__head">
-                    <strong>{{ item.displayName }}</strong>
-                    <span>{{ t(`cronSkills.registry.queueStatus.${item.status}`) }}</span>
-                  </div>
-                  <code :title="item.identifier">{{ item.identifier }}</code>
-                  <p v-if="item.error" class="sk-add-queue-item__error">{{ item.error }}</p>
-                  <div v-if="item.resultMeta.length" class="sk-add-queue-item__meta">
-                    <span v-for="meta in item.resultMeta" :key="meta">{{ meta }}</span>
-                  </div>
-                  <span
-                    v-if="item.lifecycleLabel"
-                    class="sk-add-lifecycle"
-                    :data-tone="item.lifecycleTone"
-                  >{{ item.lifecycleLabel }}</span>
-                  <details v-if="item.diagnostics.length" class="sk-add-diagnostics">
-                    <summary>{{ t('cronSkills.registry.diagnostics', { count: item.diagnostics.length }) }}</summary>
-                    <div v-for="diagnostic in item.diagnostics" :key="`${diagnostic.phase}:${diagnostic.code}`">
-                      <strong>{{ diagnostic.code }}</strong>
-                      <p>{{ diagnostic.message }}</p>
-                      <p v-if="diagnostic.hint">{{ diagnostic.hint }}</p>
-                      <pre v-if="diagnostic.details">{{ diagnosticDetails(diagnostic.details) }}</pre>
-                    </div>
-                  </details>
-                  <button
-                    v-if="item.status === 'failed'"
-                    class="btn btn--ghost btn--sm sk-add-retry"
-                    type="button"
-                    :disabled="queueRunning || mutationBlocked"
-                    @click="emit('retry', item.id)"
-                  >
-                    <Icon name="refresh" :size="14" />
-                    <span>{{ t('cronSkills.registry.retry') }}</span>
-                  </button>
-                </div>
-              </article>
-            </section>
           </div>
         </aside>
       </div>
@@ -244,7 +250,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, toRef } from 'vue'
+import { computed, nextTick, ref, toRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
@@ -281,8 +287,14 @@ const { t } = useI18n()
 const sourceMode = ref<'github' | 'clawhub'>('github')
 const drawerRef = ref<HTMLElement | null>(null)
 const closeButtonRef = ref<HTMLButtonElement | null>(null)
+const queueRef = ref<HTMLElement | null>(null)
 useDialogA11y(drawerRef, toRef(props, 'open'), () => emit('close'), {
   initialFocus: closeButtonRef,
+})
+
+watch(() => props.queueRunning, (running) => {
+  if (!running) return
+  void nextTick(() => queueRef.value?.scrollIntoView({ block: 'nearest' }))
 })
 
 const githubReferences = computed(() => props.githubUrl
@@ -376,6 +388,10 @@ function diagnosticDetails(details: Record<string, unknown>): string {
   } catch {
     return String(details)
   }
+}
+
+function hasDiagnosticDetails(details: Record<string, unknown> | undefined): boolean {
+  return Boolean(details && Object.keys(details).length)
 }
 
 function effectiveFromLabel(value: string | undefined): string {
@@ -609,6 +625,19 @@ function effectiveFromLabel(value: string | undefined): string {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+}
+
+.sk-add-queue {
+  max-height: min(46dvh, 520px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.sk-add-queue .sk-add-section-title {
+  background: var(--bg-surface);
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
 .sk-add-result {

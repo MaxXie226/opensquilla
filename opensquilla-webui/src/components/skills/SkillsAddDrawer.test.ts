@@ -133,6 +133,13 @@ describe('SkillsAddDrawer', () => {
           blocking: true,
           message: 'Unsupported field.',
           details: { upstreamText: '<em data-e2e="must-stay-text">literal text</em>' },
+        }, {
+          code: 'NO_DETAILS',
+          severity: 'warning',
+          phase: 'archive',
+          blocking: false,
+          message: 'No structured details.',
+          details: {},
         }],
       },
     }]
@@ -153,6 +160,7 @@ describe('SkillsAddDrawer', () => {
     await nextTick()
     expect(document.querySelector('.sk-add-diagnostics')?.textContent).toContain('literal text')
     expect(document.querySelector('[data-e2e="must-stay-text"]')).toBeNull()
+    expect(document.querySelectorAll('.sk-add-diagnostics pre')).toHaveLength(1)
   })
 
   it('disables install entry points without showing queue progress when another mutation owns the surface', async () => {
@@ -195,5 +203,33 @@ describe('SkillsAddDrawer', () => {
     document.querySelector<HTMLButtonElement>('.sk-add-result .btn--primary')?.click()
 
     expect(installed).toEqual([['@verified/demo@1.2.3', 'clawhub', 'Demo']])
+  })
+
+  it('shows install activity before long ClawHub search results', async () => {
+    const queue: SkillInstallQueueItem[] = [{
+      id: '["clawhub","@verified/demo"]',
+      identifier: '@verified/demo',
+      source: 'clawhub',
+      displayName: 'demo',
+      status: 'failed',
+      error: 'Rejected',
+    }]
+    mountDrawer({
+      queue,
+      results: [{
+        name: 'Demo',
+        installReference: '@verified/demo',
+        source: 'clawhub',
+      }],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const activity = document.querySelector<HTMLElement>('.sk-add-queue')!
+    const results = document.querySelector<HTMLElement>('.sk-add-results')!
+    expect(activity.compareDocumentPosition(results) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
   })
 })
