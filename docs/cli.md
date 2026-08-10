@@ -271,9 +271,10 @@ More detail:
 opensquilla skills list
 opensquilla skills search pdf
 opensquilla skills view pdf-toolkit
-opensquilla skills install <skill-name>
+opensquilla skills install <install-reference> --source <clawhub|github>
 opensquilla skills update --all
 opensquilla skills uninstall <skill-name>
+opensquilla skills doctor [<skill-name-or-install-id>] --json
 opensquilla skills inspect meta-skill-creator
 opensquilla skills meta proposals list
 opensquilla skills meta runs list

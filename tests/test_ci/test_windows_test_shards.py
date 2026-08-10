@@ -50,6 +50,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/integration/cli/tui_real_terminal/test_source_gateway_bootstrap_startup.py",
     "tests/integration/cli/tui_real_terminal/test_terminal_changes.py",
     "tests/live/test_search_api_matrix_live.py",
+    "tests/live/test_skill_hub_canary_live.py",
     "tests/live/test_multi_provider_matrix_live.py",
     "tests/live/test_search_retrieval_live.py",
     "tests/live/test_tokenrhythm_catalog_live.py",

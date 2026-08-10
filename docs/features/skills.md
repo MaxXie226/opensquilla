@@ -46,15 +46,21 @@ opensquilla skills search pdf
 ```
 
 Some skills may be ineligible when optional dependencies are missing or when the
-skill is intentionally demo-only. `skills list` is the source of truth for your
-current install.
+skill is intentionally demo-only. Use `skills doctor` when you need to distinguish
+installation, loader acceptance, precedence, and dependency readiness:
+
+```sh
+opensquilla skills doctor
+opensquilla skills doctor <skill-name-or-install-id> --json
+```
 
 ## Install, Update, and Remove Skills
 
 Install a managed skill:
 
 ```sh
-opensquilla skills install <skill-name>
+opensquilla skills install <clawhub-install-reference> --source clawhub
+opensquilla skills install <owner/repo[@ref][:subpath]> --source github
 ```
 
 Update one skill or all managed skills:
@@ -64,11 +70,39 @@ opensquilla skills update <skill-name>
 opensquilla skills update --all
 ```
 
+Use `--force` only to acknowledge a scanner verdict for one install or update;
+it does not bypass path, manifest, compatibility, or postflight validation.
+
 Remove a managed skill:
 
 ```sh
 opensquilla skills uninstall <skill-name>
 ```
+
+OpenSquilla currently supports single-root, instruction-first Community Skills
+from ClawHub and GitHub. A flat package or one wrapper directory is accepted. A
+GitHub branch or tag is resolved to an immutable commit before files are fetched.
+An install commits content and provenance; it does not install declared runtime
+dependencies.
+
+An installed Skill is not necessarily usable. It may be shadowed by a
+higher-precedence Skill, disabled by configuration, or require setup. Online
+install results become observable to agent turns from the next turn because the
+current turn keeps a pinned catalog. Offline CLI installs are only validated for
+the next Gateway start; activation and readiness are evaluated at that start.
+
+This is not full Claude Skills or OpenClaw Skills execution compatibility.
+Direct `/skill` commands, argument substitution, scoped tool permissions, hooks,
+context forks, plugin/MCP activation, and executable sandbox materialization are
+not supported by Community installation. A Skill that declares `allowed-tools`
+is installed with limited compatibility: OpenSquilla does not grant that
+preapproval, keeps the normal tool approval policy, and reports
+`TOOL_PREAPPROVAL_IGNORED` through Doctor. Fields that change control flow or
+activate executable integrations, such as hooks, context forks, agents,
+plugin/MCP activation, and command entrypoints, remain blocking instead of being
+silently ignored. Claude-style ``!`command` `` dynamic context is also retained
+as instruction text rather than executed while loading; Doctor reports
+`DYNAMIC_CONTEXT_UNSUPPORTED` and marks the installation as degraded.
 
 ## Manage Skill Sources
 
@@ -143,12 +177,20 @@ If a skill is not selected:
 
    ```sh
    opensquilla skills view <skill-name>
+   opensquilla skills doctor <skill-name>
    ```
 
 3. Ask for the outcome in normal language. Skill names can help, but user
    intent should still be clear.
 
-4. If optional dependencies are missing, install or update the skill and retry.
+4. If Doctor reports `needs_setup`, install the declared dependency separately,
+   then rerun Doctor. Doctor itself is read-only: it does not use the network,
+   run third-party scripts, or call an LLM.
+
+If a newly upgraded CLI reports `GATEWAY_UPGRADE_REQUIRED`, restart the running
+Gateway from the same upgraded installation before retrying Doctor. The CLI
+does not silently switch to an offline scan while an older Gateway still owns
+the profile.
 
 For composed workflows, read [`meta-skills.md`](meta-skills.md). For the full
 MetaSkill user guide, read [`meta-skill-user-guide.md`](meta-skill-user-guide.md).
