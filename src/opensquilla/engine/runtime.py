@@ -5873,6 +5873,14 @@ class TurnRunner:
             _resolve_submit_review(self._config) and not plan_mode and not attached_plan_run
         )
         if ctx is not None:
+            # A lossy tool-result projection is only useful when the model can
+            # recover the stored original. Surface the read-only retrieval tool
+            # before the first schema is built; normal allow/deny/profile policy
+            # still wins below, so this never expands an explicit allowlist.
+            if ctx.tool_result_store_dir:
+                if ctx.surfaced_tools is None:
+                    ctx.surfaced_tools = set()
+                ctx.surfaced_tools.add("retrieve_tool_result")
             if meta_skill_enabled and meta_auto_trigger and has_invokable_meta_skill:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
@@ -5964,6 +5972,13 @@ class TurnRunner:
         tool_defs = self._tool_registry.to_tool_definitions(ctx)
         profile = resolve_profile(ctx)
         tool_defs = filter_by_profile(tool_defs, profile, ctx)
+        if ctx is not None:
+            retrieval_available = any(
+                definition.name == "retrieve_tool_result" for definition in tool_defs
+            )
+            ctx.tool_result_retrieval_available = retrieval_available
+            if ctx is not caller_ctx:
+                caller_ctx.tool_result_retrieval_available = retrieval_available
         # layered intentionally — policy first, profile second.
         log.debug(
             "tool_policy.profile_post",

@@ -14,6 +14,7 @@ from opensquilla.engine.session_sanitize import (
     project_historical_tool_payloads,
     sanitize_session_messages,
 )
+from opensquilla.engine.tool_result_store import ToolResultStore
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.memory.session_flush import _usage_from_complete_response
 from opensquilla.provider import (
@@ -23,6 +24,8 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
     ModelCapabilities,
+    ToolDefinition,
+    ToolInputSchema,
 )
 from opensquilla.provider import (
     DoneEvent as ProviderDone,
@@ -37,6 +40,67 @@ from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
 from opensquilla.provider.types import ContentBlockImage
+
+
+def _tool_definition(name: str) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=f"Mock {name} tool.",
+        input_schema=ToolInputSchema(properties={}, required=[]),
+    )
+
+
+def _retrieval_tool_definition() -> ToolDefinition:
+    return _tool_definition("retrieve_tool_result")
+
+
+async def _unused_retrieval_handler(call: Any) -> ToolResult:
+    raise AssertionError(f"unexpected tool call: {call.tool_name}")
+
+
+def _recoverable_projection_agent(
+    tmp_path: Any,
+    *,
+    provider: Any | None = None,
+    tool_handler: Any = _unused_retrieval_handler,
+    tool_names: tuple[str, ...] = (),
+    **config_overrides: Any,
+) -> Agent:
+    store_dir = tmp_path / "tool-results"
+
+    async def recovery_capable_handler(call: Any) -> ToolResult:
+        if call.tool_name == "retrieve_tool_result":
+            record = ToolResultStore(store_dir).read(
+                call.arguments["handle"],
+                session_id="session-1",
+            )
+            return ToolResult(
+                tool_use_id=call.tool_use_id,
+                tool_name=call.tool_name,
+                content=record.content,
+            )
+        return await tool_handler(call)
+
+    setattr(
+        recovery_capable_handler,
+        "_opensquilla_available_tools",
+        frozenset({"retrieve_tool_result", *tool_names}),
+    )
+    return Agent(
+        provider=provider or CapturingProvider(),
+        config=AgentConfig(
+            tool_result_store_dir=str(store_dir),
+            tool_result_store_session_id="session-1",
+            tool_result_store_session_key="agent:main:session-1",
+            tool_result_store_agent_id="main",
+            **config_overrides,
+        ),
+        tool_definitions=[
+            *(_tool_definition(name) for name in tool_names),
+            _retrieval_tool_definition(),
+        ],
+        tool_handler=recovery_capable_handler,
+    )
 
 
 def test_agent_config_disables_tool_argument_projection_by_default() -> None:
@@ -309,7 +373,7 @@ def test_session_sanitize_strips_block_metadata_without_compressing_content() ->
     assert "timestamp" not in block.model_dump(mode="json")
 
 
-def test_historical_replay_projection_compacts_tool_payloads_and_reasoning() -> None:
+def test_historical_replay_projection_preserves_raw_tool_result_without_handle() -> None:
     large_argument = "STALE_ARGUMENT_START\n" + ("x" * 6000)
     large_result = "STALE_RESULT_START\n" + ("y" * 6000)
     messages = [
@@ -339,7 +403,7 @@ def test_historical_replay_projection_compacts_tool_payloads_and_reasoning() -> 
     projected, result = project_historical_tool_payloads(messages)
 
     assert result.tool_uses_projected == 1
-    assert result.tool_results_projected == 1
+    assert result.tool_results_projected == 0
     assert result.reasoning_chars_removed > 0
     assert projected[0].reasoning_content is None
     tool_use = projected[0].content[0]
@@ -349,16 +413,16 @@ def test_historical_replay_projection_compacts_tool_payloads_and_reasoning() -> 
     assert large_argument not in tool_use.input["content"]
     tool_result = projected[1].content[0]
     assert isinstance(tool_result, ContentBlockToolResult)
-    assert str(tool_result.content).startswith("[historical_tool_result_compacted]")
-    assert large_result not in str(tool_result.content)
+    assert tool_result.content == large_result
     assert messages[0].reasoning_content is not None
     assert messages[0].content[0].input["content"] == large_argument
 
 
 def test_historical_replay_projection_preserves_tool_result_projection_envelope() -> None:
+    handle = "tr-" + ("a" * 32)
     projection = (
         "[tool_result_projection]\n"
-        "tool_result_handle: tr-abc123\n"
+        f"tool_result_handle: {handle}\n"
         "sha256: " + ("a" * 64) + "\n"
         "original_chars: 50000\n"
         "preview_complete: false\n"
@@ -381,14 +445,17 @@ def test_historical_replay_projection_preserves_tool_result_projection_envelope(
         )
     ]
 
-    projected, result = project_historical_tool_payloads(messages)
+    projected, result = project_historical_tool_payloads(
+        messages,
+        recoverable_references=frozenset({(handle, "a" * 64)}),
+    )
 
     assert result.tool_results_projected == 1
     tool_result = projected[0].content[0]
     assert isinstance(tool_result, ContentBlockToolResult)
     assert isinstance(tool_result.content, str)
     assert tool_result.content.startswith("[tool_result_projection]\n")
-    assert "tool_result_handle: tr-abc123" in tool_result.content
+    assert f"tool_result_handle: {handle}" in tool_result.content
     assert "sha256: " + ("a" * 64) in tool_result.content
     assert "original_chars: 50000" in tool_result.content
     assert "preview_complete: false" in tool_result.content
@@ -397,6 +464,141 @@ def test_historical_replay_projection_preserves_tool_result_projection_envelope(
     assert "FAILED tests/test_api.py::test_bad" in tool_result.content
     assert "[historical_tool_result_projection_body_compacted]" in tool_result.content
     assert tool_result.content.count("large projected body") < 50
+
+
+def test_historical_replay_projection_requires_verified_reference() -> None:
+    handle = "tr-" + ("a" * 32)
+    sha256 = "a" * 64
+    projection = (
+        "[tool_result_projection]\n"
+        f"tool_result_handle: {handle}\n"
+        f"sha256: {sha256}\n"
+        "retrieve_hint: use retrieve_tool_result.\n"
+        + ("unverified projected body\n" * 500)
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=projection)],
+        )
+    ]
+
+    without_proof, without_proof_result = project_historical_tool_payloads(messages)
+    wrong_digest, wrong_digest_result = project_historical_tool_payloads(
+        messages,
+        recoverable_references=frozenset({(handle, "b" * 64)}),
+    )
+
+    assert without_proof is messages
+    assert without_proof_result.tool_results_projected == 0
+    assert wrong_digest is messages
+    assert wrong_digest_result.tool_results_projected == 0
+
+
+def test_agent_verifies_historical_references_against_store_scope(tmp_path) -> None:
+    agent = _recoverable_projection_agent(tmp_path)
+    store = ToolResultStore(tmp_path / "tool-results")
+    valid = store.write(
+        "valid raw output",
+        tool_use_id="valid",
+        tool_name="exec_command",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        agent_id="main",
+    )
+    wrong_scope = store.write(
+        "other agent raw output",
+        tool_use_id="wrong-scope",
+        tool_name="exec_command",
+        session_id="session-1",
+        session_key="agent:other:session-1",
+        agent_id="other",
+    )
+
+    def envelope(handle: str, sha256: str, marker: str) -> str:
+        return (
+            "[tool_result_projection]\n"
+            f"tool_result_handle: {handle}\n"
+            f"sha256: {sha256}\n"
+            "retrieve_hint: use retrieve_tool_result.\n"
+            + ((marker + "\n") * 500)
+        )
+
+    contents = {
+        "valid": envelope(valid.handle, valid.sha256, "valid projected body"),
+        "wrong-scope": envelope(
+            wrong_scope.handle,
+            wrong_scope.sha256,
+            "wrong scope projected body",
+        ),
+        "stale": envelope("tr-" + ("f" * 32), "f" * 64, "stale projected body"),
+        "forged": envelope(valid.handle, "0" * 64, "forged projected body"),
+    }
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id=tool_use_id, content=content)],
+        )
+        for tool_use_id, content in contents.items()
+    ]
+
+    verified = agent._verified_tool_result_references(messages)
+    projected, result = project_historical_tool_payloads(
+        messages,
+        recoverable_references=verified,
+    )
+
+    assert verified == frozenset({(valid.handle, valid.sha256)})
+    assert result.tool_results_projected == 1
+    projected_by_id = {
+        block.tool_use_id: block.content
+        for message in projected
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolResult)
+    }
+    assert projected_by_id["valid"] != contents["valid"]
+    for tool_use_id in ("wrong-scope", "stale", "forged"):
+        assert projected_by_id[tool_use_id] == contents[tool_use_id]
+
+
+@pytest.mark.parametrize(
+    "handle_line",
+    [
+        "",
+        "tool_result_handle: tr-abc123\n",
+        "tool_result_handle: tr-" + ("g" * 32) + "\n",
+    ],
+)
+def test_historical_replay_projection_preserves_unrecoverable_envelope(
+    handle_line: str,
+) -> None:
+    projection = (
+        "[tool_result_projection]\n"
+        + handle_line
+        + "retrieve_hint: use retrieve_tool_result.\n"
+        + ("unrecoverable projected body\n" * 500)
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(
+                    tool_use_id="tool-1",
+                    content=projection,
+                    is_error=False,
+                )
+            ],
+        )
+    ]
+
+    projected, result = project_historical_tool_payloads(messages)
+
+    assert result.tool_results_projected == 0
+    assert projected is messages
+    tool_result = projected[0].content[0]
+    assert isinstance(tool_result, ContentBlockToolResult)
+    assert tool_result.content == projection
 
 
 def test_historical_replay_projection_compacts_nested_tool_payloads() -> None:
@@ -433,7 +635,7 @@ def test_historical_replay_projection_compacts_nested_tool_payloads() -> None:
     assert messages[0].content[0].input["metadata"] == large_nested
 
 
-def test_historical_replay_projection_compacts_list_tool_results() -> None:
+def test_historical_replay_projection_preserves_list_tool_results_without_handle() -> None:
     large_result = [{"type": "text", "text": "LIST_RESULT_START\n" + ("y" * 8000)}]
     messages = [
         Message(
@@ -450,16 +652,14 @@ def test_historical_replay_projection_compacts_list_tool_results() -> None:
 
     projected, result = project_historical_tool_payloads(messages)
 
-    assert result.tool_results_projected == 1
+    assert result.tool_results_projected == 0
     tool_result = projected[0].content[0]
     assert isinstance(tool_result, ContentBlockToolResult)
-    assert isinstance(tool_result.content, str)
-    assert tool_result.content.startswith("[historical_tool_result_compacted]")
-    assert "y" * 1000 not in tool_result.content
+    assert tool_result.content == large_result
     assert messages[0].content[0].content == large_result
 
 
-def test_agent_aggregate_tool_result_budget_compacts_old_bulky_results() -> None:
+def test_agent_aggregate_tool_result_budget_preserves_raw_without_recovery() -> None:
     raw_old_output = "old bulky output\n" + ("x" * 4000)
     agent = Agent(
         provider=CapturingProvider(),
@@ -526,19 +726,18 @@ def test_agent_aggregate_tool_result_budget_compacts_old_bulky_results() -> None
     assert isinstance(old_result, ContentBlockToolResult)
     assert isinstance(err_result, ContentBlockToolResult)
     assert isinstance(new_result, ContentBlockToolResult)
-    assert "aggregate_tool_result_compacted" in old_result.content
-    assert "tool_result_handle:" not in old_result.content
-    assert len(old_result.content) < 1000
+    assert old_result.content == raw_old_output
     assert "Traceback" in err_result.content
     assert len(err_result.content) > 4000
     assert "recent output" in new_result.content
     assert len(new_result.content) > 4000
-    assert agent.config.metadata["tool_aggregate_projection_applied"] is True
-    assert agent.config.metadata["tool_projection_applied"] is True
-    assert agent.config.metadata["tool_projection_tokens_saved"] > 0
+    assert "tool_aggregate_projection_applied" not in agent.config.metadata
+    assert "tool_projection_applied" not in agent.config.metadata
 
 
-def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> None:
+def test_agent_large_context_compacts_old_local_tool_results_for_provider(
+    tmp_path,
+) -> None:
     def _tool_pair(tool_id: str, body: str, *, is_error: bool = False) -> list[Message]:
         return [
             Message(
@@ -557,11 +756,9 @@ def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> N
             ),
         ]
 
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200_000,
-        ),
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200_000,
     )
     messages = [
         block
@@ -589,7 +786,7 @@ def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> N
     assert isinstance(middle_result, ContentBlockToolResult)
     assert isinstance(recent_result, ContentBlockToolResult)
     assert "[tool_result_projection]" in old_result.content
-    assert "tool_result_handle:" not in old_result.content
+    assert "tool_result_handle: tr-" in old_result.content
     assert len(old_result.content) < 5_000
     assert "Traceback preserved" in error_result.content
     assert len(error_result.content) > 20_000
@@ -607,12 +804,12 @@ def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> N
 
 
 @pytest.mark.asyncio
-async def test_agent_single_tool_result_projection_does_not_store_raw_content(tmp_path) -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+async def test_agent_single_tool_result_projection_stores_recoverable_raw_content(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     raw_output = "single bulky output\n" + ("x" * 8000)
 
@@ -632,21 +829,42 @@ async def test_agent_single_tool_result_projection_does_not_store_raw_content(tm
     assert isinstance(result, ContentBlockToolResult)
 
     assert "[tool_result_projection]" in result.content
-    assert "tool_result_handle:" not in result.content
+    assert "tool_result_handle: tr-" in result.content
     assert raw_output not in result.content
-    assert not (tmp_path / "tool-results").exists()
+    stored_contents = list((tmp_path / "tool-results").rglob("content.txt"))
+    assert len(stored_contents) == 1
+    assert stored_contents[0].read_text() == raw_output
 
 
-@pytest.mark.asyncio
-async def test_agent_tool_result_projection_never_writes_raw_store(
+@pytest.mark.parametrize(
+    ("has_store", "has_schema", "has_handler"),
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+def test_agent_tool_result_projection_preserves_raw_when_recovery_is_incomplete(
     tmp_path,
+    has_store: bool,
+    has_schema: bool,
+    has_handler: bool,
 ) -> None:
+    config_kwargs: dict[str, Any] = {"context_window_tokens": 200}
+    if has_store:
+        config_kwargs.update(
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id="session-1",
+            tool_result_store_session_key="agent:main:session-1",
+            tool_result_store_agent_id="main",
+        )
     agent = Agent(
         provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+        config=AgentConfig(**config_kwargs),
+        tool_definitions=[_retrieval_tool_definition()] if has_schema else None,
+        tool_handler=_unused_retrieval_handler if has_handler else None,
     )
+    raw_output = "single bulky output\n" + ("x" * 8000)
 
     messages = [
         Message(
@@ -658,7 +876,7 @@ async def test_agent_tool_result_projection_never_writes_raw_store(
             content=[
                 ContentBlockToolResult(
                     tool_use_id="tool-1",
-                    content="single bulky output\n" + ("x" * 8000),
+                    content=raw_output,
                 )
             ],
         ),
@@ -668,18 +886,18 @@ async def test_agent_tool_result_projection_never_writes_raw_store(
     result = projected[1].content[0]
     assert isinstance(result, ContentBlockToolResult)
 
-    assert "[tool_result_projection]" in result.content
-    assert "tool_result_handle:" not in result.content
+    assert result.content == raw_output
+    assert "[tool_result_projection]" not in result.content
     assert not list((tmp_path / "tool-results").rglob("content.txt"))
 
 
-def test_agent_provider_backstop_preserves_historical_read_file_source_context() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1_000_000,
-            tool_result_provider_request_max_chars=1000,
-        ),
+def test_agent_provider_backstop_preserves_historical_read_file_source_context(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1_000_000,
+        tool_result_provider_request_max_chars=1000,
     )
     source = "\n".join(f"{index}: important implementation detail" for index in range(600))
     messages = [
@@ -714,13 +932,13 @@ def test_agent_provider_backstop_preserves_historical_read_file_source_context()
     assert "tool_provider_guard_projection_applied" not in agent.config.metadata
 
 
-def test_agent_provider_backstop_preserves_historical_exec_source_context() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1_000_000,
-            tool_result_provider_request_max_chars=1000,
-        ),
+def test_agent_provider_backstop_preserves_historical_exec_source_context(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1_000_000,
+        tool_result_provider_request_max_chars=1000,
     )
     source = "\n".join(f"{index}: fn important_{index}() {{}}" for index in range(500))
     messages = [
@@ -755,12 +973,12 @@ def test_agent_provider_backstop_preserves_historical_exec_source_context() -> N
     assert "tool_provider_guard_projection_applied" not in agent.config.metadata
 
 
-def test_agent_aggregate_tool_result_budget_uses_total_not_single_result_size() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1200,
-        ),
+def test_agent_aggregate_tool_result_budget_uses_total_not_single_result_size(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1200,
     )
     messages: list[Message] = []
     for index in range(5):
@@ -799,13 +1017,13 @@ def test_agent_aggregate_tool_result_budget_uses_total_not_single_result_size() 
     assert "recent output" not in "\n".join(compacted_contents)
 
 
-def test_agent_aggregate_projection_preserves_historical_read_file_source_context() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1200,
-            tool_result_provider_request_max_chars=1_000_000,
-        ),
+def test_agent_aggregate_projection_preserves_historical_read_file_source_context(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1200,
+        tool_result_provider_request_max_chars=1_000_000,
     )
     source = "\n".join(f"{index}: important source line" for index in range(500))
     messages: list[Message] = [
@@ -914,14 +1132,14 @@ def test_agent_aggregate_tool_result_budget_keeps_projected_history_stable() -> 
     assert projected_contents == original_contents
 
 
-def test_agent_provider_backstop_classifies_external_results_from_tool_use_names() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=1_000_000,
-            tool_result_provider_request_max_chars=1300,
-            tool_result_external_keep_recent=2,
-        ),
+def test_agent_provider_backstop_classifies_external_results_from_tool_use_names(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=1_000_000,
+        tool_result_provider_request_max_chars=1300,
+        tool_result_external_keep_recent=2,
     )
     messages: list[Message] = []
     for index in range(4):
@@ -1953,7 +2171,9 @@ async def test_agent_request_context_repeats_across_tool_loop_without_persisting
 
 
 @pytest.mark.asyncio
-async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provider() -> None:
+async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provider(
+    tmp_path,
+) -> None:
     provider = ToolLoopCapturingProvider()
     raw_output = "single bulky output\n" + ("x" * 5000)
 
@@ -1964,18 +2184,18 @@ async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provi
             content=raw_output,
         )
 
-    agent = Agent(
+    agent = _recoverable_projection_agent(
+        tmp_path,
         provider=provider,
-        config=AgentConfig(
-            # Window large enough that the projected (~250-token) tool result
-            # fits: this test exercises tool-result projection/canonicalization,
-            # not compaction. A 200-token window is below the projection floor,
-            # so inline compaction would legitimately fire and prune the result.
-            context_window_tokens=200_000,
-            max_iterations=2,
-            tool_result_projection_max_inline_chars=1000,
-        ),
         tool_handler=tool_handler,
+        tool_names=("echo",),
+        # Window large enough that the projected (~250-token) tool result
+        # fits: this test exercises tool-result projection/canonicalization,
+        # not compaction. A 200-token window is below the projection floor,
+        # so inline compaction would legitimately fire and prune the result.
+        context_window_tokens=200_000,
+        max_iterations=2,
+        tool_result_projection_max_inline_chars=1000,
     )
 
     events = [event async for event in agent.run_turn("hello")]
@@ -1986,7 +2206,7 @@ async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provi
         if isinstance(event, ToolResultEvent) and event.tool_use_id == "tool-1"
     )
     assert result_event.result != raw_output
-    assert "tool_result_handle:" not in result_event.result
+    assert "tool_result_handle: tr-" in result_event.result
     history_result = next(
         block
         for message in agent._history
@@ -2007,17 +2227,17 @@ async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provi
     )
     assert replay_result.content == result_event.result
     assert replay_result.content != raw_output
-    assert "tool_result_handle:" not in replay_result.content
+    assert "tool_result_handle: tr-" in replay_result.content
     assert "single bulky output" in replay_result.content
     assert len(replay_result.content) < len(raw_output)
 
 
-def test_agent_provider_request_messages_project_overflow_retry_tool_results() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+def test_agent_provider_request_messages_project_overflow_retry_tool_results(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     raw_output = "overflow retry bulky output\n" + ("x" * 8000)
     messages = [
@@ -2051,16 +2271,16 @@ def test_agent_provider_request_messages_project_overflow_retry_tool_results() -
     )
     assert request_result.content != raw_output
     assert "[tool_result_projection]" in request_result.content
-    assert "tool_result_handle:" not in request_result.content
+    assert "tool_result_handle: tr-" in request_result.content
     assert len(request_result.content) < len(raw_output)
 
 
-def test_agent_provider_request_guard_reuses_stable_tool_result_projection() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+def test_agent_provider_request_guard_reuses_stable_tool_result_projection(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     raw_output = "overflow retry bulky output\n" + ("x" * 8000)
     messages = [
@@ -2106,12 +2326,12 @@ def test_agent_provider_request_guard_reuses_stable_tool_result_projection() -> 
     assert agent._provider_tool_result_overrides["tool-1"].content == first_content
 
 
-def test_agent_provider_request_reapplies_frozen_projection_after_turn_reset() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+def test_agent_provider_request_reapplies_frozen_projection_after_turn_reset(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     raw_output = "overflow retry bulky output\n" + ("x" * 8000)
     messages = [
@@ -2154,12 +2374,12 @@ def test_agent_provider_request_reapplies_frozen_projection_after_turn_reset() -
     assert "[tool_result_projection]" in _result_content(second_request)
 
 
-def test_agent_provider_request_does_not_project_previously_full_visible_result() -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
+def test_agent_provider_request_does_not_project_previously_full_visible_result(
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        context_window_tokens=200,
     )
     first_raw = "first result stays full"
     first_messages = [

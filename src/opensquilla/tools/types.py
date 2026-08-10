@@ -178,6 +178,10 @@ class ToolContext:
     # run. Runtime-only prompt input; checkpoint tools continue to read live
     # storage for compare-and-set transitions.
     plan_run: Any | None = field(default=None, repr=False)
+    # Frozen after the final provider-visible tool schema is built. Dispatch
+    # and projection code use this bit to avoid replacing raw tool output with
+    # a handle that the current model is not authorized to retrieve.
+    tool_result_retrieval_available: bool = False
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

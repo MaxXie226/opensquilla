@@ -89,6 +89,7 @@ from opensquilla.engine.runtime_state_capsule import (
 from opensquilla.engine.session_sanitize import (
     SessionSanitizeResult,
     project_historical_tool_payloads,
+    recoverable_tool_result_reference,
     sanitize_session_messages,
     session_payload_chars,
 )
@@ -2666,6 +2667,7 @@ class Agent:
         self.tool_definitions = tool_definitions or []
         self._tool_definition_by_name = {tool.name: tool for tool in self.tool_definitions}
         self._raw_tool_handler = tool_handler
+        self._provider_call_tool_result_retrieval_available: bool | None = None
         self.tool_handler = tool_handler
         self.subagent_manager = subagent_manager or SubagentManager()
         self._usage_tracker = usage_tracker
@@ -2705,6 +2707,10 @@ class Agent:
             )
         if tool_context is not None:
             tool_context = self._apply_configured_tool_result_budget(tool_context)
+            tool_context.tool_result_retrieval_available = bool(
+                tool_context.tool_result_store_dir
+                and self._tool_result_recovery_available()
+            )
             tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
         # Test-only offline failure seam. ``None`` on every production path,
@@ -2998,6 +3004,11 @@ class Agent:
                 finally:
                     current_tool_context.reset(token)
 
+        setattr(
+            _handler,
+            "_opensquilla_available_tools",
+            getattr(tool_handler, "_opensquilla_available_tools", frozenset()),
+        )
         return _handler
 
     def _provider_request_proof_max_chars(self) -> int:
@@ -3907,6 +3918,199 @@ class Agent:
             return max(1, int(fallback))
         return max(1, int(self.config.tool_result_projection_max_inline_chars))
 
+    def _tool_result_recovery_available(self) -> bool:
+        """Return whether a lossy projection can be recovered by this model."""
+
+        if self._provider_call_tool_result_retrieval_available is False:
+            return False
+        capabilities = self.config.model_capabilities
+        supports_tools = (
+            getattr(capabilities, "supports_tools", None)
+            if capabilities is not None
+            else None
+        )
+        handler_tools = getattr(
+            self._raw_tool_handler,
+            "_opensquilla_available_tools",
+            frozenset(),
+        )
+        return bool(
+            self.config.tool_result_store_dir
+            and "retrieve_tool_result" in self._tool_definition_by_name
+            and "retrieve_tool_result" in handler_tools
+            and supports_tools is not False
+        )
+
+    def _tool_result_store_scope(self) -> tuple[str, str, str] | None:
+        """Resolve the exact Store scope shared by projection and retrieval."""
+
+        ctx = getattr(self, "_tool_context", None)
+        session_id = (
+            self.config.tool_result_store_session_id
+            or getattr(ctx, "tool_result_store_session_id", None)
+            or getattr(ctx, "artifact_session_id", None)
+            or self._session_key
+        )
+        session_key = (
+            self.config.tool_result_store_session_key
+            or getattr(ctx, "session_key", None)
+            or self._session_key
+        )
+        agent_id = (
+            self.config.tool_result_store_agent_id
+            or getattr(ctx, "agent_id", None)
+            or self.config.metadata.get("agent_id")
+        )
+        if not agent_id and session_key:
+            from opensquilla.session.keys import parse_agent_id
+
+            agent_id = parse_agent_id(session_key)
+        if not session_id or not session_key or not agent_id:
+            return None
+        return str(session_id), str(session_key), str(agent_id)
+
+    @staticmethod
+    def _tool_result_record_matches_scope(
+        record: ToolResultRecord,
+        *,
+        session_key: str,
+        agent_id: str,
+        sha256: str,
+    ) -> bool:
+        return bool(
+            record.session_key == session_key
+            and record.agent_id == agent_id
+            and record.sha256 == sha256
+        )
+
+    @staticmethod
+    def _provider_schema_has_tool_result_retrieval(
+        tools: list[ToolDefinition] | None,
+    ) -> bool:
+        return bool(
+            tools
+            and any(tool.name == "retrieve_tool_result" for tool in tools)
+        )
+
+    def _verified_tool_result_references(
+        self,
+        messages: list[Message],
+    ) -> frozenset[tuple[str, str]]:
+        """Return references proven readable in this Agent's active scope."""
+
+        scope = self._tool_result_store_scope()
+        if not self._tool_result_recovery_available() or scope is None:
+            return frozenset()
+        store_dir = self.config.tool_result_store_dir
+        if not store_dir:
+            return frozenset()
+        session_id, session_key, agent_id = scope
+        store = ToolResultStore(store_dir)
+        verified: set[tuple[str, str]] = set()
+        for message in messages:
+            if not isinstance(message.content, list):
+                continue
+            for block in message.content:
+                if not isinstance(block, ContentBlockToolResult):
+                    continue
+                if not isinstance(block.content, str):
+                    continue
+                reference = recoverable_tool_result_reference(block.content)
+                if reference is None or reference in verified:
+                    continue
+                handle, sha256 = reference
+                try:
+                    record = store.read(handle, session_id=session_id)
+                except Exception:  # noqa: BLE001 - stale references remain visible
+                    continue
+                if self._tool_result_record_matches_scope(
+                    record,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    sha256=sha256,
+                ):
+                    verified.add(reference)
+        return frozenset(verified)
+
+    def _restore_tool_results_without_retrieval_schema(
+        self,
+        messages: list[Message],
+    ) -> list[Message]:
+        """Restore raw Store content when this physical call hides retrieval."""
+
+        store_dir = self.config.tool_result_store_dir
+        scope = self._tool_result_store_scope()
+        if not store_dir or scope is None:
+            return messages
+        session_id, session_key, agent_id = scope
+        store = ToolResultStore(store_dir)
+        restored: list[Message] = []
+        changed = False
+        for message in messages:
+            if not isinstance(message.content, list):
+                restored.append(message)
+                continue
+            next_content: list[Any] = []
+            message_changed = False
+            for block in message.content:
+                if not isinstance(block, ContentBlockToolResult):
+                    next_content.append(block)
+                    continue
+                content = (
+                    block.content
+                    if isinstance(block.content, str)
+                    else str(block.content)
+                )
+                reference = recoverable_tool_result_reference(content)
+                if reference is None:
+                    next_content.append(block)
+                    continue
+                handle, sha256 = reference
+                try:
+                    record = store.read(handle, session_id=session_id)
+                except Exception as exc:  # noqa: BLE001 - stale handles fail open
+                    logger.warning(
+                        "tool_result_projection.restore_failed",
+                        tool_use_id=block.tool_use_id,
+                        handle=handle,
+                        error_type=type(exc).__name__,
+                    )
+                    next_content.append(block)
+                    continue
+                if not self._tool_result_record_matches_scope(
+                    record,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    sha256=sha256,
+                ):
+                    logger.warning(
+                        "tool_result_projection.restore_scope_mismatch",
+                        tool_use_id=block.tool_use_id,
+                        handle=handle,
+                    )
+                    next_content.append(block)
+                    continue
+                next_content.append(
+                    ContentBlockToolResult(
+                        tool_use_id=block.tool_use_id,
+                        content=record.content,
+                        is_error=block.is_error,
+                        execution_status=block.execution_status,
+                    )
+                )
+                message_changed = True
+                changed = True
+            restored.append(
+                Message(
+                    role=message.role,
+                    content=next_content,
+                    reasoning_content=getattr(message, "reasoning_content", None),
+                )
+                if message_changed
+                else message
+            )
+        return restored if changed else messages
+
     def _fresh_diagnostic_policy_enabled(self) -> bool:
         return bool(
             getattr(
@@ -4482,6 +4686,9 @@ class Agent:
         exceeds the provider request cap.
         """
 
+        if not self._tool_result_recovery_available():
+            return messages
+
         tool_name_by_use_id: dict[str, str] = {}
         tool_input_by_use_id: dict[str, dict[str, Any]] = {}
         tool_result_refs: list[tuple[int, int, ContentBlockToolResult]] = []
@@ -4776,12 +4983,12 @@ class Agent:
             single_over_budget = result_cap > 0 and len(content) > result_cap
             replacement_content: str | None = None
             if budget_class is ToolResultBudgetClass.CONTROL:
-                replacement_content = compact_tool_result_content(
-                    tool_name=tool_name,
-                    content=content,
+                replacement_content = self._tool_result_projection_for_provider(
+                    content,
+                    tool_use_id=block.tool_use_id,
+                    tool_name=tool_name or "tool",
+                    reason="control tool result compacted for provider request context",
                     max_preview_chars=160,
-                    budget_class=budget_class,
-                    is_error=block.is_error,
                 )
             elif (
                 budget_class is ToolResultBudgetClass.EXTERNAL
@@ -4923,6 +5130,8 @@ class Agent:
         reason: str,
         max_preview_chars: int,
     ) -> str | None:
+        if not self._tool_result_recovery_available():
+            return None
         max_preview_chars = max(0, int(max_preview_chars))
         if max_preview_chars > 0:
             max_preview_chars = max(1, min(max_preview_chars, 4_000))
@@ -4932,11 +5141,11 @@ class Agent:
             tool_use_id=tool_use_id,
             tool_name=tool_name,
         )
-        if stored is None and self.config.tool_result_store_dir:
+        if stored is None:
             return None
-        handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
-        retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
-        search_hints = _tool_result_search_hints(content) if stored is not None else ""
+        handle_line = f"tool_result_handle: {stored.handle}\n"
+        retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT
+        search_hints = _tool_result_search_hints(content)
         if max_preview_chars <= 0:
             head = ""
             tail = ""
@@ -4950,7 +5159,7 @@ class Agent:
             tail = content[-tail_chars:] if tail_chars else ""
         omitted = max(0, len(content) - len(head) - len(tail))
         signal_lines = ""
-        if stored is not None and self._projection_signal_hints_active():
+        if self._projection_signal_hints_active():
             signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
                 content,
                 handle=stored.handle,
@@ -5087,18 +5296,13 @@ class Agent:
     ) -> ToolResultRecord | None:
         if not self.config.tool_result_store_dir:
             return None
-        session_id = self.config.tool_result_store_session_id or self._session_key
-        session_key = self.config.tool_result_store_session_key or self._session_key
-        agent_id = self.config.tool_result_store_agent_id
-        if not agent_id and session_key:
-            from opensquilla.session.keys import parse_agent_id
-
-            agent_id = parse_agent_id(session_key)
-        if not session_id or not session_key or not agent_id:
+        scope = self._tool_result_store_scope()
+        if scope is None:
             self.config.metadata["tool_result_store_skips"] = (
                 self.config.metadata.get("tool_result_store_skips", 0) + 1
             )
             return None
+        session_id, session_key, agent_id = scope
         sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         cache_key = (session_id, session_key, agent_id, tool_use_id, tool_name, sha)
         store = ToolResultStore(self.config.tool_result_store_dir)
@@ -5326,9 +5530,21 @@ class Agent:
                 tool_use_id=result.tool_use_id,
                 tool_name=result.tool_name,
             )
+        self.config.metadata["tool_projection_attempts"] = (
+            self.config.metadata.get("tool_projection_attempts", 0) + 1
+        )
+        recovery_available = self._tool_result_recovery_available()
         json_guard_record: ToolResultRecord | None = None
         guarded_content, guarded = _omit_large_json_tool_fields(result.content)
         if guarded:
+            if not recovery_available:
+                return self._tool_result_projection_store_unavailable_noop(
+                    original_result,
+                    reason="tool_result_retrieval_unavailable",
+                    arguments=projection_arguments,
+                    projected_chars=len(guarded_content),
+                    json_guard_applied=True,
+                )
             if self.config.tool_result_store_dir:
                 json_guard_record = raw_snapshot_record
                 if json_guard_record is None and not raw_snapshot_store_attempted:
@@ -5365,9 +5581,6 @@ class Agent:
             )
         json_guard_applied = guarded
 
-        self.config.metadata["tool_projection_attempts"] = (
-            self.config.metadata.get("tool_projection_attempts", 0) + 1
-        )
         diagnostic_reason = self._tool_result_diagnostic_reason(result, raw_snapshot_content)
         if diagnostic_reason is not None:
             self._record_fresh_diagnostic_result(
@@ -5503,6 +5716,15 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return result
+        if not recovery_available:
+            return self._tool_result_projection_store_unavailable_noop(
+                original_result,
+                reason="tool_result_retrieval_unavailable",
+                arguments=projection_arguments,
+                projected_chars=len(reduction.inline_text),
+                reducer=reduction.reducer,
+                json_guard_applied=json_guard_applied,
+            )
         self.config.metadata["tool_projection_backend"] = "tokenjuice"
         if reduction.reducer:
             self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
@@ -6167,9 +6389,14 @@ class Agent:
         loaded_history = list(self._history)
         self._write_context_stage("session:loaded", loaded_history)
         sanitized_history, sanitize_result = sanitize_session_messages(loaded_history)
+        recoverable_references = await asyncio.to_thread(
+            self._verified_tool_result_references,
+            sanitized_history,
+        )
         sanitized_history, historical_projection_result = project_historical_tool_payloads(
             sanitized_history,
             preserve_reasoning_content=preserve_reasoning_content,
+            recoverable_references=recoverable_references,
         )
         sanitized_history = repair_tool_pairing(sanitized_history)
         sanitized_history = drop_reasoning(
@@ -7314,17 +7541,52 @@ class Agent:
                         *base_request_turn_messages,
                         *request_suffix_messages,
                     ]
-                    (
-                        request_messages,
-                        request_sanitize_result,
-                    ) = await self._provider_request_messages_with_sanitize_async(
-                        request_turn_messages,
-                        request_context_message=request_context_message,
-                        request_context_insert_index=active_request_context_insert_index,
-                        runtime_context_message=runtime_context_message,
-                        runtime_context_insert_index=active_runtime_context_insert_index,
-                        turn_objective_message=turn_objective_message,
+                    base_recovery_available = self._tool_result_recovery_available()
+                    call_retrieval_available = bool(
+                        self._provider_schema_has_tool_result_retrieval(
+                            provider_tools_for_call
+                        )
+                        and base_recovery_available
                     )
+                    call_recovery_downgraded = bool(
+                        base_recovery_available and not call_retrieval_available
+                    )
+                    if not call_retrieval_available:
+                        # Restore before provider-view assembly.  The physical
+                        # call's admission/sanitization must see the true byte
+                        # pressure; restoring after those passes can turn an
+                        # admitted bounded request into an unbounded one.
+                        request_turn_messages = (
+                            self._restore_tool_results_without_retrieval_schema(
+                                request_turn_messages
+                            )
+                        )
+                    previous_call_retrieval = (
+                        self._provider_call_tool_result_retrieval_available
+                    )
+                    self._provider_call_tool_result_retrieval_available = (
+                        call_retrieval_available
+                    )
+                    try:
+                        (
+                            request_messages,
+                            request_sanitize_result,
+                        ) = await self._provider_request_messages_with_sanitize_async(
+                            request_turn_messages,
+                            request_context_message=request_context_message,
+                            request_context_insert_index=(
+                                active_request_context_insert_index
+                            ),
+                            runtime_context_message=runtime_context_message,
+                            runtime_context_insert_index=(
+                                active_runtime_context_insert_index
+                            ),
+                            turn_objective_message=turn_objective_message,
+                        )
+                    finally:
+                        self._provider_call_tool_result_retrieval_available = (
+                            previous_call_retrieval
+                        )
                     validation_error = validate_provider_chat_request(
                         self.provider,
                         request_messages,
@@ -7483,6 +7745,71 @@ class Agent:
                                 )
                             }
                         )
+
+                    if call_recovery_downgraded and not bool(
+                        getattr(
+                            self.provider,
+                            "final_request_admission_guaranteed",
+                            False,
+                        )
+                    ):
+                        # Built-in adapters perform exact admission before
+                        # network I/O. A custom/plugin provider may not. When
+                        # this physical call hid retrieval and therefore
+                        # restored raw tool results, require either its exact
+                        # projector or conservative local token+character
+                        # bounds before handing it the expanded envelope.
+                        exact_projection = project_provider_final_request(
+                            self.provider,
+                            request_messages,
+                            provider_tools_for_call,
+                            call_chat_cfg,
+                        )
+                        if exact_projection is not None:
+                            restored_request_fits = exact_projection.fits
+                            admission_source = "provider_exact_projection"
+                        else:
+                            estimated_tokens = self._estimate_live_request_tokens(
+                                request_messages,
+                                tools=provider_tools_for_call,
+                                config=call_chat_cfg,
+                            )
+                            estimated_chars = self._estimate_live_request_chars(
+                                request_messages,
+                                tools=provider_tools_for_call,
+                                config=call_chat_cfg,
+                            )
+                            budget = self._context_budget_governor().snapshot()
+                            token_limit = max(
+                                1,
+                                int(budget.usable_tokens * budget.threshold),
+                            )
+                            char_limit = budget.provider_request_max_chars
+                            restored_request_fits = bool(
+                                estimated_tokens <= token_limit
+                                and estimated_chars <= char_limit
+                            )
+                            admission_source = "conservative_local_projection"
+                        if not restored_request_fits:
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "The provider request cannot safely include raw "
+                                    "tool results while retrieval is unavailable."
+                                ),
+                                code="provider_request_budget_exhausted",
+                            )
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="stop",
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                                admission_source=admission_source,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
 
                     self._write_turn_call_log(
                         "llm_request",
@@ -16496,6 +16823,8 @@ class Agent:
         )
 
     def _apply_provider_tool_result_overrides(self, messages: list[Message]) -> list[Message]:
+        if not self._tool_result_recovery_available():
+            return messages
         if (
             not self._provider_tool_result_overrides
             and not self._provider_tool_result_frozen_overrides
@@ -16799,6 +17128,25 @@ class Agent:
     ) -> int:
         """Estimate the current provider request size without lifetime usage."""
 
+        return max(
+            1,
+            self._estimate_live_request_chars(
+                messages,
+                tools=tools,
+                config=config,
+            )
+            // 4,
+        )
+
+    def _estimate_live_request_chars(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> int:
+        """Measure the complete conservative request envelope in JSON chars."""
+
         payload: dict[str, Any] = {
             "messages": [self._live_request_jsonable(message) for message in messages],
         }
@@ -16814,8 +17162,7 @@ class Agent:
             )
             payload.update(config_payload)
 
-        estimated_chars = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
-        return max(1, estimated_chars // 4)
+        return len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
 
     async def _check_context_overflow(
         self,
@@ -19833,6 +20180,11 @@ class Agent:
                 finally:
                     current_tool_context.reset(token)
 
+        setattr(
+            _subagent_tool_handler,
+            "_opensquilla_available_tools",
+            getattr(self._raw_tool_handler, "_opensquilla_available_tools", frozenset()),
+        )
         child_cfg = AgentConfig(
             max_iterations=spec.max_iterations,
             timeout=spec.timeout,
@@ -19969,9 +20321,12 @@ class Agent:
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
             tool_result_external_keep_recent=self.config.tool_result_external_keep_recent,
             tool_result_store_dir=self.config.tool_result_store_dir,
-            tool_result_store_session_id=self.config.tool_result_store_session_id,
-            tool_result_store_session_key=self.config.tool_result_store_session_key,
-            tool_result_store_agent_id=self.config.tool_result_store_agent_id,
+            # Rebind Store identity to the child's live ToolContext. Dispatch
+            # snapshots, Agent projections, verifier scope, and retrieval must
+            # all address the same session bucket and principal.
+            tool_result_store_session_id=subagent_ctx.tool_result_store_session_id,
+            tool_result_store_session_key=subagent_ctx.session_key,
+            tool_result_store_agent_id=subagent_ctx.agent_id,
             tool_result_store_full_trace=self.config.tool_result_store_full_trace,
             tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
             tool_result_store_disk_budget_bytes=(self.config.tool_result_store_disk_budget_bytes),
