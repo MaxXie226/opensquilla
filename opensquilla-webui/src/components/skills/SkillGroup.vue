@@ -16,7 +16,8 @@
         :description-zh="skill.description_zh"
         :emoji="skill.emoji"
         :meta="meta"
-        :lifecycle-label="skillLifecycleLabel(skill)"
+        :lifecycle-label="skillLifecyclePresentation(skill, 'installed')?.label"
+        :lifecycle-tone="skillLifecyclePresentation(skill, 'installed')?.tone"
         :status-dot-class="skillStatusDotClass(skill)"
         :status-dot-title="skillStatusDotTitle(skill)"
         @open="emit('open', skill)"
@@ -30,10 +31,10 @@ import Icon from '@/components/Icon.vue'
 import SkillTile from '@/components/skills/SkillTile.vue'
 import type { Skill } from '@/types/skills'
 import {
+  skillCatalogKey,
+  skillLifecyclePresentation,
   skillStatusDotClass,
   skillStatusDotTitle,
-  skillLifecycleLabel,
-  skillCatalogKey,
 } from '@/composables/skills/useSkillsCatalog'
 
 defineProps<{

@@ -62,6 +62,7 @@
             :trust-level="row.trustLevel"
             :installed="row.installed"
             :lifecycle-label="row.lifecycleLabel"
+            :lifecycle-tone="row.lifecycleTone"
             :busy="installingId === row.operationKey"
             @install="emit('install', String(row.installId), String(row.installSource))"
           />
@@ -77,7 +78,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import SkillTile from '@/components/skills/SkillTile.vue'
 import { skillRegistryOperationKey } from '@/composables/skills/useSkillRegistry'
-import { skillLifecycleLabel } from '@/composables/skills/useSkillsCatalog'
+import { skillLifecyclePresentation } from '@/composables/skills/useSkillsCatalog'
 import type { RegistryResult } from '@/types/skills'
 
 const { t } = useI18n()
@@ -106,11 +107,13 @@ const resultRows = computed(() =>
         lifecycle.load_state === 'rejected'
         || lifecycle.load_state === 'serving_previous'
         || lifecycle.load_state === 'validated_offline'
+        || lifecycle.install_state === 'missing'
+        || lifecycle.install_state === 'drifted'
         || lifecycle.compatibility_state === 'unsupported'
       )
-    const lifecycleLabel = lifecycle && (r.installed || showLifecycleWithoutInstall)
-      ? skillLifecycleLabel({ name: r.name, lifecycle })
-      : ''
+    const lifecyclePresentation = lifecycle && (r.installed || showLifecycleWithoutInstall)
+      ? skillLifecyclePresentation({ name: r.name, lifecycle }, 'registry')
+      : null
     const installId = r.installReference || r.install_reference || r.identifier || r.name
     const installSource = r.source || 'clawhub'
     return {
@@ -119,7 +122,8 @@ const resultRows = computed(() =>
       source: r.source || '',
       trustLevel: r.trust_level || 'community',
       installed: !!r.installed,
-      lifecycleLabel,
+      lifecycleLabel: lifecyclePresentation?.label || '',
+      lifecycleTone: lifecyclePresentation?.tone,
       installId,
       installSource,
       operationKey: skillRegistryOperationKey(installId, installSource),

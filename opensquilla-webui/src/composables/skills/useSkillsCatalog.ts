@@ -352,41 +352,96 @@ export function skillStatusChipText(skill: Skill): string {
   return i18n.global.t('cronSkills.skills.statusNeedsDeps')
 }
 
-export function skillLifecycleLabel(skill: Skill): string {
+export type SkillLifecycleSurface = 'installed' | 'registry'
+export type SkillLifecycleTone = 'success' | 'info' | 'warning' | 'danger' | 'neutral'
+
+export interface SkillLifecyclePresentation {
+  label: string
+  tone: SkillLifecycleTone
+}
+
+export function skillLifecyclePresentation(
+  skill: Skill,
+  surface: SkillLifecycleSurface,
+): SkillLifecyclePresentation | null {
   const lifecycle = skill.lifecycle
-  if (!lifecycle) return ''
+  if (!lifecycle) return null
+  if (lifecycle.install_state === 'missing') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateMissing'),
+      tone: 'danger',
+    }
+  }
   if (
     lifecycle.load_state === 'rejected'
     || lifecycle.compatibility_state === 'unsupported'
   ) {
-    return i18n.global.t('cronSkills.registry.stateRejected')
+    return {
+      label: i18n.global.t('cronSkills.registry.stateRejected'),
+      tone: 'danger',
+    }
   }
   if (lifecycle.load_state === 'serving_previous') {
-    return i18n.global.t('cronSkills.registry.stateRestored')
+    return {
+      label: i18n.global.t('cronSkills.registry.stateRestored'),
+      tone: 'warning',
+    }
+  }
+  if (lifecycle.install_state === 'drifted') {
+    return {
+      label: i18n.global.t('cronSkills.registry.stateDrifted'),
+      tone: 'warning',
+    }
   }
   if (lifecycle.load_state === 'validated_offline') {
-    return i18n.global.t('cronSkills.registry.stateNextStart')
+    return {
+      label: i18n.global.t('cronSkills.registry.stateNextStart'),
+      tone: 'info',
+    }
   }
-  if (lifecycle.load_state === 'not_discovered') return ''
+  if (lifecycle.load_state === 'not_discovered') return null
   if (lifecycle.selection_state === 'shadowed') {
-    return i18n.global.t('cronSkills.registry.stateShadowed')
+    return {
+      label: i18n.global.t('cronSkills.registry.stateShadowed'),
+      tone: 'neutral',
+    }
   }
   if (lifecycle.selection_state === 'disabled') {
-    return i18n.global.t('cronSkills.registry.stateDisabled')
+    return {
+      label: i18n.global.t('cronSkills.registry.stateDisabled'),
+      tone: 'neutral',
+    }
   }
   if (lifecycle.selection_state === 'hidden') {
-    return i18n.global.t('cronSkills.registry.stateHidden')
+    return {
+      label: i18n.global.t('cronSkills.registry.stateHidden'),
+      tone: 'neutral',
+    }
   }
   if (lifecycle.readiness_state === 'needs_setup') {
-    return i18n.global.t('cronSkills.registry.stateNeedsSetup')
+    return {
+      label: i18n.global.t('cronSkills.registry.stateNeedsSetup'),
+      tone: 'warning',
+    }
   }
   if (lifecycle.compatibility_state === 'degraded') {
-    return i18n.global.t('cronSkills.registry.stateDegraded')
+    return {
+      label: i18n.global.t('cronSkills.registry.stateDegraded'),
+      tone: 'warning',
+    }
   }
-  if (lifecycle.load_state === 'loaded' && lifecycle.selection_state === 'active') {
-    return i18n.global.t('cronSkills.registry.stateActive')
+  if (
+    lifecycle.install_state === 'tracked'
+    && lifecycle.load_state === 'loaded'
+    && lifecycle.selection_state === 'active'
+  ) {
+    if (surface === 'installed') return null
+    return {
+      label: i18n.global.t('cronSkills.registry.stateActive'),
+      tone: 'success',
+    }
   }
-  return ''
+  return null
 }
 
 export function skillLayerLabel(layer: string | undefined): string {

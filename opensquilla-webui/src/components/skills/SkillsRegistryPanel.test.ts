@@ -137,6 +137,28 @@ describe('SkillsRegistryPanel install provenance', () => {
           readiness_state: 'ready',
         },
       },
+      {
+        name: 'missing-skill',
+        installed: false,
+        lifecycle: {
+          install_state: 'missing',
+          load_state: 'not_discovered',
+          selection_state: 'shadowed',
+          compatibility_state: 'instruction_only',
+          readiness_state: 'unknown',
+        },
+      },
+      {
+        name: 'drifted-skill',
+        installed: true,
+        lifecycle: {
+          install_state: 'drifted',
+          load_state: 'loaded',
+          selection_state: 'active',
+          compatibility_state: 'instruction_only',
+          readiness_state: 'ready',
+        },
+      },
     ] satisfies RegistryResult[]
     const app = createApp({
       setup: () => () => h(SkillsRegistryPanel, {
@@ -156,15 +178,17 @@ describe('SkillsRegistryPanel install provenance', () => {
         en: {
           cronSkills: {
             registry: {
-              stateActive: 'Installed and active',
-              stateDegraded: 'Installed with limited compatibility',
-              stateNeedsSetup: 'Installed; setup required',
-              stateShadowed: 'Installed but shadowed',
-              stateDisabled: 'Installed but disabled',
-              stateHidden: 'Installed; hidden from the model catalog',
+              stateActive: 'Active',
+              stateDegraded: 'Limited compatibility',
+              stateNeedsSetup: 'Setup required',
+              stateShadowed: 'Shadowed',
+              stateDisabled: 'Disabled',
+              stateHidden: 'Hidden from model catalog',
               stateNextStart: 'Validated for next start',
               stateRejected: 'Rejected as incompatible',
-              stateRestored: 'Failed; previous version restored',
+              stateRestored: 'Previous version restored',
+              stateMissing: 'Installed files missing',
+              stateDrifted: 'Local changes detected',
             },
             tile: { installed: 'Installed' },
           },
@@ -175,22 +199,26 @@ describe('SkillsRegistryPanel install provenance', () => {
     apps.push(app)
     await nextTick()
 
-    const expected = new Map([
-      ['active-skill', 'Installed and active'],
-      ['degraded-skill', 'Installed with limited compatibility'],
-      ['needs-setup-skill', 'Installed; setup required'],
-      ['shadowed-skill', 'Installed but shadowed'],
-      ['disabled-skill', 'Installed but disabled'],
-      ['hidden-skill', 'Installed; hidden from the model catalog'],
-      ['offline-skill', 'Validated for next start'],
-      ['rejected-skill', 'Rejected as incompatible'],
-      ['unsupported-skill', 'Rejected as incompatible'],
-      ['restored-skill', 'Failed; previous version restored'],
+    const expected = new Map<string, [string, string]>([
+      ['active-skill', ['Active', 'success']],
+      ['degraded-skill', ['Limited compatibility', 'warning']],
+      ['needs-setup-skill', ['Setup required', 'warning']],
+      ['shadowed-skill', ['Shadowed', 'neutral']],
+      ['disabled-skill', ['Disabled', 'neutral']],
+      ['hidden-skill', ['Hidden from model catalog', 'neutral']],
+      ['offline-skill', ['Validated for next start', 'info']],
+      ['rejected-skill', ['Rejected as incompatible', 'danger']],
+      ['unsupported-skill', ['Rejected as incompatible', 'danger']],
+      ['restored-skill', ['Previous version restored', 'warning']],
+      ['missing-skill', ['Installed files missing', 'danger']],
+      ['drifted-skill', ['Local changes detected', 'warning']],
     ])
     const tiles = [...host.querySelectorAll<HTMLElement>('.sk-tile')]
-    for (const [name, label] of expected) {
+    for (const [name, [label, tone]] of expected) {
       const tile = tiles.find(candidate => candidate.title.startsWith(name))
       expect(tile?.textContent, name).toContain(label)
+      expect(tile?.querySelector('.sk-tile__lifecycle')?.getAttribute('data-tone'), name)
+        .toBe(tone)
     }
   })
 
@@ -226,6 +254,7 @@ describe('SkillsRegistryPanel install provenance', () => {
 
     expect(host.textContent).toContain('github')
     expect(host.textContent).toContain('community')
+    expect(host.querySelector('.sk-tile__lifecycle')).toBeNull()
   })
 
   it('renders a shadowed installation lifecycle state', async () => {
@@ -263,7 +292,7 @@ describe('SkillsRegistryPanel install provenance', () => {
       messages: {
         en: {
           cronSkills: {
-            registry: { stateShadowed: 'Installed but shadowed' },
+            registry: { stateShadowed: 'Shadowed' },
             tile: { installed: 'Installed' },
           },
         },
@@ -273,7 +302,7 @@ describe('SkillsRegistryPanel install provenance', () => {
     apps.push(app)
     await nextTick()
 
-    expect(host.textContent).toContain('Installed but shadowed')
+    expect(host.textContent).toContain('Shadowed')
     expect(host.textContent).toContain('Installed')
     // Already-installed results do not offer a second mutation button.
     expect(onInstall).not.toHaveBeenCalled()
@@ -313,7 +342,7 @@ describe('SkillsRegistryPanel install provenance', () => {
           cronSkills: {
             registry: {
               stateRejected: 'Rejected as incompatible',
-              stateShadowed: 'Installed but shadowed',
+              stateShadowed: 'Shadowed',
             },
             tile: { installed: 'Installed' },
           },
@@ -325,10 +354,10 @@ describe('SkillsRegistryPanel install provenance', () => {
     await nextTick()
 
     expect(host.textContent).toContain('Rejected as incompatible')
-    expect(host.textContent).not.toContain('Installed but shadowed')
+    expect(host.textContent).not.toContain('Shadowed')
   })
 
-  it('does not label a pre-install fetch failure as shadowed or incompatible', async () => {
+  it('shows missing installed files ahead of a shadowed selection state', async () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp({
@@ -361,8 +390,8 @@ describe('SkillsRegistryPanel install provenance', () => {
         en: {
           cronSkills: {
             registry: {
-              stateRejected: 'Rejected as incompatible',
-              stateShadowed: 'Installed but shadowed',
+              stateMissing: 'Installed files missing',
+              stateShadowed: 'Shadowed',
             },
           },
         },
@@ -372,8 +401,9 @@ describe('SkillsRegistryPanel install provenance', () => {
     apps.push(app)
     await nextTick()
 
-    expect(host.textContent).not.toContain('Rejected as incompatible')
-    expect(host.textContent).not.toContain('Installed but shadowed')
+    expect(host.textContent).toContain('Installed files missing')
+    expect(host.textContent).not.toContain('Shadowed')
+    expect(host.querySelector('.sk-tile__lifecycle')?.getAttribute('data-tone')).toBe('danger')
     expect(host.querySelector('.sk-tile__add')).not.toBeNull()
   })
 

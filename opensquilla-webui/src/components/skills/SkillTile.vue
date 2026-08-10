@@ -10,7 +10,10 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import { localizedSkillDescription } from '@/composables/skills/useSkillsCatalog'
+import {
+  localizedSkillDescription,
+  type SkillLifecycleTone,
+} from '@/composables/skills/useSkillsCatalog'
 import type { IconName } from '@/utils/icons'
 import { assignedFallbackIcon } from '@/utils/skillIcons'
 
@@ -26,6 +29,7 @@ const props = defineProps<{
   source?: string
   trustLevel?: string
   lifecycleLabel?: string
+  lifecycleTone?: SkillLifecycleTone
   statusDotClass?: string
   statusDotTitle?: string
 }>()
@@ -79,11 +83,16 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
           class="sk-tile__trust"
           :class="{ 'is-trusted': trustLevel === 'trusted' || trustLevel === 'builtin' }"
         >{{ trustLevel }}</span>
-        <span v-if="lifecycleLabel" class="sk-tile__lifecycle">{{ lifecycleLabel }}</span>
+        <span
+          v-if="lifecycleLabel"
+          class="sk-tile__lifecycle"
+          :data-tone="lifecycleTone || 'neutral'"
+        >{{ lifecycleLabel }}</span>
       </span>
       <span
         v-if="variant === 'installed' && lifecycleLabel"
         class="sk-tile__lifecycle sk-tile__lifecycle--installed"
+        :data-tone="lifecycleTone || 'neutral'"
       >{{ lifecycleLabel }}</span>
     </span>
 
@@ -218,9 +227,15 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
   width: fit-content;
 }
 .sk-tile__lifecycle {
-  border-color: color-mix(in srgb, var(--info) 38%, var(--border));
-  color: var(--info);
+  --sk-lifecycle-tone: var(--text-dim);
+  background: color-mix(in srgb, var(--sk-lifecycle-tone) 8%, transparent);
+  border-color: color-mix(in srgb, var(--sk-lifecycle-tone) 38%, var(--border));
+  color: var(--sk-lifecycle-tone);
 }
+.sk-tile__lifecycle[data-tone='success'] { --sk-lifecycle-tone: var(--ok); }
+.sk-tile__lifecycle[data-tone='info'] { --sk-lifecycle-tone: var(--info); }
+.sk-tile__lifecycle[data-tone='warning'] { --sk-lifecycle-tone: var(--warn); }
+.sk-tile__lifecycle[data-tone='danger'] { --sk-lifecycle-tone: var(--danger); }
 .sk-tile__trust {
   border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
   color: var(--warn);

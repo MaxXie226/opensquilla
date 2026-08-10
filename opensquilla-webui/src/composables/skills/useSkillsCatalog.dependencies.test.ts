@@ -5,7 +5,7 @@ import {
   skillDependencyCounts,
   skillDependencySummary,
   skillCatalogKey,
-  skillLifecycleLabel,
+  skillLifecyclePresentation,
 } from './useSkillsCatalog'
 
 describe('skill catalog identity', () => {
@@ -21,10 +21,10 @@ describe('skill catalog identity', () => {
   })
 })
 
-describe('skill lifecycle labels', () => {
+describe('skill lifecycle presentations', () => {
   it.each([
     [
-      'active installation',
+      'healthy tracked installation on the Installed surface',
       {
         install_state: 'tracked',
         load_state: 'loaded',
@@ -32,7 +32,44 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'instruction_only',
         readiness_state: 'ready',
       },
-      'Installed and active',
+      'installed',
+      null,
+    ],
+    [
+      'healthy tracked installation on the Community surface',
+      {
+        install_state: 'tracked',
+        load_state: 'loaded',
+        selection_state: 'active',
+        compatibility_state: 'instruction_only',
+        readiness_state: 'ready',
+      },
+      'registry',
+      { label: 'Active', tone: 'success' },
+    ],
+    [
+      'healthy untracked bundled or meta Skill on the Installed surface',
+      {
+        install_state: 'untracked',
+        load_state: 'loaded',
+        selection_state: 'active',
+        compatibility_state: 'native',
+        readiness_state: 'ready',
+      },
+      'installed',
+      null,
+    ],
+    [
+      'healthy untracked bundled or meta Skill on the Community surface',
+      {
+        install_state: 'untracked',
+        load_state: 'loaded',
+        selection_state: 'active',
+        compatibility_state: 'native',
+        readiness_state: 'ready',
+      },
+      'registry',
+      null,
     ],
     [
       'installation requiring setup',
@@ -43,7 +80,8 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'degraded',
         readiness_state: 'needs_setup',
       },
-      'Installed; setup required',
+      'installed',
+      { label: 'Setup required', tone: 'warning' },
     ],
     [
       'active installation with limited compatibility',
@@ -54,7 +92,8 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'degraded',
         readiness_state: 'ready',
       },
-      'Installed with limited compatibility',
+      'installed',
+      { label: 'Limited compatibility', tone: 'warning' },
     ],
     [
       'shadowed installation',
@@ -65,7 +104,8 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'instruction_only',
         readiness_state: 'ready',
       },
-      'Installed but shadowed',
+      'installed',
+      { label: 'Shadowed', tone: 'neutral' },
     ],
     [
       'disabled installation',
@@ -76,7 +116,8 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'instruction_only',
         readiness_state: 'ready',
       },
-      'Installed but disabled',
+      'installed',
+      { label: 'Disabled', tone: 'neutral' },
     ],
     [
       'model-hidden installation',
@@ -87,7 +128,8 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'instruction_only',
         readiness_state: 'ready',
       },
-      'Installed; hidden from the model catalog',
+      'installed',
+      { label: 'Hidden from model catalog', tone: 'neutral' },
     ],
     [
       'offline validation',
@@ -98,7 +140,8 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'instruction_only',
         readiness_state: 'ready',
       },
-      'Validated for next start',
+      'installed',
+      { label: 'Validated for next start', tone: 'info' },
     ],
     [
       'loader rejection',
@@ -109,7 +152,8 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'instruction_only',
         readiness_state: 'unknown',
       },
-      'Rejected as incompatible',
+      'installed',
+      { label: 'Rejected as incompatible', tone: 'danger' },
     ],
     [
       'unsupported dialect',
@@ -120,7 +164,8 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'unsupported',
         readiness_state: 'unknown',
       },
-      'Rejected as incompatible',
+      'installed',
+      { label: 'Rejected as incompatible', tone: 'danger' },
     ],
     [
       'restored previous version',
@@ -131,14 +176,65 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'instruction_only',
         readiness_state: 'ready',
       },
-      'Failed; previous version restored',
+      'installed',
+      { label: 'Previous version restored', tone: 'warning' },
     ],
-  ] as const)('renders the %s lifecycle', (_case, lifecycle, expected) => {
-    expect(skillLifecycleLabel({ name: 'community-skill', lifecycle })).toBe(expected)
+    [
+      'locally modified installation',
+      {
+        install_state: 'drifted',
+        load_state: 'loaded',
+        selection_state: 'active',
+        compatibility_state: 'instruction_only',
+        readiness_state: 'ready',
+      },
+      'installed',
+      { label: 'Local changes detected', tone: 'warning' },
+    ],
+    [
+      'missing installation files',
+      {
+        install_state: 'missing',
+        load_state: 'not_discovered',
+        selection_state: 'shadowed',
+        compatibility_state: 'unsupported',
+        readiness_state: 'unknown',
+      },
+      'installed',
+      { label: 'Installed files missing', tone: 'danger' },
+    ],
+    [
+      'otherwise undiscovered candidate',
+      {
+        install_state: 'tracked',
+        load_state: 'not_discovered',
+        selection_state: 'active',
+        compatibility_state: 'native',
+        readiness_state: 'unknown',
+      },
+      'registry',
+      null,
+    ],
+  ] as const)('renders the %s lifecycle', (_case, lifecycle, surface, expected) => {
+    expect(skillLifecyclePresentation({ name: 'community-skill', lifecycle }, surface))
+      .toEqual(expected)
+  })
+
+  it('reports a missing tree ahead of rejection and a shadowed selection state', () => {
+    expect(skillLifecyclePresentation({
+      name: 'missing-skill',
+      lifecycle: {
+        install_state: 'missing',
+        load_state: 'rejected',
+        selection_state: 'shadowed',
+        compatibility_state: 'unsupported',
+        readiness_state: 'unknown',
+      },
+    }, 'registry')).toEqual({ label: 'Installed files missing', tone: 'danger' })
   })
 
   it('reports a loader rejection ahead of a shadowed selection state', () => {
-    expect(skillLifecycleLabel({
+    expect(skillLifecyclePresentation({
       name: 'rejected-skill',
       lifecycle: {
         install_state: 'tracked',
@@ -147,33 +243,20 @@ describe('skill lifecycle labels', () => {
         compatibility_state: 'instruction_only',
         readiness_state: 'unknown',
       },
-    })).toBe('Rejected as incompatible')
+    }, 'registry')).toEqual({ label: 'Rejected as incompatible', tone: 'danger' })
   })
 
-  it('reports unsupported compatibility ahead of a shadowed selection state', () => {
-    expect(skillLifecycleLabel({
-      name: 'unsupported-skill',
+  it('reports setup ahead of limited compatibility', () => {
+    expect(skillLifecyclePresentation({
+      name: 'setup-skill',
       lifecycle: {
         install_state: 'tracked',
-        load_state: 'not_discovered',
-        selection_state: 'shadowed',
-        compatibility_state: 'unsupported',
-        readiness_state: 'unknown',
-      },
-    })).toBe('Rejected as incompatible')
-  })
-
-  it('never labels an undiscovered candidate as active', () => {
-    expect(skillLifecycleLabel({
-      name: 'not-loaded-skill',
-      lifecycle: {
-        install_state: 'tracked',
-        load_state: 'not_discovered',
+        load_state: 'loaded',
         selection_state: 'active',
-        compatibility_state: 'native',
-        readiness_state: 'unknown',
+        compatibility_state: 'degraded',
+        readiness_state: 'needs_setup',
       },
-    })).toBe('')
+    }, 'registry')).toEqual({ label: 'Setup required', tone: 'warning' })
   })
 })
 
