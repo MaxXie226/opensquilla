@@ -541,10 +541,7 @@ async def test_agent_install_message_does_not_claim_unusable_skill_is_usable_nex
         readiness_state=readiness,
     )
 
-    class FakeService(SkillManagementService):
-        def __init__(self) -> None:
-            pass
-
+    class FakeService:
         async def install(self, *args: object, **kwargs: object) -> InstallResult:
             return InstallResult(
                 success=True,

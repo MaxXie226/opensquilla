@@ -8,6 +8,7 @@ from opensquilla.gateway import rpc_skills
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.scopes import ADMIN_SCOPE, METHOD_SCOPES
 from opensquilla.skills.hub.management import InstallResult
+from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.loader import SkillLoader
 
 
@@ -334,31 +335,36 @@ async def test_skill_mutation_rpc_preserves_boolean_flag_values(
     )
     captured: dict[str, bool] = {}
 
-    class _Installer(rpc_skills.SkillManagementService):
-        def __init__(self) -> None:
-            pass
+    installer = rpc_skills.SkillManagementService(
+        router=SourceRouter([]),
+        managed_dir=tmp_path / "managed",
+        lockfile_path=tmp_path / "skills-lock.json",
+        loader=loader,
+        journal_path=tmp_path / "skill-transaction.json",
+    )
 
-        async def install(
-            self,
-            _identifier: str,
-            _source_id: str,
-            *,
-            force: bool,
-            replace_source: bool,
-        ):
-            captured["force"] = force
-            captured["replace_source"] = replace_source
-            return SimpleNamespace(success=True, name="demo", message="installed")
+    async def _install(
+        _identifier: str,
+        _source_id: str,
+        *,
+        force: bool,
+        replace_source: bool,
+    ):
+        captured["force"] = force
+        captured["replace_source"] = replace_source
+        return SimpleNamespace(success=True, name="demo", message="installed")
 
-        async def uninstall(self, _name: str, *, allow_drift: bool):
-            captured["allow_drift"] = allow_drift
-            return SimpleNamespace(success=True, name="demo", message="uninstalled")
+    async def _uninstall(_name: str, *, allow_drift: bool):
+        captured["allow_drift"] = allow_drift
+        return SimpleNamespace(success=True, name="demo", message="uninstalled")
 
-        async def update(self, _name: str, *, force: bool):
-            captured["update_force"] = force
-            return [SimpleNamespace(success=True, name="demo", message="updated")]
+    async def _update(_name: str, *, force: bool):
+        captured["update_force"] = force
+        return [SimpleNamespace(success=True, name="demo", message="updated")]
 
-    installer = _Installer()
+    monkeypatch.setattr(installer, "install", _install)
+    monkeypatch.setattr(installer, "uninstall", _uninstall)
+    monkeypatch.setattr(installer, "update", _update)
     monkeypatch.setattr(rpc_skills, "_management_service", lambda _ctx: installer)
     ctx = RpcContext(conn_id="test", skill_loader=loader)
 
@@ -396,25 +402,30 @@ async def test_skills_update_noop_preserves_success_on_wire(
         snapshot_path=tmp_path / "snapshot.json",
     )
 
-    class _Installer(rpc_skills.SkillManagementService):
-        def __init__(self) -> None:
-            pass
+    installer = rpc_skills.SkillManagementService(
+        router=SourceRouter([]),
+        managed_dir=tmp_path / "managed",
+        lockfile_path=tmp_path / "skills-lock.json",
+        loader=loader,
+        journal_path=tmp_path / "skill-transaction.json",
+    )
 
-        async def update(self, _name: str, *, force: bool):
-            assert force is False
-            return [
-                InstallResult(
-                    True,
-                    "demo",
-                    "Skill 'demo' is already current",
-                    None,
-                    str(tmp_path / "managed" / "demo"),
-                    unchanged=True,
-                    installed=True,
-                )
-            ]
+    async def _update(_name: str, *, force: bool):
+        assert force is False
+        return [
+            InstallResult(
+                True,
+                "demo",
+                "Skill 'demo' is already current",
+                None,
+                str(tmp_path / "managed" / "demo"),
+                unchanged=True,
+                installed=True,
+            )
+        ]
 
-    monkeypatch.setattr(rpc_skills, "_management_service", lambda _ctx: _Installer())
+    monkeypatch.setattr(installer, "update", _update)
+    monkeypatch.setattr(rpc_skills, "_management_service", lambda _ctx: installer)
     ctx = RpcContext(conn_id="test", skill_loader=loader)
 
     payload = await rpc_skills._handle_skills_update({"name": "demo"}, ctx)

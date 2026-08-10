@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -602,10 +603,9 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         _fsync_directory(path.parent)
     finally:
         if temporary is not None:
-            try:
+            # Cleanup is best-effort and must not mask the atomic-write outcome.
+            with suppress(OSError):
                 temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def _fsync_directory(directory: Path) -> None:

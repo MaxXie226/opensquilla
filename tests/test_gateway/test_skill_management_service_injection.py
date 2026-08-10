@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from starlette.testclient import TestClient
 
-from opensquilla.gateway.app import create_gateway_app
+import opensquilla.gateway.app as gateway_app
 from opensquilla.gateway.boot import build_services
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.protocol import make_ok_res
@@ -42,13 +42,11 @@ def _write_skill(root: Path, name: str, body: str) -> None:
 def test_http_and_websocket_contexts_share_skill_management_service(
     monkeypatch,
 ) -> None:
-    import opensquilla.gateway.app as gateway_app
-
     dispatcher = _CapturingDispatcher()
     management_service = object()
     monkeypatch.setattr(gateway_app, "get_dispatcher", lambda: dispatcher)
     config = GatewayConfig(ws_writer_queue_enabled=False)
-    app = create_gateway_app(
+    app = gateway_app.create_gateway_app(
         config,
         skill_management_service=management_service,
     )

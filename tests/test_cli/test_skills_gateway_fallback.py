@@ -231,6 +231,7 @@ def test_offline_skills_list_fails_closed_during_writer_and_pending_recovery(
     assert busy_error["code"] == "PROFILE_IN_USE"
     assert builds == 0
     assert scans == 0
+    scans_after_busy = scans
 
     recovery = CliRunner().invoke(app, ["skills", "list", "--json"])
 
@@ -240,7 +241,7 @@ def test_offline_skills_list_fails_closed_during_writer_and_pending_recovery(
     assert recovery_error["details"]["journal"] == str(journal)
     assert journal.exists()
     assert builds == 1
-    assert scans == 0
+    assert scans == scans_after_busy
 
 
 def test_offline_skills_doctor_fails_closed_before_building_loader_during_writer(

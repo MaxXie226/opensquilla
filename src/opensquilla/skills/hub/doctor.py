@@ -897,7 +897,8 @@ def _loader_error_matches(error: object, *, path: Path | None, name: str) -> boo
             if error_parent == path.resolve(strict=False):
                 return True
         except (OSError, ValueError):
-            pass
+            # An unresolvable diagnostic path cannot identify this installed candidate.
+            return False
         return False
     return str(getattr(error, "name", "") or "") in {name, "catalog"}
 
