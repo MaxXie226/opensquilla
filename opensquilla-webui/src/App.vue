@@ -397,11 +397,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, provide, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
-import { chatSessionTitlesKey } from '@/composables/chat/useChatSessionTitles'
 import { getPlatform } from '@/platform'
 import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { useRpcStore } from './stores/rpc'
@@ -462,6 +461,11 @@ import {
   optionalSessionRpcCallOptions,
 } from './composables/chat/sessionBootstrapAdmission'
 import { markCronFinishNotified } from './utils/cron/notifications'
+import {
+  buildChatSessionTitles,
+  isSensibleChatTitle,
+  provideChatSessionTitles,
+} from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
 const rpcStore = useRpcStore()
@@ -597,20 +601,10 @@ const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: 
 // reload returns the backend's canonical title.
 const renameOverrides = ref<Record<string, string>>({})
 
-// Chat header title source: the backend session list (display_name first) plus
-// local drafts and the optimistic rename override, so the active chat header
-// and the sidebar stay on the same title while a rename is in flight.
-const chatSessionTitles = computed<Record<string, string>>(() => {
-  const titles: Record<string, string> = {}
-  for (const item of allSessions.value) {
-    if (item.key && item.title) titles[item.key] = item.title
-  }
-  for (const [key, local] of Object.entries(localChatSessions.value)) {
-    if (local.title) titles[key] = local.title
-  }
-  return { ...titles, ...renameOverrides.value }
-})
-provide(chatSessionTitlesKey, chatSessionTitles)
+const chatSessionTitles = computed(() => (
+  buildChatSessionTitles(allSessions.value, renameOverrides.value)
+))
+provideChatSessionTitles(chatSessionTitles)
 
 const brandMarkUrl = computed(() => {
   if (import.meta.env.DEV) return '/opensquilla-mark.png'
@@ -779,18 +773,10 @@ function agentDisplayName(agentId: string): string {
   return agent?.name || (agentId === 'main' ? 'Main Agent' : agentId)
 }
 
-// Raw session keys (agent:…:…) and bare UUIDs must never render in the sidebar.
-const RAW_SESSION_KEY_PATTERN = /\bagent:[a-z0-9_-]+:[a-z0-9_-]+:/i
-const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
-
-function looksLikeRawSessionId(value: string): boolean {
-  return RAW_SESSION_KEY_PATTERN.test(value) || UUID_PATTERN.test(value) || /^(agent|cron):/i.test(value)
-}
-
 function sidebarConversationTitle(item: SessionItem): string {
   for (const candidate of [item.title, item.subtitle, item.groupLabel]) {
     const text = String(candidate || '').trim()
-    if (text && !looksLikeRawSessionId(text)) return text
+    if (isSensibleChatTitle(text)) return text
   }
   return t('shared.sidebar.untitledTask')
 }

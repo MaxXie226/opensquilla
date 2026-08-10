@@ -680,9 +680,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { chatSessionTitlesKey, resolveChatHeaderTitle } from '@/composables/chat/useChatSessionTitles'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useRpcStore } from '@/stores/rpc'
@@ -731,6 +730,10 @@ import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
+import {
+  resolveChatHeaderTitle,
+  useChatSessionTitles,
+} from '@/composables/chat/useChatSessionTitles'
 import {
   createChatMetaDraftRecovery,
   listServerMetaDrafts,
@@ -3222,13 +3225,19 @@ function setCollaborationMode(mode: CollaborationMode) {
   void chatPlans.setMode(mode)
 }
 
-// The session's stored title (manual rename / LLM-generated, display_name
-// first) wins via the App-provided map; the first user message summary is
-// only a fallback for sessions without a meaningful title yet.
-const sessionTitles = inject(chatSessionTitlesKey, computed<Record<string, string>>(() => ({})))
-const currentChatTitle = computed(() =>
-  resolveChatHeaderTitle(sessionKey.value, sessionTitles.value, messages.value, stripTimePrefix)
-)
+const sessionTitles = useChatSessionTitles()
+const currentChatTitle = computed(() => {
+  return resolveChatHeaderTitle(
+    sessionKey.value,
+    sessionTitles.value,
+    messages.value,
+    stripTimePrefix,
+    {
+      newChat: t('chat.newChat'),
+      chatWithSuffix: suffix => t('chat.chatWithSuffix', { suffix }),
+    },
+  )
+})
 
 const chatMarkdownExport = useChatMarkdownExport({
   messages: renderedMessages,

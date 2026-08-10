@@ -1,58 +1,91 @@
-import type { ComputedRef, InjectionKey } from 'vue'
+import {
+  computed,
+  inject,
+  provide,
+  type ComputedRef,
+  type InjectionKey,
+} from 'vue'
+
 import { truncate } from '@/composables/chat/useChatRenderedMessages'
 
-/**
- * 会话标题映射（key -> 展示标题）的注入 key。
- *
- * App.vue 以 sessions 列表（后端 display_name 优先）为主源，叠加本地草稿
- * 与重命名的乐观覆盖后 provide；ChatView 等深层路由组件注入后，chat header
- * 与 sidebar 使用同一份标题数据，重命名后 header 立即跟随，不再停留在
- * 首条消息摘要。
- */
-export const chatSessionTitlesKey: InjectionKey<ComputedRef<Record<string, string>>> = Symbol('chat-session-titles')
+export type ChatSessionTitles = Readonly<Record<string, string>>
 
-// Raw session keys (agent:…:…) and bare UUIDs must never render in the header,
-// mirroring the sidebar's filter in App.vue.
+const chatSessionTitlesKey: InjectionKey<ComputedRef<ChatSessionTitles>> = Symbol('chat-session-titles')
+
+export function provideChatSessionTitles(titles: ComputedRef<ChatSessionTitles>) {
+  provide(chatSessionTitlesKey, titles)
+}
+
+export function useChatSessionTitles(): ComputedRef<ChatSessionTitles> {
+  return inject(chatSessionTitlesKey, computed<ChatSessionTitles>(() => ({})))
+}
+
 const RAW_SESSION_KEY_PATTERN = /\bagent:[a-z0-9_-]+:[a-z0-9_-]+:/i
 const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
 
 export function looksLikeRawSessionId(value: string): boolean {
-  return RAW_SESSION_KEY_PATTERN.test(value) || UUID_PATTERN.test(value) || /^(agent|cron):/i.test(value)
+  return RAW_SESSION_KEY_PATTERN.test(value)
+    || UUID_PATTERN.test(value)
+    || /^(agent|cron):/i.test(value)
 }
 
-/** True when a stored title is meaningful enough to show in the chat header. */
-export function isSensibleChatTitle(title: string): boolean {
-  const text = String(title || '').trim()
-  return !!text && !looksLikeRawSessionId(text)
+export function isSensibleChatTitle(value: string): boolean {
+  const title = String(value || '').trim()
+  return !!title && !looksLikeRawSessionId(title)
 }
 
-const CHAT_HEADER_MAX = 28
+interface ChatSessionTitleItem {
+  key: string
+  title: string
+}
+
+export function buildChatSessionTitles(
+  sessions: readonly ChatSessionTitleItem[],
+  renameOverrides: ChatSessionTitles,
+): ChatSessionTitles {
+  const titles: Record<string, string> = {}
+  for (const session of sessions) {
+    if (session.key && isSensibleChatTitle(session.title)) {
+      titles[session.key] = session.title.trim()
+    }
+  }
+  for (const [key, title] of Object.entries(renameOverrides)) {
+    if (key && isSensibleChatTitle(title)) titles[key] = title.trim()
+  }
+  return titles
+}
 
 export interface ChatHeaderMessage {
   role: string
   text?: string | null
 }
 
-/**
- * Resolve the chat header title. The session's stored title (manual rename /
- * LLM-generated, display_name first) wins; the first user message summary is
- * only a fallback for sessions that carry no meaningful title yet (drafts,
- * sessions outside the sidebar list window).
- */
+interface ChatHeaderLabels {
+  newChat: string
+  chatWithSuffix: (suffix: string) => string
+}
+
 export function resolveChatHeaderTitle(
   sessionKey: string,
-  sessionTitles: Record<string, string>,
-  messages: ChatHeaderMessage[],
+  sessionTitles: ChatSessionTitles,
+  messages: readonly ChatHeaderMessage[],
   stripTimePrefix: (text: string) => string,
+  labels: ChatHeaderLabels,
 ): string {
-  const named = sessionKey ? sessionTitles[sessionKey] : ''
-  if (isSensibleChatTitle(named)) return truncate(named, CHAT_HEADER_MAX)
+  const storedTitle = sessionKey ? sessionTitles[sessionKey] || '' : ''
+  if (isSensibleChatTitle(storedTitle)) return truncate(storedTitle.trim(), 28)
 
-  const firstUser = messages.find((msg) => msg.role === 'user' && stripTimePrefix(msg.text || '').trim())
+  const firstUser = messages.find(message => (
+    message.role === 'user' && stripTimePrefix(message.text || '').trim()
+  ))
   if (firstUser) {
-    return truncate(stripTimePrefix(firstUser.text || '').replace(/\s+/g, ' ').trim(), CHAT_HEADER_MAX)
+    return truncate(
+      stripTimePrefix(firstUser.text || '').replace(/\s+/g, ' ').trim(),
+      28,
+    )
   }
+
   const suffix = sessionKey.split(':').pop() || ''
-  if (!suffix || suffix === 'default') return 'New chat'
-  return `Chat ${suffix}`
+  if (!suffix || suffix === 'default') return labels.newChat
+  return labels.chatWithSuffix(suffix)
 }
