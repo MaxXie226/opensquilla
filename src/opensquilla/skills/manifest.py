@@ -1090,13 +1090,6 @@ def validate_hub_candidate(
     )
 
 
-# Compatibility aliases for loader-local helpers that were historically
-# imported by name in tests and internal comments.
-_parse_frontmatter = parse_skill_frontmatter
-_resolve_metadata = resolve_skill_metadata
-_resolve_provenance = resolve_skill_provenance
-
-
 __all__ = [
     "MAX_SKILL_FILE_BYTES",
     "SkillManifestValidation",

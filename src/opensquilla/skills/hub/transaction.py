@@ -185,6 +185,8 @@ def ensure_safe_transaction_roots(managed_dir: Path) -> tuple[Path, Path]:
         try:
             root.mkdir(mode=0o700)
         except FileExistsError:
+            # Reserved roots persist across transactions; the checks below
+            # verify that an existing path is still an ordinary safe directory.
             pass
         info = _ordinary_directory_info(root, label="reserved transaction root")
         try:

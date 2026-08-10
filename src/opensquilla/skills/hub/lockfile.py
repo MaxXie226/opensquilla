@@ -618,6 +618,9 @@ def _fsync_directory(directory: Path) -> None:
     try:
         os.fsync(descriptor)
     except OSError:
+        # Some platforms and filesystems do not support fsync on directories.
+        # The atomic file replacement has already completed, so durability here
+        # remains best-effort by contract.
         pass
     finally:
         os.close(descriptor)
