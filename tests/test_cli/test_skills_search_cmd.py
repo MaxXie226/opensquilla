@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -120,10 +121,12 @@ def test_skills_search_include_diagnostics_help_and_json_requirement() -> None:
     )
 
     assert help_result.exit_code == 0, help_result.output
-    assert "--include-diagnostics" in help_result.output
-    assert "wrap results and source diagnostics" in help_result.output
+    help_output = click.unstyle(help_result.output)
+    invalid_output = click.unstyle(invalid_result.output)
+    assert "--include-diagnostics" in help_output
+    assert "wrap results and source diagnostics" in help_output
     assert invalid_result.exit_code != 0
-    assert "--include-diagnostics requires --json" in invalid_result.output
+    assert "--include-diagnostics requires --json" in invalid_output
 
 
 def test_skills_search_human_does_not_call_source_failure_zero_results(monkeypatch) -> None:

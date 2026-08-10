@@ -5,6 +5,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+import click
 from typer.testing import CliRunner
 
 from opensquilla.cli import gateway_lifecycle
@@ -568,7 +569,7 @@ def test_skills_scanner_confirmation_requires_force(monkeypatch):
     )
 
     assert result.exit_code != 0
-    assert "--risk-confirmation requires --force" in result.output
+    assert "--risk-confirmation requires --force" in click.unstyle(result.output)
     assert not any(method == "skills.install" for method, _params in fake.calls)
 
 
