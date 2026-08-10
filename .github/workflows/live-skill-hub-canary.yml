@@ -28,7 +28,7 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
       OPENSQUILLA_RUN_LIVE_SKILL_HUB: "1"
       OPENSQUILLA_LIVE_SKILL_FIXTURE_REVISION: ${{ inputs.fixture_revision || github.sha }}
-      OPENSQUILLA_LIVE_SKILL_INSTALL_REFERENCE: ${{ format('{0}@{1}:tests/fixtures/live_skill_hub/community-canary', github.repository, inputs.fixture_revision || github.sha) }}
+      OPENSQUILLA_LIVE_SKILL_INSTALL_REFERENCE: ${{ format('{0}@{1}:tests/fixtures/live_skill_hub/opensquilla-live-skill-hub-canary', github.repository, inputs.fixture_revision || github.sha) }}
       PYTHONUTF8: "1"
 
     steps:

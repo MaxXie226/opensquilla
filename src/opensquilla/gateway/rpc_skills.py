@@ -44,6 +44,7 @@ from opensquilla.skills.hub.management import (
     committed_store_read_guard,
     lifecycle_for_candidate,
 )
+from opensquilla.skills.hub.source import SkillSourceFetchError
 from opensquilla.skills.hub.transaction import journal_path_for_state
 from opensquilla.skills.loader import PinnedSkillLoader, SkillLoader
 from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
@@ -1100,7 +1101,12 @@ async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[st
     source_id = params.get("source")
     if source_id is not None and not isinstance(source_id, str):
         source_id = None
-    results = await router.search(query, limit=limit, source_id=source_id)
+    search_diagnostics: list[dict[str, Any]] = []
+    try:
+        results = await router.search(query, limit=limit, source_id=source_id)
+    except SkillSourceFetchError as exc:
+        results = []
+        search_diagnostics = [item.to_dict() for item in exc.diagnostics]
     injected_lockfile = getattr(management_service, "lockfile_path", None)
     if injected_lockfile:
         from opensquilla.skills.hub.lockfile import Lockfile
@@ -1108,7 +1114,7 @@ async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[st
         installed = Lockfile.load(Path(injected_lockfile))
     else:
         installed = installed_skill_lockfile()
-    return {
+    payload = {
         "results": [
             {
                 "name": r.name,
@@ -1124,6 +1130,9 @@ async def _handle_skills_search(params: dict | None, ctx: RpcContext) -> dict[st
             for r in results
         ]
     }
+    if search_diagnostics:
+        payload["diagnostics"] = search_diagnostics
+    return payload
 
 
 @_d.method("skills.reload", scope="operator.admin")

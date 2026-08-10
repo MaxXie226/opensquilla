@@ -1906,8 +1906,12 @@ class SkillManagementService:
                     resolved_revision = str(getattr(resolution, "revision", "") or "")
                     prior_revision = old_entry.resolved_revision
                     prior_tree = old_entry.tree_sha256 or old_entry.sha256
-                    same_immutable_revision = bool(
-                        update_name is not None
+                    same_immutable_package_revision = bool(
+                        resolution.immutable
+                        and old_entry.source == source_id
+                        and old_package_id
+                        and source_package_id
+                        and old_package_id == source_package_id
                         and resolved_revision
                         and resolved_revision == prior_revision
                     )
@@ -1916,8 +1920,9 @@ class SkillManagementService:
                         and artifact_digest
                         and old_entry.artifact_sha256 != artifact_digest
                     )
-                    if same_immutable_revision and (
-                        prior_tree != installed_tree or artifact_changed
+                    tree_changed = bool(prior_tree and prior_tree != installed_tree)
+                    if same_immutable_package_revision and (
+                        tree_changed or artifact_changed
                     ):
                         message = (
                             f"Source returned different content for immutable revision "
@@ -1935,13 +1940,23 @@ class SkillManagementService:
                                 ),
                                 details={
                                     "revision": resolved_revision,
-                                    "treeChanged": prior_tree != installed_tree,
+                                    "treeChanged": tree_changed,
                                     "artifactChanged": artifact_changed,
                                 },
                             )
                         )
                         raise RuntimeError(message)
-                    if same_immutable_revision:
+                    tree_unchanged = bool(prior_tree and prior_tree == installed_tree)
+                    artifact_unchanged = bool(
+                        old_entry.artifact_sha256
+                        and artifact_digest
+                        and old_entry.artifact_sha256 == artifact_digest
+                    )
+                    if (
+                        same_immutable_package_revision
+                        and tree_unchanged
+                        and artifact_unchanged
+                    ):
                         diagnostics.append(
                             _diagnostic(
                                 "ALREADY_CURRENT",

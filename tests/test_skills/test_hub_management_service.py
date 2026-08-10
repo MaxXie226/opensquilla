@@ -2008,6 +2008,186 @@ async def test_update_noop_is_successful_and_unchanged_without_mutating_store(
 
 
 @pytest.mark.asyncio
+async def test_repeat_install_of_same_immutable_artifact_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "managed"
+    loader = SkillLoader(managed_dir=managed)
+    loader.reload(force=True, reason="test.initial")
+    source = FakeImmutableSource(
+        {
+            "SKILL.md": (
+                "---\nname: repeat-skill\n"
+                "description: repeated install contract\n---\nInstructions.\n"
+            )
+        }
+    )
+    service = _service(tmp_path, source, loader=loader)
+
+    first = await service.install("repeat-skill", "fake")
+    lock_before = (tmp_path / "skills-lock.json").read_bytes()
+    tree_before = compute_tree_sha256(managed / "repeat-skill")
+    generation_before = loader.snapshot().generation
+    second = await service.install("repeat-skill", "fake")
+
+    assert first.success is True
+    assert first.unchanged is False
+    assert second.success is True
+    assert second.unchanged is True
+    assert second.install_id == first.install_id
+    assert second.catalog_generation == generation_before
+    assert loader.snapshot().generation == generation_before
+    assert (tmp_path / "skills-lock.json").read_bytes() == lock_before
+    assert compute_tree_sha256(managed / "repeat-skill") == tree_before
+    assert [item.code for item in second.diagnostics][-1] == "ALREADY_CURRENT"
+    _assert_no_transaction_ids(managed)
+
+
+@pytest.mark.asyncio
+async def test_offline_repeat_install_remains_validated_for_next_start(
+    tmp_path: Path,
+) -> None:
+    source = FakeImmutableSource(
+        {
+            "SKILL.md": (
+                "---\nname: offline-repeat\n"
+                "description: offline repeated install\n---\nInstructions.\n"
+            )
+        }
+    )
+    service = _service(tmp_path, source)
+
+    first = await service.install("offline-repeat", "fake")
+    second = await service.install("offline-repeat", "fake")
+
+    assert first.success is True
+    assert second.success is True
+    assert second.unchanged is True
+    assert second.active is False
+    assert second.instruction_usable is False
+    assert second.effective_from == "next_start"
+    assert second.lifecycle is not None
+    assert second.lifecycle.load_state.value == "validated_offline"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_installs_publish_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = tmp_path / "managed"
+    loader = SkillLoader(managed_dir=managed)
+    loader.reload(force=True, reason="test.initial")
+    source = FakeImmutableSource(
+        {
+            "SKILL.md": (
+                "---\nname: concurrent-same\n"
+                "description: concurrent identical install\n---\nInstructions.\n"
+            )
+        }
+    )
+    service = _service(tmp_path, source, loader=loader)
+    real_reload = loader.reload_verified
+    reload_calls = 0
+
+    def count_reload(*args, **kwargs) -> SkillReloadResult:
+        nonlocal reload_calls
+        reload_calls += 1
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "reload_verified", count_reload)
+
+    first, second = await asyncio.gather(
+        service.install("concurrent-same", "fake"),
+        service.install("concurrent-same", "fake"),
+    )
+
+    results = [first, second]
+    assert all(result.success for result in results)
+    assert sorted(result.unchanged for result in results) == [False, True]
+    assert len({result.install_id for result in results}) == 1
+    assert reload_calls == 1
+    assert loader.get_by_name("concurrent-same") is not None
+    assert Lockfile.load(tmp_path / "skills-lock.json").get("concurrent-same") is not None
+    _assert_no_transaction_ids(managed)
+
+
+@pytest.mark.asyncio
+async def test_repeat_install_rejects_changed_tree_for_same_immutable_artifact(
+    tmp_path: Path,
+) -> None:
+    source = FakeImmutableSource(
+        {
+            "SKILL.md": (
+                "---\nname: repeat-tamper\n"
+                "description: immutable repeat contract\n---\nOld instructions.\n"
+            )
+        }
+    )
+    service = _service(tmp_path, source)
+    first = await service.install("repeat-tamper", "fake")
+    target = tmp_path / "managed" / "repeat-tamper" / "SKILL.md"
+    tree_before = target.read_bytes()
+    lock_before = (tmp_path / "skills-lock.json").read_bytes()
+    source.files["SKILL.md"] = (
+        "---\nname: repeat-tamper\n"
+        "description: immutable repeat contract\n---\nChanged instructions.\n"
+    )
+
+    repeated = await service.install("repeat-tamper", "fake")
+
+    assert first.success is True
+    assert repeated.success is False
+    assert repeated.unchanged is False
+    diagnostic = next(
+        item
+        for item in repeated.diagnostics
+        if item.code == "SOURCE_IMMUTABILITY_VIOLATION"
+    )
+    assert diagnostic.details == {
+        "revision": "a" * 40,
+        "treeChanged": True,
+        "artifactChanged": False,
+    }
+    assert target.read_bytes() == tree_before
+    assert (tmp_path / "skills-lock.json").read_bytes() == lock_before
+
+
+@pytest.mark.asyncio
+async def test_repeat_install_rejects_changed_artifact_digest_for_same_revision(
+    tmp_path: Path,
+) -> None:
+    source = MutableArtifactDigestSource(
+        {
+            "SKILL.md": (
+                "---\nname: repeat-artifact\n"
+                "description: immutable artifact repeat contract\n---\nInstructions.\n"
+            )
+        }
+    )
+    service = _service(tmp_path, source)
+    first = await service.install("repeat-artifact", "fake")
+    lock_before = (tmp_path / "skills-lock.json").read_bytes()
+    source.artifact_digest = "artifact-two"
+
+    repeated = await service.install("repeat-artifact", "fake")
+
+    assert first.success is True
+    assert repeated.success is False
+    diagnostic = next(
+        item
+        for item in repeated.diagnostics
+        if item.code == "SOURCE_IMMUTABILITY_VIOLATION"
+    )
+    assert diagnostic.details == {
+        "revision": "a" * 40,
+        "treeChanged": False,
+        "artifactChanged": True,
+    }
+    assert (tmp_path / "skills-lock.json").read_bytes() == lock_before
+
+
+@pytest.mark.asyncio
 async def test_update_rejects_changed_tree_for_same_immutable_revision(
     tmp_path: Path,
 ) -> None:
@@ -2115,6 +2295,51 @@ async def test_same_adapter_different_package_requires_explicit_replacement(
     entry = Lockfile.load(tmp_path / "skills-lock.json").get("shared-name")
     assert entry is not None
     assert entry.source_package_id == "fake:owner-b/shared-name"
+
+
+@pytest.mark.asyncio
+async def test_different_package_with_same_revision_is_replaced_not_noop(
+    tmp_path: Path,
+) -> None:
+    class SameRevisionPackagesSource(FakeImmutableSource):
+        async def resolve(self, identifier: str) -> SourceResolution:
+            resolution = await super().resolve(identifier)
+            return replace(resolution, package_identifier=identifier)
+
+    source = SameRevisionPackagesSource(
+        {
+            "SKILL.md": (
+                "---\nname: shared-revision\n"
+                "description: first package\n---\nOld instructions.\n"
+            )
+        }
+    )
+    service = _service(tmp_path, source)
+    first = await service.install("owner-a/shared-revision", "fake")
+    source.files["SKILL.md"] = (
+        "---\nname: shared-revision\n"
+        "description: second package\n---\nNew instructions.\n"
+    )
+
+    replaced = await service.install(
+        "owner-b/shared-revision",
+        "fake",
+        replace_source=True,
+    )
+
+    assert first.success is True
+    assert replaced.success is True
+    assert replaced.unchanged is False
+    assert not any(
+        item.code == "SOURCE_IMMUTABILITY_VIOLATION"
+        for item in replaced.diagnostics
+    )
+    entry = Lockfile.load(tmp_path / "skills-lock.json").get("shared-revision")
+    assert entry is not None
+    assert entry.source_package_id == "fake:owner-b/shared-revision"
+    assert "New instructions." in (
+        tmp_path / "managed" / "shared-revision" / "SKILL.md"
+    ).read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

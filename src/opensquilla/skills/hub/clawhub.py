@@ -305,17 +305,46 @@ class ClawHubSource(SkillSource):
                     params={"q": query, "limit": limit},
                     headers=self._headers(),
                 )
-                response.raise_for_status()
-                data = response.json()
         except Exception as exc:
             log.warning("clawhub.search_failed", error=str(exc))
-            return []
+            raise source_transport_error(
+                exc,
+                phase=DiagnosticPhase.SOURCE,
+                source_name="ClawHub",
+            ) from exc
 
-        if isinstance(data, str) or (isinstance(data, dict) and "error" in data):
+        raise_for_source_http_status(
+            response,
+            phase=DiagnosticPhase.SOURCE,
+            source_name="ClawHub",
+        )
+        try:
+            data = response.json()
+        except (TypeError, ValueError) as exc:
+            log.warning("clawhub.search_invalid_json")
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="ClawHub",
+            ) from exc
+
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and "error" not in data:
+            if "results" in data:
+                items = data["results"]
+            elif "skills" in data:
+                items = data["skills"]
+            else:
+                items = None
+        else:
+            items = None
+        if not isinstance(items, list):
             log.warning("clawhub.search_error", data=str(data)[:100])
-            return []
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.SOURCE,
+                source_name="ClawHub",
+            )
 
-        items = data if isinstance(data, list) else data.get("results", data.get("skills", []))
         results: list[SkillMeta] = []
         for item in items:
             if not isinstance(item, dict):

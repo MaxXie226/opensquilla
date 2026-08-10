@@ -11,7 +11,11 @@ from opensquilla.skills.hub.clawhub import ClawHubSource
 from opensquilla.skills.hub.github import GitHubSource
 from opensquilla.skills.hub.management import SkillManagementService
 from opensquilla.skills.hub.router import SourceRouter
-from opensquilla.skills.hub.source import SkillBundle, SourceResolution
+from opensquilla.skills.hub.source import (
+    SkillBundle,
+    SkillSourceFetchError,
+    SourceResolution,
+)
 from opensquilla.skills.manifest import parse_skill_frontmatter
 
 _COMMIT = "b" * 40
@@ -150,6 +154,68 @@ async def test_search_preserves_exact_publisher_and_skills_sh_install_refs(monke
     assert [result.canonical_identifier for result in results] == [
         "@alice/weather",
         "skills-sh:acme/skills/weather",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_empty_results_are_not_reported_as_source_failure(monkeypatch) -> None:
+    _mock_httpx(
+        monkeypatch,
+        {
+            "https://hub.test/api/v1/search": _Response(json_data={"results": []})
+        },
+    )
+
+    results = await ClawHubSource(base_url="https://hub.test").search("missing")
+
+    assert results == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_code"),
+    [
+        (401, "SOURCE_AUTH_FAILED"),
+        (403, "SOURCE_AUTH_FAILED"),
+        (429, "SOURCE_RATE_LIMITED"),
+        (500, "SOURCE_SERVER_FAILED"),
+        (503, "SOURCE_SERVER_FAILED"),
+        ("transport", "SOURCE_TRANSPORT_FAILED"),
+        ("invalid-json", "SOURCE_INVALID_RESPONSE"),
+        ("invalid-shape", "SOURCE_INVALID_RESPONSE"),
+    ],
+)
+async def test_search_failures_surface_stable_source_diagnostics(
+    monkeypatch,
+    outcome: int | str,
+    expected_code: str,
+) -> None:
+    search_url = "https://hub.test/api/v1/search"
+    if outcome == "invalid-json":
+        response = _InvalidJsonResponse()
+    elif outcome == "invalid-shape":
+        response = _Response(json_data={"results": {"slug": "weather"}})
+    elif isinstance(outcome, int):
+        response = _Response(status_code=outcome)
+    else:
+        response = _Response(json_data={"results": []})
+    _mock_httpx(monkeypatch, {search_url: response})
+    if outcome == "transport":
+
+        async def failing_get(
+            _client: _AsyncClient,
+            _url: str,
+            **_kwargs: Any,
+        ) -> _Response:
+            raise OSError("simulated DNS failure")
+
+        monkeypatch.setattr(_AsyncClient, "get", failing_get)
+
+    with pytest.raises(SkillSourceFetchError) as raised:
+        await ClawHubSource(base_url="https://hub.test").search("weather")
+
+    assert [(item.code, item.phase.value) for item in raised.value.diagnostics] == [
+        (expected_code, "source")
     ]
 
 

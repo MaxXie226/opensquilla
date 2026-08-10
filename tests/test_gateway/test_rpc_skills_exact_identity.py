@@ -6,9 +6,10 @@ import pytest
 
 from opensquilla.gateway import rpc_skills
 from opensquilla.gateway.rpc import RpcContext
+from opensquilla.skills.hub.contracts import DiagnosticPhase
 from opensquilla.skills.hub.lockfile import LockEntry, Lockfile, compute_tree_sha256
 from opensquilla.skills.hub.management import SkillManagementService
-from opensquilla.skills.hub.source import SkillMeta
+from opensquilla.skills.hub.source import SkillMeta, SkillSourceFetchError
 from opensquilla.skills.loader import SkillLoader
 
 
@@ -164,6 +165,42 @@ async def test_registry_search_uses_injected_management_router_and_lockfile(
     response = await rpc_skills._handle_skills_search({"query": "plot"}, ctx)
 
     assert response["results"][0]["installed"] is True
+
+
+@pytest.mark.asyncio
+async def test_registry_search_preserves_results_container_with_source_diagnostics() -> None:
+    class FailingRouter:
+        async def search(self, query, limit=20, source_id=None):
+            assert (query, limit, source_id) == ("weather", 20, "clawhub")
+            raise SkillSourceFetchError.diagnostic(
+                "SOURCE_TRANSPORT_FAILED",
+                "Could not reach ClawHub for the Skill request.",
+                phase=DiagnosticPhase.SOURCE,
+                hint="Check network connectivity, then retry.",
+            )
+
+    ctx = RpcContext(conn_id="test")
+    ctx._skill_router = FailingRouter()  # type: ignore[attr-defined]
+
+    response = await rpc_skills._handle_skills_search(
+        {"query": "weather", "source": "clawhub"},
+        ctx,
+    )
+
+    assert response["results"] == []
+    assert response["diagnostics"] == [
+        {
+            "code": "SOURCE_TRANSPORT_FAILED",
+            "severity": "error",
+            "phase": "source",
+            "message": "Could not reach ClawHub for the Skill request.",
+            "blocking": True,
+            "path": "",
+            "field_name": "",
+            "hint": "Check network connectivity, then retry.",
+            "details": {},
+        }
+    ]
 
 
 @pytest.mark.asyncio
