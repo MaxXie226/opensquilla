@@ -6,6 +6,8 @@
       'chat--meta-setup': Boolean(setupState),
       'chat--drag-over': threadDragOver,
       'chat--plan-questionnaire-open': Boolean(dockedPlanQuestionnaire),
+      'chat--composer-floating': composerFxEnabled && !isNewChatLanding,
+      'chat--composer-collapsed': composerCollapsed && composerFxEnabled && !isNewChatLanding,
     }"
     @dragenter="onChatDragEnter"
     @dragover="onChatDragOver"
@@ -75,13 +77,60 @@
       </div>
       <div class="chat-thread-shell">
         <div
+          v-if="forkTransition"
+          class="chat-fork-transition-overlay"
+          data-testid="chat-fork-transition-overlay"
+        >
+          <div
+            class="chat-fork-transition-status"
+            :class="{ 'chat-fork-transition-status--error': forkTransition.phase === 'error' }"
+            :role="forkTransition.phase === 'error' ? 'alert' : 'status'"
+            :aria-live="forkTransition.phase === 'error' ? 'assertive' : 'polite'"
+            aria-atomic="true"
+            data-testid="chat-fork-transition-status"
+          >
+            <span
+              v-if="forkTransition.phase !== 'error'"
+              class="chat-fork-transition-status__spinner"
+              aria-hidden="true"
+            />
+            <Icon v-else name="info" :size="15" aria-hidden="true" />
+            <span class="chat-fork-transition-status__copy">{{ forkTransition.phase === 'error'
+              ? t('chat.forkOpenFailed')
+              : forkTransition.phase === 'creating'
+                ? t('chat.forkCreating')
+                : forkTransition.phase === 'returning'
+                  ? t('chat.forkReturning')
+                  : t('chat.forkOpening') }}</span>
+            <template v-if="forkTransition.phase === 'error'">
+              <button
+                type="button"
+                class="btn btn--ghost chat-fork-transition-status__action"
+                data-testid="chat-fork-retry"
+                @click="retryForkTransition"
+              >{{ t('chat.reloadSession') }}</button>
+              <button
+                type="button"
+                class="btn btn--ghost chat-fork-transition-status__action"
+                data-testid="chat-fork-return"
+                @click="returnToForkParent"
+              >{{ t('chat.forkReturnOriginal') }}</button>
+            </template>
+          </div>
+        </div>
+        <div
           ref="threadRef"
           class="chat-thread"
           role="region"
           tabindex="0"
           :aria-label="t('chat.conversation')"
-          :aria-busy="isStreaming"
+          :aria-busy="isStreaming || forkInFlight"
           @scroll="onThreadScroll"
+          @wheel.passive="onThreadWheel"
+          @touchmove.passive="markThreadScrollIntent('either')"
+          @pointerdown="markThreadScrollIntent('either')"
+          @pointermove="onThreadPointerMove"
+          @keydown="onThreadScrollKeydown"
         >
         <template v-if="isNewChatLanding">
           <div class="chat-landing-brand" :aria-label="t('chat.newChatBrand')">
@@ -95,25 +144,25 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="visibleHistoryRecoveryState"
+          v-if="!forkTransition && visibleHistoryRecoveryState"
           :key="`${sessionKey}:history`"
           :state="visibleHistoryRecoveryState"
           @retry="retryHistory"
         />
         <ChatSessionRecoveryStatus
-          v-if="liveRecoveryState"
+          v-if="!forkTransition && liveRecoveryState"
           :key="`${sessionKey}:live`"
           :state="liveRecoveryState"
           @retry="retryLive"
         />
         <div
-          v-if="showConfirmedEmptySession"
+          v-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
         >
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding"
+          v-if="!isNewChatLanding && !forkTransition"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
           :loading="historyState.loadingEarlier"
@@ -127,9 +176,16 @@
           @retry="retryHistory"
         />
 
+        <div
+          class="chat-message-surface"
+          :class="{ 'chat-message-surface--preview': forkTransition }"
+          :inert="forkTransition ? true : undefined"
+          :aria-hidden="forkTransition ? 'true' : undefined"
+          :data-preview-session="forkTransition?.parentKey"
+        >
         <ChatMessageList
-          :messages="renderedMessages"
-          :session-key="sessionKey"
+          :messages="forkTransition?.previewMessages || renderedMessages"
+          :session-key="forkTransition?.parentKey || sessionKey"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
@@ -174,6 +230,7 @@
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
         </ChatMessageList>
+        </div>
 
         <!-- Manual or turn-boundary compaction has no assistant turn to own
              it. Keep one quiet transcript maintenance row instead of a
@@ -391,7 +448,7 @@
         </template>
         </div>
         <ConversationMinimap
-          v-if="!isNewChatLanding && !shareMode"
+          v-if="!isNewChatLanding && !shareMode && !forkTransition"
           :messages="renderedMessages"
           :scroll-container="threadRef"
           :strip-time-prefix="stripTimePrefix"
@@ -503,7 +560,7 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
-      :input-disabled="Boolean(dockedPlanQuestionnaire)"
+      :input-disabled="Boolean(dockedPlanQuestionnaire) || Boolean(forkTransition)"
       :run-mode="runMode"
       :allowed-run-modes="composerAllowedRunModes"
       :safe-setup-available="composerSafeSetupAvailable"
@@ -530,6 +587,9 @@
       :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
       :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
       :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
+      :collapsed="composerCollapsed && composerFxEnabled && !isNewChatLanding"
+      :floating="composerFxEnabled && !isNewChatLanding"
+      @expand="expandComposer"
       @composition-change="composing = $event"
       @beforeinput="onTextareaBeforeInput"
       @file-change="onFileInputChange"
@@ -727,6 +787,7 @@ import {
   type DurableMetaDraft,
 } from '@/composables/chat/useChatSlashCommands'
 import { useChatStream } from '@/composables/chat/useChatStream'
+import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
@@ -761,6 +822,15 @@ import type {
   HiddenControlDispatchResult,
   ToolResultContext,
 } from '@/types/chat'
+import {
+  createForkTransitionLifetime,
+  forkNavigationPhase,
+  forkRouteHandoffAction,
+  forkRpcRequest,
+  snapshotForkPreviewMessages,
+  validatedForkChildKey,
+  type ForkRpcResponse,
+} from '@/utils/chat/forkTransition'
 import type {
   ArtifactPayload,
   MetaDraftDiscardResponse,
@@ -806,6 +876,10 @@ import {
 import { listPendingMetaDiscards } from '@/utils/chat/metaDiscardOutbox'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
+  createComposerRetractionController,
+  type ComposerScrollIntent,
+} from '@/utils/chat/composerRetraction'
+import {
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
   isCurrentSessionPayload as payloadIsCurrentSession,
@@ -845,6 +919,7 @@ import {
 
 interface ChatComposerHandle {
   composerElement: () => HTMLElement | null
+  canCollapse: () => boolean
   focusTextarea: () => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
@@ -931,6 +1006,17 @@ const pendingAutoSendSessionKey = ref('')
 
 const threadRef = ref<HTMLElement | null>(null)
 const composerRef = ref<ChatComposerHandle | null>(null)
+/* Floating-composer retract: a pure controller accumulates slow user travel
+   while ignoring scrollTop changes caused by history, minimap, and layout. */
+const composerRetraction = createComposerRetractionController()
+const composerCollapsed = ref(false)
+let pendingComposerScrollIntent: ComposerScrollIntent = null
+let composerScrollIntentTimer: number | null = null
+
+// Settings → Appearance "Floating composer" toggle. Off: the composer docks in
+// the normal layout and never retracts; on (default): it floats over the
+// transcript and collapses to a single line while scrolling up.
+const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 type ChatHeaderActionsHandle = {
   focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
 }
@@ -939,6 +1025,43 @@ const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+
+function clearPendingComposerScrollIntent() {
+  pendingComposerScrollIntent = null
+  if (composerScrollIntentTimer !== null) {
+    window.clearTimeout(composerScrollIntentTimer)
+    composerScrollIntentTimer = null
+  }
+}
+
+function resetComposerRetraction() {
+  clearPendingComposerScrollIntent()
+  composerCollapsed.value = composerRetraction.reset()
+}
+
+function expandComposer() {
+  clearPendingComposerScrollIntent()
+  composerCollapsed.value = composerRetraction.expand(threadRef.value?.scrollTop ?? null)
+}
+
+function markThreadScrollIntent(intent: Exclude<ComposerScrollIntent, null>) {
+  pendingComposerScrollIntent = intent
+  if (composerScrollIntentTimer !== null) window.clearTimeout(composerScrollIntentTimer)
+  // Wheel scrolling can land one frame after its input event. A short token
+  // covers that browser scheduling gap; direction matching still rejects a
+  // history-prepend correction that moves opposite to the gesture.
+  composerScrollIntentTimer = window.setTimeout(() => {
+    pendingComposerScrollIntent = null
+    composerScrollIntentTimer = null
+  }, 120)
+}
+
+function currentThreadScrollIntent(): ComposerScrollIntent {
+  return pendingComposerScrollIntent
+}
+
+watch(composerFxEnabled, resetComposerRetraction, { flush: 'sync' })
+watch(sessionKey, resetComposerRetraction, { flush: 'sync' })
 const promptCacheKeepaliveOpen = ref(false)
 const promptCacheKeepaliveStatus = ref<PromptCacheKeepaliveStatus | null>(null)
 const promptCacheKeepaliveAvailable = computed(() => (
@@ -953,6 +1076,26 @@ const autoScroll = ref(true)
 const historyNavigationScrollLock = createHistoryNavigationScrollLock(autoScroll)
 const composing = ref(false)
 const messages = ref<Message[]>([])
+
+type ForkTransitionPhase = 'creating' | 'opening' | 'returning' | 'error'
+
+interface ForkTransitionState {
+  generation: number
+  parentKey: string
+  childKey: string
+  targetKey: string
+  throughTurnId?: string
+  phase: ForkTransitionPhase
+  errorReason?: 'navigation' | 'history' | 'live'
+  /** Render-only snapshot; never becomes the child session's canonical messages. */
+  previewMessages: ChatRenderedMessage[]
+}
+
+const forkTransition = ref<ForkTransitionState | null>(null)
+const forkInFlight = computed(() => (
+  forkTransition.value !== null && forkTransition.value.phase !== 'error'
+))
+const forkTransitionLifetime = createForkTransitionLifetime()
 
 // Session / UI
 const lastHeaderRole = ref('')
@@ -1501,6 +1644,7 @@ const {
   isDraftRoute,
   persistSession,
   readProjectFromUrl,
+  readSessionFromUrl,
   resolveInitialSession,
 } = chatSessionRoute
 
@@ -1553,6 +1697,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   stripGeneratedArtifactMarkers,
   stripTimePrefix,
   isSubagentCompletionMessage,
+  timeTranslator: t,
 })
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
 
@@ -1644,6 +1789,7 @@ const chatHistory = useChatHistory({
   scrollToBottom,
 })
 const {
+  historySessionKey,
   historyState,
   loadHistory,
   loadEarlierHistory,
@@ -2812,7 +2958,9 @@ watch(messages, () => attachTurnReasoning())
 // Unsubscribers
 let unsubs: (() => void)[] = []
 let chatViewDisposed = false
-let composerResizeObserver: ResizeObserver | null = null
+let composerDockResizeObserver: ResizeObserver | null = null
+let composerDockPinFrame: number | null = null
+let lastComposerDockHeight = -1
 
 /* ── Computed ──────────────────────────────────────────────────────── */
 
@@ -2827,6 +2975,8 @@ const isNewChatLanding = computed(() => {
     pendingQueue.value.length === 0 &&
     !compactStatus.value.visible
 })
+
+watch(isNewChatLanding, resetComposerRetraction, { flush: 'sync' })
 
 const historyRecoveryState = computed(() => {
   return resolveChatHistoryRecoveryState({
@@ -3000,7 +3150,18 @@ const activeProjectComposerBlockMessage = computed(() => {
 })
 
 const composerSendBlockedMessage = computed(() =>
-  modelImageSendBlockedMessage.value
+  (forkTransition.value
+    ? t(
+        forkTransition.value.phase === 'error'
+          ? 'chat.forkOpenFailed'
+          : forkTransition.value.phase === 'creating'
+            ? 'chat.forkCreating'
+            : forkTransition.value.phase === 'returning'
+              ? 'chat.forkReturning'
+              : 'chat.forkOpening',
+      )
+    : '')
+  || modelImageSendBlockedMessage.value
   || liveSendBlockedReason.value
   || activeProjectComposerBlockMessage.value,
 )
@@ -3439,26 +3600,167 @@ function closeDeliverables() {
 
 /* ── Fork ──────────────────────────────────────────────────────────── */
 
-// Whole-conversation fork from the tip: the backend copies the transcript
-// into a sibling session, then we navigate there the same way the session
-// switcher does (route query change → switchToSession).
-const forkInFlight = ref(false)
+function clearForkTransition(generation?: number) {
+  if (
+    generation !== undefined
+    && forkTransition.value?.generation !== generation
+  ) return
+  const clearedGeneration = generation ?? forkTransition.value?.generation
+  forkTransition.value = null
+  forkTransitionLifetime.invalidate(clearedGeneration)
+}
 
-async function forkConversation() {
-  const parentKey = sessionKey.value
-  if (!parentKey || forkInFlight.value) return
-  if (pendingSessionIntent.value === 'new_chat') return
-  forkInFlight.value = true
+function isForkTransitionActive(generation: number): boolean {
+  return Boolean(
+    chatViewActive
+    && !chatViewDisposed
+    && forkTransitionLifetime.isCurrent(generation)
+    && forkTransition.value?.generation === generation
+  )
+}
+
+function failForkTransition(
+  generation: number,
+  reason: NonNullable<ForkTransitionState['errorReason']>,
+  error: unknown,
+) {
+  if (!isForkTransitionActive(generation)) return
+  const transition = forkTransition.value!
+  console.warn('Fork child hand-off failed:', error instanceof Error ? error.message : error)
+  const firstFailure = transition.phase !== 'error'
+  forkTransition.value = {
+    ...transition,
+    phase: 'error',
+    errorReason: reason,
+  }
+  if (firstFailure) pushToast(t('chat.toast.forkOpenFailed'), { tone: 'warn' })
+}
+
+async function retryForkTransition() {
+  const transition = forkTransition.value
+  if (
+    !transition?.targetKey
+    || transition.phase !== 'error'
+    || !isForkTransitionActive(transition.generation)
+  ) return
+  const retryPhase = forkNavigationPhase(transition.targetKey, transition.parentKey)
+  forkTransition.value = {
+    ...transition,
+    phase: retryPhase,
+    errorReason: undefined,
+  }
   try {
-    const res = await rpc.call<{ key?: string }>('sessions.fork', { key: parentKey })
-    const childKey = typeof res?.key === 'string' ? res.key : ''
-    if (!childKey) throw new Error('sessions.fork returned no key')
-    router.push({ path: '/chat', query: { session: childKey } }).catch(() => {})
+    if (
+      sessionKey.value !== transition.targetKey
+      || readSessionFromUrl() !== transition.targetKey
+    ) {
+      const navigationFailure = await router.push({
+        path: '/chat',
+        query: { session: transition.targetKey },
+      })
+      if (!isForkTransitionActive(transition.generation)) return
+      if (navigationFailure && readSessionFromUrl() !== transition.targetKey) {
+        throw navigationFailure
+      }
+      return
+    }
+    if (livePhase.value === 'degraded') void retryLive()
+    void retryHistory()
+  } catch (error) {
+    failForkTransition(transition.generation, 'navigation', error)
+  }
+}
+
+async function returnToForkParent() {
+  const transition = forkTransition.value
+  if (!transition || !isForkTransitionActive(transition.generation)) return
+  if (
+    sessionKey.value === transition.parentKey
+    && readSessionFromUrl() === transition.parentKey
+  ) {
+    if (
+      transition.targetKey === transition.parentKey
+      && historySessionKey.value === transition.parentKey
+      && historyState.value.initialLoadStatus !== 'ready'
+    ) {
+      if (transition.phase === 'error') {
+        await retryForkTransition()
+        if (!isForkTransitionActive(transition.generation)) return
+      }
+      return
+    }
+    clearForkTransition(transition.generation)
+    return
+  }
+  forkTransition.value = {
+    ...transition,
+    targetKey: transition.parentKey,
+    phase: 'returning',
+    errorReason: undefined,
+  }
+  try {
+    const navigationFailure = await router.push({
+      path: '/chat',
+      query: { session: transition.parentKey },
+    })
+    if (!isForkTransitionActive(transition.generation)) return
+    if (navigationFailure && readSessionFromUrl() !== transition.parentKey) {
+      throw navigationFailure
+    }
+  } catch (error) {
+    failForkTransition(transition.generation, 'navigation', error)
+  }
+}
+
+async function forkConversation(throughTurnId?: string) {
+  const parentKey = sessionKey.value
+  if (!parentKey || forkTransition.value) return
+  if (pendingSessionIntent.value === 'new_chat' || isStreaming.value) return
+  const normalizedTurnId = throughTurnId?.trim() || undefined
+  const generation = forkTransitionLifetime.begin()
+  if (!generation) return
+  forkTransition.value = {
+    generation,
+    parentKey,
+    childKey: '',
+    targetKey: parentKey,
+    ...(normalizedTurnId ? { throughTurnId: normalizedTurnId } : {}),
+    phase: 'creating',
+    previewMessages: snapshotForkPreviewMessages(renderedMessages.value, normalizedTurnId),
+  }
+  try {
+    const request = forkRpcRequest(parentKey, normalizedTurnId)
+    const res = await rpc.call<ForkRpcResponse>(request.method, request.params)
+    if (!isForkTransitionActive(generation)) return
+    const childKey = validatedForkChildKey(res, normalizedTurnId)
+    if (sessionKey.value !== parentKey) {
+      clearForkTransition(generation)
+      return
+    }
+    forkTransition.value = {
+      ...forkTransition.value,
+      childKey,
+      targetKey: childKey,
+      phase: 'opening',
+    }
+    const navigationFailure = await router.push({
+      path: '/chat',
+      query: { session: childKey },
+    })
+    if (!isForkTransitionActive(generation)) return
+    if (navigationFailure && readSessionFromUrl() !== childKey) {
+      throw navigationFailure
+    }
   } catch (err) {
-    console.warn('Fork failed:', err)
-    pushToast(t('chat.toast.forkFailed'), { tone: 'danger' })
-  } finally {
-    forkInFlight.value = false
+    if (!isForkTransitionActive(generation)) return
+    const childCreated = Boolean(forkTransition.value?.childKey)
+    if (childCreated) {
+      failForkTransition(generation, 'navigation', err)
+    } else if (forkTransition.value?.generation === generation) {
+      console.warn('Fork failed:', err)
+      clearForkTransition(generation)
+      pushToast(t('chat.toast.forkFailed'), { tone: 'danger' })
+    }
   }
 }
 
@@ -3649,21 +3951,76 @@ function scrollToBottom() {
 }
 
 function onThreadScroll() {
-  if (!threadRef.value) return
-  const gap = threadRef.value.scrollHeight - threadRef.value.scrollTop - threadRef.value.clientHeight
+  const el = threadRef.value
+  if (!el) return
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
   historyNavigationScrollLock.updateFromScroll(gap)
+  if (isNewChatLanding.value || !composerFxEnabled.value) {
+    resetComposerRetraction()
+    return
+  }
+  const wasCollapsed = composerCollapsed.value
+  composerCollapsed.value = composerRetraction.observe({
+    scrollTop: el.scrollTop,
+    bottomGap: gap,
+    intent: currentThreadScrollIntent(),
+    canCollapse: !slashOpen.value && (composerRef.value?.canCollapse() ?? true),
+    navigationLocked: historyNavigationScrollLock.locked,
+  })
+  if (composerCollapsed.value !== wasCollapsed) clearPendingComposerScrollIntent()
+}
+
+function onThreadWheel(event: WheelEvent) {
+  if (event.deltaY === 0) return
+  markThreadScrollIntent(event.deltaY < 0 ? 'up' : 'down')
+}
+
+function onThreadPointerMove(event: PointerEvent) {
+  if (event.buttons !== 0 || event.pointerType === 'touch') {
+    markThreadScrollIntent('either')
+  }
+}
+
+function onThreadScrollKeydown(event: KeyboardEvent) {
+  if (event.target !== event.currentTarget) return
+  const up = event.key === 'ArrowUp'
+    || event.key === 'PageUp'
+    || event.key === 'Home'
+    || (event.key === ' ' && event.shiftKey)
+  const down = event.key === 'ArrowDown'
+    || event.key === 'PageDown'
+    || event.key === 'End'
+    || (event.key === ' ' && !event.shiftKey)
+  if (up || down) markThreadScrollIntent(up ? 'up' : 'down')
+}
+
+function syncComposerRetractionFromThread() {
+  const el = threadRef.value
+  if (!el) return
+  clearPendingComposerScrollIntent()
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  historyNavigationScrollLock.updateFromScroll(gap)
+  composerCollapsed.value = composerRetraction.observe({
+    scrollTop: el.scrollTop,
+    bottomGap: gap,
+    intent: null,
+    canCollapse: !slashOpen.value && (composerRef.value?.canCollapse() ?? true),
+    navigationLocked: false,
+  })
 }
 
 function onHistoryNavigate() {
   cancelAnchorStabilization()
+  syncComposerRetractionFromThread()
   historyNavigationScrollLock.start()
 }
 
 function onHistoryNavigateEnd() {
   historyNavigationScrollLock.finish()
-  // Reconcile once at the final position: scroll events emitted during the
-  // smooth transition were intentionally ignored while the lock was active.
-  onThreadScroll()
+  // Smooth-scroll frames and the final arrival are navigation, not transcript
+  // browsing gestures. Establish a baseline without toggling the composer.
+  syncComposerRetractionFromThread()
+  if (autoScroll.value) expandComposer()
 }
 
 // Show the jump-to-latest affordance whenever the reader has scrolled up off the
@@ -3673,6 +4030,7 @@ const showJumpToLatest = computed(() => !autoScroll.value && messages.value.leng
 function jumpToLatest() {
   cancelAnchorStabilization()
   historyNavigationScrollLock.finish()
+  expandComposer()
   autoScroll.value = true
   scrollToBottom()
 }
@@ -4083,14 +4441,27 @@ onMounted(async () => {
       error instanceof Error ? error.message : error,
     )
   })
-  // Composer resize observer
-  const composerEl = composerRef.value?.composerElement()
-  if (composerEl) {
-    composerResizeObserver = new ResizeObserver(() => {
-      const h = composerRef.value?.composerElement()?.getBoundingClientRect().height || 0
-      document.documentElement.style.setProperty('--composer-h', h + 'px')
-    })
-    composerResizeObserver.observe(composerEl)
+  // The entire dock can grow through attachments, pending work, and textarea
+  // autoresize. Publish its real height locally so the thread always reserves
+  // exactly enough clearance for the floating surface.
+  const composerDock = composerRef.value?.composerElement()?.parentElement ?? null
+  if (composerDock && typeof ResizeObserver !== 'undefined') {
+    const publishComposerDockHeight = () => {
+      const height = Math.ceil(composerDock.getBoundingClientRect().height)
+      if (height === lastComposerDockHeight) return
+      lastComposerDockHeight = height
+      threadRef.value?.style.setProperty('--composer-dock-h', `${height}px`)
+      if (autoScroll.value && composerDockPinFrame === null) {
+        composerDockPinFrame = requestAnimationFrame(() => {
+          composerDockPinFrame = null
+          const thread = threadRef.value
+          if (thread && autoScroll.value) thread.scrollTop = thread.scrollHeight
+        })
+      }
+    }
+    composerDockResizeObserver = new ResizeObserver(publishComposerDockHeight)
+    composerDockResizeObserver.observe(composerDock)
+    publishComposerDockHeight()
   }
 
   // Focus textarea on desktop
@@ -4148,6 +4519,8 @@ onMounted(async () => {
 onUnmounted(() => {
   chatViewActive = false
   chatViewDisposed = true
+  forkTransitionLifetime.dispose()
+  forkTransition.value = null
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
   draftProjectHydration.invalidate()
@@ -4166,8 +4539,16 @@ onUnmounted(() => {
   cleanupVoiceInput()
   chatApprovals.cleanup()
   metaRuns.cleanup()
-  if (composerResizeObserver) { composerResizeObserver.disconnect(); composerResizeObserver = null }
-  document.documentElement.style.removeProperty('--composer-h')
+  if (composerDockResizeObserver) {
+    composerDockResizeObserver.disconnect()
+    composerDockResizeObserver = null
+  }
+  if (composerDockPinFrame !== null) {
+    cancelAnimationFrame(composerDockPinFrame)
+    composerDockPinFrame = null
+  }
+  clearPendingComposerScrollIntent()
+  threadRef.value?.style.removeProperty('--composer-dock-h')
   // Drop any live share-preview object URL so the blob can be reclaimed.
   if (sharePreview.value) {
     URL.revokeObjectURL(sharePreview.value.url)
@@ -4182,6 +4563,20 @@ useDocumentEvent('keydown', onDocumentKeydown)
 watch(() => route.query.session, async (newSession) => {
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
+  const transition = forkTransition.value
+  if (transition) {
+    const handoffAction = forkRouteHandoffAction(newSession, transition)
+    if (handoffAction === 'returning') {
+      forkTransition.value = {
+        ...transition,
+        targetKey: transition.parentKey,
+        phase: 'returning',
+        errorReason: undefined,
+      }
+    } else if (handoffAction === 'clear') {
+      clearForkTransition(transition.generation)
+    }
+  }
   if (newSession && typeof newSession === 'string') {
     recordSessionNavigationDiag('route.query.session', {
       from: sessionKey.value,
@@ -4191,6 +4586,54 @@ watch(() => route.query.session, async (newSession) => {
     await switchToSession(newSession)
   }
 })
+
+// A route switch briefly retains the parent's terminal history status. Require
+// the history composable to bind to the child key before treating `ready` as
+// hand-off completion, otherwise the preview would disappear one tick early.
+watch(
+  () => [
+    sessionKey.value,
+    historySessionKey.value,
+    historyState.value.initialLoadStatus,
+  ] as const,
+  ([activeKey, loadedKey, status]) => {
+    const transition = forkTransition.value
+    if (
+      !transition
+      || transition.phase === 'creating'
+      || !transition.targetKey
+      || activeKey !== transition.targetKey
+      || loadedKey !== transition.targetKey
+    ) return
+    if (status === 'ready') {
+      clearForkTransition(transition.generation)
+    } else if (status === 'error') {
+      failForkTransition(
+        transition.generation,
+        'history',
+        new Error('Child history failed to load'),
+      )
+    }
+  },
+)
+
+watch(
+  () => [sessionKey.value, livePhase.value] as const,
+  ([activeKey, phase]) => {
+    const transition = forkTransition.value
+    if (
+      transition?.phase !== 'creating'
+      && transition?.targetKey === activeKey
+      && phase === 'degraded'
+    ) {
+      failForkTransition(
+        transition.generation,
+        'live',
+        new Error('Child live subscription unavailable'),
+      )
+    }
+  },
+)
 
 // Entering the draft route resets to a clean draft for the requested agent.
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
