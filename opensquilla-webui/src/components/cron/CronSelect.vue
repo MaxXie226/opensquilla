@@ -1,5 +1,5 @@
 <template>
-  <div ref="root" class="cron-select" :class="{ 'is-open': open, 'is-disabled': disabled, 'is-embedded': embedded }">
+  <div ref="root" class="cron-select" :class="{ 'is-open': open, 'is-disabled': disabled, 'is-embedded': embedded }" @focusout="onFocusOut">
     <button
       ref="trigger"
       :id="id"
@@ -137,6 +137,12 @@ function onOptionKeydown(event: KeyboardEvent) {
 
 function onDocumentPointerDown(event: PointerEvent) {
   if (!root.value?.contains(event.target as Node)) open.value = false
+}
+
+function onFocusOut(event: FocusEvent) {
+  const nextTarget = event.relatedTarget
+  if (nextTarget instanceof Node && root.value?.contains(nextTarget)) return
+  open.value = false
 }
 
 onMounted(() => document.addEventListener('pointerdown', onDocumentPointerDown))

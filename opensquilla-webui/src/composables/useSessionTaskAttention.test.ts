@@ -84,6 +84,20 @@ describe('useSessionTaskAttention', () => {
     expect(store.attentionFor(sessionKey, 'idle')).toBe('none')
   })
 
+  it('marks a failed static cron reminder as failed instead of completed', () => {
+    const store = createSessionTaskAttentionStore(null)
+    const sessionKey = 'cron:drink:run:run-failed'
+
+    store.handleSessionsChanged({
+      key: sessionKey,
+      reason: 'cron_static_message',
+      taskId: sessionKey,
+      status: 'failed',
+    }, BACKGROUND_CONTEXT)
+
+    expect(store.attentionFor(sessionKey, 'idle')).toBe('failed')
+  })
+
   it.each(['failed', 'timeout', 'abandoned', 'interrupted'])(
     'uses the quiet failed state for %s background tasks',
     status => {

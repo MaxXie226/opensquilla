@@ -461,6 +461,7 @@ def make_static_message_handler(
             log.warning("static_message_handler.empty_text", job_id=job.id)
             return HandlerResult(session_key=session_key)
 
+        session_persisted = False
         sm = session_manager_ref() if session_manager_ref else None
         if sm is not None:
             try:
@@ -478,22 +479,35 @@ def make_static_message_handler(
                         "source_tool": f"cron:{job.id}",
                     },
                 )
-                if session_event_emitter is not None:
-                    await session_event_emitter(
-                        session_key,
-                        "sessions.changed",
-                        {
-                            "key": session_key,
-                            "reason": "cron_static_message",
-                            "taskId": session_key,
-                            "status": "succeeded",
-                        },
-                    )
+                session_persisted = True
             except Exception:
                 log.warning(
                     "static_message_handler.session_setup_failed",
                     job_id=job.id,
                     session_key=session_key,
+                    exc_info=True,
+                )
+
+        async def emit_session_status(status: str) -> None:
+            if not session_persisted or session_event_emitter is None:
+                return
+            try:
+                await session_event_emitter(
+                    session_key,
+                    "sessions.changed",
+                    {
+                        "key": session_key,
+                        "reason": "cron_static_message",
+                        "taskId": session_key,
+                        "status": status,
+                    },
+                )
+            except Exception:
+                log.warning(
+                    "static_message_handler.session_event_failed",
+                    job_id=job.id,
+                    session_key=session_key,
+                    status=status,
                     exc_info=True,
                 )
 
@@ -504,17 +518,23 @@ def make_static_message_handler(
             session_target=str(job.session_target),
             session_key=session_key,
         )
-        report = await delivery_chain.deliver(
-            job,
-            result_text=text,
-            success=True,
-            summary=text[:500],
-            session_key=session_key,
-            route_envelope=build_reply_rendezvous_envelope(job, session_key),
-        )
-        delivery_error = _required_delivery_error(job, report)
-        if delivery_error:
-            raise RuntimeError(delivery_error)
+        try:
+            report = await delivery_chain.deliver(
+                job,
+                result_text=text,
+                success=True,
+                summary=text[:500],
+                session_key=session_key,
+                route_envelope=build_reply_rendezvous_envelope(job, session_key),
+            )
+            delivery_error = _required_delivery_error(job, report)
+            if delivery_error:
+                raise RuntimeError(delivery_error)
+        except Exception:
+            await emit_session_status("failed")
+            raise
+
+        await emit_session_status("succeeded")
         return HandlerResult(
             summary=text[:500],
             session_key=session_key,

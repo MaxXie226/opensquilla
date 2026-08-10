@@ -160,4 +160,22 @@ describe('CronJobPanel friendly schedule contracts', () => {
     expect(trigger.getAttribute('aria-expanded')).toBe('false')
     expect(document.activeElement).toBe(trigger)
   })
+
+  it('closes a themed selector when Tab moves focus to the next field', async () => {
+    mountPanel()
+    await nextTick()
+
+    const trigger = document.querySelector<HTMLButtonElement>('#cp-repeat-kind')!
+    const nextField = document.querySelector<HTMLButtonElement>('#cp-payload-kind-simple')!
+    trigger.focus()
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+    await nextTick()
+    expect(trigger.getAttribute('aria-expanded')).toBe('true')
+
+    nextField.focus()
+    await nextTick()
+
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(nextField)
+  })
 })

@@ -475,7 +475,7 @@ async function runJobAndShowHistory(id: string) {
   // discover that the job name doubles as a hidden history control.
   selectedId.value = id
   await cronJobs.runJob(id)
-  await cronRuns.loadRuns(id)
+  if (selectedId.value === id) await cronRuns.loadRuns(id)
 }
 
 function onHorizonClick(id: string) {
