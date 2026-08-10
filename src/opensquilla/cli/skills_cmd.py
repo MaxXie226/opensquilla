@@ -24,7 +24,11 @@ skills_app = typer.Typer(help="Skill management - list, search, install, uninsta
 
 
 def _install_result_payload(result: Any) -> dict[str, Any]:
-    payload = dict(result) if isinstance(result, dict) else asdict(result)
+    serializer = getattr(result, "to_dict", None)
+    if callable(serializer):
+        payload = dict(serializer())
+    else:
+        payload = dict(result) if isinstance(result, dict) else asdict(result)
     scan = payload.get("scan")
     if scan is None:
         payload.pop("scan", None)
@@ -43,14 +47,47 @@ async def _try_gateway_skill_mutation(
 
     client = gateway_client_module.GatewayClient()
     try:
-        await client.connect(default_gateway_url())
-    except (SystemExit, ConnectionError, OSError):
+        await client.connect(
+            default_gateway_url(),
+            token=default_gateway_token(),
+        )
+    except SystemExit as exc:
+        await client.close()
+        message = str(exc)
+        if message.startswith("Cannot connect to OpenSquilla gateway at "):
+            return None
+        # A malformed/auth-rejected handshake proves that something is
+        # listening. Never race that Gateway with an offline profile writer.
+        emit_error(message, json_output=json_output, code="GATEWAY_UNAVAILABLE")
+        raise typer.Exit(1) from exc
+    except (ConnectionError, OSError):
         await client.close()
         return None
 
     try:
         payload = await client.call(method, params)
     except gateway_client_module.GatewayRPCError as exc:
+        if method == "skills.doctor" and str(exc.code or "").upper() == "METHOD_NOT_FOUND":
+            message = (
+                "The running Gateway does not support Skill Doctor. Upgrade or restart "
+                "the Gateway with this OpenSquilla version, then retry."
+            )
+            emit_error(
+                message,
+                json_output=json_output,
+                code="GATEWAY_UPGRADE_REQUIRED",
+                details={
+                    "method": method,
+                    "gatewayCode": "METHOD_NOT_FOUND",
+                    "hint": (
+                        "Restart the Gateway from the same upgraded OpenSquilla "
+                        "installation, then run skills doctor again."
+                    ),
+                },
+            )
+            # A reachable Gateway owns the live profile. Even though Doctor is
+            # read-only, do not race it with an offline catalog observation.
+            raise typer.Exit(1) from exc
         emit_error(
             exc.message,
             json_output=json_output,
@@ -147,12 +184,11 @@ async def _reload_running_skill_catalog(*, json_output: bool) -> dict[str, Any]:
     }
 
 
-def _load_skill_rows() -> list[dict[str, Any]]:
+def _build_offline_skill_loader() -> tuple[Any, Any]:
     import os
     from pathlib import Path
 
     from opensquilla.gateway.config import GatewayConfig
-    from opensquilla.skills.eligibility import EligibilityContext, check_eligibility
     from opensquilla.skills.loader import SkillLoader
     from opensquilla.skills.paths import resolve_skill_layer_dirs
 
@@ -174,7 +210,29 @@ def _load_skill_rows() -> list[dict[str, Any]]:
         project_agents_dir=layer_dirs.project_agents_dir,
         extra_dirs=layer_dirs.extra_dirs,
     )
-    ctx = EligibilityContext.auto()
+    return config, loader
+
+
+def _load_skill_rows(
+    *,
+    config: Any | None = None,
+    loader: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Build legacy CLI rows from a lock-protected offline catalog scan.
+
+    Offline eligibility only describes locally observable requirements.  It
+    must not be presented as evidence that a running Gateway published the
+    candidate, so the additive runtime fields remain explicitly inactive.
+    """
+
+    from opensquilla.skills.eligibility import (
+        check_eligibility,
+        eligibility_context_for_skills_config,
+    )
+
+    if config is None or loader is None:
+        config, loader = _build_offline_skill_loader()
+    ctx = eligibility_context_for_skills_config(config.skills)
     rows: list[dict[str, Any]] = []
     for skill in sorted(loader.get_user_invocable(), key=lambda x: x.name):
         provenance = getattr(skill, "provenance", None)
@@ -192,6 +250,10 @@ def _load_skill_rows() -> list[dict[str, Any]]:
                 "homepage": skill.homepage,
                 "userInvocable": skill.user_invocable,
                 "disableModelInvocation": skill.disable_model_invocation,
+                "active": False,
+                "available": False,
+                "catalogState": "validated_offline",
+                "effectiveFrom": "next_start",
                 "provenance": {
                     "origin": provenance.origin if provenance else "unknown",
                     "license": provenance.license if provenance else "unknown",
@@ -203,6 +265,126 @@ def _load_skill_rows() -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _gateway_skill_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Adapt ``skills.list`` to the long-standing CLI JSON list shape."""
+
+    raw_rows = payload.get("skills")
+    if not isinstance(raw_rows, list) or any(not isinstance(row, dict) for row in raw_rows):
+        raise ValueError("Gateway returned an invalid skills.list response")
+
+    rows: list[dict[str, Any]] = []
+    for raw_row in raw_rows:
+        row = dict(raw_row)
+        file_path = str(row.get("filePath") or row.get("file_path") or "")
+        base_dir = str(row.get("baseDir") or row.get("base_dir") or "")
+        if not base_dir and file_path:
+            base_dir = str(Path(file_path).parent)
+        provenance_raw = row.get("provenance")
+        provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
+        eligible = bool(row.get("eligible", False))
+        rows.append(
+            {
+                "name": str(row.get("name") or ""),
+                "layer": str(row.get("layer") or ""),
+                "eligible": eligible,
+                "description": str(row.get("description") or ""),
+                "always": bool(row.get("always", False)),
+                "triggers": list(row.get("triggers") or []),
+                "path": str(row.get("path") or base_dir),
+                "filePath": file_path,
+                "baseDir": base_dir,
+                "homepage": str(row.get("homepage") or ""),
+                "userInvocable": bool(
+                    row.get("userInvocable", row.get("user_invocable", True))
+                ),
+                "disableModelInvocation": bool(
+                    row.get("disableModelInvocation")
+                    or row.get("disable_model_invocation", False)
+                ),
+                "active": True,
+                "available": eligible,
+                "catalogState": "live",
+                "provenance": {
+                    "origin": str(provenance.get("origin") or "unknown"),
+                    "license": str(provenance.get("license") or "unknown"),
+                    "upstreamUrl": str(
+                        provenance.get("upstreamUrl") or provenance.get("upstream_url") or ""
+                    ),
+                    "maintainedBy": str(
+                        provenance.get("maintainedBy")
+                        or provenance.get("maintained_by")
+                        or "OpenSquilla"
+                    ),
+                },
+            }
+        )
+    return rows
+
+
+class _OfflineSkillListBlockedError(RuntimeError):
+    """Stable local failure raised before an unsafe offline catalog scan."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
+def _pending_skill_journal(config: Any, loader: Any) -> Path | None:
+    """Return the selected transaction journal when any entry occupies it."""
+
+    from opensquilla.skills.hub.transaction import journal_path_for_state, path_is_occupied
+
+    managed_dir = getattr(loader, "managed_dir", None)
+    if managed_dir is None:
+        return None
+    configured_state = str(getattr(config, "state_dir", "") or "").strip()
+    state_root = Path(configured_state) if configured_state else None
+    journal_path = journal_path_for_state(Path(managed_dir), state_root)
+    try:
+        return journal_path if path_is_occupied(journal_path) else None
+    except OSError as exc:
+        raise _OfflineSkillListBlockedError(
+            "The managed Skill transaction journal could not be inspected safely",
+            code="SKILL_RECOVERY_REQUIRED",
+            details={"journal": str(journal_path)},
+        ) from exc
+
+
+def _offline_management_service() -> tuple[Any, Any]:
+    from opensquilla.paths import default_opensquilla_home
+    from opensquilla.skills.hub.defaults import build_default_skill_installer
+    from opensquilla.skills.hub.transaction import journal_path_for_state
+
+    config, loader = _build_offline_skill_loader()
+    managed_dir = loader.managed_dir
+    if managed_dir is None:
+        raise RuntimeError("No managed Skill directory is configured")
+    configured_state = str(getattr(config, "state_dir", "") or "").strip()
+    state_root = Path(configured_state) if configured_state else None
+    service = build_default_skill_installer(
+        managed_dir=managed_dir,
+        loader=None,
+        journal_path=journal_path_for_state(managed_dir, state_root),
+        offline=True,
+    )
+    return service, default_opensquilla_home()
+
+
+def _recover_offline_management_service(service: Any) -> None:
+    """Run filesystem-only recovery after the CLI has acquired the profile lease."""
+
+    recover = getattr(service, "recover_offline_store", None)
+    if callable(recover):
+        recover()
 
 
 def inspect_compiled_dag(*, name: str, bundled_dir: Path | None = None) -> str:
@@ -262,13 +444,77 @@ def inspect_compiled_dag(*, name: str, bundled_dir: Path | None = None) -> str:
 def skills_list(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
-    """List all installed/available skills."""
-    rows = _load_skill_rows()
+    """List the live Gateway catalog, or validate local Skills offline."""
+
+    async def _list() -> tuple[list[dict[str, Any]], bool]:
+        payload = await _try_gateway_skill_mutation(
+            "skills.list",
+            {},
+            json_output=json_output,
+        )
+        if payload is not None:
+            try:
+                return _gateway_skill_rows(payload), True
+            except ValueError as exc:
+                raise _OfflineSkillListBlockedError(
+                    str(exc),
+                    code="GATEWAY_INVALID_RESPONSE",
+                ) from exc
+
+        # The connection probe above established that the configured Gateway is
+        # unreachable. Bind the complete local observation to the profile writer
+        # lease so a starting Gateway or offline transaction cannot publish a
+        # different tree while this process scans it.
+        from opensquilla.paths import default_opensquilla_home
+        from opensquilla.profile_operation_lock import ProfileOperationLock
+        from opensquilla.recovery.errors import ProfileLockBusyError
+
+        try:
+            with ProfileOperationLock(default_opensquilla_home()):
+                config, loader = _build_offline_skill_loader()
+                journal_path = _pending_skill_journal(config, loader)
+                if journal_path is not None:
+                    raise _OfflineSkillListBlockedError(
+                        "Managed Skill transaction recovery is pending; "
+                        "refusing an offline catalog scan",
+                        code="SKILL_RECOVERY_REQUIRED",
+                        details={"journal": str(journal_path)},
+                    )
+                return _load_skill_rows(config=config, loader=loader), False
+        except ProfileLockBusyError as exc:
+            raise _OfflineSkillListBlockedError(
+                "The Gateway is unreachable, but another process is using this profile; "
+                "refusing an offline catalog scan",
+                code="PROFILE_IN_USE",
+            ) from exc
+
+    try:
+        rows, live_catalog = asyncio.run(_list())
+    except _OfflineSkillListBlockedError as exc:
+        emit_error(
+            str(exc),
+            json_output=json_output,
+            code=exc.code,
+            details=exc.details or None,
+        )
+        raise typer.Exit(1) from exc
+
     if json_output:
         print_json(rows)
         return
 
-    table = Table(title=f"Skills ({len(rows)})")
+    if not live_catalog:
+        console.print(
+            "[yellow]Validated offline only:[/] no running Gateway catalog was inspected; "
+            "these Skills are not reported as active or available until the next start."
+        )
+    table = Table(
+        title=(
+            f"Skills ({len(rows)})"
+            if live_catalog
+            else f"Skills ({len(rows)}, validated offline)"
+        )
+    )
     table.add_column("Name", style=ACCENT)
     table.add_column("Layer")
     table.add_column("Eligible")
@@ -278,7 +524,15 @@ def skills_list(
         table.add_row(
             row["name"],
             row["layer"],
-            "[green]yes[/]" if row["eligible"] else "[dim]no[/]",
+            (
+                "[green]yes[/]"
+                if live_catalog and row["eligible"]
+                else "[dim]no[/]"
+                if live_catalog
+                else "[green]ready (offline)[/]"
+                if row["eligible"]
+                else "[dim]needs setup (offline)[/]"
+            ),
             (
                 row["description"][:60] + "..."
                 if len(row["description"]) > 60
@@ -363,19 +617,53 @@ def skills_view(
 def skills_update(
     name: str | None = typer.Argument(None, help="Skill name to update"),
     all_skills: bool = typer.Option(False, "--all", help="Update all managed skills"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Accept a dangerous scanner verdict for this update only",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Update one managed skill, or all managed skills."""
     if bool(name) == all_skills:
         raise typer.BadParameter("provide exactly one of NAME or --all")
 
-    async def _run(client):
-        params = {} if all_skills else {"name": name}
-        return await client.call("skills.update", params)
+    async def _update() -> dict[str, Any]:
+        params: dict[str, Any] = {} if all_skills else {"name": name}
+        if force:
+            params["force"] = True
+        payload = await _try_gateway_skill_mutation(
+            "skills.update",
+            params,
+            json_output=json_output,
+        )
+        if payload is not None:
+            return payload
 
-    payload = run_gateway_sync(_run, json_output=json_output)
+        from opensquilla.paths import default_opensquilla_home
+        from opensquilla.profile_operation_lock import ProfileOperationLock
+
+        profile_home = default_opensquilla_home()
+        with ProfileOperationLock(profile_home):
+            service, _ = _offline_management_service()
+            _recover_offline_management_service(service)
+            offline_results = await service.update(
+                None if all_skills else name,
+                force=force,
+            )
+        return {
+            "results": [_install_result_payload(result) for result in offline_results],
+        }
+
+    payload = asyncio.run(_update())
     results = payload.get("results", []) if isinstance(payload, dict) else []
-    failures = [r for r in results if isinstance(r, dict) and not r.get("success", False)]
+    failures = [
+        r
+        for r in results
+        if isinstance(r, dict)
+        and not r.get("success", False)
+        and not r.get("unchanged", False)
+    ]
     top_level_failure = isinstance(payload, dict) and payload.get("success") is False
     if json_output:
         print_json(payload)
@@ -387,10 +675,15 @@ def skills_update(
         for row in results:
             if not isinstance(row, dict):
                 continue
-            ok = bool(row.get("success", False))
+            unchanged = bool(row.get("unchanged", False))
+            ok = bool(row.get("success", False)) or unchanged
             table.add_row(
                 str(row.get("name") or ""),
-                "[green]ok[/]" if ok else "[red]failed[/]",
+                "[dim]unchanged[/]"
+                if unchanged
+                else "[green]ok[/]"
+                if ok
+                else "[red]failed[/]",
                 str(row.get("message") or ""),
             )
         console.print(table)
@@ -457,18 +750,35 @@ def skills_install(
         "-s",
         help=(
             "Source (clawhub, github). GitHub accepts owner/repo, "
-            "owner/repo:path, or GitHub URLs."
+            "owner/repo@ref:path, or GitHub URLs."
         ),
     ),
-    force: bool = typer.Option(False, "--force", "-f", help="Force install (skip security block)"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Accept a dangerous scanner verdict; path, schema, and postflight checks still apply",
+    ),
+    replace_source: bool = typer.Option(
+        False,
+        "--replace-source",
+        help="Explicitly replace a same-name install tracked from another source",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Install a skill from a Community source."""
 
     async def _install() -> None:
+        rpc_params: dict[str, Any] = {
+            "identifier": identifier,
+            "source": source,
+            "force": force,
+        }
+        if replace_source:
+            rpc_params["replaceSource"] = True
         payload = await _try_gateway_skill_mutation(
             "skills.install",
-            {"identifier": identifier, "source": source, "force": force},
+            rpc_params,
             json_output=json_output,
         )
         if payload is not None:
@@ -480,13 +790,25 @@ def skills_install(
             )
             return
 
-        from opensquilla.skills.hub.defaults import build_default_skill_installer
+        from opensquilla.paths import default_opensquilla_home
+        from opensquilla.profile_operation_lock import ProfileOperationLock
 
-        installer = build_default_skill_installer()
+        profile_home = default_opensquilla_home()
 
         if not json_output:
             console.print(f"Installing '{identifier}' from {source}...")
-        result = await installer.install(identifier, source, force=force)
+        with ProfileOperationLock(profile_home):
+            installer, _ = _offline_management_service()
+            _recover_offline_management_service(installer)
+            try:
+                result = await installer.install(
+                    identifier,
+                    source,
+                    force=force,
+                    replace_source=replace_source,
+                )
+            except TypeError:
+                result = await installer.install(identifier, source, force=force)
 
         if json_output:
             print_json(_install_result_payload(result))
@@ -496,6 +818,8 @@ def skills_install(
 
         if result.success:
             console.print(f"[green]Installed:[/] {result.name} → {result.path}")
+            if result.message:
+                console.print(result.message)
             if result.scan and result.scan.verdict != "safe":
                 scan = result.scan
                 console.print(
@@ -511,14 +835,22 @@ def skills_install(
 @skills_app.command("uninstall")
 def skills_uninstall(
     name: str = typer.Argument(..., help="Skill name to remove"),
+    allow_drift: bool = typer.Option(
+        False,
+        "--allow-drift",
+        help="Confirm removal of a tracked Skill with local file changes",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Uninstall a managed skill."""
 
     async def _uninstall() -> None:
+        rpc_params: dict[str, Any] = {"name": name}
+        if allow_drift:
+            rpc_params["allowDrift"] = True
         payload = await _try_gateway_skill_mutation(
             "skills.uninstall",
-            {"name": name},
+            rpc_params,
             json_output=json_output,
         )
         if payload is not None:
@@ -530,10 +862,17 @@ def skills_uninstall(
             )
             return
 
-        from opensquilla.skills.hub.defaults import build_default_skill_installer
+        from opensquilla.paths import default_opensquilla_home
+        from opensquilla.profile_operation_lock import ProfileOperationLock
 
-        installer = build_default_skill_installer()
-        result = await installer.uninstall(name)
+        profile_home = default_opensquilla_home()
+        with ProfileOperationLock(profile_home):
+            installer, _ = _offline_management_service()
+            _recover_offline_management_service(installer)
+            try:
+                result = await installer.uninstall(name, allow_drift=allow_drift)
+            except TypeError:
+                result = await installer.uninstall(name)
 
         if json_output:
             print_json(_install_result_payload(result))
@@ -548,6 +887,119 @@ def skills_uninstall(
             raise typer.Exit(1)
 
     asyncio.run(_uninstall())
+
+
+@skills_app.command("doctor")
+def skills_doctor(
+    name: str | None = typer.Argument(None, help="Skill name or install id"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+) -> None:
+    """Diagnose local Community Skill install, load, and readiness state."""
+
+    async def _doctor() -> dict[str, Any]:
+        params = {"name": name} if name else {}
+        payload = await _try_gateway_skill_mutation(
+            "skills.doctor",
+            params,
+            json_output=json_output,
+        )
+        if payload is not None:
+            return payload
+
+        from opensquilla.paths import default_opensquilla_home
+        from opensquilla.profile_operation_lock import ProfileOperationLock
+        from opensquilla.recovery.errors import ProfileLockBusyError
+        from opensquilla.skills.eligibility import eligibility_context_for_skills_config
+        from opensquilla.skills.hub.doctor import SkillDoctor
+        from opensquilla.skills.hub.transaction import journal_path_for_state
+
+        try:
+            # Bind config resolution, loader construction, lockfile/journal
+            # inspection, and the complete tree scan to one profile generation.
+            with ProfileOperationLock(default_opensquilla_home()):
+                config, loader = _build_offline_skill_loader()
+                if loader.managed_dir is None:
+                    return {
+                        "ok": False,
+                        "skills": [],
+                        "diagnostics": [
+                            {
+                                "code": "MANAGED_ROOT_UNAVAILABLE",
+                                "severity": "error",
+                                "phase": "store",
+                                "blocking": True,
+                                "message": "No managed Skill directory is configured",
+                                "hint": (
+                                    "Configure the managed Skill directory before installing."
+                                ),
+                                "details": {},
+                            }
+                        ],
+                    }
+                configured_state = str(getattr(config, "state_dir", "") or "").strip()
+                state_root = Path(configured_state) if configured_state else None
+                return SkillDoctor(
+                    managed_dir=loader.managed_dir,
+                    lockfile_path=default_opensquilla_home() / "skills-lock.json",
+                    loader=None,
+                    journal_path=journal_path_for_state(loader.managed_dir, state_root),
+                    eligibility_context=eligibility_context_for_skills_config(config.skills),
+                ).doctor(name).to_dict()
+        except ProfileLockBusyError as exc:
+            raise _OfflineSkillListBlockedError(
+                "The Gateway is unreachable, but another process is using this profile; "
+                "refusing an offline Doctor scan",
+                code="PROFILE_IN_USE",
+            ) from exc
+
+    try:
+        payload = asyncio.run(_doctor())
+    except _OfflineSkillListBlockedError as exc:
+        emit_error(
+            str(exc),
+            json_output=json_output,
+            code=exc.code,
+            details=exc.details or None,
+        )
+        raise typer.Exit(1) from exc
+    if json_output:
+        print_json(payload)
+    else:
+        summary = payload.get("summary") if isinstance(payload, dict) else {}
+        table = Table(title="Skill doctor")
+        table.add_column("Name", style=ACCENT)
+        table.add_column("Install")
+        table.add_column("Load")
+        table.add_column("Selection")
+        table.add_column("Compatibility")
+        table.add_column("Readiness")
+        for row in payload.get("skills", []):
+            if not isinstance(row, dict):
+                continue
+            lifecycle = row.get("lifecycle", {})
+            table.add_row(
+                str(row.get("name") or ""),
+                str(lifecycle.get("install_state") or ""),
+                str(lifecycle.get("load_state") or ""),
+                str(lifecycle.get("selection_state") or ""),
+                str(lifecycle.get("compatibility_state") or ""),
+                str(lifecycle.get("readiness_state") or ""),
+            )
+        console.print(table)
+        if isinstance(summary, dict):
+            console.print(
+                f"Checked {summary.get('checked', 0)} Skill(s); "
+                f"{summary.get('blocking', 0)} blocking diagnostic(s)."
+            )
+        for diagnostic in payload.get("diagnostics", []):
+            if isinstance(diagnostic, dict):
+                console.print(
+                    f"[{diagnostic.get('severity', 'info')}] "
+                    f"{diagnostic.get('code', 'DIAGNOSTIC')}: "
+                    f"{diagnostic.get('message', '')}"
+                )
+    if payload.get("ok") is False:
+        raise typer.Exit(1)
 
 
 # ── Meta-skill sub-commands ───────────────────────────────────────────────

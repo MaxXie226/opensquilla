@@ -18,8 +18,10 @@ import structlog
 from opensquilla.skills.hub.defaults import (
     build_default_skill_installer,
     get_default_skill_router,
-    installed_skill_names,
+    installed_skill_lockfile,
 )
+from opensquilla.skills.hub.identity import is_skill_meta_installed
+from opensquilla.skills.hub.management import SkillManagementService
 from opensquilla.skills.types import SkillInstallSpec, SkillLayer, SkillSpec
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
@@ -93,6 +95,86 @@ def _active_skill(name: str) -> Any | None:
     return _loader.get_by_name(name) if _loader is not None else None
 
 
+def _expanded_skill_body(skill: Any) -> str:
+    """Expand location placeholders only in an invoked SKILL.md body.
+
+    The catalog prompt intentionally carries no host location. Supporting
+    resources are returned byte-for-byte by ``SkillResources``; only the body
+    selected through ``skill_view`` receives the runtime base directory.
+    """
+
+    body = str(getattr(skill, "content", "") or "")
+    base_dir = str(getattr(skill, "base_dir", "") or "")
+    if not body or not base_dir:
+        return body
+    return body.replace("{baseDir}", base_dir).replace("{base_dir}", base_dir)
+
+
+async def _pinned_resource_tree_matches(skill: Any) -> bool:
+    """Verify that a pinned spec still owns the bytes on disk.
+
+    Unpinned standalone calls refresh through the live loader. A turn-pinned
+    call must never combine instructions from one generation with supporting
+    files from another generation, including during a concurrent directory
+    swap.
+    """
+
+    if _active_catalog() is None:
+        return True
+    expected = str(getattr(skill, "tree_digest", "") or "")
+    base_dir = str(getattr(skill, "base_dir", "") or "")
+    if not expected or not base_dir:
+        return False
+    from opensquilla.skills.tree import compute_tree_sha256
+
+    try:
+        return await asyncio.to_thread(compute_tree_sha256, Path(base_dir)) == expected
+    except (OSError, ValueError):
+        return False
+
+
+def _resource_generation_mismatch(name: str) -> str:
+    return (
+        f"Skill resources changed after the current catalog was pinned: {name}. "
+        "Retry skill_view in the next turn."
+    )
+
+
+def _managed_resource_manifest(
+    skill: Any,
+    *,
+    lockfile_path: Path | None = None,
+) -> tuple[str, ...] | None:
+    """Return lock-recorded v2 files for one exact managed candidate."""
+
+    if getattr(skill, "layer", None) is not SkillLayer.MANAGED:
+        return None
+    from opensquilla.paths import default_opensquilla_home
+    from opensquilla.skills.hub.lockfile import Lockfile
+
+    selected_lockfile = lockfile_path or default_opensquilla_home() / "skills-lock.json"
+    lockfile = Lockfile.load(selected_lockfile)
+    if lockfile.mutation_blocked:
+        return ()
+    entry = lockfile.get(str(getattr(skill, "name", "") or ""))
+    if entry is None or not entry.parser_version:
+        return None
+    target = Path(str(getattr(skill, "base_dir", "") or ""))
+    if entry.relative_path and entry.relative_path == target.name:
+        recorded = target
+    else:
+        recorded = Path(entry.path) if entry.path else target
+    try:
+        if recorded.resolve(strict=False) != target.resolve(strict=False):
+            return ()
+    except (OSError, ValueError):
+        return ()
+    raw_files = entry.extra.get("files", [])
+    if not isinstance(raw_files, list):
+        return ()
+    return tuple(item for item in raw_files if isinstance(item, str))
+
+
 # Valid skill name pattern: lowercase alphanumeric + hyphens
 _SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{0,62}$")
 _INSTALL_OUTPUT_LIMIT = 4_000
@@ -120,7 +202,7 @@ def _render_skill_md(
     Frontmatter is serialized with the YAML library rather than hand-formatted,
     so punctuation the loader parses as YAML structure (``:``, ``#``, ``[``,
     ``{``, leading quotes, ...) is quoted correctly and round-trips through
-    ``skills.loader._parse_frontmatter``. Hand-concatenating unquoted scalars
+    ``skills.manifest.parse_skill_frontmatter``. Hand-concatenating unquoted scalars
     silently corrupted or destroyed skills whose description/trigger contained
     such punctuation.
     """
@@ -213,7 +295,7 @@ def _find_install_spec(skill_name: str, install_id: str) -> SkillInstallSpec:
     raise ToolError(f"Install spec not found for skill '{skill_name}': {install_id}")
 
 
-def _community_result_to_dict(row: Any, installed: set[str]) -> dict[str, Any]:
+def _community_result_to_dict(row: Any, installed: Any) -> dict[str, Any]:
     identifier = getattr(row, "identifier", "") or getattr(row, "name", "")
     name = getattr(row, "name", "")
     return {
@@ -224,7 +306,8 @@ def _community_result_to_dict(row: Any, installed: set[str]) -> dict[str, Any]:
         "source": getattr(row, "source_id", ""),
         "trust_level": getattr(row, "trust_level", ""),
         "identifier": identifier,
-        "installed": identifier in installed or name in installed,
+        "installReference": getattr(row, "canonical_identifier", "") or identifier,
+        "installed": is_skill_meta_installed(row, installed),
     }
 
 
@@ -252,18 +335,35 @@ async def _run_install_argv(argv: list[str]) -> tuple[int, str, str, bool]:
 
 
 def create_skill_tools(
-    loader: SkillLoader, skills_cfg_getter: Callable[[], object] | None = None
+    loader: SkillLoader,
+    skills_cfg_getter: Callable[[], object] | None = None,
+    management_service: SkillManagementService | None = None,
 ) -> None:
     """Register skill tools (list, view, create, edit, delete) with the global registry.
 
     ``skills_cfg_getter`` returns the live skills config so operator gating
-    (coding mode / disabled) is honored at call time, not boot time.
+    (coding mode / disabled) is honored at call time, not boot time. The
+    Gateway composition root supplies ``management_service`` so agent installs
+    share its configured journal and managed-root transaction lock.
     """
     from opensquilla.skills.eligibility import set_live_skills_config_getter
 
     global _loader
     _loader = loader
     set_live_skills_config_getter(skills_cfg_getter)
+    injected_lockfile_path = (
+        getattr(management_service, "lockfile_path", None)
+        if management_service is not None
+        else None
+    )
+    resource_lockfile_path = (
+        Path(injected_lockfile_path) if injected_lockfile_path else None
+    )
+    injected_skill_router = (
+        getattr(management_service, "router", None)
+        if management_service is not None
+        else None
+    )
 
     @tool(
         name="skill_list",
@@ -355,19 +455,34 @@ def create_skill_tools(
         if file_path:
             normalized_path = file_path.strip().lstrip("./")
             if normalized_path in {"", "SKILL.md"}:
-                return skill.content or f"(Skill '{name}' has no body content)"
+                return _expanded_skill_body(skill) or (
+                    f"(Skill '{name}' has no body content)"
+                )
 
             from pathlib import Path
 
             from opensquilla.skills.resources import SkillResources
 
-            resources = SkillResources(Path(skill.base_dir))
-            content = resources.read_resource(normalized_path)
+            if not await _pinned_resource_tree_matches(skill):
+                return _resource_generation_mismatch(name)
+
+            resources = SkillResources(
+                Path(skill.base_dir),
+                managed_manifest_files=_managed_resource_manifest(
+                    skill,
+                    lockfile_path=resource_lockfile_path,
+                ),
+            )
+            content = await asyncio.to_thread(resources.read_resource, normalized_path)
             if content is None:
                 return f"File not found in skill '{name}': {file_path}"
+            # Close the check/read race: a concurrent publish after the first
+            # digest must not leak its bytes into this pinned turn.
+            if not await _pinned_resource_tree_matches(skill):
+                return _resource_generation_mismatch(name)
             return content
 
-        return skill.content or f"(Skill '{name}' has no body content)"
+        return _expanded_skill_body(skill) or f"(Skill '{name}' has no body content)"
 
     @tool(
         name="skill_search_community",
@@ -412,9 +527,14 @@ def create_skill_tools(
         source_id: str | None = str(source or "clawhub").strip() or "clawhub"
         if source_id in {"all", "*"}:
             source_id = None
-        router = get_default_skill_router()
+        router = injected_skill_router or get_default_skill_router()
         results = await router.search(clean_query, limit=result_limit, source_id=source_id)
-        installed = installed_skill_names()
+        if resource_lockfile_path is not None:
+            from opensquilla.skills.hub.lockfile import Lockfile
+
+            installed = Lockfile.load(resource_lockfile_path)
+        else:
+            installed = installed_skill_lockfile()
         return json.dumps(
             {
                 "status": "ok",
@@ -451,6 +571,14 @@ def create_skill_tools(
                 ),
                 "default": False,
             },
+            "replace_source": {
+                "type": "boolean",
+                "description": (
+                    "Replace a same-name install from another source only after "
+                    "the user explicitly approves."
+                ),
+                "default": False,
+            },
         },
         required=["identifier"],
         owner_only=True,
@@ -459,40 +587,76 @@ def create_skill_tools(
         identifier: str,
         source: str = "clawhub",
         force: bool = False,
+        replace_source: bool = False,
     ) -> str:
         if _loader is None:
             raise ToolError("Skill loader not available")
+        if type(force) is not bool or type(replace_source) is not bool:
+            raise ToolError("force and replace_source must be booleans")
         clean_identifier = str(identifier or "").strip()
         if not clean_identifier:
             raise ToolError("identifier must not be empty")
         source_id = str(source or "clawhub").strip() or "clawhub"
 
-        installer = build_default_skill_installer(managed_dir=_loader.managed_dir)
-        try:
-            with _loader.mutation_guard(reason="tool.skill_install_community"):
-                result = await installer.install(
-                    clean_identifier,
-                    source_id,
-                    force=bool(force),
+        installer: Any = management_service
+        if installer is None:
+            try:
+                installer = build_default_skill_installer(
+                    managed_dir=_loader.managed_dir,
+                    loader=_loader,
+                    offline=False,
                 )
-                if not result.success:
-                    raise _NoCatalogMutationError(result)
-        except _NoCatalogMutationError as exc:
-            result = exc.result
+            except TypeError:
+                installer = build_default_skill_installer(managed_dir=_loader.managed_dir)
+        if isinstance(installer, SkillManagementService):
+            result = await installer.install(
+                clean_identifier,
+                source_id,
+                force=force,
+                replace_source=replace_source,
+            )
+        else:
+            try:
+                with _loader.mutation_guard(reason="tool.skill_install_community"):
+                    result = await installer.install(
+                        clean_identifier,
+                        source_id,
+                        force=force,
+                    )
+                    if not result.success:
+                        raise _NoCatalogMutationError(result)
+            except _NoCatalogMutationError as exc:
+                result = exc.result
 
-        payload: dict[str, Any] = {
+        serializer = getattr(result, "to_dict", None)
+        payload: dict[str, Any] = dict(serializer()) if callable(serializer) else {}
+        payload.update({
             "status": "installed" if result.success else "failed",
             "success": result.success,
             "name": result.name,
             "identifier": clean_identifier,
             "source": source_id,
             "message": result.message,
-        }
+        })
         if result.path:
             payload["path"] = result.path
         if result.scan:
             payload["scan_verdict"] = result.scan.verdict
             payload["scan_findings"] = [finding.__dict__ for finding in result.scan.findings]
+        if result.success:
+            visibility = (
+                "It can be used from the next turn."
+                if bool(getattr(result, "instruction_usable", False))
+                else (
+                    "The committed catalog state becomes observable from the next turn; "
+                    "the lifecycle result does not declare the Skill usable."
+                )
+            )
+            payload["message"] = (
+                f"{result.message} The current turn keeps its pinned Skill catalog; "
+                f"{visibility}"
+            )
+            payload["effectiveFrom"] = "next_turn"
         return json.dumps(payload)
 
     @tool(

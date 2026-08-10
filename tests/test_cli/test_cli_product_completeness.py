@@ -88,7 +88,7 @@ class FakeGatewayClient:
 
 class FailingConnectGatewayClient(FakeGatewayClient):
     async def connect(self, url: str, *, token=None) -> None:
-        raise SystemExit("gateway offline")
+        raise SystemExit(f"Cannot connect to OpenSquilla gateway at {url}")
 
 
 class RPCFailGatewayClient(FakeGatewayClient):
@@ -483,6 +483,47 @@ def test_skills_view_and_update_use_gateway_rpc(monkeypatch):
     assert update.exit_code == 0, update.stdout
     assert json.loads(update.stdout)["results"][0]["success"] is True
     assert ("skills.get", {"name": "planner"}) in fake.calls
+    assert ("skills.update", {"name": "planner"}) in fake.calls
+
+
+def test_skills_update_force_is_forwarded_to_gateway(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.rpc_payloads = {
+        "skills.update": {
+            "results": [{"success": True, "name": "planner", "message": "updated"}]
+        },
+    }
+
+    result = runner.invoke(
+        app,
+        ["skills", "update", "planner", "--force", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert ("skills.update", {"name": "planner", "force": True}) in fake.calls
+
+
+def test_skills_update_noop_keeps_legacy_success_and_zero_exit(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.rpc_payloads = {
+        "skills.update": {
+            "results": [
+                {
+                    "success": True,
+                    "unchanged": True,
+                    "name": "planner",
+                    "message": "already current",
+                }
+            ]
+        },
+    }
+
+    result = runner.invoke(app, ["skills", "update", "planner", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["results"][0]["success"] is True
+    assert payload["results"][0]["unchanged"] is True
     assert ("skills.update", {"name": "planner"}) in fake.calls
 
 
