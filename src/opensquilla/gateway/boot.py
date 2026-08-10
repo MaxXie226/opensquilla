@@ -648,6 +648,8 @@ class ServiceContainer:
     tool_registry: ToolRegistry | None = None
     session_manager: SessionManager | None = None
     skill_loader: SkillLoader | None = None
+    skill_management_service: Any = None
+    skill_management_state: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker | None = None
     usage_event_sink: Any = None
     usage_backfill_task: asyncio.Task[Any] | None = None
@@ -2488,6 +2490,11 @@ async def build_services(
     path need: session storage, provider selector, tool registry, memory,
     skills, scheduler, search, and MCP discovery.
 
+    Managed-Skill crash recovery runs only when the current thread already
+    owns :class:`ProfileOperationLock`. Callers without that capability still
+    receive the other services, but the managed Skill layer is quarantined and
+    its recovery state is left byte-for-byte untouched.
+
     Parameters that are *None* are auto-constructed from *config* defaults.
     Pass explicit instances to override (useful for tests and embedding).
 
@@ -2895,6 +2902,8 @@ async def build_services(
 
     # ── Skill loader (boot order 19) ────────────────────────────────
     skill_loader = None
+    skill_management_service = None
+    skill_management_state: dict[str, Any] = {}
     try:
         from opensquilla.skills.loader import SkillLoader
         from opensquilla.skills.paths import resolve_skill_layer_dirs
@@ -2911,14 +2920,96 @@ async def build_services(
             managed_override=config.skills.managed_dir,
             extra_dirs=[Path(d) for d in config.skills.extra_dirs],
         )
-        skill_loader = SkillLoader(
+        managed_skill_dir = layer_dirs.managed_dir
+        if managed_skill_dir is None:
+            raise RuntimeError("No managed Skill directory is configured")
+        # Recover any interrupted managed-Skill transaction before the
+        # production loader is allowed to scan that layer. Gateway and supported
+        # standalone CLI lifecycles already hold the profile lease on this
+        # thread. Public embedders that call build_services() without that
+        # capability must remain read-only: quarantine the managed layer instead
+        # of racing an active writer or sweeping its transaction reservation.
+        from opensquilla.paths import default_opensquilla_home
+        from opensquilla.profile_operation_lock import (
+            profile_operation_lock_held_by_current_thread,
+        )
+        from opensquilla.skills.hub.contracts import (
+            DiagnosticPhase,
+            DiagnosticSeverity,
+            SkillDiagnostic,
+        )
+        from opensquilla.skills.hub.transaction import (
+            journal_path_for_state,
+            recover_pending_skill_transaction,
+        )
+
+        configured_state = str(getattr(config, "state_dir", "") or "").strip()
+        skill_journal_path = journal_path_for_state(
+            managed_skill_dir,
+            Path(configured_state) if configured_state else None,
+        )
+        skill_management_state.update(
+            {
+                "managed_dir": managed_skill_dir,
+                "journal_path": skill_journal_path,
+            }
+        )
+        profile_home = default_opensquilla_home()
+        if profile_operation_lock_held_by_current_thread(profile_home):
+            recovery_diagnostics = recover_pending_skill_transaction(
+                managed_dir=managed_skill_dir,
+                lockfile_path=profile_home / "skills-lock.json",
+                journal_path=skill_journal_path,
+                sweep_orphan_staging=True,
+            )
+        else:
+            recovery_diagnostics = [
+                SkillDiagnostic(
+                    code="PROFILE_LEASE_REQUIRED",
+                    severity=DiagnosticSeverity.ERROR,
+                    phase=DiagnosticPhase.STORE,
+                    message=(
+                        "Managed Skill recovery was skipped because this service "
+                        "builder does not hold the profile writer lease"
+                    ),
+                    blocking=True,
+                    hint=(
+                        "Call build_services() only while ProfileOperationLock is held "
+                        "for the active OpenSquilla profile."
+                    ),
+                )
+            ]
+        skill_management_state["recovery_diagnostics"] = tuple(recovery_diagnostics)
+        for diagnostic in recovery_diagnostics:
+            log.warning(
+                "build_services.skill_transaction_recovery",
+                **diagnostic.to_dict(),
+            )
+        managed_recovery_required = any(
+            item.blocking for item in recovery_diagnostics
+        )
+        if managed_recovery_required:
+            log.warning(
+                "build_services.skill_managed_layer_quarantined",
+                managed_dir=str(managed_skill_dir),
+            )
+        candidate_skill_loader = SkillLoader(
             bundled_dir=layer_dirs.bundled_dir,
             workspace_dir=layer_dirs.workspace_dir,
-            managed_dir=layer_dirs.managed_dir,
+            managed_dir=managed_skill_dir,
             personal_agents_dir=layer_dirs.personal_agents_dir,
             project_agents_dir=layer_dirs.project_agents_dir,
             extra_dirs=layer_dirs.extra_dirs,
         )
+        if managed_recovery_required:
+            # Quarantine is a loader safety invariant, not a side effect of the
+            # optional management-service composition below.  Assign the loader
+            # only after the freeze succeeds so a construction failure cannot
+            # leave uncommitted managed bytes available to later boot consumers.
+            candidate_skill_loader.freeze_catalog_for_recovery(
+                reason="skill.management.startup-recovery-required"
+            )
+        skill_loader = candidate_skill_loader
         log.info(
             "build_services.skill_loader_initialized",
             bundled_dir=str(layer_dirs.bundled_dir),
@@ -2927,11 +3018,23 @@ async def build_services(
         # Register skill_list and skill_view tools. Pass a live getter for the
         # skills config so coding-mode / disabled gating is honored at call
         # time (config is updated in place by config.patch).
+        from opensquilla.skills.hub.defaults import (
+            build_default_skill_management_service,
+        )
         from opensquilla.tools.builtin.skill_tools import create_skill_tools
+
+        skill_management_service = build_default_skill_management_service(
+            managed_dir=managed_skill_dir,
+            loader=skill_loader,
+            journal_path=skill_journal_path,
+            offline=False,
+            startup_recovery_diagnostics=recovery_diagnostics,
+        )
 
         create_skill_tools(
             skill_loader,
             skills_cfg_getter=lambda: getattr(config, "skills", None),
+            management_service=skill_management_service,
         )
         log.info("build_services.skill_tools_registered")
     except Exception as e:
@@ -3268,6 +3371,8 @@ async def build_services(
         tool_registry=tool_registry,
         session_manager=session_manager,
         skill_loader=skill_loader,
+        skill_management_service=skill_management_service,
+        skill_management_state=skill_management_state,
         usage_tracker=usage_tracker,
         usage_event_sink=usage_event_sink,
         cron_scheduler=cron_scheduler,
@@ -4429,6 +4534,8 @@ async def start_gateway_server(
         usage_event_sink=usage_event_sink,
         meta_run_writer=getattr(svc, "meta_run_writer", None),
         skill_loader=svc.skill_loader,
+        skill_management_service=getattr(svc, "skill_management_service", None),
+        skill_management_state=getattr(svc, "skill_management_state", None) or {},
         cron_scheduler=svc.cron_scheduler,
         turn_runner=turn_runner,
         task_runtime=task_runtime,

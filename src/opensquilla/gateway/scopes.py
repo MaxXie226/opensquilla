@@ -176,6 +176,7 @@ METHOD_SCOPES: dict[str, str] = {
     "skills.list": READ_SCOPE,
     "skills.get": READ_SCOPE,
     "skills.search": READ_SCOPE,
+    "skills.doctor": READ_SCOPE,
     "cron.list": READ_SCOPE,
     "cron.status": READ_SCOPE,
     "cron.runs": READ_SCOPE,

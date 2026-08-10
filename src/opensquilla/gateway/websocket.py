@@ -834,6 +834,7 @@ async def handle_ws_connection(
     usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
+    skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
@@ -847,6 +848,7 @@ async def handle_ws_connection(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     prompt_cache_keepalive_service: Any = None,
+    skill_management_service: Any = None,
 ) -> None:
     """Main WebSocket connection handler."""
     if not websocket_origin_allowed(ws, config):
@@ -1043,6 +1045,7 @@ async def handle_ws_connection(
             usage_event_sink,
             meta_run_writer,
             skill_loader,
+            skill_management_state,
             cron_scheduler,
             turn_runner,
             task_runtime,
@@ -1056,6 +1059,7 @@ async def handle_ws_connection(
             memory_retrievers,
             provider_stats=provider_stats,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
+            skill_management_service=skill_management_service,
         )
     except WebSocketDisconnect:
         pass
@@ -1135,6 +1139,7 @@ async def _message_loop(
     usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
+    skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
@@ -1148,6 +1153,7 @@ async def _message_loop(
     memory_retrievers: dict[str, Any] | None = None,
     provider_stats: Any = None,
     prompt_cache_keepalive_service: Any = None,
+    skill_management_service: Any = None,
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
@@ -1237,6 +1243,8 @@ async def _message_loop(
                 usage_event_sink=usage_event_sink,
                 meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
+                skill_management_service=skill_management_service,
+                skill_management_state=skill_management_state or {},
                 cron_scheduler=cron_scheduler,
                 turn_runner=turn_runner,
                 task_runtime=task_runtime,
