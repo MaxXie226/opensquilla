@@ -91,11 +91,6 @@ matrix-e2e = ["matrix-nio[e2e]>=0.25,<0.26", "markdown>=3.0"]
 document-extras = [
     "weasyprint>=60.0",
 ]
-swebench = [
-    "datasets>=2.19",
-    "swebench>=4.0",
-]
-
 [project.scripts]
 opensquilla = "opensquilla.cli.main:app"
 gateway = "opensquilla.cli.main:gateway_app"
@@ -225,7 +220,6 @@ module = [
     "botbuilder.*",
     "botpy.*",
     "cachetools.*",
-    "datasets.*",
     "dingtalk_stream.*",
     "extract_msg.*",
     "jieba",
@@ -234,7 +228,6 @@ module = [
     "onnxruntime.*",
     "readability.*",
     "src.router.*",
-    "swebench.*",
     "tiktoken.*",
     "tokenizers.*",
     "websockets.*",

@@ -3,6 +3,12 @@
 The `opensquilla` CLI is the fastest way to configure, run, inspect, and
 automate OpenSquilla.
 
+Install the current release with the recommended integrations:
+
+```sh
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
+```
+
 Run:
 
 ```sh
@@ -38,7 +44,6 @@ opensquilla <command> --help
 | `opensquilla models` | Inspect available models. |
 | `opensquilla agents` | Manage durable agents. |
 | `opensquilla mcp-server` | Run the OpenSquilla MCP server bridge. |
-| `opensquilla swebench` | Run optional SWE-bench solve/eval workflows. |
 | `opensquilla dist` | Emit a reproducible workspace-state inventory. |
 | `opensquilla reset` | Reset a session and flush memory synchronously. |
 
@@ -198,21 +203,6 @@ is updated.
 `--verification-mode build` is for app or artifact delivery checks.
 `--verification-mode scratch` creates an empty throwaway repo and must not be
 combined with `--repo`.
-
-## SWE-Bench
-
-`opensquilla swebench` is an optional evaluation surface, not part of the normal
-install path. It requires Docker plus the `swebench` extra.
-
-```sh
-uv tool install --python 3.12 "opensquilla[recommended,swebench] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.2/opensquilla-0.5.2-py3-none-any.whl"
-opensquilla swebench pull django__django-16429 --dataset verified
-opensquilla swebench solve django__django-16429 --dataset verified --json
-opensquilla swebench eval predictions.jsonl --dataset verified
-```
-
-Use `opensquilla code-task` for trusted real-repository coding tasks when you do
-not need the Docker-based SWE-bench harness.
 
 ## Configuration Commands
 
