@@ -1,20 +1,28 @@
-import { ref, type Ref } from 'vue'
+import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { useRpcStore } from '@/stores/rpc'
 import { useToasts } from '@/composables/useToasts'
+import {
+  createSkillMutationGate,
+  type SkillMutationGate,
+} from '@/composables/skills/useSkillMutationGate'
 import type {
   RegistryResult,
   SkillDependencyInstallOutcome,
   SkillDiagnostic,
   SkillLifecycle,
+  SkillSourceResolution,
 } from '@/types/skills'
 
 interface RegistrySearchData {
   results?: RegistryResult[]
+  diagnostics?: SkillDiagnostic[]
+  message?: string
 }
 
-interface InstallResult {
+export interface InstallResult {
   success: boolean
+  unchanged?: boolean
   name?: string
   message?: string
   installed?: boolean
@@ -22,14 +30,102 @@ interface InstallResult {
   instruction_usable?: boolean
   installId?: string
   lifecycle?: SkillLifecycle
+  resolution?: SkillSourceResolution
   diagnostics?: SkillDiagnostic[]
   rollbackPerformed?: boolean
+  catalogGeneration?: number
   effectiveFrom?: 'next_turn' | 'next_start' | string
   missing_still?: {
     bins?: string[]
     env?: string[]
     env_any?: string[][]
   }
+}
+
+export type SkillInstallQueueStatus =
+  | 'queued'
+  | 'installing'
+  | 'installed'
+  | 'unchanged'
+  | 'failed'
+
+export interface SkillInstallQueueItem {
+  id: string
+  identifier: string
+  source: string
+  displayName: string
+  status: SkillInstallQueueStatus
+  result?: InstallResult
+  error?: string
+}
+
+interface SkillInstallRequest {
+  identifier: string
+  source: string
+  displayName?: string
+}
+
+const GENERIC_GITHUB_SKILL_SEGMENTS = new Set([
+  'skill',
+  'skills',
+  'skill.md',
+  'skills.md',
+])
+
+function decodedPathSegment(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function concisePathLabel(segments: string[], fallback: string): string {
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = decodedPathSegment(segments[index]).trim()
+    if (!segment || GENERIC_GITHUB_SKILL_SEGMENTS.has(segment.toLowerCase())) continue
+    return segment
+  }
+  return fallback
+}
+
+/**
+ * Derive a short queue label without rewriting the exact GitHub install
+ * identifier. The production resolver still receives the original reference.
+ */
+export function githubSkillDisplayName(identifier: string): string {
+  const trimmed = identifier.trim()
+  if (!trimmed) return trimmed
+
+  try {
+    const url = new URL(trimmed)
+    if (url.hostname.toLowerCase() === 'github.com') {
+      const segments = url.pathname.split('/').filter(Boolean)
+      const repository = decodedPathSegment(segments[1] || '').replace(/\.git$/i, '')
+      const treeMarker = segments.findIndex(segment =>
+        segment.toLowerCase() === 'tree' || segment.toLowerCase() === 'blob')
+      const skillPath = treeMarker >= 0
+        ? segments.slice(treeMarker + 2)
+        : segments.slice(2)
+      return concisePathLabel(skillPath, repository || trimmed)
+    }
+  } catch {
+    // Exact GitHub references also have a non-URL owner/repo@revision:path form.
+  }
+
+  const separator = trimmed.indexOf(':')
+  const packageReference = separator >= 0 ? trimmed.slice(0, separator) : trimmed
+  const skillPath = separator >= 0 ? trimmed.slice(separator + 1) : ''
+  const revisionMarker = packageReference.lastIndexOf('@')
+  const packageIdentifier = revisionMarker > packageReference.lastIndexOf('/')
+    ? packageReference.slice(0, revisionMarker)
+    : packageReference
+  const packageSegments = packageIdentifier.split('/').filter(Boolean)
+  const repository = decodedPathSegment(
+    packageSegments[packageSegments.length - 1] || '',
+  ).replace(/\.git$/i, '')
+
+  return concisePathLabel(skillPath.split('/').filter(Boolean), repository || trimmed)
 }
 
 export function skillRegistryOperationKey(identifier: string, source: string): string {
@@ -41,12 +137,19 @@ export interface SkillRegistry {
   githubUrl: Ref<string>
   registryResults: Ref<RegistryResult[]>
   registryLoading: Ref<boolean>
+  registryDiagnostics: Ref<SkillDiagnostic[]>
+  registrySearchError: Ref<string>
   installingId: Ref<string | null>
+  installQueue: Ref<SkillInstallQueueItem[]>
+  queueRunning: Ref<boolean>
+  mutationBusy: ComputedRef<boolean>
+  queueRefreshWarning: Ref<string>
   installingDepsId: Ref<string | null>
   uninstallingName: Ref<string | null>
   searchRegistry: () => Promise<void>
-  installGithub: () => void
-  installSkill: (identifier: string, source: string) => Promise<void>
+  installGithub: () => Promise<void>
+  installSkill: (identifier: string, source: string, displayName?: string) => Promise<void>
+  retryQueueItem: (id: string) => Promise<void>
   installDeps: (name: string, installId: string) => Promise<SkillDependencyInstallOutcome>
   uninstallSkill: (name: string) => Promise<boolean>
 }
@@ -54,6 +157,7 @@ export interface SkillRegistry {
 export function useSkillRegistry(
   rpc: ReturnType<typeof useRpcStore>,
   loadData: () => Promise<boolean>,
+  mutationGate: SkillMutationGate = createSkillMutationGate(),
 ): SkillRegistry {
   const { pushToast } = useToasts()
   const t = i18n.global.t
@@ -61,7 +165,13 @@ export function useSkillRegistry(
   const githubUrl = ref('')
   const registryResults = ref<RegistryResult[]>([])
   const registryLoading = ref(false)
+  const registryDiagnostics = ref<SkillDiagnostic[]>([])
+  const registrySearchError = ref('')
   const installingId = ref<string | null>(null)
+  const installQueue = ref<SkillInstallQueueItem[]>([])
+  const queueRunning = ref(false)
+  const mutationBusy = computed(() => mutationGate.busy.value)
+  const queueRefreshWarning = ref('')
   const installingDepsId = ref<string | null>(null)
   const uninstallingName = ref<string | null>(null)
 
@@ -69,20 +179,124 @@ export function useSkillRegistry(
     if (!registryQuery.value.trim()) return
     registryLoading.value = true
     registryResults.value = []
+    registryDiagnostics.value = []
+    registrySearchError.value = ''
     try {
-      const data = await rpc.call<RegistrySearchData>('skills.search', { query: registryQuery.value.trim(), limit: 20 })
+      const data = await rpc.call<RegistrySearchData>('skills.search', {
+        query: registryQuery.value.trim(),
+        limit: 20,
+        source: 'clawhub',
+      })
       registryResults.value = data.results || []
+      registryDiagnostics.value = data.diagnostics || []
+      registrySearchError.value = data.message || ''
     } catch (err) {
-      pushToast(t('cronSkills.registry.toastSearchFailed', { error: (err as Error).message }), { tone: 'danger' })
+      registrySearchError.value = (err as Error).message
+      pushToast(t('cronSkills.registry.toastSearchFailed', { error: registrySearchError.value }), { tone: 'danger' })
     } finally {
       registryLoading.value = false
     }
   }
 
-  function installGithub() {
-    const url = githubUrl.value.trim()
-    if (!url) return
-    void installSkill(url, 'github')
+  function uniqueRequests(requests: SkillInstallRequest[]): SkillInstallRequest[] {
+    const seen = new Set<string>()
+    return requests.flatMap((request) => {
+      const identifier = request.identifier.trim()
+      const source = (request.source || 'clawhub').trim() || 'clawhub'
+      if (!identifier) return []
+      const key = skillRegistryOperationKey(identifier, source)
+      if (seen.has(key)) return []
+      seen.add(key)
+      return [{ ...request, identifier, source }]
+    })
+  }
+
+  function requestToQueueItem(request: SkillInstallRequest): SkillInstallQueueItem {
+    return {
+      id: skillRegistryOperationKey(request.identifier, request.source),
+      identifier: request.identifier,
+      source: request.source,
+      displayName: request.displayName
+        || (request.source === 'github'
+          ? githubSkillDisplayName(request.identifier)
+          : request.identifier),
+      status: 'queued',
+    }
+  }
+
+  function removeSuccessfulGithubLines(items: SkillInstallQueueItem[]) {
+    const successful = new Set(
+      items
+        .filter(item => item.source === 'github'
+          && (item.status === 'installed' || item.status === 'unchanged'))
+        .map(item => item.identifier),
+    )
+    if (!successful.size) return
+    githubUrl.value = githubUrl.value
+      .split(/\r?\n/)
+      .filter(line => !successful.has(line.trim()))
+      .join('\n')
+      .trim()
+  }
+
+  async function refreshCatalogAfterBatch(items: SkillInstallQueueItem[]) {
+    const changed = items.some(item => item.status === 'installed' || item.status === 'unchanged')
+    if (!changed) return
+    if (!(await loadData())) {
+      queueRefreshWarning.value = t('cronSkills.skillsView.reloadListFailed')
+      pushToast(queueRefreshWarning.value, { tone: 'warn' })
+    }
+  }
+
+  async function processQueueItems(items: SkillInstallQueueItem[]) {
+    for (const item of items) {
+      item.status = 'installing'
+      item.error = ''
+      item.result = undefined
+      installingId.value = item.id
+      try {
+        const res = await rpc.call<InstallResult>('skills.install', {
+          identifier: item.identifier,
+          source: item.source,
+        })
+        item.result = res
+        item.displayName = res.name || item.displayName
+        item.status = res.success ? (res.unchanged ? 'unchanged' : 'installed') : 'failed'
+        item.error = res.success ? '' : (res.message || t('cronSkills.registry.installFailed'))
+        markRegistryResultOutcome(item.identifier, item.source, res)
+      } catch (err) {
+        item.status = 'failed'
+        item.error = (err as Error).message
+      } finally {
+        installingId.value = null
+      }
+    }
+  }
+
+  async function runNewBatch(requests: SkillInstallRequest[]) {
+    const unique = uniqueRequests(requests)
+    if (!unique.length) return
+    if (!mutationGate.acquire('install_queue')) return
+    installQueue.value = unique.map(requestToQueueItem)
+    queueRefreshWarning.value = ''
+    queueRunning.value = true
+    try {
+      await processQueueItems(installQueue.value)
+      removeSuccessfulGithubLines(installQueue.value)
+      await refreshCatalogAfterBatch(installQueue.value)
+    } finally {
+      queueRunning.value = false
+      installingId.value = null
+      mutationGate.release('install_queue')
+    }
+  }
+
+  async function installGithub() {
+    await runNewBatch(
+      githubUrl.value
+        .split(/\r?\n/)
+        .map(identifier => ({ identifier, source: 'github' })),
+    )
   }
 
   function markRegistryResultOutcome(
@@ -94,12 +308,11 @@ export function useSkillRegistry(
     registryResults.value = registryResults.value.map((registryResult) => {
       const resultSource = registryResult.source || 'clawhub'
       const resultIdentifier = registryResult.installReference
+        || registryResult.install_reference
         || registryResult.identifier
         || registryResult.name
       const sameSource = resultSource === installSource
-      const sameIdentifier =
-        resultIdentifier === identifier ||
-        registryResult.identifier === identifier
+      const sameIdentifier = resultIdentifier === identifier
 
       if (!sameSource || !sameIdentifier) return registryResult
       return {
@@ -112,23 +325,24 @@ export function useSkillRegistry(
     })
   }
 
-  async function installSkill(identifier: string, source: string) {
-    installingId.value = skillRegistryOperationKey(identifier, source)
+  async function installSkill(identifier: string, source: string, displayName?: string) {
+    await runNewBatch([{ identifier, source, displayName }])
+  }
+
+  async function retryQueueItem(id: string) {
+    const item = installQueue.value.find(candidate => candidate.id === id)
+    if (!item || item.status !== 'failed') return
+    if (!mutationGate.acquire('install_queue')) return
+    queueRefreshWarning.value = ''
+    queueRunning.value = true
     try {
-      const res = await rpc.call<InstallResult>('skills.install', { identifier, source })
-      if (res.success) {
-        markRegistryResultOutcome(identifier, source, res)
-        if (!(await loadData())) {
-          pushToast(t('cronSkills.skillsView.reloadListFailed'), { tone: 'warn' })
-        }
-      } else {
-        markRegistryResultOutcome(identifier, source, res)
-        pushToast(res.message || t('cronSkills.registry.installFailed'), { tone: 'danger' })
-      }
-    } catch (err) {
-      pushToast((err as Error).message, { tone: 'danger' })
+      await processQueueItems([item])
+      removeSuccessfulGithubLines([item])
+      await refreshCatalogAfterBatch([item])
     } finally {
+      queueRunning.value = false
       installingId.value = null
+      mutationGate.release('install_queue')
     }
   }
 
@@ -139,7 +353,7 @@ export function useSkillRegistry(
       message,
       missingStill: { bins: [], env: [], env_any: [] },
     })
-    if (!name || !installId) return failed()
+    if (!name || !installId || !mutationGate.acquire('dependency_install')) return failed()
     installingDepsId.value = installId
     try {
       const res = await rpc.call<InstallResult>('skills.deps.install', { name, install_id: installId })
@@ -171,10 +385,12 @@ export function useSkillRegistry(
       return failed((err as Error).message)
     } finally {
       installingDepsId.value = null
+      mutationGate.release('dependency_install')
     }
   }
 
   async function uninstallSkill(name: string): Promise<boolean> {
+    if (!name || !mutationGate.acquire('uninstall')) return false
     uninstallingName.value = name
     try {
       const res = await rpc.call<InstallResult>('skills.uninstall', { name })
@@ -191,6 +407,7 @@ export function useSkillRegistry(
       return false
     } finally {
       uninstallingName.value = null
+      mutationGate.release('uninstall')
     }
   }
 
@@ -199,12 +416,19 @@ export function useSkillRegistry(
     githubUrl,
     registryResults,
     registryLoading,
+    registryDiagnostics,
+    registrySearchError,
     installingId,
+    installQueue,
+    queueRunning,
+    mutationBusy,
+    queueRefreshWarning,
     installingDepsId,
     uninstallingName,
     searchRegistry,
     installGithub,
     installSkill,
+    retryQueueItem,
     installDeps,
     uninstallSkill,
   }

@@ -113,6 +113,23 @@ export interface SkillDiagnostic {
   details?: Record<string, unknown>
 }
 
+export interface SkillSourceResolution {
+  source?: string
+  requestedIdentifier?: string
+  canonicalIdentifier?: string
+  packageIdentifier?: string
+  publisher?: string
+  version?: string
+  immutableRevision?: string
+  upstreamUrl?: string
+  artifactKind?: string
+  artifactDigest?: string
+  resolverContentHash?: string
+  trustState?: string
+  immutable?: boolean
+  diagnostics?: SkillDiagnostic[]
+}
+
 export interface SkillInvocationCapability {
   model_catalog: boolean
   skill_view: boolean
@@ -206,6 +223,8 @@ export interface ProposalsSettings {
 export interface RegistryResult {
   name: string
   description?: string
+  version?: string
+  author?: string
   identifier?: string
   source?: string
   trust_level?: string
