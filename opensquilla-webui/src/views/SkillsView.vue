@@ -428,8 +428,8 @@ async function installDepsAndMaybeClose(name: string, installId: string) {
   await installCurrentDependencies(name, installId)
 }
 
-async function uninstallSkillAndClose(name: string) {
-  const removed = await uninstallSkill(name)
+async function uninstallSkillAndClose(name: string, installId: string) {
+  const removed = await uninstallSkill(name, installId)
   if (removed) closeDialog()
 }
 </script>

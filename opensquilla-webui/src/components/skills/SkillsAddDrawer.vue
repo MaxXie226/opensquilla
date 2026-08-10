@@ -28,67 +28,78 @@
           </header>
 
           <div class="sk-add-drawer__body">
-            <div class="sk-add-source-tabs" role="tablist" :aria-label="t('cronSkills.registry.sourceLabel')">
+            <div class="sk-add-source-tabs" role="group" :aria-label="t('cronSkills.registry.sourceLabel')">
               <button
                 id="skills-add-tab-clawhub"
                 class="sk-add-source-tab"
                 :class="{ 'is-active': sourceMode === 'clawhub' }"
                 type="button"
-                role="tab"
-                :aria-selected="sourceMode === 'clawhub'"
-                aria-controls="skills-add-panel-clawhub"
+                :aria-pressed="sourceMode === 'clawhub'"
                 @click="sourceMode = 'clawhub'"
               >
                 <Icon name="download" :size="16" />
                 <span>{{ t('cronSkills.registry.sourceClawHub') }}</span>
-                <span v-if="runningSource === 'clawhub'" class="sk-add-source-status">
+                <span
+                  v-if="runningSource === 'clawhub' && sourceMode !== 'clawhub'"
+                  class="sk-add-source-status"
+                >
                   <span class="sk-spinner" aria-hidden="true" />
-                  <span class="sk-add-sr-only">{{ t('cronSkills.registry.sourceInstalling', {
-                    name: runningItemName('clawhub'),
-                  }) }}</span>
+                  <span class="sk-add-sr-only">{{ sourceRunningLabel('clawhub') }}</span>
                 </span>
                 <span
-                  v-else-if="sourceFailureCount('clawhub')"
+                  v-else-if="sourceAttentionCount('clawhub')"
                   class="sk-add-source-failures"
-                  :aria-label="t('cronSkills.registry.sourceFailures', { count: sourceFailureCount('clawhub') })"
-                >{{ sourceFailureCount('clawhub') }}</span>
+                  :aria-label="sourceAttentionLabel('clawhub')"
+                >{{ sourceAttentionCount('clawhub') }}</span>
               </button>
               <button
                 id="skills-add-tab-github"
                 class="sk-add-source-tab"
                 :class="{ 'is-active': sourceMode === 'github' }"
                 type="button"
-                role="tab"
-                :aria-selected="sourceMode === 'github'"
-                aria-controls="skills-add-panel-github"
+                :aria-pressed="sourceMode === 'github'"
                 @click="sourceMode = 'github'"
               >
                 <Icon name="share" :size="16" />
                 <span>{{ t('cronSkills.registry.sourceGitHub') }}</span>
-                <span v-if="runningSource === 'github'" class="sk-add-source-status">
+                <span
+                  v-if="runningSource === 'github' && sourceMode !== 'github'"
+                  class="sk-add-source-status"
+                >
                   <span class="sk-spinner" aria-hidden="true" />
-                  <span class="sk-add-sr-only">{{ t('cronSkills.registry.sourceInstalling', {
-                    name: runningItemName('github'),
-                  }) }}</span>
+                  <span class="sk-add-sr-only">{{ sourceRunningLabel('github') }}</span>
                 </span>
                 <span
-                  v-else-if="sourceFailureCount('github')"
+                  v-else-if="sourceAttentionCount('github')"
                   class="sk-add-source-failures"
-                  :aria-label="t('cronSkills.registry.sourceFailures', { count: sourceFailureCount('github') })"
-                >{{ sourceFailureCount('github') }}</span>
+                  :aria-label="sourceAttentionLabel('github')"
+                >{{ sourceAttentionCount('github') }}</span>
               </button>
             </div>
+
+            <p
+              class="sk-add-sr-only sk-add-install-announcement"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            >{{ installAnnouncement }}</p>
 
             <section
               v-if="queueRows.length"
               ref="queueRef"
               class="sk-add-queue"
               :data-source="sourceMode"
-              aria-live="polite"
             >
               <div class="sk-add-section-title">
                 <div>
-                  <h3>{{ t('cronSkills.registry.queueTitle') }}</h3>
+                  <h3>
+                    <span
+                      v-if="currentActivityPhase === 'refreshing'"
+                      class="sk-spinner"
+                      aria-hidden="true"
+                    />
+                    {{ t('cronSkills.registry.queueTitle') }}
+                  </h3>
                   <span>{{ queueSummary }}</span>
                 </div>
                 <div class="sk-add-section-title__actions">
@@ -123,18 +134,23 @@
                   :data-status="item.status"
                 >
                   <span class="sk-add-queue-item__icon" aria-hidden="true">
-                    <span v-if="item.status === 'installing'" class="sk-spinner" />
+                    <span v-if="item.status === 'installing'" class="sk-spinner" aria-hidden="true" />
                     <Icon v-else-if="item.status === 'installed' || item.status === 'unchanged'" name="check" :size="18" />
-                    <Icon v-else-if="item.status === 'failed'" name="info" :size="18" />
+                    <Icon v-else-if="item.status === 'failed' || item.status === 'unknown'" name="info" :size="18" />
                     <Icon v-else name="clock" :size="18" />
                   </span>
                   <div class="sk-add-queue-item__body">
                     <div class="sk-add-queue-item__head">
                       <strong>{{ item.displayName }}</strong>
-                      <span>{{ t(`cronSkills.registry.queueStatus.${item.status}`) }}</span>
+                      <span>{{ item.status === 'unknown'
+                        ? t('cronSkills.registry.installResultUnknown')
+                        : t(`cronSkills.registry.queueStatus.${item.status}`) }}</span>
                     </div>
                     <code :title="item.identifier">{{ item.identifier }}</code>
                     <p v-if="item.error" class="sk-add-queue-item__error">{{ item.error }}</p>
+                    <p v-if="item.status === 'deferred'" class="sk-add-queue-item__note">
+                      {{ t('cronSkills.registry.rateLimitDeferred') }}
+                    </p>
                     <div v-if="item.resultMeta.length" class="sk-add-queue-item__meta">
                       <span v-for="meta in item.resultMeta" :key="meta">{{ meta }}</span>
                     </div>
@@ -159,13 +175,19 @@
                     </details>
                     <button
                       v-if="item.status === 'failed'"
-                      class="btn btn--ghost btn--sm sk-add-retry"
+                      class="btn btn--sm sk-add-retry"
+                      :class="item.requiresRiskAcknowledgement ? 'btn--primary' : 'btn--ghost'"
                       type="button"
                       :disabled="installControlsBlocked"
-                      @click="emit('retry', item.id)"
+                      :data-testid="item.requiresRiskAcknowledgement
+                        ? 'skills-install-acknowledge-risk'
+                        : undefined"
+                      @click="emit('retry', item.id, item.requiresRiskAcknowledgement)"
                     >
                       <Icon name="refresh" :size="14" />
-                      <span>{{ t('cronSkills.registry.retry') }}</span>
+                      <span>{{ item.requiresRiskAcknowledgement
+                        ? t('cronSkills.registry.installAnyway')
+                        : t('cronSkills.registry.retry') }}</span>
                     </button>
                   </div>
                 </article>
@@ -176,8 +198,6 @@
               v-if="sourceMode === 'github'"
               id="skills-add-panel-github"
               class="sk-add-source-panel"
-              role="tabpanel"
-              aria-labelledby="skills-add-tab-github"
             >
               <label class="sk-add-field-label" for="skills-add-github-input">
                 {{ t('cronSkills.registry.githubReferencesLabel') }}
@@ -189,33 +209,55 @@
                 rows="7"
                 spellcheck="false"
                 autocomplete="off"
+                :aria-describedby="githubReferencesDescribedBy"
+                :aria-invalid="githubBatchOverLimit ? 'true' : undefined"
                 :disabled="installControlsBlocked"
                 :placeholder="t('cronSkills.registry.githubReferencesPlaceholder')"
                 @input="emit('update:githubUrl', ($event.target as HTMLTextAreaElement).value)"
               />
-              <p class="sk-add-help">{{ t('cronSkills.registry.githubReferencesHint') }}</p>
+              <p id="skills-add-github-format-hint" class="sk-add-help">
+                {{ t('cronSkills.registry.githubReferencesHint') }}
+              </p>
+              <p id="skills-add-github-batch-hint" class="sk-add-help">
+                {{ t('cronSkills.registry.githubBatchBehavior', {
+                  count: githubReferenceCount,
+                  max: GITHUB_BATCH_MAX_REFERENCES,
+                }) }}
+              </p>
+              <div
+                v-if="githubBatchOverLimit"
+                id="skills-add-github-limit-hint"
+                class="sk-add-callout sk-add-callout--danger"
+                role="alert"
+              >
+                {{ t('cronSkills.registry.githubBatchLimitExceeded', {
+                  max: GITHUB_BATCH_MAX_REFERENCES,
+                }) }}
+              </div>
               <button
                 class="btn btn--primary sk-add-primary"
-                :class="{ 'sk-add-primary--busy': currentQueueRunning }"
                 data-testid="skills-install-github"
                 type="button"
-                :disabled="installControlsBlocked || githubReferenceCount === 0"
+                :disabled="installControlsBlocked || githubReferenceCount === 0 || githubBatchOverLimit"
                 :aria-busy="currentQueueRunning"
                 @click="emit('installGithub')"
               >
-                <span v-if="currentQueueRunning" class="sk-spinner" />
-                <Icon v-else name="download" :size="16" />
+                <Icon v-if="!currentQueueRunning" name="download" :size="16" />
                 <span>{{ primaryActionLabel }}</span>
               </button>
-              <p class="sk-add-help sk-add-help--center">{{ t('cronSkills.registry.duplicatesSkipped') }}</p>
+              <p
+                v-if="githubDuplicateCount > 0"
+                id="skills-add-github-duplicates-hint"
+                class="sk-add-help sk-add-help--center"
+              >
+                {{ t('cronSkills.registry.duplicatesSkipped', { count: githubDuplicateCount }) }}
+              </p>
             </section>
 
             <section
               v-if="sourceMode === 'clawhub'"
               id="skills-add-panel-clawhub"
               class="sk-add-source-panel"
-              role="tabpanel"
-              aria-labelledby="skills-add-tab-clawhub"
             >
               <label class="sk-add-field-label" for="skills-add-clawhub-query">
                 {{ t('cronSkills.registry.searchLabel') }}
@@ -256,10 +298,15 @@
                 <strong>{{ diagnostic.code }}</strong>
                 <span>{{ diagnostic.message }}</span>
                 <small v-if="diagnostic.hint">{{ diagnostic.hint }}</small>
+                <small v-if="searchDiagnosticRetryAfter(diagnostic.details)">
+                  {{ t('cronSkills.registry.retryAfter', {
+                    value: searchDiagnosticRetryAfter(diagnostic.details),
+                  }) }}
+                </small>
               </div>
 
               <div v-if="loading" class="sk-add-empty" role="status">
-                <span class="sk-spinner" />
+                <span class="sk-spinner" aria-hidden="true" />
                 <span>{{ t('cronSkills.registry.searching') }}</span>
               </div>
               <div v-else-if="results.length" class="sk-add-results">
@@ -284,24 +331,19 @@
                         {{ row.lifecycleLabel }}
                       </span>
                     </div>
-                    <p
-                      v-if="row.queueStatus === 'failed' && row.queueError"
-                      class="sk-add-result__error"
-                      role="status"
-                    >{{ row.queueError }}</p>
                   </div>
                   <button
                     class="btn btn--sm"
                     :class="[
-                      row.installed || row.queueStatus === 'failed' ? 'btn--ghost' : 'btn--primary',
-                      { 'sk-add-result__action--busy': row.queueStatus === 'installing' },
+                      row.installed || row.queueStatus === 'failed' || row.queueStatus === 'unknown'
+                        ? 'btn--ghost'
+                        : 'btn--primary',
                     ]"
                     type="button"
-                    :disabled="row.installed || installControlsBlocked || row.queueStatus === 'queued'"
+                    :disabled="resultActionDisabled(row)"
                     :aria-busy="row.queueStatus === 'installing'"
                     @click="handleResultAction(row)"
                   >
-                    <span v-if="row.queueStatus === 'installing'" class="sk-spinner" />
                     <span>{{ resultActionLabel(row) }}</span>
                   </button>
                 </article>
@@ -328,7 +370,11 @@ import type {
   SkillInstallActivities,
   SkillInstallSource,
 } from '@/composables/skills/useSkillRegistry'
-import { skillRegistryOperationKey } from '@/composables/skills/useSkillRegistry'
+import {
+  GITHUB_BATCH_MAX_REFERENCES,
+  skillInstallRequiresRiskAcknowledgement,
+  skillRegistryOperationKey,
+} from '@/composables/skills/useSkillRegistry'
 import { skillLifecyclePresentation } from '@/composables/skills/useSkillsCatalog'
 import type { RegistryResult, SkillDiagnostic } from '@/types/skills'
 
@@ -352,7 +398,7 @@ const emit = defineEmits<{
   search: []
   installGithub: []
   install: [identifier: string, source: string, displayName: string]
-  retry: [id: string]
+  retry: [id: string, acknowledgeRisk?: boolean]
   clearActivity: [source: SkillInstallSource]
 }>()
 
@@ -392,7 +438,8 @@ function settleActivityExpansion(source: SkillInstallSource) {
     activityExpanded.value[source] = true
     return
   }
-  activityExpanded.value[source] = items.some(item => item.status === 'failed')
+  activityExpanded.value[source] = items.some(item =>
+    item.status === 'failed' || item.status === 'unknown')
 }
 
 const currentActivity = computed(() => props.activities[sourceMode.value])
@@ -402,13 +449,36 @@ const currentQueueRunning = computed(() => props.runningSource === sourceMode.va
 const anyQueueRunning = computed(() => props.runningSource !== null)
 const installControlsBlocked = computed(() => anyQueueRunning.value || Boolean(props.mutationBlocked))
 
+function activityPhase(source: SkillInstallSource) {
+  const activity = props.activities[source]
+  if (activity.phase) return activity.phase
+  if (props.runningSource !== source) return 'terminal'
+  return activity.items.some(item => item.status === 'queued' || item.status === 'installing')
+    ? 'installing'
+    : 'refreshing'
+}
+
+const currentActivityPhase = computed(() => activityPhase(sourceMode.value))
+
 const githubReferences = computed(() => props.githubUrl
   .split(/\r?\n/)
   .map(value => value.trim())
   .filter(Boolean))
 const githubReferenceCount = computed(() => new Set(githubReferences.value).size)
+const githubDuplicateCount = computed(() => githubReferences.value.length - githubReferenceCount.value)
+const githubBatchOverLimit = computed(() =>
+  githubReferenceCount.value > GITHUB_BATCH_MAX_REFERENCES)
+const githubReferencesDescribedBy = computed(() => [
+  'skills-add-github-format-hint',
+  'skills-add-github-batch-hint',
+  githubBatchOverLimit.value ? 'skills-add-github-limit-hint' : '',
+  githubDuplicateCount.value > 0 ? 'skills-add-github-duplicates-hint' : '',
+].filter(Boolean).join(' '))
 const completedCount = computed(() => currentItems.value.filter(item =>
-  item.status === 'installed' || item.status === 'unchanged' || item.status === 'failed').length)
+  item.status === 'installed'
+    || item.status === 'unchanged'
+    || item.status === 'failed'
+    || item.status === 'unknown').length)
 const currentIndex = computed(() => {
   const installing = currentItems.value.findIndex(item => item.status === 'installing')
   return installing >= 0
@@ -417,6 +487,9 @@ const currentIndex = computed(() => {
 })
 const primaryActionLabel = computed(() => {
   if (currentQueueRunning.value) {
+    if (currentActivityPhase.value === 'refreshing') {
+      return t('cronSkills.skillsView.refreshing')
+    }
     return t('cronSkills.registry.installingProgress', {
       current: currentIndex.value,
       total: currentItems.value.length,
@@ -425,22 +498,56 @@ const primaryActionLabel = computed(() => {
   return t('cronSkills.registry.installCount', { count: githubReferenceCount.value })
 })
 const queueSummary = computed(() => {
+  if (currentQueueRunning.value) {
+    if (currentActivityPhase.value === 'refreshing') {
+      return t('cronSkills.skillsView.refreshing')
+    }
+    return `${t('cronSkills.registry.sourceInstalling', {
+      name: runningItemName(sourceMode.value),
+    })} · ${currentIndex.value} / ${currentItems.value.length}`
+  }
   const installed = currentItems.value.filter(item => item.status === 'installed').length
   const unchanged = currentItems.value.filter(item => item.status === 'unchanged').length
   const failed = currentItems.value.filter(item => item.status === 'failed').length
+  const deferred = currentItems.value.filter(item => item.status === 'deferred').length
+  const unknown = currentItems.value.filter(item => item.status === 'unknown').length
   return [
     t('cronSkills.registry.queueProcessed', {
       processed: completedCount.value,
       total: currentItems.value.length,
     }),
-    t('cronSkills.registry.queueInstalled', { count: installed }),
-    t('cronSkills.registry.queueUnchanged', { count: unchanged }),
-    t('cronSkills.registry.queueFailed', { count: failed }),
+    ...(installed ? [t('cronSkills.registry.queueInstalled', { count: installed })] : []),
+    ...(unchanged ? [t('cronSkills.registry.queueUnchanged', { count: unchanged })] : []),
+    ...(failed ? [t('cronSkills.registry.queueFailed', { count: failed })] : []),
+    ...(deferred ? [t('cronSkills.registry.queueDeferred', { count: deferred })] : []),
+    ...(unknown ? [t('cronSkills.registry.queueUnknown', { count: unknown })] : []),
   ].join(' · ')
 })
 
-function sourceFailureCount(source: SkillInstallSource): number {
-  return props.activities[source].items.filter(item => item.status === 'failed').length
+function sourceRunningLabel(source: SkillInstallSource): string {
+  if (activityPhase(source) === 'refreshing') return t('cronSkills.skillsView.refreshing')
+  return t('cronSkills.registry.sourceInstalling', { name: runningItemName(source) })
+}
+
+const installAnnouncement = computed(() => {
+  if (props.runningSource) return sourceRunningLabel(props.runningSource)
+  if (currentItems.value.length) return queueSummary.value
+  return ''
+})
+
+function sourceAttentionCount(source: SkillInstallSource): number {
+  return props.activities[source].items.filter(item =>
+    item.status === 'failed' || item.status === 'unknown').length
+}
+
+function sourceAttentionLabel(source: SkillInstallSource): string {
+  const items = props.activities[source].items
+  const failed = items.filter(item => item.status === 'failed').length
+  const unknown = items.filter(item => item.status === 'unknown').length
+  return [
+    ...(failed ? [t('cronSkills.registry.sourceFailures', { count: failed })] : []),
+    ...(unknown ? [t('cronSkills.registry.queueUnknown', { count: unknown })] : []),
+  ].join(', ')
 }
 
 function runningItemName(source: SkillInstallSource): string {
@@ -473,6 +580,7 @@ const resultRows = computed(() => props.results.map((result) => {
   const operationKey = skillRegistryOperationKey(installId, installSource)
   const queueItem = activityForSource(installSource).items.find(item => item.id === operationKey)
   const operationFailed = queueItem?.status === 'failed'
+  const operationUnknown = queueItem?.status === 'unknown'
   const operationPreserved = operationFailed && Boolean(queueItem?.result?.installed)
   const presentation = lifecycle && (
     operationPreserved
@@ -480,6 +588,12 @@ const resultRows = computed(() => props.results.map((result) => {
   )
     ? skillLifecyclePresentation({ name: result.name, lifecycle }, 'registry')
     : null
+  const operationLabel = operationUnknown
+    ? t('cronSkills.registry.installResultUnknown')
+    : operationFailed
+      ? t('cronSkills.registry.queueStatus.failed')
+      : ''
+  const operationTone = operationUnknown ? 'warning' : 'danger'
   return {
     name: result.name,
     description: (result.description || '').slice(0, 180),
@@ -488,39 +602,45 @@ const resultRows = computed(() => props.results.map((result) => {
     source: installSource,
     trustLevel: result.trust_level || t('cronSkills.registry.community'),
     installed: Boolean(result.installed),
-    operationLabel: operationFailed
-      ? t(queueItem?.result?.installed
-        ? 'cronSkills.registry.existingInstallPreserved'
-        : 'cronSkills.registry.notInstalled')
-      : '',
-    operationTone: operationFailed && queueItem?.result?.installed
-      ? 'warning'
-      : 'danger',
+    operationLabel,
+    operationTone,
     lifecycleLabel: presentation?.label || '',
     lifecycleTone: presentation?.tone || 'neutral',
     installId,
     installSource,
     operationKey,
     queueStatus: queueItem?.status,
-    queueError: queueItem?.error || '',
   }
 }))
 
 type ResultRow = (typeof resultRows.value)[number]
 
 function resultActionLabel(row: ResultRow): string {
+  if (row.queueStatus === 'queued' || row.queueStatus === 'installing') {
+    return t(`cronSkills.registry.queueStatus.${row.queueStatus}`)
+  }
+  if (row.queueStatus === 'failed' || row.queueStatus === 'unknown') {
+    return t('cronSkills.registry.viewDetails')
+  }
   if (row.installed) return t('cronSkills.registry.installed')
-  if (row.queueStatus === 'failed') return t('cronSkills.registry.retry')
   if (row.queueStatus) return t(`cronSkills.registry.queueStatus.${row.queueStatus}`)
   return t('cronSkills.registry.install')
 }
 
 function handleResultAction(row: ResultRow) {
-  if (row.queueStatus === 'failed') {
-    emit('retry', row.operationKey)
+  if (row.queueStatus === 'failed' || row.queueStatus === 'unknown') {
+    const source = row.installSource === 'github' ? 'github' : 'clawhub'
+    sourceMode.value = source
+    activityExpanded.value[source] = true
+    void nextTick(() => queueRef.value?.scrollIntoView({ block: 'nearest' }))
     return
   }
   emit('install', row.installId, row.installSource, row.name)
+}
+
+function resultActionDisabled(row: ResultRow): boolean {
+  if (row.queueStatus === 'failed' || row.queueStatus === 'unknown') return false
+  return row.installed || installControlsBlocked.value || row.queueStatus === 'queued'
 }
 
 const queueRows = computed(() => currentItems.value.map((item) => {
@@ -544,6 +664,7 @@ const queueRows = computed(() => currentItems.value.map((item) => {
   ].filter((value): value is string => Boolean(value)))]
   return {
     ...item,
+    requiresRiskAcknowledgement: skillInstallRequiresRiskAcknowledgement(item.result),
     operationLabel: operationFailed
       ? t(item.result?.installed
         ? 'cronSkills.registry.existingInstallPreserved'
@@ -565,6 +686,17 @@ function diagnosticDetails(details: Record<string, unknown>): string {
   } catch {
     return String(details)
   }
+}
+
+function searchDiagnosticRetryAfter(
+  details: Record<string, unknown> | undefined,
+): string {
+  const value = details?.retryAfter
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value >= 0 ? String(value) : ''
+  }
+  if (typeof value !== 'string') return ''
+  return value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 80)
 }
 
 function hasDiagnosticDetails(details: Record<string, unknown> | undefined): boolean {
@@ -764,10 +896,6 @@ function effectiveFromLabel(value: string | undefined): string {
   width: 100%;
 }
 
-.sk-add-primary--busy:disabled[aria-busy="true"] {
-  opacity: 1;
-}
-
 .sk-add-search-row {
   display: grid;
   gap: var(--sp-2);
@@ -884,12 +1012,6 @@ function effectiveFromLabel(value: string | undefined): string {
   -webkit-line-clamp: 2;
 }
 
-.sk-add-result__body .sk-add-result__error {
-  color: var(--danger);
-  font-size: 11px;
-  -webkit-line-clamp: 1;
-}
-
 .sk-add-result[data-status="installing"] {
   border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
 }
@@ -897,10 +1019,6 @@ function effectiveFromLabel(value: string | undefined): string {
 .sk-add-result[data-status="failed"] {
   background: color-mix(in srgb, var(--danger) 5%, var(--bg));
   border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
-}
-
-.sk-add-result__action--busy {
-  opacity: 1;
 }
 
 .sk-add-result__meta,
@@ -961,8 +1079,16 @@ function effectiveFromLabel(value: string | undefined): string {
 }
 
 .sk-add-section-title h3 {
+  align-items: center;
+  display: inline-flex;
   font-size: var(--fs-sm);
+  gap: 6px;
   margin: 0;
+}
+
+.sk-add-section-title h3 .sk-spinner {
+  height: 13px;
+  width: 13px;
 }
 
 .sk-add-section-title span {
@@ -1039,6 +1165,12 @@ function effectiveFromLabel(value: string | undefined): string {
 }
 
 .sk-add-queue-item__error {
+  font-size: var(--fs-xs);
+  margin: 7px 0;
+}
+
+.sk-add-queue-item__note {
+  color: var(--text-muted);
   font-size: var(--fs-xs);
   margin: 7px 0;
 }

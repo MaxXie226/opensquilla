@@ -14,7 +14,12 @@ interface SkillDetailRpc {
 
 interface SkillDetailControllerOptions {
   rpc: SkillDetailRpc
-  installDeps: (name: string, installId: string) => Promise<SkillDependencyInstallOutcome>
+  installDeps: (
+    name: string,
+    installId: string,
+    skillInstallId?: string,
+    instanceId?: string,
+  ) => Promise<SkillDependencyInstallOutcome>
   closeDelayMs?: number
 }
 
@@ -148,7 +153,12 @@ export function useSkillDetailController(
         return false
       }
 
-      const outcome = await options.installDeps(name, installId)
+      const outcome = await options.installDeps(
+        name,
+        installId,
+        latestBeforeInstall.install_id || '',
+        latestBeforeInstall.instance_id || '',
+      )
       if (!isCurrent(generation, identity)) return false
       if (!outcome.success) {
         installFeedback.value = outcome.message

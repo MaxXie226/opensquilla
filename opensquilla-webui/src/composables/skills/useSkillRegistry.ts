@@ -47,6 +47,8 @@ export type SkillInstallQueueStatus =
   | 'installing'
   | 'installed'
   | 'unchanged'
+  | 'deferred'
+  | 'unknown'
   | 'failed'
 
 export interface SkillInstallQueueItem {
@@ -59,11 +61,49 @@ export interface SkillInstallQueueItem {
   error?: string
 }
 
+export function skillInstallRequiresRiskAcknowledgement(
+  result: InstallResult | undefined,
+): boolean {
+  return Boolean(skillInstallRiskConfirmation(result))
+}
+
+export function skillInstallRiskConfirmation(
+  result: InstallResult | undefined,
+): string {
+  const diagnostic = result?.diagnostics?.find(candidate =>
+    candidate.code === 'SCAN_CONFIRMATION_REQUIRED')
+  const token = diagnostic?.details?.confirmationToken
+  return typeof token === 'string' ? token.trim() : ''
+}
+
 export type SkillInstallSource = 'clawhub' | 'github'
+
+export const GITHUB_BATCH_MAX_REFERENCES = 10
+
+const GITHUB_RATE_LIMIT_DIAGNOSTIC_CODES = new Set([
+  'SOURCE_RATE_LIMITED',
+  'FETCH_RATE_LIMITED',
+])
+
+export function skillInstallWasRateLimited(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false
+  if (Array.isArray(value)) return value.some(skillInstallWasRateLimited)
+
+  const record = value as Record<string, unknown>
+  if (typeof record.code === 'string'
+    && GITHUB_RATE_LIMIT_DIAGNOSTIC_CODES.has(record.code)) return true
+  return skillInstallWasRateLimited(record.diagnostics)
+    || skillInstallWasRateLimited(record.details)
+    || skillInstallWasRateLimited(record.resolution)
+}
+
+export type SkillInstallActivityPhase = 'installing' | 'refreshing' | 'terminal'
 
 export interface SkillInstallActivity {
   items: SkillInstallQueueItem[]
   refreshWarning: string
+  /** Optional while older in-memory fixtures and clients age out. */
+  phase?: SkillInstallActivityPhase
 }
 
 export type SkillInstallActivities = Record<SkillInstallSource, SkillInstallActivity>
@@ -158,10 +198,15 @@ export interface SkillRegistry {
   searchRegistry: () => Promise<void>
   installGithub: () => Promise<void>
   installSkill: (identifier: string, source: string, displayName?: string) => Promise<void>
-  retryQueueItem: (id: string) => Promise<void>
+  retryQueueItem: (id: string, acknowledgeRisk?: boolean) => Promise<void>
   clearInstallActivity: (source: SkillInstallSource) => void
-  installDeps: (name: string, installId: string) => Promise<SkillDependencyInstallOutcome>
-  uninstallSkill: (name: string) => Promise<boolean>
+  installDeps: (
+    name: string,
+    installId: string,
+    skillInstallId?: string,
+    instanceId?: string,
+  ) => Promise<SkillDependencyInstallOutcome>
+  uninstallSkill: (name: string, installId?: string) => Promise<boolean>
 }
 
 export function useSkillRegistry(
@@ -179,35 +224,43 @@ export function useSkillRegistry(
   const registrySearchError = ref('')
   const installingId = ref<string | null>(null)
   const installActivities = ref<SkillInstallActivities>({
-    clawhub: { items: [], refreshWarning: '' },
-    github: { items: [], refreshWarning: '' },
+    clawhub: { items: [], refreshWarning: '', phase: 'terminal' },
+    github: { items: [], refreshWarning: '', phase: 'terminal' },
   })
   const runningSource = ref<SkillInstallSource | null>(null)
   const queueRunning = computed(() => runningSource.value !== null)
   const mutationBusy = computed(() => mutationGate.busy.value)
   const installingDepsId = ref<string | null>(null)
   const uninstallingName = ref<string | null>(null)
+  let searchRequestId = 0
 
   async function searchRegistry() {
-    if (!registryQuery.value.trim()) return
+    const query = registryQuery.value.trim()
+    const requestId = ++searchRequestId
+    if (!query) {
+      registryLoading.value = false
+      return
+    }
     registryLoading.value = true
     registryResults.value = []
     registryDiagnostics.value = []
     registrySearchError.value = ''
     try {
       const data = await rpc.call<RegistrySearchData>('skills.search', {
-        query: registryQuery.value.trim(),
+        query,
         limit: 20,
         source: 'clawhub',
       })
+      if (requestId !== searchRequestId) return
       registryResults.value = data.results || []
       registryDiagnostics.value = data.diagnostics || []
       registrySearchError.value = data.message || ''
     } catch (err) {
+      if (requestId !== searchRequestId) return
       registrySearchError.value = (err as Error).message
       pushToast(t('cronSkills.registry.toastSearchFailed', { error: registrySearchError.value }), { tone: 'danger' })
     } finally {
-      registryLoading.value = false
+      if (requestId === searchRequestId) registryLoading.value = false
     }
   }
 
@@ -262,36 +315,70 @@ export function useSkillRegistry(
   ) {
     const changed = items.some(item => item.status === 'installed' || item.status === 'unchanged')
     if (!changed) return
-    if (!(await loadData())) {
+    installActivities.value[source].phase = 'refreshing'
+    let refreshed = false
+    try {
+      refreshed = await loadData()
+    } catch {
+      // A durable installation remains successful even when its follow-up
+      // catalog read cannot complete. Surface that as the existing warning.
+    }
+    if (!refreshed) {
       const message = t('cronSkills.skillsView.reloadListFailed')
       installActivities.value[source].refreshWarning = message
       pushToast(message, { tone: 'warn' })
     }
   }
 
-  async function processQueueItems(items: SkillInstallQueueItem[]) {
-    for (const item of items) {
+  async function processQueueItems(
+    items: SkillInstallQueueItem[],
+    riskConfirmation = '',
+  ) {
+    for (const [index, item] of items.entries()) {
       item.status = 'installing'
       item.error = ''
       item.result = undefined
       installingId.value = item.id
+      let rateLimited = false
       try {
         const res = await rpc.call<InstallResult>('skills.install', {
           identifier: item.identifier,
           source: item.source,
+          ...(riskConfirmation
+            ? { force: true, riskConfirmation }
+            : {}),
         })
         item.result = res
         item.displayName = res.name || item.displayName
         item.status = res.success ? (res.unchanged ? 'unchanged' : 'installed') : 'failed'
         item.error = res.success ? '' : (res.message || t('cronSkills.registry.installFailed'))
         markRegistryResultOutcome(item.identifier, item.source, res)
+        rateLimited = item.source === 'github' && skillInstallWasRateLimited(res)
       } catch (err) {
-        item.status = 'failed'
+        rateLimited = item.source === 'github' && skillInstallWasRateLimited(err)
+        // A stable rate-limit diagnostic means this attempt did not run. For
+        // other transport interruptions, the Gateway may already have committed.
+        item.status = rateLimited ? 'failed' : 'unknown'
         item.error = (err as Error).message
       } finally {
         installingId.value = null
       }
+      if (!rateLimited) continue
+      for (const deferred of items.slice(index + 1)) {
+        deferred.status = 'deferred'
+        deferred.error = ''
+      }
+      break
     }
+  }
+
+  function settleInterruptedItems(source: SkillInstallSource) {
+    for (const item of installActivities.value[source].items) {
+      if (item.status !== 'queued' && item.status !== 'installing') continue
+      item.status = 'unknown'
+      item.error ||= t('cronSkills.registry.installResultUnknown')
+    }
+    installActivities.value[source].phase = 'terminal'
   }
 
   async function runNewBatch(requests: SkillInstallRequest[]) {
@@ -300,7 +387,7 @@ export function useSkillRegistry(
     if (!mutationGate.acquire('install_queue')) return
     const source = activitySource(unique[0].source)
     const items = unique.map(requestToQueueItem)
-    installActivities.value[source] = { items, refreshWarning: '' }
+    installActivities.value[source] = { items, refreshWarning: '', phase: 'installing' }
     const activityItems = installActivities.value[source].items
     runningSource.value = source
     try {
@@ -308,6 +395,7 @@ export function useSkillRegistry(
       removeSuccessfulGithubLines(activityItems)
       await refreshCatalogAfterBatch(source, activityItems)
     } finally {
+      settleInterruptedItems(source)
       runningSource.value = null
       installingId.value = null
       mutationGate.release('install_queue')
@@ -315,11 +403,13 @@ export function useSkillRegistry(
   }
 
   async function installGithub() {
-    await runNewBatch(
+    const requests = uniqueRequests(
       githubUrl.value
         .split(/\r?\n/)
         .map(identifier => ({ identifier, source: 'github' })),
     )
+    if (requests.length > GITHUB_BATCH_MAX_REFERENCES) return
+    await runNewBatch(requests)
   }
 
   function markRegistryResultOutcome(
@@ -352,20 +442,26 @@ export function useSkillRegistry(
     await runNewBatch([{ identifier, source, displayName }])
   }
 
-  async function retryQueueItem(id: string) {
+  async function retryQueueItem(id: string, acknowledgeRisk = false) {
     const source = (['clawhub', 'github'] as const).find(candidate =>
       installActivities.value[candidate].items.some(item => item.id === id))
     if (!source) return
     const item = installActivities.value[source].items.find(candidate => candidate.id === id)
     if (!item || item.status !== 'failed') return
+    const riskConfirmation = acknowledgeRisk
+      ? skillInstallRiskConfirmation(item.result)
+      : ''
+    if (acknowledgeRisk && !riskConfirmation) return
     if (!mutationGate.acquire('install_queue')) return
     installActivities.value[source].refreshWarning = ''
+    installActivities.value[source].phase = 'installing'
     runningSource.value = source
     try {
-      await processQueueItems([item])
+      await processQueueItems([item], riskConfirmation)
       removeSuccessfulGithubLines([item])
       await refreshCatalogAfterBatch(source, [item])
     } finally {
+      settleInterruptedItems(source)
       runningSource.value = null
       installingId.value = null
       mutationGate.release('install_queue')
@@ -374,10 +470,15 @@ export function useSkillRegistry(
 
   function clearInstallActivity(source: SkillInstallSource) {
     if (runningSource.value) return
-    installActivities.value[source] = { items: [], refreshWarning: '' }
+    installActivities.value[source] = { items: [], refreshWarning: '', phase: 'terminal' }
   }
 
-  async function installDeps(name: string, installId: string): Promise<SkillDependencyInstallOutcome> {
+  async function installDeps(
+    name: string,
+    installId: string,
+    skillInstallId = '',
+    instanceId = '',
+  ): Promise<SkillDependencyInstallOutcome> {
     const failed = (message = ''): SkillDependencyInstallOutcome => ({
       success: false,
       complete: false,
@@ -387,7 +488,12 @@ export function useSkillRegistry(
     if (!name || !installId || !mutationGate.acquire('dependency_install')) return failed()
     installingDepsId.value = installId
     try {
-      const res = await rpc.call<InstallResult>('skills.deps.install', { name, install_id: installId })
+      const res = await rpc.call<InstallResult>('skills.deps.install', {
+        name,
+        install_id: installId,
+        ...(skillInstallId ? { installId: skillInstallId } : {}),
+        ...(instanceId ? { instanceId } : {}),
+      })
       if (res.success) {
         pushToast(res.message || t('cronSkills.registry.installed'), { tone: 'ok' })
         const still = res.missing_still || {}
@@ -420,11 +526,14 @@ export function useSkillRegistry(
     }
   }
 
-  async function uninstallSkill(name: string): Promise<boolean> {
-    if (!name || !mutationGate.acquire('uninstall')) return false
+  async function uninstallSkill(name: string, installId = ''): Promise<boolean> {
+    if ((!name && !installId) || !mutationGate.acquire('uninstall')) return false
     uninstallingName.value = name
     try {
-      const res = await rpc.call<InstallResult>('skills.uninstall', { name })
+      const res = await rpc.call<InstallResult>('skills.uninstall', {
+        ...(name ? { name } : {}),
+        ...(installId ? { installId } : {}),
+      })
       if (res.success) {
         if (!(await loadData())) {
           pushToast(t('cronSkills.skillsView.reloadListFailed'), { tone: 'warn' })

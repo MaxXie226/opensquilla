@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { watch } from 'vue'
 import {
+  GITHUB_BATCH_MAX_REFERENCES,
   githubSkillDisplayName,
+  skillInstallRiskConfirmation,
+  skillInstallRequiresRiskAcknowledgement,
+  skillInstallWasRateLimited,
   skillRegistryOperationKey,
   useSkillRegistry,
 } from './useSkillRegistry'
@@ -167,7 +171,7 @@ describe('useSkillRegistry install state', () => {
     })
     const loadData = vi.fn(async () => true)
     const registry = useSkillRegistry({ call } as never, loadData)
-    const lines = Array.from({ length: 15 }, (_, index) =>
+    const lines = Array.from({ length: GITHUB_BATCH_MAX_REFERENCES }, (_, index) =>
       `https://github.com/acme/skill-${index + 1}`)
     registry.githubUrl.value = [lines[0], ...lines, lines[4]].join('\n')
 
@@ -176,11 +180,143 @@ describe('useSkillRegistry install state', () => {
     expect(identifiers).toEqual(lines)
     expect(maxActiveCalls).toBe(1)
     expect(loadData).toHaveBeenCalledOnce()
-    expect(registry.installActivities.value.github.items).toHaveLength(15)
-    expect(registry.installActivities.value.github.items[2].status).toBe('failed')
+    expect(registry.installActivities.value.github.items).toHaveLength(GITHUB_BATCH_MAX_REFERENCES)
+    expect(registry.installActivities.value.github.items[2].status).toBe('unknown')
     expect(registry.installActivities.value.github.items[3].status).toBe('installed')
     expect(registry.githubUrl.value).toBe('https://github.com/acme/skill-3')
     expect(registry.queueRunning.value).toBe(false)
+  })
+
+  it('rejects more than ten unique GitHub references without truncating or starting RPCs', async () => {
+    const call = vi.fn(async () => ({ success: true, installed: true }))
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({ call } as never, loadData)
+    const references = Array.from({ length: GITHUB_BATCH_MAX_REFERENCES + 1 }, (_, index) =>
+      `https://github.com/acme/skill-${index + 1}`)
+    const input = [references[0], '', ...references, references[3]].join('\n')
+    registry.githubUrl.value = input
+
+    await registry.installGithub()
+
+    expect(call).not.toHaveBeenCalled()
+    expect(loadData).not.toHaveBeenCalled()
+    expect(registry.installActivities.value.github.items).toEqual([])
+    expect(registry.githubUrl.value).toBe(input)
+    expect(registry.queueRunning.value).toBe(false)
+  })
+
+  it.each([
+    {
+      label: 'a direct source diagnostic',
+      diagnostics: [{
+        code: 'SOURCE_RATE_LIMITED',
+        severity: 'error',
+        phase: 'source',
+        blocking: true,
+        message: 'GitHub rate limited this request.',
+      }],
+    },
+    {
+      label: 'a nested fetch diagnostic',
+      diagnostics: [{
+        code: 'SOURCE_FETCH_FAILED',
+        severity: 'error',
+        phase: 'source',
+        blocking: true,
+        message: 'GitHub fetch failed.',
+        details: {
+          diagnostics: [{
+            code: 'FETCH_RATE_LIMITED',
+            severity: 'error',
+            phase: 'fetch',
+            blocking: true,
+            message: 'GitHub rate limited the archive request.',
+          }],
+        },
+      }],
+    },
+  ])('pauses a GitHub batch after $label and preserves unattempted lines', async ({ diagnostics }) => {
+    const references = Array.from({ length: 4 }, (_, index) =>
+      `https://github.com/acme/skill-${index + 1}`)
+    const call = vi.fn(async (_method: string, params: { identifier: string }) => {
+      if (params.identifier === references[0]) return { success: true, installed: true }
+      if (params.identifier === references[1]) {
+        return {
+          success: false,
+          installed: false,
+          message: 'GitHub rate limited this batch.',
+          diagnostics,
+        }
+      }
+      throw new Error(`unexpected install attempt: ${params.identifier}`)
+    })
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({ call } as never, loadData)
+    registry.githubUrl.value = references.join('\n')
+
+    await registry.installGithub()
+
+    expect(call.mock.calls.map(([, params]) => params.identifier)).toEqual(references.slice(0, 2))
+    expect(registry.installActivities.value.github.items.map(item => item.status)).toEqual([
+      'installed',
+      'failed',
+      'deferred',
+      'deferred',
+    ])
+    expect(registry.installActivities.value.github.items.slice(2).every(item =>
+      !item.error)).toBe(true)
+    expect(registry.githubUrl.value).toBe(references.slice(1).join('\n'))
+    expect(loadData).toHaveBeenCalledOnce()
+  })
+
+  it('pauses remaining GitHub references when a thrown RPC error carries rate-limit details', async () => {
+    const references = [
+      'https://github.com/acme/skill-1',
+      'https://github.com/acme/skill-2',
+      'https://github.com/acme/skill-3',
+    ]
+    const rpcError = Object.assign(new Error('GitHub rate limited this request.'), {
+      details: {
+        diagnostics: [{
+          code: 'SOURCE_RATE_LIMITED',
+          severity: 'error',
+          phase: 'source',
+          blocking: true,
+          message: 'Try again later.',
+        }],
+      },
+    })
+    const call = vi.fn(async () => { throw rpcError })
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({ call } as never, loadData)
+    registry.githubUrl.value = references.join('\n')
+
+    await registry.installGithub()
+
+    expect(call).toHaveBeenCalledOnce()
+    expect(registry.installActivities.value.github.items.map(item => item.status)).toEqual([
+      'failed',
+      'deferred',
+      'deferred',
+    ])
+    expect(registry.githubUrl.value).toBe(references.join('\n'))
+    expect(loadData).not.toHaveBeenCalled()
+  })
+
+  it('recognizes rate limits nested in stable RPC error details', () => {
+    expect(skillInstallWasRateLimited({
+      details: {
+        diagnostics: [{ code: 'FETCH_RATE_LIMITED' }],
+      },
+    })).toBe(true)
+    expect(skillInstallWasRateLimited({
+      resolution: {
+        diagnostics: [{ code: 'SOURCE_RATE_LIMITED' }],
+      },
+    })).toBe(true)
+    expect(skillInstallWasRateLimited({
+      diagnostics: [{ code: 'FETCH_SERVER_FAILED' }],
+    })).toBe(false)
   })
 
   it('ignores a rapid second submit while the first immutable install is in flight', async () => {
@@ -224,6 +360,45 @@ describe('useSkillRegistry install state', () => {
     await installing
 
     expect(observed).toEqual(['queued', 'installing', 'installed'])
+  })
+
+  it('separates installation from catalog refresh and then settles terminally', async () => {
+    let finishRefresh: ((value: boolean) => void) | undefined
+    const refreshPending = new Promise<boolean>((resolve) => { finishRefresh = resolve })
+    const registry = useSkillRegistry(
+      { call: vi.fn(async () => ({ success: true, installed: true })) } as never,
+      vi.fn(async () => refreshPending),
+    )
+
+    const installing = registry.installSkill('@acme/phase', 'clawhub', 'Phase Skill')
+    await vi.waitFor(() => {
+      expect(registry.installActivities.value.clawhub.phase).toBe('refreshing')
+    })
+
+    expect(registry.runningSource.value).toBe('clawhub')
+    expect(registry.installActivities.value.clawhub.items[0].status).toBe('installed')
+    finishRefresh?.(true)
+    await installing
+
+    expect(registry.runningSource.value).toBeNull()
+    expect(registry.installActivities.value.clawhub.phase).toBe('terminal')
+    expect(registry.installActivities.value.clawhub.items.some(item =>
+      item.status === 'queued' || item.status === 'installing')).toBe(false)
+  })
+
+  it('marks an interrupted install response unknown instead of claiming it was not installed', async () => {
+    const registry = useSkillRegistry(
+      { call: vi.fn(async () => { throw new Error('connection closed') }) } as never,
+      vi.fn(async () => true),
+    )
+
+    await registry.installSkill('@acme/uncertain', 'clawhub', 'Uncertain Skill')
+
+    const item = registry.installActivities.value.clawhub.items[0]
+    expect(item.status).toBe('unknown')
+    expect(item.error).toBe('connection closed')
+    expect(registry.installActivities.value.clawhub.phase).toBe('terminal')
+    expect(registry.runningSource.value).toBeNull()
   })
 
   it('refuses queue starts while dependency, uninstall, or reload owns the mutation gate', async () => {
@@ -345,6 +520,106 @@ describe('useSkillRegistry install state', () => {
     expect(registry.installActivities.value.github.items[0]).toBe(githubItem)
     expect(registry.installActivities.value.github.items[0].status).toBe('failed')
     expect(loadData).toHaveBeenCalledOnce()
+    expect(call.mock.calls[call.mock.calls.length - 1]?.[1]).toEqual({
+      identifier: '@acme/demo',
+      source: 'clawhub',
+    })
+  })
+
+  it('sends force only after an explicit scanner-risk acknowledgement', async () => {
+    const calls: Array<Record<string, unknown>> = []
+    const confirmationToken = 'reviewed-artifact-confirmation'
+    const call = vi.fn(async (_method: string, params: Record<string, unknown>) => {
+      calls.push(params)
+      if (params.force === true && params.riskConfirmation === confirmationToken) {
+        return { success: true, installed: true }
+      }
+      return {
+        success: false,
+        installed: false,
+        message: 'Review scanner findings before continuing.',
+        diagnostics: [{
+          code: 'SCAN_CONFIRMATION_REQUIRED',
+          severity: 'warning',
+          phase: 'security',
+          blocking: true,
+          message: 'The local scanner found content that requires review.',
+          details: {
+            confirmationToken,
+            resolvedIdentifier: '@acme/review-me@1.0.0',
+            artifactDigest: 'artifact-digest',
+            treeDigest: 'tree-digest',
+          },
+        }],
+      }
+    })
+    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true))
+
+    await registry.installSkill('@acme/review-me', 'clawhub', 'Review me')
+    const item = registry.installActivities.value.clawhub.items[0]
+
+    expect(item.status).toBe('failed')
+    expect(skillInstallRequiresRiskAcknowledgement(item.result)).toBe(true)
+    expect(skillInstallRiskConfirmation(item.result)).toBe(confirmationToken)
+    expect(calls[0]).toEqual({
+      identifier: '@acme/review-me',
+      source: 'clawhub',
+    })
+
+    await registry.retryQueueItem(item.id, true)
+
+    expect(calls[1]).toEqual({
+      identifier: '@acme/review-me',
+      source: 'clawhub',
+      force: true,
+      riskConfirmation: confirmationToken,
+    })
+    expect(item.status).toBe('installed')
+  })
+
+  it('does not send bare force for an unbound legacy scanner diagnostic', async () => {
+    const call = vi.fn(async () => ({
+      success: false,
+      message: 'Review scanner findings before continuing.',
+      diagnostics: [{
+        code: 'SCAN_CONFIRMATION_REQUIRED',
+        severity: 'warning',
+        phase: 'security',
+        blocking: true,
+        message: 'The scanner found content that requires review.',
+      }],
+    }))
+    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true))
+
+    await registry.installSkill('@acme/legacy-review', 'clawhub')
+    const item = registry.installActivities.value.clawhub.items[0]
+    expect(skillInstallRequiresRiskAcknowledgement(item.result)).toBe(false)
+
+    await registry.retryQueueItem(item.id, true)
+
+    expect(call).toHaveBeenCalledOnce()
+  })
+
+  it('does not allow risk acknowledgement to force an unrelated failure', async () => {
+    const call = vi.fn(async () => ({
+      success: false,
+      message: 'Archive integrity failed.',
+      diagnostics: [{
+        code: 'ARTIFACT_DIGEST_MISMATCH',
+        severity: 'error',
+        phase: 'security',
+        blocking: true,
+        message: 'Digest mismatch.',
+      }],
+    }))
+    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true))
+
+    await registry.installSkill('@acme/bad-digest', 'clawhub')
+    const item = registry.installActivities.value.clawhub.items[0]
+    await registry.retryQueueItem(item.id, true)
+
+    expect(call).toHaveBeenCalledOnce()
+    expect(skillInstallRequiresRiskAcknowledgement(item.result)).toBe(false)
   })
 
   it('retains terminal batches across sources and replaces only the same source', async () => {
@@ -447,6 +722,30 @@ describe('useSkillRegistry install state', () => {
       source: 'clawhub',
     })
     expect(registry.registryDiagnostics.value).toEqual([diagnostic])
+  })
+
+  it('keeps only the latest ClawHub search response', async () => {
+    let finishFirst: ((value: RegistrySearchDataFixture) => void) | undefined
+    let finishSecond: ((value: RegistrySearchDataFixture) => void) | undefined
+    type RegistrySearchDataFixture = { results: Array<{ name: string }> }
+    const first = new Promise<RegistrySearchDataFixture>((resolve) => { finishFirst = resolve })
+    const second = new Promise<RegistrySearchDataFixture>((resolve) => { finishSecond = resolve })
+    const call = vi.fn()
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second)
+    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true))
+
+    registry.registryQuery.value = 'first'
+    const firstSearch = registry.searchRegistry()
+    registry.registryQuery.value = 'second'
+    const secondSearch = registry.searchRegistry()
+    finishSecond?.({ results: [{ name: 'Second result' }] })
+    await secondSearch
+    finishFirst?.({ results: [{ name: 'Stale first result' }] })
+    await firstSearch
+
+    expect(registry.registryResults.value.map(result => result.name)).toEqual(['Second result'])
+    expect(registry.registryLoading.value).toBe(false)
   })
 
   it('warns when installation succeeds but the catalog list cannot refresh', async () => {

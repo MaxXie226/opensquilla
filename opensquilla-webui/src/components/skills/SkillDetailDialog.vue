@@ -177,7 +177,7 @@
       </section>
       <footer class="sk-detail__foot">
         <small v-if="skill.file_path" class="sk-dim sk-detail__path">{{ skill.file_path }}</small>
-        <button v-if="skill.layer === 'managed'" class="btn btn--sm" :disabled="mutationDisabled || uninstallingName === skill.name" @click="emit('uninstall', skill.name)">
+        <button v-if="skill.layer === 'managed'" class="btn btn--sm" :disabled="mutationDisabled || uninstallingName === skill.name" @click="emit('uninstall', skill.name, skill.install_id || '')">
           {{ uninstallingName === skill.name ? t('cronSkills.skillDetail.removing') : t('cronSkills.skillDetail.remove') }}
         </button>
       </footer>
@@ -221,7 +221,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: []
   installDeps: [name: string, installId: string]
-  uninstall: [name: string]
+  uninstall: [name: string, installId: string]
 }>()
 
 const dialogRef = ref<HTMLDialogElement | null>(null)
