@@ -3650,6 +3650,21 @@
       "editWhileStreaming": "等待当前回复完成后再编辑",
       "attachmentNeedsAttention": "附件需处理",
       "fixAttachmentBeforeSteer": "请先编辑这条消息，重试或移除失败的附件后再发送",
+      "steerUnavailable": {
+        "attachment": "暂无法引导：带附件的消息只支持下一轮发送。消息仍在排队。",
+        "deliveryInProgress": "暂无法引导：另一条排队消息正在投递，请等待其完成。",
+        "steeringInProgress": "暂无法引导：这条消息正在应用到当前任务。",
+        "gatewayUnsupported": "暂无法引导：当前网关不支持同轮引导。消息仍在排队。",
+        "ensemble": "暂无法引导：模型集成任务只支持下一轮跟进。消息仍在排队。",
+        "taskType": "暂无法引导：此类任务只支持下一轮跟进。消息仍在排队。",
+        "queueOnly": "暂无法引导：当前任务只支持下一轮跟进。消息仍在排队。",
+        "noActiveTurn": "暂无法引导：当前没有可引导的活动任务。消息仍在排队。",
+        "turnClosing": "暂无法引导：当前任务正在结束。消息仍在排队。",
+        "capabilityPending": "暂无法引导：当前任务的引导能力尚未同步。消息仍在排队。",
+        "taskMismatch": "暂无法引导：活动任务标识尚未同步。消息仍在排队。",
+        "textUnsupported": "暂无法引导：当前任务不接受文本引导。消息仍在排队。",
+        "generic": "当前任务暂不支持同轮引导。消息仍在排队。"
+      },
       "clearQueue": "清空队列",
       "removeMessage": "移除待发送消息 {index}"
     },

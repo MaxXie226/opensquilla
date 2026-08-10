@@ -3597,6 +3597,21 @@
       "editWhileStreaming": "Espera a que termine la respuesta actual antes de editar",
       "attachmentNeedsAttention": "Revisar adjunto",
       "fixAttachmentBeforeSteer": "Edita este mensaje y vuelve a intentar o elimina el adjunto fallido antes de enviarlo",
+      "steerUnavailable": {
+        "attachment": "Redirección no disponible: los mensajes con archivos adjuntos solo pueden enviarse como mensajes de seguimiento. El mensaje permanece en cola.",
+        "deliveryInProgress": "Redirección no disponible: se está entregando otro mensaje en cola. Espera a que termine.",
+        "steeringInProgress": "Redirección no disponible: este mensaje ya se está aplicando al turno actual.",
+        "gatewayUnsupported": "Redirección no disponible: esta puerta de enlace no admite redirección en el mismo turno. El mensaje permanece en cola.",
+        "ensemble": "Redirección no disponible: las ejecuciones de conjunto solo aceptan mensajes de seguimiento. El mensaje permanece en cola.",
+        "taskType": "Redirección no disponible: este tipo de tarea solo acepta mensajes de seguimiento. El mensaje permanece en cola.",
+        "queueOnly": "Redirección no disponible: la tarea actual solo acepta mensajes de seguimiento. El mensaje permanece en cola.",
+        "noActiveTurn": "Redirección no disponible: no hay un turno activo que redirigir. El mensaje permanece en cola.",
+        "turnClosing": "Redirección no disponible: el turno actual está finalizando. El mensaje permanece en cola.",
+        "capabilityPending": "Redirección no disponible: la capacidad de redirección de la tarea actual aún no se ha sincronizado. El mensaje permanece en cola.",
+        "taskMismatch": "Redirección no disponible: la identidad de la tarea activa aún no se ha sincronizado. El mensaje permanece en cola.",
+        "textUnsupported": "Redirección no disponible: la tarea actual no acepta indicaciones de texto. El mensaje permanece en cola.",
+        "generic": "La redirección no está disponible para la tarea actual. El mensaje permanece en cola."
+      },
       "clearQueue": "Vaciar cola",
       "removeMessage": "Quitar el mensaje pendiente {index}"
     },

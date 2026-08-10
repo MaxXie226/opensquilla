@@ -3650,6 +3650,21 @@
       "editWhileStreaming": "Wait for the current reply to finish before editing",
       "attachmentNeedsAttention": "Needs attention",
       "fixAttachmentBeforeSteer": "Edit this message and retry or remove the failed attachment before sending",
+      "steerUnavailable": {
+        "attachment": "Steer unavailable: messages with attachments can only be sent as follow-up messages. The message remains queued.",
+        "deliveryInProgress": "Steer unavailable: another queued message is being delivered. Wait for it to finish.",
+        "steeringInProgress": "Steer unavailable: this message is already being applied to the current turn.",
+        "gatewayUnsupported": "Steer unavailable: this gateway does not support same-turn steering. The message remains queued.",
+        "ensemble": "Steer unavailable: ensemble runs only accept follow-up messages. The message remains queued.",
+        "taskType": "Steer unavailable: this task type only accepts follow-up messages. The message remains queued.",
+        "queueOnly": "Steer unavailable: the current task only accepts follow-up messages. The message remains queued.",
+        "noActiveTurn": "Steer unavailable: there is no active turn to steer. The message remains queued.",
+        "turnClosing": "Steer unavailable: the current turn is finishing. The message remains queued.",
+        "capabilityPending": "Steer unavailable: the current task's steering capability has not synchronized yet. The message remains queued.",
+        "taskMismatch": "Steer unavailable: the active task identity has not synchronized yet. The message remains queued.",
+        "textUnsupported": "Steer unavailable: the current task does not accept text guidance. The message remains queued.",
+        "generic": "Steer unavailable for the current task. The message remains queued."
+      },
       "clearQueue": "Clear queue",
       "removeMessage": "Remove pending message {index}"
     },

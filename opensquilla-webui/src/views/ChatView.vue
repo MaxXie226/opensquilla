@@ -526,6 +526,7 @@
       :max-pending="maxPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
       :steer-available="sameTurnSteerAvailable"
+      :steer-unavailable-message="sameTurnSteerUnavailableMessage"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
@@ -819,6 +820,7 @@ import type {
   ChatRunStatus,
   ChatRunStatusSource,
   ChatRunStatusState,
+  ChatSteerCapability,
   ChatStreamTimelineItem,
   ChatToolCall,
   DisplayAttachment,
@@ -834,6 +836,10 @@ import {
   validatedForkChildKey,
   type ForkRpcResponse,
 } from '@/utils/chat/forkTransition'
+import {
+  steerUnavailableReason,
+  type SteerUnavailableReason,
+} from '@/utils/chat/steerAvailability'
 import type {
   ArtifactPayload,
   MetaDraftDiscardResponse,
@@ -2289,13 +2295,15 @@ const {
 } = chatComposerShortcuts
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
+const activeSteerCapability = computed<ChatSteerCapability | null>(() => {
+  const task = runStatus.value.task
+  return task?.steer_capability || task?.steerCapability || null
+})
+
 const chatSend = useChatSend({
   rpc,
   supportsMethod: method => rpc.supportsMethod(method),
-  activeSteerCapability: computed(() => {
-    const task = runStatus.value.task
-    return task?.steer_capability || task?.steerCapability || null
-  }),
+  activeSteerCapability,
   inputText,
   messages,
   sessionKey,
@@ -2517,6 +2525,44 @@ const sameTurnSteerAvailable = computed(() => (
   isStreaming.value
   && chatSend.supportsSameTurnSteer()
 ))
+
+function steerUnavailableReasonMessage(reason: SteerUnavailableReason): string {
+  switch (reason) {
+    case 'gatewayUnsupported':
+      return t('chat.pending.steerUnavailable.gatewayUnsupported')
+    case 'ensemble':
+      return t('chat.pending.steerUnavailable.ensemble')
+    case 'taskType':
+      return t('chat.pending.steerUnavailable.taskType')
+    case 'queueOnly':
+      return t('chat.pending.steerUnavailable.queueOnly')
+    case 'noActiveTurn':
+      return t('chat.pending.steerUnavailable.noActiveTurn')
+    case 'turnClosing':
+      return t('chat.pending.steerUnavailable.turnClosing')
+    case 'capabilityPending':
+      return t('chat.pending.steerUnavailable.capabilityPending')
+    case 'taskMismatch':
+      return t('chat.pending.steerUnavailable.taskMismatch')
+    case 'textUnsupported':
+      return t('chat.pending.steerUnavailable.textUnsupported')
+    default:
+      return t('chat.pending.steerUnavailable.generic')
+  }
+}
+
+const sameTurnSteerUnavailableMessage = computed(() => {
+  if (sameTurnSteerAvailable.value) return ''
+  const reason = steerUnavailableReason({
+    isStreaming: isStreaming.value,
+    methodAvailable: rpc.supportsMethod('sessions.steer.v2'),
+    modelRoutingMode: modelRoutingMode.value,
+    capability: activeSteerCapability.value,
+    activeTaskId: activeStreamTaskId.value,
+  })
+  return reason ? steerUnavailableReasonMessage(reason) : ''
+})
+
 const composerSameTurnSteerAvailable = computed(() => (
   sameTurnSteerAvailable.value
   && pendingAttachments.value.length === 0
