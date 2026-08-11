@@ -1300,6 +1300,136 @@ async def test_custom_provider_blocks_oversized_final_envelope_before_chat(
 
 
 @pytest.mark.asyncio
+async def test_goal_terminal_custom_provider_admission_failure_synthesizes_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A durable Goal terminal result must not regress to an Agent error.
+
+    The final summary call hides tools, so a prior projected tool result must be
+    restored before request admission.  If that expanded request cannot fit a
+    custom provider's conservative envelope, finish from the durable Goal state
+    without calling the provider again.
+    """
+
+    monkeypatch.setattr(
+        agent_mod,
+        "reduce_tool_result_with_tokenjuice",
+        lambda **kwargs: SimpleNamespace(
+            inline_text="[tokenjuice]\nshort summary",
+            raw_chars=len(kwargs["content"]),
+            reduced_chars=26,
+            ratio=0.001,
+            reducer="generic/fallback",
+        ),
+        raising=False,
+    )
+    raw = "goal diagnostic output\n" + ("x" * 8_000)
+    large_system = "goal system contract\n" + ("s" * 35_000)
+
+    class _GoalTerminalProvider:
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def chat(self, messages, tools=None, config=None):
+            self.calls.append({"messages": messages, "tools": tools})
+            call_number = len(self.calls)
+            if call_number > 2:  # pragma: no cover - admission must stop this call
+                raise AssertionError("terminal summary provider call must be skipped")
+            return self._stream(call_number)
+
+        async def _stream(self, call_number: int):
+            if call_number == 1:
+                tool_use_id = "tool-diagnostic"
+                tool_name = "exec_command"
+                arguments = {"command": "pytest -q"}
+            else:
+                tool_use_id = "tool-goal-complete"
+                tool_name = "update_goal"
+                arguments = {"status": "complete"}
+            yield ProviderToolUseStartEvent(
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+            )
+            yield ProviderToolUseEndEvent(
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+            yield ProviderDoneEvent(
+                stop_reason="tool_use",
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    async def handler(tool_call: ToolCall) -> ToolResult:
+        if tool_call.tool_name == "exec_command":
+            content = raw
+        elif tool_call.tool_name == "update_goal":
+            content = json.dumps(
+                {"status": "accepted", "goal": {"status": "complete"}}
+            )
+        else:  # pragma: no cover - only declared tools above are callable
+            raise AssertionError(f"unexpected tool call: {tool_call.tool_name}")
+        return ToolResult(
+            tool_use_id=tool_call.tool_use_id,
+            tool_name=tool_call.tool_name,
+            content=content,
+        )
+
+    _declare_available_tools(
+        handler,
+        "exec_command",
+        "update_goal",
+        "retrieve_tool_result",
+    )
+    provider = _GoalTerminalProvider()
+    agent = Agent(
+        provider=provider,
+        config=_recoverable_config(
+            tmp_path,
+            system_prompt=large_system,
+            context_window_tokens=100_000,
+            provider_request_proof_max_chars=20_000,
+            max_iterations=3,
+        ),
+        tool_definitions=[
+            _tool_def("exec_command"),
+            _tool_def("update_goal"),
+            _tool_def("retrieve_tool_result"),
+        ],
+        tool_handler=handler,
+        tool_context=ToolContext(
+            is_owner=True,
+            session_key="agent:main:session-1",
+            goal_context={"goalId": "goal-1"},
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id="session-1",
+        ),
+        session_key="agent:main:session-1",
+    )
+
+    events = [event async for event in agent.run_turn("finish the goal")]
+
+    assert len(provider.calls) == 2
+    assert all(
+        any(tool.name == "retrieve_tool_result" for tool in call["tools"])
+        for call in provider.calls
+    )
+    assert not any(event.kind == "error" for event in events)
+    assert "The Goal is complete." in "".join(
+        event.text for event in events if event.kind == "text_delta"
+    )
+    done = next(event for event in events if event.kind == "done")
+    assert done.text == "The Goal is complete."
+
+
+@pytest.mark.asyncio
 async def test_custom_provider_gate_counts_tool_schema_in_full_envelope(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
