@@ -13,7 +13,6 @@ type HeaderInstance = ComponentPublicInstance & {
 
 const BASE_PROPS = {
   title: 'Responsive header test',
-  sessionKey: 'session-test-123',
   copyState: null,
   copyIcon: 'copy' as const,
   copyLiveText: '',
@@ -138,6 +137,21 @@ afterEach(() => {
 })
 
 describe('ChatHeaderActions', () => {
+  it('keeps the copy control in the title group and exposes the full title as its tooltip', async () => {
+    const fullTitle = 'A complete session title that may be visually truncated'
+    const { el } = await mountHeader(800, { title: fullTitle })
+    const identity = el.querySelector<HTMLElement>('.chat-header__identity')!
+    const title = identity.querySelector<HTMLHeadingElement>('.chat-header__title')!
+    const copy = identity.querySelector<HTMLButtonElement>('.chat-header__copy')!
+    const spacer = el.querySelector<HTMLElement>('.chat-header__spacer')!
+
+    expect(title.textContent).toBe(fullTitle)
+    expect(title.title).toBe(fullTitle)
+    expect(title.nextElementSibling).toBe(copy)
+    expect(identity.nextElementSibling).toBe(spacer)
+    expect(spacer.nextElementSibling?.classList.contains('chat-header__actions')).toBe(true)
+  })
+
   it.each([
     { name: 'wide', width: 800 },
     { name: 'compact', width: 400 },

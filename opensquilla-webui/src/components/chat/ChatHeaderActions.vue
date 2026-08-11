@@ -6,7 +6,7 @@
     data-testid="chat-header-actions"
   >
     <div class="chat-header__identity">
-      <h1 class="chat-header__title chat-label" :title="sessionKey">{{ title }}</h1>
+      <h1 class="chat-header__title chat-label" :title="title">{{ title }}</h1>
       <button
         v-if="layout === 'wide'"
         ref="wideCopyRef"
@@ -21,6 +21,8 @@
       </button>
       <span class="chat-header__copy-live" aria-live="polite">{{ copyLiveText }}</span>
     </div>
+
+    <span class="chat-header__spacer" aria-hidden="true"></span>
 
     <div v-if="layout === 'wide'" class="chat-header__actions">
       <button
@@ -152,7 +154,6 @@ type Action = 'deliverables' | 'share' | 'copy-session-key'
 
 const props = defineProps<{
   title: string
-  sessionKey: string
   copyState: string | null
   copyIcon: IconName
   copyLiveText: string
@@ -369,14 +370,14 @@ defineExpose({ focusAction, closeMenu })
 .chat-header__identity {
   align-items: center;
   display: flex;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   gap: var(--sp-1);
   min-width: 0;
 }
 
 .chat-header__title {
   color: var(--text);
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   font-size: 0.9375rem;
   font-weight: 500;
   line-height: 1.3;
@@ -385,6 +386,11 @@ defineExpose({ focusAction, closeMenu })
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.chat-header__spacer {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .chat-header__copy {
@@ -541,10 +547,6 @@ defineExpose({ focusAction, closeMenu })
   color: var(--text-muted);
   font-size: var(--fs-xs);
   margin-top: 2px;
-}
-
-.chat-header[data-layout='tight'] .chat-header__identity {
-  flex-basis: 0;
 }
 
 @media (max-width: 768px) {
