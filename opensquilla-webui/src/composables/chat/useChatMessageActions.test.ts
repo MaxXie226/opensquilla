@@ -251,7 +251,7 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     expect(copyTextWithFallback).toHaveBeenCalledWith('Keep my words unchanged.')
   })
 
-  it('copies timeline markers only when they are not assistant boundaries', async () => {
+  it('copies the canonical projection without assistant boundary markers', async () => {
     const { sanitizeCopyText } = useChatTextRendering()
     const { api } = makeOptions([], sanitizeCopyText)
 
@@ -269,7 +269,7 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
       ],
     }))
 
-    expect(copyTextWithFallback).toHaveBeenCalledWith('Before\n\nNO_REPLY\n\nAfter')
+    expect(copyTextWithFallback).toHaveBeenCalledWith('BeforeNO_REPLYAfter')
   })
 
   it('preserves a mixed sentinel-looking boundary when copying a direct-user answer', async () => {

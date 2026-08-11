@@ -78,7 +78,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     // its exact paragraph spacing instead of rebuilding it from timeline
     // chunks, which can insert separators that are not visible on screen.
     if (answer.source === 'canonical') {
-      return options.sanitizeCopyText(answer.text)
+      return options.sanitizeCopyText(answer.text, { provenance })
     }
     // The raw message text can be absent in older history, so rebuild only
     // that source-less compatibility case from the available segments while
