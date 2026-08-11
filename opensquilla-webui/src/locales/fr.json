@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Réduction de la barre latérale annulée",
     "openBlockedSession": "Ouvrir la session bloquée",
     "approvalRequired": "Approbation requise",
+    "approvalRequiredCount": "Approbations requises : {count}",
+    "systemStatus": "État du système",
+    "systemStatusSummary": "État du système : {state} ; {count} alertes",
     "manageConnection": "Gérer la connexion à la passerelle",
     "connectionTitle": "Connexion : {state} — gérer dans les Paramètres",
     "connectionState": {

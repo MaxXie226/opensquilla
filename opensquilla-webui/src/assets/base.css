@@ -1874,7 +1874,7 @@ pre {
     width: 44px;
   }
 
-  .topbar--chat .topbar-right--attention .conn-pill,
+  .topbar--chat .topbar-right--attention > .conn-pill,
   .topbar--chat .topbar-right--attention .bgm-menu-wrap,
   .topbar--chat .topbar-right--attention .lang-menu-wrap,
   .topbar--chat .topbar-right--attention > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {

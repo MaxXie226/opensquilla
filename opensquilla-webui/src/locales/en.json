@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Sidebar collapse canceled",
     "openBlockedSession": "Open the blocked session",
     "approvalRequired": "Approval required",
+    "approvalRequiredCount": "Approval required: {count}",
+    "systemStatus": "System status",
+    "systemStatusSummary": "System status: {state}; {count} notices",
     "manageConnection": "Manage gateway connection",
     "connectionTitle": "Connection: {state} — manage in Settings",
     "connectionState": {

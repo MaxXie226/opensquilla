@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Se canceló la contracción de la barra lateral",
     "openBlockedSession": "Abrir la sesión bloqueada",
     "approvalRequired": "Aprobación requerida",
+    "approvalRequiredCount": "Aprobaciones requeridas: {count}",
+    "systemStatus": "Estado del sistema",
+    "systemStatusSummary": "Estado del sistema: {state}; {count} avisos",
     "manageConnection": "Gestionar conexión de la puerta de enlace",
     "connectionTitle": "Conexión: {state} — gestionar en Ajustes",
     "connectionState": {

@@ -211,8 +211,15 @@ test.describe('Responsive chat header actions', () => {
     }))
     await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(`${SESSION_KEY}-approval`)}`)
 
-    await expect(page.locator('.approval-inline')).toBeVisible({ timeout: 10000 })
-    await expect(page.locator('.conn-pill')).toBeHidden()
+    const systemStatus = page.getByTestId('chat-system-status')
+    await expect(systemStatus).toBeVisible({ timeout: 10000 })
+    await expect(systemStatus).toHaveAttribute('data-layout', 'tight')
+    const systemTrigger = page.getByTestId('chat-system-status-trigger')
+    await expect(systemTrigger).toBeVisible()
+    await expect(systemTrigger).toHaveClass(/conn-pill/)
+    await systemTrigger.click()
+    await expect(page.getByTestId('chat-system-approval')).toBeVisible()
+    await expect(page.getByTestId('chat-system-connection')).toBeVisible()
     await expect(page.getByTestId('bgm-toggle')).toBeHidden()
     await expect(page.getByTestId('chat-session-actions-trigger')).toBeVisible()
     await expectGeometryIsUsable(

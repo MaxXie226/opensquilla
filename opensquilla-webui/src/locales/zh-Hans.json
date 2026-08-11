@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "已取消收起侧边栏",
     "openBlockedSession": "打开被阻塞的会话",
     "approvalRequired": "需要审批",
+    "approvalRequiredCount": "需要审批：{count}",
+    "systemStatus": "系统状态",
+    "systemStatusSummary": "系统状态：{state}；{count} 项提醒",
     "manageConnection": "管理网关连接",
     "connectionTitle": "连接：{state} — 在设置中管理",
     "connectionState": {

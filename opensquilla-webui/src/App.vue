@@ -168,7 +168,7 @@
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
-    <header class="topbar" :class="{ 'topbar--chat': isChatRoute }">
+    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
         <button
@@ -201,25 +201,38 @@
         class="topbar-right"
         :class="{ 'topbar-right--attention': appStore.approvalCount > 0 }"
       >
-        <button
-          v-if="appStore.approvalCount > 0"
-          class="approval-inline"
-          @click="openBlockedApprovalSession"
-          :title="t('chrome.openBlockedSession')"
-        >
-          {{ t('chrome.approvalRequired') }}
-        </button>
-        <button
-          v-if="webConfigEnabled"
-          type="button"
-          class="conn-pill conn-pill--link"
-          :class="rpcStore.state"
-          :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
-          :aria-label="t('chrome.manageConnection')"
-          @click="openConnectionSettings"
-        >{{ connectionStateLabel }}</button>
-        <span v-else class="conn-pill" :class="rpcStore.state">{{ connectionStateLabel }}</span>
-        <DesktopUpdateIndicator />
+        <ChatSystemStatus
+          v-if="isChatRoute"
+          :layout="systemHeaderLayout"
+          :connection-state="rpcStore.state"
+          :connection-label="connectionStateLabel"
+          :approval-count="appStore.approvalCount"
+          :can-manage-connection="webConfigEnabled"
+          @open-connection="openConnectionSettings"
+          @open-approval="openBlockedApprovalSession"
+          @open-update="openDesktopRuntimeSettings"
+        />
+        <template v-else>
+          <button
+            v-if="appStore.approvalCount > 0"
+            class="approval-inline"
+            @click="openBlockedApprovalSession"
+            :title="t('chrome.openBlockedSession')"
+          >
+            {{ t('chrome.approvalRequired') }}
+          </button>
+          <button
+            v-if="webConfigEnabled"
+            type="button"
+            class="conn-pill conn-pill--link"
+            :class="rpcStore.state"
+            :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
+            :aria-label="t('chrome.manageConnection')"
+            @click="openConnectionSettings"
+          >{{ connectionStateLabel }}</button>
+          <span v-else class="conn-pill" :class="rpcStore.state">{{ connectionStateLabel }}</span>
+          <DesktopUpdateIndicator />
+        </template>
         <!-- Opt-in (Settings → Appearance or the command palette); off by
              default so the topbar stays music-free until asked for. -->
         <BgmControl v-if="bgmEnabled" />
@@ -420,6 +433,7 @@ import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.
 import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
+import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
@@ -429,7 +443,9 @@ import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import { useBgm } from './composables/useBgm'
+import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
+import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
 import { useDialogLayer } from './composables/useDialogA11y'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
@@ -477,6 +493,7 @@ const $route = useRoute()
 const sidebarRef = ref<HTMLElement | null>(null)
 const sidebarDockToggleRef = ref<HTMLButtonElement | null>(null)
 const topbarSidebarToggleRef = ref<HTMLButtonElement | null>(null)
+const topbarRef = ref<HTMLElement | null>(null)
 type SidebarResizerHandle = { cancel: () => boolean }
 const sidebarResizerRef = ref<SidebarResizerHandle | null>(null)
 
@@ -561,6 +578,7 @@ watch(
 // Feature-gated topbar music control; the singleton `enabled` ref is written by
 // Settings → Appearance and the command palette.
 const { enabled: bgmEnabled } = useBgm()
+const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
 interface AppCronRunFinishedPayload {
@@ -728,6 +746,17 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
 
 // Chat layout applies to both the session view and the draft route.
 const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const systemHeaderPressureCount = computed(() => (
+  Number(rpcStore.state !== 'connected')
+  + Number(appStore.approvalCount > 0)
+  + Number(desktopUpdate.visible.value)
+  + Number(bgmEnabled.value)
+))
+const systemHeaderLayout = useSystemHeaderLayout({
+  target: topbarRef,
+  active: isChatRoute,
+  pressureCount: systemHeaderPressureCount,
+})
 const activeProjectDraftId = computed(() =>
   $route.path === '/chat/new' ? String($route.query.project || '') : '',
 )
@@ -1535,6 +1564,12 @@ function openSettings() {
 // gateway link can be inspected or re-pointed.
 function openConnectionSettings() {
   router.push('/settings/connection')
+}
+
+// Compact chat headers hand off to the complete Desktop update workflow rather
+// than recreating update actions inside the status summary.
+function openDesktopRuntimeSettings() {
+  router.push('/settings/runtime')
 }
 
 function scheduleSessionRefresh() {
