@@ -35,6 +35,19 @@ const messages = {
 
 const mounted: Array<{ app: App; el: HTMLElement }> = []
 let headerWidth = 800
+let coarsePointer = false
+let animationFrameId = 0
+const animationFrames = new Map<number, FrameRequestCallback>()
+const coarsePointerListeners = new Set<EventListenerOrEventListenerObject>()
+
+interface ResizeObserverFixture {
+  callback: ResizeObserverCallback
+  disconnect: ReturnType<typeof vi.fn>
+  observe: ReturnType<typeof vi.fn>
+  unobserve: ReturnType<typeof vi.fn>
+}
+
+const resizeObservers: ResizeObserverFixture[] = []
 
 function rect(width: number, height = 48): DOMRect {
   return {
@@ -53,6 +66,32 @@ function rect(width: number, height = 48): DOMRect {
 async function flush() {
   await nextTick()
   await nextTick()
+}
+
+async function flushAnimationFrame() {
+  const callbacks = Array.from(animationFrames.values())
+  animationFrames.clear()
+  callbacks.forEach(callback => callback(0))
+  await flush()
+}
+
+function resizeHeader(width: number, observer = resizeObservers[resizeObservers.length - 1]!) {
+  headerWidth = width
+  observer.callback([], observer as unknown as ResizeObserver)
+}
+
+function setViewportWidth(width: number) {
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: width })
+  window.dispatchEvent(new Event('resize'))
+}
+
+function setCoarsePointer(matches: boolean) {
+  coarsePointer = matches
+  const event = { matches, media: '(pointer: coarse)' } as MediaQueryListEvent
+  for (const listener of coarsePointerListeners) {
+    if (typeof listener === 'function') listener(event)
+    else listener.handleEvent(event)
+  }
 }
 
 async function mountHeader(
@@ -81,8 +120,9 @@ async function mountHeader(
   }))
   const instance = app.mount(el) as HeaderInstance
   mounted.push({ app, el })
+  const observer = resizeObservers[resizeObservers.length - 1]!
   await flush()
-  return { el, handlers, instance }
+  return { app, el, handlers, instance, observer }
 }
 
 function trigger(el: HTMLElement): HTMLButtonElement {
@@ -110,6 +150,11 @@ function renderedActions(el: HTMLElement): string[] {
 beforeEach(() => {
   document.body.innerHTML = ''
   headerWidth = 800
+  coarsePointer = false
+  animationFrameId = 0
+  animationFrames.clear()
+  coarsePointerListeners.clear()
+  resizeObservers.length = 0
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200 })
 
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
@@ -119,10 +164,40 @@ beforeEach(() => {
     const bounds = this.getBoundingClientRect()
     return [bounds] as unknown as DOMRectList
   })
-  vi.stubGlobal('ResizeObserver', class {
-    observe() {}
-    unobserve() {}
-    disconnect() {}
+  vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+    const id = ++animationFrameId
+    animationFrames.set(id, callback)
+    return id
+  }))
+  vi.stubGlobal('cancelAnimationFrame', vi.fn((id: number) => {
+    animationFrames.delete(id)
+  }))
+  vi.stubGlobal('matchMedia', vi.fn((query: string) => ({
+    get matches() {
+      return query === '(pointer: coarse)' && coarsePointer
+    },
+    media: query,
+    onchange: null,
+    addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      coarsePointerListeners.add(listener)
+    },
+    removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      coarsePointerListeners.delete(listener)
+    },
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => true,
+  } as MediaQueryList)))
+  vi.stubGlobal('ResizeObserver', class implements ResizeObserverFixture {
+    callback: ResizeObserverCallback
+    disconnect = vi.fn()
+    observe = vi.fn()
+    unobserve = vi.fn()
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback
+      resizeObservers.push(this)
+    }
   })
 })
 
@@ -150,6 +225,139 @@ describe('ChatHeaderActions', () => {
     expect(title.nextElementSibling).toBe(copy)
     expect(identity.nextElementSibling).toBe(spacer)
     expect(spacer.nextElementSibling?.classList.contains('chat-header__actions')).toBe(true)
+  })
+
+  it.each([
+    { width: 143, expected: 'tight' },
+    { width: 184, expected: 'compact' },
+    { width: 216, expected: 'compact' },
+    { width: 544, expected: 'compact' },
+    { width: 576, expected: 'wide' },
+  ])('classifies an initial $width px host as $expected without waiting for a frame', async ({
+    width,
+    expected,
+  }) => {
+    const { el } = await mountHeader(width)
+
+    expect(el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')?.dataset.layout)
+      .toBe(expected)
+    expect(requestAnimationFrame).not.toHaveBeenCalled()
+  })
+
+  it('applies both hysteresis bands at their exact transition boundaries', async () => {
+    const { el, observer } = await mountHeader(800)
+    const header = el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')!
+
+    for (const [width, expected] of [
+      [544, 'wide'],
+      [543, 'compact'],
+      [184, 'compact'],
+      [183, 'tight'],
+      [215, 'tight'],
+      [216, 'compact'],
+      [575, 'compact'],
+      [576, 'wide'],
+    ] as const) {
+      resizeHeader(width, observer)
+      await flushAnimationFrame()
+      expect(header.dataset.layout, `${width}px`).toBe(expected)
+    }
+  })
+
+  it('coalesces repeated ResizeObserver notifications into one animation frame', async () => {
+    const { el, observer } = await mountHeader(800)
+    const header = el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')!
+
+    resizeHeader(700, observer)
+    resizeHeader(600, observer)
+    resizeHeader(500, observer)
+
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1)
+    expect(header.dataset.layout).toBe('wide')
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('compact')
+  })
+
+  it('caps wide on mobile and coarse pointers while still allowing tight', async () => {
+    const { el, observer } = await mountHeader(800)
+    const header = el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')!
+
+    setViewportWidth(768)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('compact')
+
+    setViewportWidth(1200)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('wide')
+
+    setCoarsePointer(true)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('compact')
+
+    resizeHeader(143, observer)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('tight')
+
+    resizeHeader(800, observer)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('compact')
+
+    setCoarsePointer(false)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('wide')
+  })
+
+  it('keeps focus reachable and closes the menu across wide, compact, tight, and wide', async () => {
+    const { el, observer } = await mountHeader(800)
+    const header = el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')!
+    const wideCopy = el.querySelector<HTMLButtonElement>('.chat-header__copy')!
+    wideCopy.focus()
+
+    resizeHeader(543, observer)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('compact')
+    expect(document.activeElement).toBe(trigger(el))
+
+    await openMenu(el)
+    const menuCopy = el.querySelector<HTMLButtonElement>('[data-testid="chat-session-action-copy"]')!
+    menuCopy.focus()
+
+    resizeHeader(183, observer)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('tight')
+    expect(el.querySelector('[role="menu"]')).toBeNull()
+    expect(document.activeElement).toBe(trigger(el))
+
+    resizeHeader(576, observer)
+    await flushAnimationFrame()
+    expect(header.dataset.layout).toBe('wide')
+    expect(document.activeElement).toBe(
+      el.querySelector<HTMLButtonElement>('[data-testid="chat-session-action-deliverables"]'),
+    )
+  })
+
+  it('disconnects observers, media listeners, and a pending frame on unmount', async () => {
+    const { app, el, observer } = await mountHeader(800)
+    expect(observer.observe).toHaveBeenCalledWith(
+      el.querySelector('[data-testid="chat-header-actions"]'),
+    )
+    expect(coarsePointerListeners.size).toBe(1)
+
+    resizeHeader(500, observer)
+    expect(animationFrames.size).toBe(1)
+    mounted.pop()
+    app.unmount()
+    el.remove()
+
+    expect(observer.disconnect).toHaveBeenCalledTimes(1)
+    expect(cancelAnimationFrame).toHaveBeenCalledTimes(1)
+    expect(animationFrames.size).toBe(0)
+    expect(coarsePointerListeners.size).toBe(0)
+
+    const scheduledFrames = vi.mocked(requestAnimationFrame).mock.calls.length
+    setViewportWidth(700)
+    setCoarsePointer(true)
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(scheduledFrames)
   })
 
   it.each([

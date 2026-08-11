@@ -147,10 +147,15 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import {
+  resolveSessionHeaderLayout,
+  type SessionHeaderLayout,
+} from '@/utils/headerLayout'
 import type { IconName } from '@/utils/icons'
 
-type Layout = 'wide' | 'compact' | 'tight'
 type Action = 'deliverables' | 'share' | 'copy-session-key'
+
+const COARSE_POINTER_QUERY = '(pointer: coarse)'
 
 const props = defineProps<{
   title: string
@@ -177,10 +182,13 @@ const primaryActionRef = ref<HTMLButtonElement | null>(null)
 const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
 const wideShareRef = ref<HTMLButtonElement | null>(null)
 const wideCopyRef = ref<HTMLButtonElement | null>(null)
-const layout = ref<Layout>('wide')
+const layout = ref<SessionHeaderLayout>('wide')
 const menuOpen = ref(false)
 useDialogLayer(computed(() => menuOpen.value))
 let resizeObserver: ResizeObserver | null = null
+let coarsePointerMedia: MediaQueryList | null = null
+let layoutFrame: number | null = null
+let hasMeasuredLayout = false
 
 const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey'))
 const deliverablesLabel = computed(() => t('chat.deliverablesCount', { count: props.deliverableCount }))
@@ -214,28 +222,62 @@ function isVisible(element: HTMLElement | null): element is HTMLElement {
   return Boolean(element && element.getClientRects().length > 0)
 }
 
+function actionForElement(element: Element | null): Action | null {
+  if (element === wideDeliverablesRef.value) return 'deliverables'
+  if (element === wideShareRef.value) return 'share'
+  if (element === wideCopyRef.value) return 'copy-session-key'
+  if (element === primaryActionRef.value) return primaryAction.value
+  if (!(element instanceof HTMLElement)) return null
+  const testId = element.dataset.testid
+  if (testId === 'chat-session-action-deliverables') return 'deliverables'
+  if (testId === 'chat-session-action-share') return 'share'
+  if (testId === 'chat-session-action-copy') return 'copy-session-key'
+  return null
+}
+
+function focusWideFallback() {
+  const fallback = wideDeliverablesRef.value
+    || wideShareRef.value
+    || wideCopyRef.value
+  fallback?.focus()
+}
+
 function syncLayout() {
   const width = rootRef.value?.getBoundingClientRect().width ?? 0
-  const next: Layout = width < 144
-    ? 'tight'
-    : (window.innerWidth <= 768 || width < 560 ? 'compact' : 'wide')
+  const next = resolveSessionHeaderLayout({
+    availableWidth: width,
+    previousLayout: hasMeasuredLayout ? layout.value : null,
+    mobile: window.innerWidth <= 768,
+    coarseOnly: coarsePointerMedia?.matches ?? false,
+  })
+  hasMeasuredLayout = true
   if (next === layout.value) return
-  const restoreFocus = menuOpen.value
-    && menuRef.value?.contains(document.activeElement)
+
+  const activeElement = document.activeElement
+  const focusedAction = actionForElement(activeElement)
+  const restoreHeaderFocus = Boolean(
+    activeElement instanceof Node && rootRef.value?.contains(activeElement),
+  )
   layout.value = next
   menuOpen.value = false
-  if (restoreFocus) {
+  if (restoreHeaderFocus) {
     void nextTick(() => {
+      if (focusedAction && focusAction(focusedAction)) return
       if (next !== 'wide') {
         menuTriggerRef.value?.focus()
         return
       }
-      const fallback = wideDeliverablesRef.value
-        || wideShareRef.value
-        || wideCopyRef.value
-      fallback?.focus()
+      focusWideFallback()
     })
   }
+}
+
+function scheduleLayout() {
+  if (layoutFrame != null) return
+  layoutFrame = window.requestAnimationFrame(() => {
+    layoutFrame = null
+    syncLayout()
+  })
 }
 
 function menuItems(): HTMLButtonElement[] {
@@ -340,18 +382,28 @@ watch(() => [
 })
 
 onMounted(() => {
+  coarsePointerMedia = typeof window.matchMedia === 'function'
+    ? window.matchMedia(COARSE_POINTER_QUERY)
+    : null
+  coarsePointerMedia?.addEventListener('change', scheduleLayout)
   syncLayout()
   if (typeof ResizeObserver !== 'undefined' && rootRef.value) {
-    resizeObserver = new ResizeObserver(syncLayout)
+    resizeObserver = new ResizeObserver(scheduleLayout)
     resizeObserver.observe(rootRef.value)
   }
-  window.addEventListener('resize', syncLayout)
+  window.addEventListener('resize', scheduleLayout)
 })
 
 onUnmounted(() => {
   resizeObserver?.disconnect()
   resizeObserver = null
-  window.removeEventListener('resize', syncLayout)
+  coarsePointerMedia?.removeEventListener('change', scheduleLayout)
+  coarsePointerMedia = null
+  window.removeEventListener('resize', scheduleLayout)
+  if (layoutFrame != null) {
+    window.cancelAnimationFrame(layoutFrame)
+    layoutFrame = null
+  }
 })
 
 defineExpose({ focusAction, closeMenu })
