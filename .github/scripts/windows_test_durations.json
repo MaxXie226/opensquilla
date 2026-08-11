@@ -1276,6 +1276,7 @@
     "tests/test_migrations/test_v033_goal_runs.py": 0.01,
     "tests/test_migrations/test_v034_goal_message_anchor.py": 0.01,
     "tests/test_session/test_goal_storage.py": 0.01,
-    "tests/test_session/test_goals.py": 0.01
+    "tests/test_session/test_goals.py": 0.01,
+    "tests/test_engine/test_runtime_tool_result_retrieval_surfacing.py": 0.01
   }
 }

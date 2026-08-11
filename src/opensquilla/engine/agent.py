@@ -7718,19 +7718,25 @@ class Agent:
                         )
                         and base_recovery_available
                     )
-                    call_recovery_downgraded = bool(
-                        base_recovery_available and not call_retrieval_available
-                    )
+                    call_recovery_downgraded = False
                     if not call_retrieval_available:
                         # Restore before provider-view assembly.  The physical
                         # call's admission/sanitization must see the true byte
                         # pressure; restoring after those passes can turn an
                         # admitted bounded request into an unbounded one.
-                        request_turn_messages = (
+                        restored_request_turn_messages = (
                             self._restore_tool_results_without_retrieval_schema(
                                 request_turn_messages
                             )
                         )
+                        # A tool-less/finalization call may hide retrieval even
+                        # when history contains no projected Store references.
+                        # Only the actual raw restoration expands the request and
+                        # therefore needs the custom-provider admission gate.
+                        call_recovery_downgraded = (
+                            restored_request_turn_messages is not request_turn_messages
+                        )
+                        request_turn_messages = restored_request_turn_messages
                     previous_call_retrieval = (
                         self._provider_call_tool_result_retrieval_available
                     )

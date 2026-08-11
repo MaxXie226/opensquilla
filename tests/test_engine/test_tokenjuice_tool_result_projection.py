@@ -1430,6 +1430,99 @@ async def test_goal_terminal_custom_provider_admission_failure_synthesizes_summa
 
 
 @pytest.mark.asyncio
+async def test_goal_terminal_without_projection_keeps_custom_provider_summary_call(
+    tmp_path,
+) -> None:
+    """Hiding retrieval alone must not invoke the raw-restoration admission gate."""
+
+    large_system = "goal system contract\n" + ("s" * 35_000)
+
+    class _GoalSummaryProvider:
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def chat(self, messages, tools=None, config=None):
+            self.calls.append({"messages": messages, "tools": tools})
+            return self._stream(len(self.calls))
+
+        async def _stream(self, call_number: int):
+            if call_number == 1:
+                yield ProviderToolUseStartEvent(
+                    tool_use_id="tool-goal-complete",
+                    tool_name="update_goal",
+                )
+                yield ProviderToolUseEndEvent(
+                    tool_use_id="tool-goal-complete",
+                    tool_name="update_goal",
+                    arguments={"status": "complete"},
+                )
+                yield ProviderDoneEvent(
+                    stop_reason="tool_use",
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+                return
+            if call_number == 2:
+                yield TextDeltaEvent(text="deterministic provider summary")
+                yield ProviderDoneEvent(
+                    stop_reason="stop",
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+                return
+            raise AssertionError("unexpected provider call")
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    async def handler(tool_call: ToolCall) -> ToolResult:
+        assert tool_call.tool_name == "update_goal"
+        return ToolResult(
+            tool_use_id=tool_call.tool_use_id,
+            tool_name=tool_call.tool_name,
+            content=json.dumps(
+                {"status": "accepted", "goal": {"status": "complete"}}
+            ),
+        )
+
+    _declare_available_tools(handler, "update_goal", "retrieve_tool_result")
+    provider = _GoalSummaryProvider()
+    agent = Agent(
+        provider=provider,
+        config=_recoverable_config(
+            tmp_path,
+            system_prompt=large_system,
+            context_window_tokens=100_000,
+            provider_request_proof_max_chars=20_000,
+            max_iterations=3,
+        ),
+        tool_definitions=[
+            _tool_def("update_goal"),
+            _tool_def("retrieve_tool_result"),
+        ],
+        tool_handler=handler,
+        tool_context=ToolContext(
+            is_owner=True,
+            session_key="agent:main:session-1",
+            goal_context={"goalId": "goal-1"},
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id="session-1",
+        ),
+        session_key="agent:main:session-1",
+    )
+
+    events = [event async for event in agent.run_turn("finish the goal")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["tools"] is None
+    assert not any(event.kind == "error" for event in events)
+    done = next(event for event in events if event.kind == "done")
+    assert done.text == "deterministic provider summary"
+
+
+@pytest.mark.asyncio
 async def test_custom_provider_gate_counts_tool_schema_in_full_envelope(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

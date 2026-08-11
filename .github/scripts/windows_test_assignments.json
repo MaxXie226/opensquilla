@@ -76,6 +76,7 @@
       "tests/test_engine/test_runtime_agent_max_iterations.py",
       "tests/test_engine/test_runtime_agent_max_provider_retries.py",
       "tests/test_engine/test_runtime_meta_run_writer_wiring.py",
+      "tests/test_engine/test_runtime_tool_result_retrieval_surfacing.py",
       "tests/test_engine/test_runtime_web_chat_timeout.py",
       "tests/test_engine/test_selector_fallback_routed_model.py",
       "tests/test_engine/test_slash_command_registry.py",
