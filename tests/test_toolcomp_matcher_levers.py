@@ -356,6 +356,9 @@ def test_cd_unwrap_leaves_unsafe_prefixes_untouched(monkeypatch: pytest.MonkeyPa
         "cd /tmp/x | tee log && git status",
         "cd /a; git status",
         "cd && git status",
+        'cd "$(printf /tmp)" && git status',
+        "cd `printf /tmp` && git status",
+        'pushd "$(printf /tmp)" && pytest -q',
     ]:
         assert _select(command) == "generic/fallback", command
 
@@ -428,6 +431,14 @@ def test_strip_leading_cd_prefix_rules() -> None:
     assert strip_leading_cd_prefix("cd\n/tmp/build.sh && ls") == "cd\n/tmp/build.sh && ls"
     assert strip_leading_cd_prefix("cd\xa0/a && ls") == "cd\xa0/a && ls"
     assert strip_leading_cd_prefix("cd /a\n&& ls") == "cd /a\n&& ls"
+    assert (
+        strip_leading_cd_prefix('cd "$(printf /tmp)" && git status')
+        == 'cd "$(printf /tmp)" && git status'
+    )
+    assert (
+        strip_leading_cd_prefix("cd `printf /tmp` && git status")
+        == "cd `printf /tmp` && git status"
+    )
     assert strip_leading_cd_prefix("cd /a \n && ls") == "cd /a \n && ls"
     chained = "cd /a && " * 9 + "ls"
     assert strip_leading_cd_prefix(chained) == "cd /a && ls"

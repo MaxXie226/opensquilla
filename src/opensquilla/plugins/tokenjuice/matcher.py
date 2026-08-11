@@ -25,6 +25,30 @@ _SHELL_TOOL_NAMES = frozenset({"exec_command"})
 # must use the generic fallback instead.  Quoted and escaped characters are
 # literals and do not make a command composite.
 _COMPOSITE_SHELL_CHARS = frozenset({"|", "&", ";", "<", ">", "(", ")", "\n", "\r"})
+_SHELL_REPARSE_BUILTINS = frozenset({"call", "eval", "iex", "invoke-expression"})
+_SHELL_LAUNCHER_BUILTINS = frozenset({"builtin", "command", "exec"})
+_POSIX_SHELL_EXECUTABLES = frozenset(
+    {"ash", "bash", "csh", "dash", "fish", "ksh", "mksh", "nu", "sh", "tcsh", "yash", "zsh"}
+)
+_POWERSHELL_EXECUTABLES = frozenset({"powershell", "pwsh"})
+_ENV_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-P",
+        "-a",
+        "-C",
+        "-u",
+        "--argv0",
+        "--block-signal",
+        "--chdir",
+        "--default-signal",
+        "--ignore-signal",
+        "--unset",
+    }
+)
+_ENV_OPTIONS_WITHOUT_VALUE = frozenset(
+    {"-0", "-i", "-v", "--debug", "--ignore-environment", "--null", "--verbose"}
+)
+_ENV_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 # Git global options that consume the next argv entry; subcommand extraction
 # must skip them (and their inline `--opt=value` forms) to find the verb.
@@ -35,7 +59,6 @@ _GIT_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
         "--git-dir",
         "--work-tree",
         "--namespace",
-        "--exec-path",
         "--super-prefix",
         "--config-env",
     }
@@ -47,6 +70,19 @@ _GIT_GLOBAL_OPTION_INLINE_PREFIXES = (
     "--exec-path=",
     "--super-prefix=",
     "--config-env=",
+)
+_GIT_GLOBAL_OPTIONS_WITHOUT_SUBCOMMAND = frozenset(
+    {
+        "-h",
+        "-v",
+        "--",
+        "--help",
+        "--html-path",
+        "--info-path",
+        "--man-path",
+        "--exec-path",
+        "--version",
+    }
 )
 
 # Only horizontal whitespace may separate the keyword from its argument: a
@@ -128,9 +164,10 @@ def _is_simple_shell_command(command: str) -> bool:
     if quote is not None or escaping:
         return False
     try:
-        return bool(shlex.split(command))
+        argv = shlex.split(command)
     except ValueError:
         return False
+    return bool(argv) and not _shell_dispatch_reparses(argv)
 
 
 def _generic_fallback_rule(rules: tuple[Rule, ...]) -> Rule | None:
@@ -157,6 +194,10 @@ def _contains_all(argv: list[str], needles: list[str]) -> bool:
     return all(needle in argv for needle in needles)
 
 
+def _starts_with(argv: list[str], prefix: list[str]) -> bool:
+    return bool(prefix) and argv[: len(prefix)] == prefix
+
+
 def _contains_command_text(command: str, needles: list[str]) -> bool:
     lowered = command.lower()
     return all(needle.lower() in lowered for needle in needles)
@@ -173,7 +214,175 @@ def _command_name(argv: list[str]) -> str | None:
     return os.path.basename(first)
 
 
-def _git_subcommand(argv: list[str]) -> str | None:
+def _variable_executable_token(executable: str) -> bool:
+    return executable.startswith("$") or (
+        len(executable) > 2 and executable[0] in {"%", "!"} and executable[-1] == executable[0]
+    )
+
+
+def _normalized_executable_token(raw_token: str) -> str:
+    name = raw_token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for suffix in (".exe", ".cmd", ".bat", ".com"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _matches_executable_name(executable: str, names: frozenset[str]) -> bool:
+    if executable in names:
+        return True
+    # POSIX shlex removes backslashes from an unquoted Windows drive path.
+    return ":" in executable and any(executable.endswith(name) for name in names)
+
+
+def _runner_command_index(tokens: list[str], index: int) -> int | None:
+    if index < len(tokens) and tokens[index] == "--":
+        index += 1
+    if index >= len(tokens) or tokens[index].startswith("-"):
+        return None
+    return index
+
+
+def _first_executable_index(tokens: list[str]) -> int | None:
+    index = 0
+    while index < len(tokens) and _ENV_ASSIGNMENT_PATTERN.match(tokens[index]):
+        index += 1
+    return index if index < len(tokens) else None
+
+
+def _effective_command_tokens(tokens: list[str]) -> list[str]:
+    executable_index = _first_executable_index(tokens)
+    return tokens[executable_index:] if executable_index is not None else []
+
+
+def _invoked_command_and_args(tokens: list[str]) -> tuple[str, list[str]] | None:
+    effective_tokens = _effective_command_tokens(tokens)
+    if not effective_tokens:
+        return None
+    executable = _normalized_executable_token(effective_tokens[0])
+    if re.fullmatch(r"(?:py|python(?:\d+(?:\.\d+)*)?)", executable):
+        if len(effective_tokens) > 2 and effective_tokens[1] == "-m":
+            return _normalized_executable_token(effective_tokens[2]), effective_tokens[3:]
+        return executable, effective_tokens[1:]
+    if executable in {"uv", "poetry", "pipenv"}:
+        if len(effective_tokens) > 1 and effective_tokens[1] == "run":
+            command_index = _runner_command_index(effective_tokens, 2)
+            if command_index is None:
+                return None
+            return (
+                _normalized_executable_token(effective_tokens[command_index]),
+                effective_tokens[command_index + 1 :],
+            )
+        return executable, effective_tokens[1:]
+    if executable in {"npm", "pnpm", "yarn"}:
+        if len(effective_tokens) > 1 and effective_tokens[1] in {"dlx", "exec"}:
+            command_index = _runner_command_index(effective_tokens, 2)
+            if command_index is None:
+                return None
+            return (
+                _normalized_executable_token(effective_tokens[command_index]),
+                effective_tokens[command_index + 1 :],
+            )
+        return executable, effective_tokens[1:]
+    if executable in {"bunx", "npx", "uvx"}:
+        command_index = _runner_command_index(effective_tokens, 1)
+        if command_index is None:
+            return None
+        return (
+            _normalized_executable_token(effective_tokens[command_index]),
+            effective_tokens[command_index + 1 :],
+        )
+    return executable, effective_tokens[1:]
+
+
+def _invoked_command_basename(tokens: list[str]) -> str | None:
+    invoked = _invoked_command_and_args(tokens)
+    return invoked[0] if invoked is not None else None
+
+
+def _command_basename_matches(tokens: list[str], candidates: list[str]) -> bool:
+    actual = _invoked_command_basename(tokens)
+    if actual is None:
+        return False
+    names = frozenset(_normalized_executable_token(candidate) for candidate in candidates)
+    # Do not suffix-match a POSIX-shlexed Windows path here: backslashes are
+    # removed, so ``C:\\tools\\notpytest.exe`` becomes
+    # ``c:toolsnotpytest`` and cannot be distinguished from a real pytest
+    # path.  Ambiguous paths must use the generic fallback.
+    return actual in names
+
+
+def _command_args_start_with_any(tokens: list[str], prefixes: list[list[str]]) -> bool:
+    invoked = _invoked_command_and_args(tokens)
+    return invoked is not None and any(_starts_with(invoked[1], prefix) for prefix in prefixes)
+
+
+def _env_launches_command(argv: list[str]) -> bool:
+    index = 1
+    while index < len(argv):
+        raw_arg = argv[index]
+        if raw_arg == "--":
+            return index + 1 < len(argv)
+        if raw_arg in {"-S", "--split-string"}:
+            return True
+        if raw_arg.startswith(("-S=", "--split-string=")) or (
+            raw_arg.startswith("-S") and len(raw_arg) > 2
+        ):
+            return True
+        if _ENV_ASSIGNMENT_PATTERN.match(raw_arg):
+            index += 1
+            continue
+        if raw_arg in _ENV_OPTIONS_WITH_VALUE:
+            if index + 1 >= len(argv):
+                return True
+            index += 2
+            continue
+        if raw_arg in _ENV_OPTIONS_WITHOUT_VALUE or raw_arg.startswith(
+            (
+                "--argv0=",
+                "--block-signal=",
+                "--chdir=",
+                "--default-signal=",
+                "--ignore-signal=",
+                "--unset=",
+            )
+        ):
+            index += 1
+            continue
+        # Unknown options fail closed; a non-option is env's launched command.
+        return True
+    return False
+
+
+def _shell_dispatch_reparses(argv: list[str]) -> bool:
+    """Return whether argv0 is a shell or a launcher hiding the real command.
+
+    Operators inside a quoted shell payload are opaque to the outer scan.
+    Specialized reducers therefore cannot prove that all output belongs to one
+    command and must use the generic fallback.  Only the actual executable
+    position is inspected, so ordinary arguments named ``bash`` or ``eval`` do
+    not degrade a correctly identified command.
+    """
+
+    effective_argv = _effective_command_tokens(argv)
+    if not effective_argv:
+        return False
+    executable = _normalized_executable_token(effective_argv[0])
+    if (
+        _variable_executable_token(executable)
+        or executable in _SHELL_REPARSE_BUILTINS
+        or executable in _SHELL_LAUNCHER_BUILTINS
+        or _matches_executable_name(executable, _POSIX_SHELL_EXECUTABLES)
+        or _matches_executable_name(executable, frozenset({"cmd"}))
+        or _matches_executable_name(executable, _POWERSHELL_EXECUTABLES)
+    ):
+        return True
+    if _matches_executable_name(executable, frozenset({"env"})):
+        return _env_launches_command(effective_argv)
+    return False
+
+
+def _git_subcommand_position(argv: list[str]) -> tuple[str, int] | None:
     if _command_name(argv) != "git":
         return None
     index = 1
@@ -182,6 +391,8 @@ def _git_subcommand(argv: list[str]) -> str | None:
         if not arg:
             index += 1
             continue
+        if arg in _GIT_GLOBAL_OPTIONS_WITHOUT_SUBCOMMAND or arg.startswith("--list-cmds="):
+            return None
         if arg in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
             index += 2
             continue
@@ -191,8 +402,25 @@ def _git_subcommand(argv: list[str]) -> str | None:
         if arg.startswith("-"):
             index += 1
             continue
-        return arg
+        return arg, index
     return None
+
+
+def _git_subcommand(argv: list[str]) -> str | None:
+    located = _git_subcommand_position(argv)
+    return located[0] if located is not None else None
+
+
+def _git_subcommand_args(argv: list[str]) -> list[str]:
+    located = _git_subcommand_position(argv)
+    return argv[located[1] + 1 :] if located is not None else []
+
+
+def _before_double_dash(argv: list[str]) -> list[str]:
+    try:
+        return argv[: argv.index("--")]
+    except ValueError:
+        return argv
 
 
 def strip_leading_cd_prefix(command: str) -> str:
@@ -231,8 +459,16 @@ def _match_leading_cd_chain(command: str) -> str | None:
             escaping = False
         elif char == "\\":
             escaping = True
-        elif quote:
-            if char == quote:
+        elif quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "`" or command[index : index + 2] == "$(":
+            # Command substitution in the directory token may itself emit
+            # output, so stripping the prefix would falsely attribute that
+            # output to the command after ``&&``.
+            return None
+        elif quote == '"':
+            if char == '"':
                 quote = None
         elif char in {"'", '"'}:
             quote = char
@@ -287,27 +523,95 @@ def rule_matches(
     # must not consume an arbitrary tool's command-shaped argument.
     command_match_allowed = tool_name in _SHELL_TOOL_NAMES or bool(tool_names)
     tokens = command_argv(command, argv) if command_match_allowed else []
+    strict_enabled = _matcher_strict_enabled()
+    position_aware_criterion = any(
+        match.get(name)
+        for name in (
+            "commandBasenames",
+            "commandArgsStartsWithAny",
+            "gitSubcommands",
+            "argvStartsWithAny",
+            "gitSubcommandArgsStartsWithAny",
+            "argvIncludesBeforeDoubleDash",
+        )
+    )
+    # Only rules that opt into a strict position-aware criterion may look
+    # through leading NAME=value assignments.  Applying this to every legacy
+    # argv0 rule would expand their known broad token matching surface.
+    positional_tokens = (
+        _effective_command_tokens(tokens) if strict_enabled and position_aware_criterion else tokens
+    )
     argv0 = _list_of_strings(match.get("argv0"))
-    if argv0 and (not tokens or tokens[0] not in argv0):
+    if argv0 and (not positional_tokens or positional_tokens[0] not in argv0):
+        return False
+
+    command_basenames = _list_of_strings(match.get("commandBasenames"))
+    if (
+        command_basenames
+        and strict_enabled
+        and not _command_basename_matches(tokens, command_basenames)
+    ):
+        return False
+
+    command_args_starts_with_any = _list_of_string_lists(match.get("commandArgsStartsWithAny"))
+    if (
+        command_args_starts_with_any
+        and strict_enabled
+        and not _command_args_start_with_any(tokens, command_args_starts_with_any)
+    ):
         return False
 
     git_subcommands = _list_of_strings(match.get("gitSubcommands"))
     if (
         git_subcommands
-        and _matcher_strict_enabled()
-        and (_git_subcommand(tokens) or "") not in git_subcommands
+        and strict_enabled
+        and (_git_subcommand(positional_tokens) or "") not in git_subcommands
+    ):
+        return False
+
+    git_args_starts_with_any = _list_of_string_lists(match.get("gitSubcommandArgsStartsWithAny"))
+    if (
+        git_args_starts_with_any
+        and strict_enabled
+        and not any(
+            _starts_with(_git_subcommand_args(positional_tokens), entry)
+            for entry in git_args_starts_with_any
+        )
+    ):
+        return False
+
+    argv_starts_with_any = _list_of_string_lists(match.get("argvStartsWithAny"))
+    if (
+        argv_starts_with_any
+        and strict_enabled
+        and not any(_starts_with(positional_tokens, entry) for entry in argv_starts_with_any)
     ):
         return False
 
     argv_includes = _list_of_string_lists(match.get("argvIncludes"))
-    if argv_includes and not any(_contains_all(tokens, entry) for entry in argv_includes):
+    if argv_includes and not any(
+        _contains_all(positional_tokens, entry) for entry in argv_includes
+    ):
+        return False
+
+    argv_includes_before_double_dash = _list_of_string_lists(
+        match.get("argvIncludesBeforeDoubleDash")
+    )
+    if (
+        argv_includes_before_double_dash
+        and strict_enabled
+        and not any(
+            _contains_all(_before_double_dash(positional_tokens), entry)
+            for entry in argv_includes_before_double_dash
+        )
+    ):
         return False
 
     argv_includes_any = _list_of_string_lists(match.get("argvIncludesAny"))
     if (
         argv_includes_any
-        and _matcher_strict_enabled()
-        and not any(_contains_all(tokens, entry) for entry in argv_includes_any)
+        and strict_enabled
+        and not any(_contains_all(positional_tokens, entry) for entry in argv_includes_any)
     ):
         return False
 
@@ -332,6 +636,14 @@ def rule_matches(
 
     output_regex = match.get("outputRegex")
     if isinstance(output_regex, str) and not re.search(output_regex, content, re.MULTILINE):
+        return False
+
+    strict_output_regex = match.get("strictOutputRegex")
+    if (
+        strict_enabled
+        and isinstance(strict_output_regex, str)
+        and not re.search(strict_output_regex, content, re.MULTILINE)
+    ):
         return False
 
     return True
@@ -364,10 +676,39 @@ def select_rule(
         # A specialized reducer is safe only when all output belongs to one
         # parseable command.  This also guards malformed tails produced by the
         # optional cd unwrapping path.
-        if not _is_simple_shell_command(command):
+        if not _is_simple_shell_command(command) or (
+            argv and _shell_dispatch_reparses(command_argv(command, argv))
+        ):
             return _generic_fallback_rule(rules)
 
-    for rule in rules:
+    ordered_rules = rules
+    if _matcher_strict_enabled():
+        # High-priority cross-cutting rules (for example explicit help) keep
+        # precedence.  Exact invoked-command rules then beat broad task-family
+        # fallbacks such as `task/python` for `python -m pytest`.
+        strict_specificity_keys = (
+            "commandBasenames",
+            "commandArgsStartsWithAny",
+            "argvIncludesBeforeDoubleDash",
+            "gitSubcommandArgsStartsWithAny",
+        )
+        ordered_rules = (
+            tuple(rule for rule in rules if rule.priority > 0)
+            + tuple(
+                rule
+                for rule in rules
+                if rule.priority <= 0
+                and any(rule.match.get(key) for key in strict_specificity_keys)
+            )
+            + tuple(
+                rule
+                for rule in rules
+                if rule.priority <= 0
+                and not any(rule.match.get(key) for key in strict_specificity_keys)
+            )
+        )
+
+    for rule in ordered_rules:
         if rule_matches(
             rule,
             tool_name=tool_name,
