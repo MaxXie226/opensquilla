@@ -35,19 +35,20 @@
         data-testid="chat-session-action-deliverables"
         @click="emit('open-deliverables')"
       >
-        <Icon name="download" :size="14" />
-        <span class="chat-share-btn__label">{{ deliverablesLabel }}</span>
+        <Icon name="fileText" :size="14" />
+        <span class="chat-share-btn__label">{{ t('chat.deliverables') }}</span>
+        <span class="chat-header__count-badge" aria-hidden="true">{{ deliverableBadge }}</span>
       </button>
       <button
         v-if="!shareMode"
         ref="wideShareRef"
         type="button"
         class="chat-header__action chat-share-btn"
-        :disabled="shareableMessageCount === 0"
+        :aria-disabled="!canShare"
         :title="shareLabel"
         :aria-label="shareAriaLabel"
         data-testid="chat-session-action-share"
-        @click="emit('start-share')"
+        @click="invoke('share')"
       >
         <Icon name="share" :size="14" />
         <span class="chat-share-btn__label">{{ t('chat.share') }}</span>
@@ -69,7 +70,12 @@
         data-testid="chat-header-primary-action"
         @click="invoke(primaryAction)"
       >
-        <Icon :name="primaryAction === 'deliverables' ? 'download' : 'share'" :size="16" />
+        <Icon :name="primaryAction === 'deliverables' ? 'fileText' : 'share'" :size="16" />
+        <span
+          v-if="primaryAction === 'deliverables'"
+          class="chat-header__count-badge chat-header__count-badge--corner"
+          aria-hidden="true"
+        >{{ deliverableBadge }}</span>
       </button>
 
       <button
@@ -88,6 +94,11 @@
         @keydown.up.prevent="openMenu('last')"
       >
         <Icon name="moreHorizontal" :size="18" />
+        <span
+          v-if="layout === 'tight' && deliverableCount > 0"
+          class="chat-header__count-badge chat-header__count-badge--corner"
+          aria-hidden="true"
+        >{{ deliverableBadge }}</span>
       </button>
 
       <div
@@ -105,27 +116,34 @@
           type="button"
           class="chat-header__menu-item"
           role="menuitem"
+          :aria-label="deliverablesLabel"
           data-testid="chat-session-action-deliverables"
           @click="invoke('deliverables', true)"
         >
-          <Icon name="download" :size="16" />
-          <span>{{ deliverablesLabel }}</span>
+          <Icon name="fileText" :size="16" />
+          <span>{{ t('chat.deliverables') }}</span>
+          <span class="chat-header__count-badge" aria-hidden="true">{{ deliverableBadge }}</span>
         </button>
         <button
           v-if="menuActions.includes('share')"
           type="button"
           class="chat-header__menu-item"
           role="menuitem"
-          :aria-disabled="shareableMessageCount === 0"
+          :aria-disabled="!canShare"
           data-testid="chat-session-action-share"
           @click="invoke('share', true)"
         >
           <Icon name="share" :size="16" />
           <span class="chat-header__menu-copy">
             <span>{{ t('chat.share') }}</span>
-            <small v-if="shareableMessageCount === 0">{{ t('chat.shareSendFirst') }}</small>
+            <small v-if="!canShare">{{ t('chat.shareSendFirst') }}</small>
           </span>
         </button>
+        <div
+          v-if="menuActions.length > 1"
+          class="chat-header__menu-divider"
+          role="separator"
+        ></div>
         <button
           type="button"
           class="chat-header__menu-item"
@@ -192,17 +210,21 @@ let hasMeasuredLayout = false
 
 const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey'))
 const deliverablesLabel = computed(() => t('chat.deliverablesCount', { count: props.deliverableCount }))
-const shareLabel = computed(() => props.shareableMessageCount === 0
+const deliverableBadge = computed(() => props.deliverableCount > 99
+  ? '99+'
+  : String(props.deliverableCount))
+const canShare = computed(() => props.shareableMessageCount > 0)
+const shareLabel = computed(() => !canShare.value
   ? t('chat.shareSendFirst')
   : t('chat.shareSelectHint'))
-const shareAriaLabel = computed(() => props.shareableMessageCount === 0
+const shareAriaLabel = computed(() => !canShare.value
   ? t('chat.shareSendFirst')
   : t('chat.share'))
 
 const primaryAction = computed<Action | null>(() => {
   if (layout.value === 'tight') return null
   if (props.deliverableCount > 0) return 'deliverables'
-  if (!props.shareMode && props.shareableMessageCount > 0) return 'share'
+  if (!props.shareMode && canShare.value) return 'share'
   return null
 })
 
@@ -306,7 +328,7 @@ function toggleMenu() {
 }
 
 function invoke(action: Action, fromMenu = false) {
-  if (action === 'share' && props.shareableMessageCount === 0) return
+  if (action === 'share' && !canShare.value) return
   // Dialogs capture their invoker synchronously. Move focus to a stable node
   // before the menu item is unmounted so close-focus never falls back to body.
   if (fromMenu) closeMenu(true)
@@ -510,7 +532,7 @@ defineExpose({ focusAction, closeMenu })
   white-space: nowrap;
 }
 
-.chat-header__action:hover:not(:disabled),
+.chat-header__action:hover:not(:disabled):not([aria-disabled='true']),
 .chat-header__action:focus-visible,
 .chat-header__action.is-open {
   background: var(--bg-hover);
@@ -518,13 +540,10 @@ defineExpose({ focusAction, closeMenu })
   color: var(--text);
 }
 
-.chat-header__action:disabled {
+.chat-header__action:disabled,
+.chat-header__action[aria-disabled='true'] {
   cursor: not-allowed;
   opacity: 0.6;
-}
-
-.chat-header__action--deliverables {
-  color: var(--accent);
 }
 
 .chat-header__action--icon {
@@ -534,12 +553,37 @@ defineExpose({ focusAction, closeMenu })
   min-height: 44px;
   min-width: 44px;
   padding: 0;
+  position: relative;
   width: 44px;
 }
 
 .chat-header__action--icon-small {
   min-width: 30px;
   padding: 0.25rem;
+}
+
+.chat-header__count-badge {
+  align-items: center;
+  background: var(--bg-hover);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-full);
+  box-sizing: border-box;
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: 0.625rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  height: 18px;
+  justify-content: center;
+  line-height: 16px;
+  min-width: 18px;
+  padding-inline: 4px;
+}
+
+.chat-header__count-badge--corner {
+  inset-block-start: 1px;
+  inset-inline-end: 1px;
+  position: absolute;
 }
 
 .chat-header__menu {
@@ -573,7 +617,7 @@ defineExpose({ focusAction, closeMenu })
   width: 100%;
 }
 
-.chat-header__menu-item:hover,
+.chat-header__menu-item:hover:not([aria-disabled='true']),
 .chat-header__menu-item:focus-visible {
   background: var(--bg-hover);
   color: var(--text);
@@ -583,6 +627,15 @@ defineExpose({ focusAction, closeMenu })
 .chat-header__menu-item[aria-disabled='true'] {
   cursor: not-allowed;
   opacity: 0.62;
+}
+
+.chat-header__menu-item > .chat-header__count-badge {
+  margin-inline-start: auto;
+}
+
+.chat-header__menu-divider {
+  border-top: 1px solid var(--border);
+  margin: var(--sp-1) var(--sp-2);
 }
 
 .chat-header__menu-copy,

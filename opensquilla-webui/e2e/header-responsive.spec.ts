@@ -273,7 +273,7 @@ test.describe('Responsive chat header actions', () => {
       await expect(page.getByTestId('chat-session-action-share')).toHaveAccessibleName('分享')
       await expect(page.getByTestId('chat-session-action-copy')).toBeVisible()
       await expect(page.getByTestId('chat-session-action-copy'))
-        .toHaveAccessibleName('复制会话密钥')
+        .toHaveAccessibleName('复制会话 ID')
       await expectGeometryIsUsable(
         page,
         '.topbar button, .topbar a, .chat-header button, .chat-header a, '

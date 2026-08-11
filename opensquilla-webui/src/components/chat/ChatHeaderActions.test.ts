@@ -6,6 +6,7 @@ import { createI18n } from 'vue-i18n'
 import ChatHeaderActions from './ChatHeaderActions.vue'
 
 type Action = 'deliverables' | 'share' | 'copy-session-key'
+type LayoutName = 'wide' | 'compact' | 'tight'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -25,6 +26,7 @@ const messages = {
   chat: {
     copied: 'Copied',
     copySessionKey: 'Copy session ID',
+    deliverables: 'Deliverables',
     deliverablesCount: 'Deliverables ({count})',
     sessionActions: 'Session actions',
     share: 'Share',
@@ -32,6 +34,26 @@ const messages = {
     shareSendFirst: 'Send a message first to share',
   },
 }
+
+const LAYOUT_CASES: Array<{ layout: LayoutName; width: number }> = [
+  { layout: 'wide', width: 800 },
+  { layout: 'compact', width: 400 },
+  { layout: 'tight', width: 120 },
+]
+
+const ACTION_STATES = [
+  { deliverableCount: 0, shareMode: false, shareableMessageCount: 0 },
+  { deliverableCount: 0, shareMode: false, shareableMessageCount: 3 },
+  { deliverableCount: 0, shareMode: true, shareableMessageCount: 0 },
+  { deliverableCount: 0, shareMode: true, shareableMessageCount: 3 },
+  { deliverableCount: 2, shareMode: false, shareableMessageCount: 0 },
+  { deliverableCount: 2, shareMode: false, shareableMessageCount: 3 },
+  { deliverableCount: 2, shareMode: true, shareableMessageCount: 0 },
+  { deliverableCount: 2, shareMode: true, shareableMessageCount: 3 },
+]
+
+const ACTION_TRUTH_TABLE = LAYOUT_CASES.flatMap(layout =>
+  ACTION_STATES.map(state => ({ ...layout, ...state })))
 
 const mounted: Array<{ app: App; el: HTMLElement }> = []
 let headerWidth = 800
@@ -145,6 +167,34 @@ function renderedActions(el: HTMLElement): string[] {
     actions.push(action === 'copy' ? 'copy-session-key' : action)
   }
   return actions
+}
+
+function expectedActions({
+  deliverableCount,
+  shareMode,
+}: Pick<typeof BASE_PROPS, 'deliverableCount' | 'shareMode'>): Action[] {
+  const actions: Action[] = []
+  if (deliverableCount > 0) actions.push('deliverables')
+  if (!shareMode) actions.push('share')
+  actions.push('copy-session-key')
+  return actions
+}
+
+function expectedPrimaryAction({
+  layout,
+  deliverableCount,
+  shareMode,
+  shareableMessageCount,
+}: {
+  layout: LayoutName
+  deliverableCount: number
+  shareMode: boolean
+  shareableMessageCount: number
+}): Action | null {
+  if (layout !== 'compact') return null
+  if (deliverableCount > 0) return 'deliverables'
+  if (!shareMode && shareableMessageCount > 0) return 'share'
+  return null
 }
 
 beforeEach(() => {
@@ -360,28 +410,124 @@ describe('ChatHeaderActions', () => {
     expect(requestAnimationFrame).toHaveBeenCalledTimes(scheduledFrames)
   })
 
+  it.each(ACTION_TRUTH_TABLE)(
+    'renders the exact action truth table in $layout with deliverables=$deliverableCount, shareMode=$shareMode, shareable=$shareableMessageCount',
+    async ({ layout, width, deliverableCount, shareMode, shareableMessageCount }) => {
+      const state = { deliverableCount, shareMode, shareableMessageCount }
+      const { el } = await mountHeader(width, state)
+      const header = el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')!
+      expect(header.dataset.layout).toBe(layout)
+
+      const expectedPrimary = expectedPrimaryAction({ layout, ...state })
+      const primary = el.querySelector<HTMLElement>('[data-action]')
+      expect(primary?.dataset.action ?? null).toBe(expectedPrimary)
+
+      if (layout !== 'wide') await openMenu(el)
+
+      const expected = expectedActions(state)
+      const actions = renderedActions(el)
+      expect(actions.sort()).toEqual([...expected].sort())
+      expect(new Set(actions).size).toBe(actions.length)
+
+      const menuActions = layout === 'wide'
+        ? []
+        : expected.filter(action => action !== expectedPrimary)
+      expect(Boolean(el.querySelector('[role="separator"]'))).toBe(menuActions.length > 1)
+
+      const tightBadge = layout === 'wide'
+        ? null
+        : trigger(el).querySelector<HTMLElement>('.chat-header__count-badge')
+      expect(Boolean(tightBadge)).toBe(layout === 'tight' && deliverableCount > 0)
+      if (tightBadge) {
+        expect(tightBadge.textContent).toBe('2')
+        expect(tightBadge.getAttribute('aria-hidden')).toBe('true')
+        expect(trigger(el).getAttribute('aria-label')).toBe('Session actions')
+      }
+
+      if (!shareMode && shareableMessageCount === 0) {
+        const unavailableShare = el.querySelector<HTMLButtonElement>(
+          '[data-action="share"], [data-testid="chat-session-action-share"]',
+        )!
+        expect(unavailableShare.disabled).toBe(false)
+        expect(unavailableShare.tabIndex).toBe(0)
+        expect(unavailableShare.getAttribute('aria-disabled')).toBe('true')
+      }
+    },
+  )
+
   it.each([
-    { name: 'wide', width: 800 },
-    { name: 'compact', width: 400 },
-    { name: 'tight', width: 120 },
-  ])('renders every available action exactly once in the $name layout', async ({ name, width }) => {
-    const { el } = await mountHeader(width)
-    const header = el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')!
-    expect(header.dataset.layout).toBe(name)
+    { count: 99, badge: '99' },
+    { count: 100, badge: '99+' },
+  ])('shows a neutral $badge count while preserving the full accessible count', async ({
+    count,
+    badge,
+  }) => {
+    const wide = await mountHeader(800, { deliverableCount: count })
+    const wideAction = wide.el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-deliverables"]',
+    )!
+    expect(wideAction.getAttribute('aria-label')).toBe(`Deliverables (${count})`)
+    expect(wideAction.querySelector('.chat-header__count-badge')?.textContent).toBe(badge)
 
-    if (name !== 'wide') await openMenu(el)
+    const compact = await mountHeader(400, { deliverableCount: count })
+    const compactAction = compact.el.querySelector<HTMLButtonElement>(
+      '[data-action="deliverables"]',
+    )!
+    expect(compactAction.getAttribute('aria-label')).toBe(`Deliverables (${count})`)
+    expect(compactAction.querySelector('.chat-header__count-badge')?.textContent).toBe(badge)
 
-    const actions = renderedActions(el)
-    expect(actions.sort()).toEqual(['copy-session-key', 'deliverables', 'share'].sort())
-    expect(new Set(actions).size).toBe(actions.length)
+    const tight = await mountHeader(120, { deliverableCount: count })
+    const tightBadge = trigger(tight.el).querySelector<HTMLElement>('.chat-header__count-badge')!
+    expect(tightBadge.textContent).toBe(badge)
+    expect(tightBadge.getAttribute('aria-hidden')).toBe('true')
+    expect(trigger(tight.el).getAttribute('aria-label')).toBe('Session actions')
 
-    if (name === 'compact') {
-      expect(el.querySelector('[data-action="deliverables"]')).toBeTruthy()
-      expect(el.querySelector('[data-testid="chat-session-action-deliverables"]')).toBeNull()
-    }
-    if (name === 'tight') {
-      expect(el.querySelector('[data-action]')).toBeNull()
-      expect(el.querySelector('[data-testid="chat-session-action-deliverables"]')).toBeTruthy()
+    await openMenu(tight.el)
+    const menuAction = tight.el.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-session-action-deliverables"]',
+    )!
+    expect(menuAction.getAttribute('aria-label')).toBe(`Deliverables (${count})`)
+    expect(menuAction.querySelector('.chat-header__count-badge')?.textContent).toBe(badge)
+  })
+
+  it('keeps unavailable wide share focusable and exposes its exact reason', async () => {
+    const { el, handlers, instance } = await mountHeader(800, {
+      deliverableCount: 0,
+      shareableMessageCount: 0,
+    })
+    const share = el.querySelector<HTMLButtonElement>('[data-testid="chat-session-action-share"]')!
+
+    expect(share.disabled).toBe(false)
+    expect(share.tabIndex).toBe(0)
+    expect(share.getAttribute('aria-disabled')).toBe('true')
+    expect(share.getAttribute('aria-label')).toBe('Send a message first to share')
+    expect(share.title).toBe('Send a message first to share')
+
+    share.focus()
+    expect(document.activeElement).toBe(share)
+    expect(instance.focusAction('share')).toBe(true)
+    expect(document.activeElement).toBe(share)
+
+    share.click()
+    expect(handlers.share).not.toHaveBeenCalled()
+  })
+
+  it('keeps the compact deliverables priority and tight menu placement explicit', async () => {
+    for (const { layout, width } of LAYOUT_CASES) {
+      const { el } = await mountHeader(width)
+      const header = el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')!
+      expect(header.dataset.layout).toBe(layout)
+
+      if (layout !== 'wide') await openMenu(el)
+
+      if (layout === 'compact') {
+        expect(el.querySelector('[data-action="deliverables"]')).toBeTruthy()
+        expect(el.querySelector('[data-testid="chat-session-action-deliverables"]')).toBeNull()
+      }
+      if (layout === 'tight') {
+        expect(el.querySelector('[data-action]')).toBeNull()
+        expect(el.querySelector('[data-testid="chat-session-action-deliverables"]')).toBeTruthy()
+      }
     }
   })
 
