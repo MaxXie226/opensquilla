@@ -1547,7 +1547,12 @@ class TestSessionsList:
             session_key="agent:main:subagent:760b927a",
             parent_session_key=parent_key,
             spawned_by="task-123",
-            origin={"kind": "subagent", "spawnDepth": 1},
+            derived_title="Analyze Issue #1130 search readiness",
+            origin={
+                "kind": "subagent",
+                "spawnDepth": 1,
+                "task": "Analyze Issue #1130 search readiness",
+            },
         )
         manager = FakeSessionManager([session])
         manager._storage._agent_tasks[session.session_key] = [
@@ -1572,6 +1577,7 @@ class TestSessionsList:
         self._assert_contract_base(row)
         assert row["sessionKind"] == "task"
         assert row["surface"] == "subagent"
+        assert row["title"] == "Analyze Issue #1130 search readiness"
         assert row["conversationKind"] == "unknown"
         assert row["runStatus"] == "running"
         assert row["interactive"] is False

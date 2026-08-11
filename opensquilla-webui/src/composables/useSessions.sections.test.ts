@@ -22,6 +22,22 @@ function sectionFor(sections: SidebarSection[], family: SidebarSection['family']
   return found
 }
 
+describe('normalizeSessionItem subagent titles', () => {
+  it('keeps a durable task title and preserves the legacy grounding-prompt fallback', () => {
+    expect(session({
+      key: 'agent:main:subagent:new',
+      sessionKind: 'task',
+      title: 'Analyze checkout failures',
+    }).title).toBe('Analyze checkout failures')
+
+    expect(session({
+      key: 'agent:main:subagent:legacy',
+      sessionKind: 'task',
+      title: 'You are a subagent. Execute the delegated task',
+    }).title).toBe('Subagent task')
+  })
+})
+
 describe('arrangeSidebarSections — family bucketing', () => {
   it('buckets chat, channel, and cron sessions into their families', () => {
     const sections = arrangeSidebarSections([

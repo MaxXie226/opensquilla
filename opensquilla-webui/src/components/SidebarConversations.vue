@@ -1003,7 +1003,7 @@ function onSelectRow(row: SidebarConversationItem) {
               />
             </button>
 
-            <!-- Chat-only ⋯ menu: rename + delete -->
+            <!-- Per-session ⋯ menu: task rows omit pin but keep rename + delete. -->
             <Teleport to="body">
               <div
                 v-if="
@@ -1068,6 +1068,7 @@ function onSelectRow(row: SidebarConversationItem) {
                   row.sessionKind === 'chat'
                   || row.sessionKind === 'cron'
                   || row.sessionKind === 'channel'
+                  || row.sessionKind === 'task'
                 )
                 && !row.provisional
                 && renamingKey !== row.key
@@ -1097,6 +1098,7 @@ function onSelectRow(row: SidebarConversationItem) {
                 @keydown="onMenuKeydown"
               >
                 <button
+                  v-if="row.sessionKind !== 'task'"
                   type="button"
                   class="sidebar-row-menu__item"
                   role="menuitem"
