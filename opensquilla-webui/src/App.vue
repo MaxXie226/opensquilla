@@ -235,7 +235,10 @@
         </template>
         <!-- Opt-in (Settings → Appearance or the command palette); off by
              default so the topbar stays music-free until asked for. -->
-        <BgmControl v-if="bgmEnabled" />
+        <BgmControl
+          v-if="bgmEnabled"
+          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
+        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
