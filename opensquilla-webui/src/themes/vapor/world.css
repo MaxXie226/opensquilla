@@ -54,8 +54,7 @@
 
 /* -- ACCENT SURFACES: soft neon bloom ---------------------------------------- */
 [data-theme="vapor"] .btn--primary,
-[data-theme="vapor"] .conn-pill,
-[data-theme="vapor"] .sidebar-new-session {
+[data-theme="vapor"] .conn-pill {
   box-shadow:
     var(--elev-1),
     0 0 18px color-mix(in srgb, var(--accent) 32%, transparent),

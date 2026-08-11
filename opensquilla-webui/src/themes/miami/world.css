@@ -51,12 +51,10 @@
   filter: drop-shadow(0 1px 6px color-mix(in srgb, var(--accent) 22%, transparent));
 }
 
-/* Soft pastel candy glow on the primary action, the live connection pill, and
-   new-chat -- the "vivid but airy" accent halo (static; the sheen sweep below
-   adds the motion). */
+/* Soft pastel candy glow on elevated accent surfaces. Sidebar navigation stays
+   flat so it remains visually behind modal scrims and matches adjacent rows. */
 [data-theme="miami"] .btn--primary,
-[data-theme="miami"] .conn-pill,
-[data-theme="miami"] .sidebar-new-session {
+[data-theme="miami"] .conn-pill {
   position: relative;
   overflow: hidden;
   box-shadow: var(--elev-1),
@@ -70,8 +68,7 @@
    (opacity:0) so with reduced motion no frozen streak sits on the surface; the
    sweep animation is the only thing that makes it briefly glint. */
 [data-theme="miami"] .btn--primary::after,
-[data-theme="miami"] .conn-pill::after,
-[data-theme="miami"] .sidebar-new-session::after {
+[data-theme="miami"] .conn-pill::after {
   content: "";
   position: absolute;
   top: 0;
@@ -113,8 +110,7 @@
   }
 
   [data-theme="miami"] .btn--primary::after,
-  [data-theme="miami"] .conn-pill::after,
-  [data-theme="miami"] .sidebar-new-session::after {
+  [data-theme="miami"] .conn-pill::after {
     animation: miami-sheen 9s linear infinite; /* motion-allow */
   }
 }
