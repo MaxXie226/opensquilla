@@ -107,6 +107,7 @@ class _ToolCallingProvider:
 
 class _FinalizationCapturingProvider(_ToolCallingProvider):
     def __init__(self) -> None:
+        super().__init__()
         self.calls: list[dict[str, Any]] = []
 
     def chat(self, messages, tools=None, config=None):

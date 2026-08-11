@@ -1209,6 +1209,11 @@ _TOOL_RESULT_HINT_LINE_MAX_CHARS = 180
 _TOOL_RESULT_HINT_MAX_LINES = 8
 _TOOL_RESULT_HINT_MAX_CHARS = 900
 _TOOL_RESULT_HINT_SCAN_MAX_CHARS = 2048
+# Historical verification reads and hashes raw Store payloads so that a lossy
+# projection is only compacted when recovery is genuinely available. Bound the
+# number of unique handles per turn; references beyond this limit stay visible
+# in their original envelope (fail open) instead of causing unbounded Store I/O.
+_MAX_HISTORICAL_TOOL_RESULT_REFERENCE_PROBES = 256
 _TOOL_PROJECTION_EVENT_ARGUMENT_KEYS = frozenset(
     {"command", "cmd", "workdir", "cwd", "path", "paths"}
 )
@@ -3946,8 +3951,8 @@ class Agent:
             and supports_tools is not False
         )
 
-    def _tool_result_store_scope(self) -> tuple[str, str, str] | None:
-        """Resolve the exact Store scope shared by projection and retrieval."""
+    def _tool_result_store_session_id(self) -> str | None:
+        """Resolve the session bucket used by Store reads and retrieval."""
 
         ctx = getattr(self, "_tool_context", None)
         session_id = (
@@ -3956,6 +3961,13 @@ class Agent:
             or getattr(ctx, "artifact_session_id", None)
             or self._session_key
         )
+        return str(session_id) if session_id else None
+
+    def _tool_result_store_scope(self) -> tuple[str, str, str] | None:
+        """Resolve the Store session bucket and write provenance."""
+
+        ctx = getattr(self, "_tool_context", None)
+        session_id = self._tool_result_store_session_id()
         session_key = (
             self.config.tool_result_store_session_key
             or getattr(ctx, "session_key", None)
@@ -3975,16 +3987,22 @@ class Agent:
         return str(session_id), str(session_key), str(agent_id)
 
     @staticmethod
-    def _tool_result_record_matches_scope(
+    def _tool_result_record_matches_reference(
         record: ToolResultRecord,
         *,
-        session_key: str,
-        agent_id: str,
+        session_id: str,
         sha256: str,
     ) -> bool:
+        """Verify a projection reference inside the active session bucket.
+
+        ``session_key`` and ``agent_id`` on a Store record describe the writer;
+        they are not a second authorization boundary. Direct children share the
+        parent's session bucket intentionally while using a distinct session key,
+        and ``retrieve_tool_result`` addresses the same bucket by ``session_id``.
+        """
+
         return bool(
-            record.session_key == session_key
-            and record.agent_id == agent_id
+            record.session_id == session_id
             and record.sha256 == sha256
         )
 
@@ -4001,21 +4019,21 @@ class Agent:
         self,
         messages: list[Message],
     ) -> frozenset[tuple[str, str]]:
-        """Return references proven readable in this Agent's active scope."""
+        """Return references readable in this Agent's session with the claimed SHA."""
 
-        scope = self._tool_result_store_scope()
-        if not self._tool_result_recovery_available() or scope is None:
+        session_id = self._tool_result_store_session_id()
+        if not self._tool_result_recovery_available() or session_id is None:
             return frozenset()
         store_dir = self.config.tool_result_store_dir
         if not store_dir:
             return frozenset()
-        session_id, session_key, agent_id = scope
         store = ToolResultStore(store_dir)
         verified: set[tuple[str, str]] = set()
-        for message in messages:
+        records_by_handle: dict[str, ToolResultRecord | None] = {}
+        for message in reversed(messages):
             if not isinstance(message.content, list):
                 continue
-            for block in message.content:
+            for block in reversed(message.content):
                 if not isinstance(block, ContentBlockToolResult):
                     continue
                 if not isinstance(block.content, str):
@@ -4024,14 +4042,24 @@ class Agent:
                 if reference is None or reference in verified:
                     continue
                 handle, sha256 = reference
-                try:
-                    record = store.read(handle, session_id=session_id)
-                except Exception:  # noqa: BLE001 - stale references remain visible
+                if handle in records_by_handle:
+                    record = records_by_handle[handle]
+                else:
+                    if (
+                        len(records_by_handle)
+                        >= _MAX_HISTORICAL_TOOL_RESULT_REFERENCE_PROBES
+                    ):
+                        return frozenset(verified)
+                    try:
+                        record = store.read(handle, session_id=session_id)
+                    except Exception:  # noqa: BLE001 - stale references remain visible
+                        record = None
+                    records_by_handle[handle] = record
+                if record is None:
                     continue
-                if self._tool_result_record_matches_scope(
+                if self._tool_result_record_matches_reference(
                     record,
-                    session_key=session_key,
-                    agent_id=agent_id,
+                    session_id=session_id,
                     sha256=sha256,
                 ):
                     verified.add(reference)
@@ -4041,13 +4069,12 @@ class Agent:
         self,
         messages: list[Message],
     ) -> list[Message]:
-        """Restore raw Store content when this physical call hides retrieval."""
+        """Restore session-scoped raw content when this call hides retrieval."""
 
         store_dir = self.config.tool_result_store_dir
-        scope = self._tool_result_store_scope()
-        if not store_dir or scope is None:
+        session_id = self._tool_result_store_session_id()
+        if not store_dir or session_id is None:
             return messages
-        session_id, session_key, agent_id = scope
         store = ToolResultStore(store_dir)
         restored: list[Message] = []
         changed = False
@@ -4082,14 +4109,13 @@ class Agent:
                     )
                     next_content.append(block)
                     continue
-                if not self._tool_result_record_matches_scope(
+                if not self._tool_result_record_matches_reference(
                     record,
-                    session_key=session_key,
-                    agent_id=agent_id,
+                    session_id=session_id,
                     sha256=sha256,
                 ):
                     logger.warning(
-                        "tool_result_projection.restore_scope_mismatch",
+                        "tool_result_projection.restore_reference_mismatch",
                         tool_use_id=block.tool_use_id,
                         handle=handle,
                     )
@@ -6394,9 +6420,13 @@ class Agent:
         loaded_history = list(self._history)
         self._write_context_stage("session:loaded", loaded_history)
         sanitized_history, sanitize_result = sanitize_session_messages(loaded_history)
+        verification_history = limit_turns(
+            sanitized_history,
+            self.config.max_history_turns,
+        )
         recoverable_references = await asyncio.to_thread(
             self._verified_tool_result_references,
-            sanitized_history,
+            verification_history,
         )
         sanitized_history, historical_projection_result = project_historical_tool_payloads(
             sanitized_history,

@@ -8,10 +8,12 @@ from typing import Any
 
 import pytest
 
+import opensquilla.engine.session_sanitize as session_sanitize_module
 from opensquilla.engine import Agent, AgentConfig, ToolResult, ToolResultEvent
 from opensquilla.engine.history import limit_turns
 from opensquilla.engine.session_sanitize import (
     project_historical_tool_payloads,
+    recoverable_tool_result_reference,
     sanitize_session_messages,
 )
 from opensquilla.engine.tool_result_store import ToolResultStore
@@ -495,7 +497,7 @@ def test_historical_replay_projection_requires_verified_reference() -> None:
     assert wrong_digest_result.tool_results_projected == 0
 
 
-def test_agent_verifies_historical_references_against_store_scope(tmp_path) -> None:
+def test_agent_verifies_historical_references_against_session_store(tmp_path) -> None:
     agent = _recoverable_projection_agent(tmp_path)
     store = ToolResultStore(tmp_path / "tool-results")
     valid = store.write(
@@ -506,9 +508,9 @@ def test_agent_verifies_historical_references_against_store_scope(tmp_path) -> N
         session_key="agent:main:session-1",
         agent_id="main",
     )
-    wrong_scope = store.write(
+    same_session_other_writer = store.write(
         "other agent raw output",
-        tool_use_id="wrong-scope",
+        tool_use_id="same-session-other-writer",
         tool_name="exec_command",
         session_id="session-1",
         session_key="agent:other:session-1",
@@ -526,10 +528,10 @@ def test_agent_verifies_historical_references_against_store_scope(tmp_path) -> N
 
     contents = {
         "valid": envelope(valid.handle, valid.sha256, "valid projected body"),
-        "wrong-scope": envelope(
-            wrong_scope.handle,
-            wrong_scope.sha256,
-            "wrong scope projected body",
+        "same-session-other-writer": envelope(
+            same_session_other_writer.handle,
+            same_session_other_writer.sha256,
+            "same session projected body",
         ),
         "stale": envelope("tr-" + ("f" * 32), "f" * 64, "stale projected body"),
         "forged": envelope(valid.handle, "0" * 64, "forged projected body"),
@@ -548,8 +550,13 @@ def test_agent_verifies_historical_references_against_store_scope(tmp_path) -> N
         recoverable_references=verified,
     )
 
-    assert verified == frozenset({(valid.handle, valid.sha256)})
-    assert result.tool_results_projected == 1
+    assert verified == frozenset(
+        {
+            (valid.handle, valid.sha256),
+            (same_session_other_writer.handle, same_session_other_writer.sha256),
+        }
+    )
+    assert result.tool_results_projected == 2
     projected_by_id = {
         block.tool_use_id: block.content
         for message in projected
@@ -558,8 +565,185 @@ def test_agent_verifies_historical_references_against_store_scope(tmp_path) -> N
         if isinstance(block, ContentBlockToolResult)
     }
     assert projected_by_id["valid"] != contents["valid"]
-    for tool_use_id in ("wrong-scope", "stale", "forged"):
+    assert (
+        projected_by_id["same-session-other-writer"]
+        != contents["same-session-other-writer"]
+    )
+    for tool_use_id in ("stale", "forged"):
         assert projected_by_id[tool_use_id] == contents[tool_use_id]
+
+
+def test_historical_reference_verification_bounds_unique_store_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    agent = _recoverable_projection_agent(tmp_path)
+    references: dict[str, str] = {}
+    messages: list[Message] = []
+    for index in range(300):
+        handle = f"tr-{index:032x}"
+        sha256 = f"{index:064x}"
+        references[handle] = sha256
+        messages.append(
+            Message(
+                role="user",
+                content=[
+                    ContentBlockToolResult(
+                        tool_use_id=f"tool-{index}",
+                        content=(
+                            "[tool_result_projection]\n"
+                            f"tool_result_handle: {handle}\n"
+                            f"sha256: {sha256}\n"
+                            "retrieve_hint: use retrieve_tool_result.\n"
+                        ),
+                    )
+                ],
+            )
+        )
+
+    reads: list[str] = []
+
+    def fake_read(
+        _store: ToolResultStore,
+        handle: str,
+        *,
+        session_id: str,
+    ) -> Any:
+        reads.append(handle)
+        return SimpleNamespace(
+            session_id=session_id,
+            sha256=references[handle],
+        )
+
+    monkeypatch.setattr(ToolResultStore, "read", fake_read)
+
+    verified = agent._verified_tool_result_references(messages)
+
+    assert len(reads) == 256
+    assert len(verified) == 256
+    assert reads[0] == "tr-0000000000000000000000000000012b"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_verifies_only_retained_history_turns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    provider = CapturingProvider()
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        provider=provider,
+        max_history_turns=1,
+        max_iterations=1,
+        flush_enabled=False,
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old user turn"),
+            Message(role="assistant", content="old response"),
+            Message(role="user", content="retained user turn"),
+            Message(role="assistant", content="retained response"),
+        ]
+    )
+    verified_messages: list[Message] = []
+
+    def capture_verification(messages: list[Message]) -> frozenset[tuple[str, str]]:
+        verified_messages.extend(messages)
+        return frozenset()
+
+    monkeypatch.setattr(agent, "_verified_tool_result_references", capture_verification)
+
+    events = [event async for event in agent.run_turn("continue")]
+
+    assert any(event.kind == "done" for event in events)
+    assert [message.content for message in verified_messages] == [
+        "retained user turn",
+        "retained response",
+    ]
+
+
+def _deep_recoverable_reference_candidate(*, depth: int = 10_000) -> str:
+    return (
+        '{"result_truncated":true,"retrieve_hint":"retrieve raw output",'
+        '"tool_result_handle":"tr-'
+        + ("a" * 32)
+        + '","tool_result_sha256":"'
+        + ("b" * 64)
+        + '","nested":'
+        + ("[" * depth)
+        + "0"
+        + ("]" * depth)
+        + "}"
+    )
+
+
+def test_recoverable_tool_result_reference_prefilters_unmarked_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_json_loads(_content: str) -> Any:
+        raise AssertionError("unmarked JSON must not reach json.loads")
+
+    monkeypatch.setattr(session_sanitize_module.json, "loads", unexpected_json_loads)
+
+    assert recoverable_tool_result_reference('{"nested":{"value":1}}') is None
+
+
+def test_recoverable_tool_result_reference_rejects_deep_marked_json() -> None:
+    assert (
+        recoverable_tool_result_reference(_deep_recoverable_reference_candidate())
+        is None
+    )
+
+
+def test_recoverable_tool_result_reference_accepts_structured_envelope() -> None:
+    handle = "tr-" + ("a" * 32)
+    sha256 = "b" * 64
+    envelope = json.dumps(
+        {
+            "result_truncated": True,
+            "retrieve_hint": "retrieve raw output",
+            "tool_result_handle": handle,
+            "tool_result_sha256": sha256,
+        },
+        indent=2,
+    )
+
+    assert recoverable_tool_result_reference(f"\n{envelope}\t") == (handle, sha256)
+
+
+@pytest.mark.asyncio
+async def test_agent_run_turn_ignores_deep_historical_json_reference(tmp_path) -> None:
+    provider = CapturingProvider()
+    agent = _recoverable_projection_agent(
+        tmp_path,
+        provider=provider,
+        max_iterations=1,
+        flush_enabled=False,
+    )
+    agent.set_history(
+        [
+            Message(
+                role="assistant",
+                content=[
+                    ContentBlockToolUse(id="deep-json", name="exec_command", input={})
+                ],
+            ),
+            Message(
+                role="user",
+                content=[
+                    ContentBlockToolResult(
+                        tool_use_id="deep-json",
+                        content=_deep_recoverable_reference_candidate(),
+                    )
+                ],
+            ),
+        ]
+    )
+
+    events = [event async for event in agent.run_turn("continue")]
+
+    assert any(event.kind == "done" for event in events)
+    assert len(provider.calls) == 1
 
 
 @pytest.mark.parametrize(

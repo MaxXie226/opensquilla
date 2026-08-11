@@ -375,33 +375,75 @@ async def test_projection_with_wrong_sha_is_not_restored(
     assert restored[0].content[0].content == forged
 
 
-@pytest.mark.parametrize("record_exists", [True, False], ids=["wrong-scope", "stale"])
-def test_unavailable_projection_reference_is_not_restored(
-    tmp_path: Path,
-    record_exists: bool,
-) -> None:
-    agent = _agent_with_retrieval(tmp_path)
-    raw = "scope-bound raw output"
-    if record_exists:
-        record = ToolResultStore(tmp_path / "tool-results").write(
-            raw,
-            tool_use_id="tool-1",
-            tool_name="exec_command",
-            session_id=_SESSION_ID,
-            session_key="agent:other:webchat:session-1",
-            agent_id="other",
-        )
-        handle = record.handle
-        sha256 = record.sha256
-    else:
-        handle = "tr-" + ("f" * 32)
-        sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    projection = (
+def _projection_reference(handle: str, sha256: str) -> str:
+    return (
         "[tool_result_projection]\n"
         f"tool_result_handle: {handle}\n"
         f"sha256: {sha256}\n"
         "retrieve_hint: use retrieve_tool_result with this tool_result_handle.\n"
     )
+
+
+def test_same_session_dedup_across_writer_provenance_remains_recoverable(
+    tmp_path: Path,
+) -> None:
+    tool_definitions, tool_handler = _retrieval_surface()
+    agent = Agent(
+        provider=_NoopProvider(),
+        config=AgentConfig(
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id=_SESSION_ID,
+        ),
+        tool_definitions=tool_definitions,
+        tool_handler=tool_handler,
+    )
+    store = ToolResultStore(tmp_path / "tool-results")
+    raw = "shared parent and child output"
+    parent_record = store.write(
+        raw,
+        tool_use_id="parent-tool",
+        tool_name="exec_command",
+        session_id=_SESSION_ID,
+        session_key="agent:other:webchat:session-1",
+        agent_id="other",
+    )
+    child_record = store.write(
+        raw,
+        tool_use_id="child-tool",
+        tool_name="exec_command",
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        agent_id="main",
+    )
+    assert child_record.handle == parent_record.handle
+
+    projection = _projection_reference(child_record.handle, child_record.sha256)
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="child-tool", content=projection)],
+        )
+    ]
+
+    verified = agent._verified_tool_result_references(messages)
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert verified == frozenset({(child_record.handle, child_record.sha256)})
+    assert restored[0].content[0].content == raw
+
+
+def test_cross_session_projection_reference_is_not_restored(tmp_path: Path) -> None:
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "other session raw output"
+    record = ToolResultStore(tmp_path / "tool-results").write(
+        raw,
+        tool_use_id="tool-1",
+        tool_name="exec_command",
+        session_id="session-2",
+        session_key="agent:main:webchat:session-2",
+        agent_id="main",
+    )
+    projection = _projection_reference(record.handle, record.sha256)
     messages = [
         Message(
             role="user",
@@ -409,6 +451,26 @@ def test_unavailable_projection_reference_is_not_restored(
         )
     ]
 
+    assert agent._verified_tool_result_references(messages) == frozenset()
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert restored[0].content[0].content == projection
+
+
+def test_stale_projection_reference_is_not_restored(tmp_path: Path) -> None:
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "missing raw output"
+    handle = "tr-" + ("f" * 32)
+    sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    projection = _projection_reference(handle, sha256)
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=projection)],
+        )
+    ]
+
+    assert agent._verified_tool_result_references(messages) == frozenset()
     restored = agent._restore_tool_results_without_retrieval_schema(messages)
 
     assert restored[0].content[0].content == projection

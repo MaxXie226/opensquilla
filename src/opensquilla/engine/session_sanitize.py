@@ -368,9 +368,36 @@ def recoverable_tool_result_reference(content: str) -> tuple[str, str] | None:
         if not _TOOL_RESULT_SHA256_RE.fullmatch(sha256):
             return None
         return handle, sha256
+
+    # Structured truncation envelopes are always JSON objects emitted with
+    # these literal keys.  Reject unrelated historical JSON before invoking
+    # the recursive decoder: arbitrary tool output can be deeply nested even
+    # though it cannot possibly contain a recoverable Store reference.
+    object_start = 0
+    object_end = len(content)
+    while object_start < object_end and content[object_start] in " \t\r\n":
+        object_start += 1
+    while object_end > object_start and content[object_end - 1] in " \t\r\n":
+        object_end -= 1
+    if (
+        object_start == object_end
+        or content[object_start] != "{"
+        or content[object_end - 1] != "}"
+    ):
+        return None
+    if any(
+        marker not in content
+        for marker in (
+            '"result_truncated"',
+            '"retrieve_hint"',
+            '"tool_result_handle"',
+            '"tool_result_sha256"',
+        )
+    ):
+        return None
     try:
         payload = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, RecursionError, TypeError):
         return None
     if not isinstance(payload, dict):
         return None

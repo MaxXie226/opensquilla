@@ -63,7 +63,7 @@ def test_store_does_not_bypass_explicit_retrieval_deny(tmp_path: Path) -> None:
     assert ctx.tool_result_retrieval_available is False
 
 
-def test_store_does_not_surface_owner_only_retrieval_to_non_owner(
+def test_store_does_not_bypass_non_owner_channel_profile(
     tmp_path: Path,
 ) -> None:
     ctx = ToolContext(
@@ -76,3 +76,18 @@ def test_store_does_not_surface_owner_only_retrieval_to_non_owner(
 
     assert "retrieve_tool_result" not in names
     assert ctx.tool_result_retrieval_available is False
+
+
+def test_store_surfaces_retrieval_to_authenticated_non_owner_web_session(
+    tmp_path: Path,
+) -> None:
+    ctx = ToolContext(
+        is_owner=False,
+        caller_kind=CallerKind.WEB,
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+    )
+
+    names = _tool_names(_runner(), ctx)
+
+    assert "retrieve_tool_result" in names
+    assert ctx.tool_result_retrieval_available is True
