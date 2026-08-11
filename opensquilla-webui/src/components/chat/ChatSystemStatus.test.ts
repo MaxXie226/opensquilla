@@ -135,9 +135,16 @@ describe('ChatSystemStatus layout matrix', () => {
 
     const connection = byTestId(host, 'connection-status') as HTMLButtonElement
     expect(connection.classList.contains('connected')).toBe(true)
+    expect(connection.classList.contains('topbar-state--connection')).toBe(true)
+    expect(connection.dataset.state).toBe('normal')
     expect(connection.getAttribute('aria-label')).toContain('Connected')
-    expect(byTestId(host, 'chat-system-approval')?.textContent).toContain('2')
-    expect(byTestId(host, 'desktop-update-indicator')).not.toBeNull()
+    const approval = byTestId(host, 'chat-system-approval') as HTMLButtonElement
+    expect(approval.textContent).toContain('2')
+    expect(approval.classList.contains('topbar-state--approval')).toBe(true)
+    expect(approval.dataset.state).toBe('danger')
+    const desktopUpdate = byTestId(host, 'desktop-update-indicator') as HTMLButtonElement
+    expect(desktopUpdate.classList.contains('topbar-state--update')).toBe(true)
+    expect(desktopUpdate.dataset.state).toBe('info')
     expect(byTestId(host, 'chat-system-status-trigger')).toBeNull()
 
     connection.click()
@@ -172,6 +179,8 @@ describe('ChatSystemStatus layout matrix', () => {
 
     expect(host.querySelectorAll('[data-testid="connection-status"]')).toHaveLength(1)
     const trigger = byTestId(host, 'chat-system-status-trigger') as HTMLButtonElement
+    expect(trigger.classList.contains('topbar-state--system')).toBe(true)
+    expect(trigger.dataset.state).toBe('danger')
     trigger.click()
     await nextTick()
 
@@ -189,6 +198,8 @@ describe('ChatSystemStatus layout matrix', () => {
     const trigger = byTestId(host, 'chat-system-status-trigger') as HTMLButtonElement
     expect(trigger.classList.contains('conn-pill')).toBe(true)
     expect(trigger.classList.contains('connected')).toBe(true)
+    expect(trigger.classList.contains('topbar-state--system')).toBe(true)
+    expect(trigger.dataset.state).toBe('normal')
     trigger.click()
     await nextTick()
 
@@ -218,6 +229,44 @@ describe('ChatSystemStatus layout matrix', () => {
     expect(byTestId(host, 'chat-system-update')).toBeNull()
     expect(host.textContent).not.toContain('private transport detail')
     expect(host.textContent).not.toContain('raw transport detail')
+  })
+
+  it('uses warning for connecting and danger for disconnected connection controls', async () => {
+    const connecting = await mountStatus({
+      layout: 'compact',
+      connectionState: 'connecting',
+      connectionLabel: 'Connecting',
+    })
+    expect(byTestId(connecting.host, 'connection-status')?.dataset.state).toBe('warning')
+
+    const disconnected = await mountStatus({
+      layout: 'compact',
+      connectionState: 'disconnected',
+      connectionLabel: 'Disconnected',
+    })
+    expect(byTestId(disconnected.host, 'connection-status')?.dataset.state).toBe('danger')
+  })
+
+  it('uses update severity until a higher-priority approval takes over the summary', async () => {
+    const controller = mocks.controller as {
+      state: ReturnType<typeof ref<DesktopUpdateState>>
+      visible: ReturnType<typeof ref<boolean>>
+      latestVersion: ReturnType<typeof ref<string>>
+    }
+    controller.state.value = updateState({
+      status: 'available',
+      latestVersion: '2.0.0',
+      installMode: 'native',
+    })
+    controller.latestVersion.value = '2.0.0'
+    controller.visible.value = true
+    const { host, props } = await mountStatus({ layout: 'compact' })
+    const trigger = byTestId(host, 'chat-system-status-trigger') as HTMLButtonElement
+    expect(trigger.dataset.state).toBe('info')
+
+    props.approvalCount = 1
+    await nextTick()
+    expect(trigger.dataset.state).toBe('danger')
   })
 
   it('keeps an unavailable connection row focusable without emitting an action', async () => {

@@ -466,6 +466,8 @@ describe('ChatHeaderActions', () => {
     const wideAction = wide.el.querySelector<HTMLButtonElement>(
       '[data-testid="chat-session-action-deliverables"]',
     )!
+    expect(wideAction.classList.contains('topbar-state--deliverables')).toBe(true)
+    expect(wideAction.dataset.state).toBe('normal')
     expect(wideAction.getAttribute('aria-label')).toBe(`Deliverables (${count})`)
     expect(wideAction.querySelector('.chat-header__count-badge')?.textContent).toBe(badge)
 
@@ -473,11 +475,15 @@ describe('ChatHeaderActions', () => {
     const compactAction = compact.el.querySelector<HTMLButtonElement>(
       '[data-action="deliverables"]',
     )!
+    expect(compactAction.classList.contains('topbar-state--deliverables')).toBe(true)
+    expect(compactAction.dataset.state).toBe('normal')
     expect(compactAction.getAttribute('aria-label')).toBe(`Deliverables (${count})`)
     expect(compactAction.querySelector('.chat-header__count-badge')?.textContent).toBe(badge)
 
     const tight = await mountHeader(120, { deliverableCount: count })
     const tightBadge = trigger(tight.el).querySelector<HTMLElement>('.chat-header__count-badge')!
+    expect(tightBadge.classList.contains('topbar-state--deliverables')).toBe(true)
+    expect(tightBadge.dataset.state).toBe('normal')
     expect(tightBadge.textContent).toBe(badge)
     expect(tightBadge.getAttribute('aria-hidden')).toBe('true')
     expect(trigger(tight.el).getAttribute('aria-label')).toBe('Session actions')
@@ -486,6 +492,8 @@ describe('ChatHeaderActions', () => {
     const menuAction = tight.el.querySelector<HTMLButtonElement>(
       '[data-testid="chat-session-action-deliverables"]',
     )!
+    expect(menuAction.classList.contains('topbar-state--deliverables')).toBe(true)
+    expect(menuAction.dataset.state).toBe('normal')
     expect(menuAction.getAttribute('aria-label')).toBe(`Deliverables (${count})`)
     expect(menuAction.querySelector('.chat-header__count-badge')?.textContent).toBe(badge)
   })

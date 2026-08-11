@@ -116,8 +116,7 @@ function openMenu(position: 'first' | 'last' = 'first') {
 }
 
 function closeMenu(restoreFocus = false) {
-  // A routed action can unmount this component immediately after the emit.
-  // Restore focus while the stable trigger still exists in the document.
+  // Restore focus before a routed action can unmount the stable trigger.
   if (restoreFocus) triggerRef.value?.focus()
   menuOpen.value = false
 }
@@ -255,7 +254,8 @@ watch(menuActions, actions => {
       v-if="layout === 'wide' && normalizedApprovalCount > 0"
       ref="approvalRef"
       type="button"
-      class="approval-inline chat-system-status__approval"
+      class="approval-inline chat-system-status__approval topbar-state topbar-state--approval"
+      data-state="danger"
       data-system-action="approval"
       data-testid="chat-system-approval"
       :title="t('chrome.openBlockedSession')"
@@ -268,9 +268,9 @@ watch(menuActions, actions => {
       v-if="layout !== 'tight' && canManageConnection"
       ref="connectionRef"
       type="button"
-      class="conn-pill conn-pill--link chat-system-status__connection"
+      class="conn-pill conn-pill--link chat-system-status__connection topbar-state topbar-state--connection"
       :class="connectionState"
-      :data-state="connectionState"
+      :data-state="connectionSeverity"
       data-system-action="connection"
       data-testid="connection-status"
       :title="connectionTitle"
@@ -283,9 +283,9 @@ watch(menuActions, actions => {
     <span
       v-else-if="layout !== 'tight'"
       ref="connectionRef"
-      class="conn-pill chat-system-status__connection"
+      class="conn-pill chat-system-status__connection topbar-state topbar-state--connection"
       :class="connectionState"
-      :data-state="connectionState"
+      :data-state="connectionSeverity"
       data-testid="connection-status"
       tabindex="-1"
     >
@@ -306,12 +306,12 @@ watch(menuActions, actions => {
       v-if="showMenuTrigger"
       ref="triggerRef"
       type="button"
-      class="chat-system-status__trigger"
+      class="chat-system-status__trigger topbar-state topbar-state--system"
       :class="[
         { 'conn-pill': layout === 'tight' },
         layout === 'tight' ? connectionState : `is-${severity}`,
       ]"
-      :data-state="layout === 'tight' ? connectionState : severity"
+      :data-state="severity"
       data-testid="chat-system-status-trigger"
       :title="t('chrome.systemStatus')"
       :aria-label="systemSummaryLabel"
@@ -365,8 +365,9 @@ watch(menuActions, actions => {
         @click="invoke('connection')"
       >
         <span
-          class="chat-system-status__menu-icon conn-pill"
+          class="chat-system-status__menu-icon conn-pill topbar-state topbar-state--connection"
           :class="connectionState"
+          :data-state="connectionSeverity"
           aria-hidden="true"
         >
           <span class="chat-system-status__state-dot"></span>
@@ -386,7 +387,11 @@ watch(menuActions, actions => {
         data-testid="chat-system-approval"
         @click="invoke('approval')"
       >
-        <span class="chat-system-status__menu-icon is-danger" aria-hidden="true">
+        <span
+          class="chat-system-status__menu-icon is-danger topbar-state topbar-state--approval"
+          data-state="danger"
+          aria-hidden="true"
+        >
           <Icon name="shield" :size="16" />
         </span>
         <span class="chat-system-status__menu-copy">
@@ -405,7 +410,12 @@ watch(menuActions, actions => {
         :title="updateTitle"
         @click="invoke('update')"
       >
-        <span class="chat-system-status__menu-icon" :class="`is-${updateSeverity}`" aria-hidden="true">
+        <span
+          class="chat-system-status__menu-icon topbar-state topbar-state--update"
+          :class="`is-${updateSeverity}`"
+          :data-state="updateSeverity"
+          aria-hidden="true"
+        >
           <Icon :name="updateIconName" :size="16" />
         </span>
         <span class="chat-system-status__menu-copy">
@@ -435,6 +445,12 @@ watch(menuActions, actions => {
   gap: 6px;
   justify-content: center;
   min-height: 30px;
+}
+
+.chat-system-status__connection.topbar-state {
+  background: var(--topbar-state-fill);
+  border-color: var(--topbar-state-border);
+  color: var(--topbar-state-channel);
 }
 
 button.chat-system-status__connection {
@@ -483,6 +499,11 @@ button.chat-system-status__connection:focus-visible,
   white-space: nowrap;
 }
 
+.chat-system-status__approval.topbar-state {
+  background: var(--topbar-state-channel);
+  border: 1px solid var(--topbar-state-border);
+}
+
 .chat-system-status__update-wide {
   align-items: center;
   display: flex;
@@ -506,11 +527,17 @@ button.chat-system-status__connection:focus-visible,
   width: 30px;
 }
 
+.chat-system-status__trigger.topbar-state {
+  background: var(--topbar-state-fill);
+  border-color: var(--topbar-state-border);
+  color: var(--topbar-state-channel);
+}
+
 .chat-system-status__trigger:hover,
 .chat-system-status__trigger[aria-expanded='true'] {
-  background: var(--bg-hover);
-  border-color: var(--border-strong);
-  color: var(--text);
+  background: color-mix(in srgb, var(--topbar-state-channel) 14%, var(--bg-elevated));
+  border-color: var(--topbar-state-border);
+  color: var(--topbar-state-channel);
 }
 
 .chat-system-status__trigger.is-warning {
@@ -544,7 +571,7 @@ button.chat-system-status__connection:focus-visible,
 }
 
 .chat-system-status__update-dot {
-  background: var(--accent);
+  background: var(--topbar-state-channel);
   border: 2px solid var(--bg-surface);
   border-radius: 999px;
   height: 9px;
@@ -606,6 +633,12 @@ button.chat-system-status__connection:focus-visible,
   min-width: 28px;
   padding: 0;
   width: 28px;
+}
+
+.chat-system-status__menu-icon.topbar-state {
+  background: var(--topbar-state-fill);
+  border: 1px solid var(--topbar-state-border);
+  color: var(--topbar-state-channel);
 }
 
 .chat-system-status__menu-icon.is-info {

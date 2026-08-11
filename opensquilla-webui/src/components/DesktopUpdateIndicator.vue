@@ -27,6 +27,7 @@ const {
   title,
   description,
   iconName,
+  severity,
 } = useDesktopUpdatePresentation(update)
 
 function positionPopover() {
@@ -91,7 +92,8 @@ useDocumentEvent('keydown', event => {
     <button
       type="button"
       ref="triggerRef"
-      class="desktop-update__trigger"
+      class="desktop-update__trigger topbar-state topbar-state--update"
+      :data-state="severity"
       data-testid="desktop-update-indicator"
       :aria-expanded="open ? 'true' : 'false'"
       aria-haspopup="dialog"
@@ -173,10 +175,10 @@ useDocumentEvent('keydown', event => {
 
 .desktop-update__trigger {
   align-items: center;
-  background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
-  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: var(--topbar-state-fill);
+  border: 1px solid var(--topbar-state-border);
   border-radius: var(--radius-full);
-  color: var(--accent);
+  color: var(--topbar-state-channel);
   cursor: pointer;
   display: inline-flex;
   font: inherit;
@@ -195,7 +197,7 @@ useDocumentEvent('keydown', event => {
 }
 
 .desktop-update__trigger:hover {
-  background: color-mix(in srgb, var(--accent) 14%, var(--bg-elevated));
+  background: color-mix(in srgb, var(--topbar-state-channel) 14%, var(--bg-elevated));
 }
 
 .desktop-update__trigger:focus-visible {

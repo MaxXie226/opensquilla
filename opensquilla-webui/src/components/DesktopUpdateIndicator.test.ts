@@ -84,6 +84,8 @@ describe('DesktopUpdateIndicator', () => {
 
     const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
     expect(trigger.textContent).toContain('Downloading 42%')
+    expect(trigger.classList.contains('topbar-state--update')).toBe(true)
+    expect(trigger.dataset.state).toBe('info')
     trigger.click()
     await settle()
 
@@ -100,6 +102,7 @@ describe('DesktopUpdateIndicator', () => {
 
     const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
     expect(trigger).toBeTruthy()
+    expect(trigger.dataset.state).toBe('info')
     expect(trigger.textContent).toContain('Update')
     expect(trigger.textContent).toContain('99.0.0')
 
@@ -184,6 +187,7 @@ describe('DesktopUpdateIndicator', () => {
 
     const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
     expect(trigger).toBeTruthy()
+    expect(trigger.dataset.state).toBe('danger')
     trigger.click()
     await settle()
     expect(document.body.textContent).toContain('release-channel data is invalid')

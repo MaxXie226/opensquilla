@@ -29,7 +29,8 @@
         v-if="deliverableCount > 0"
         ref="wideDeliverablesRef"
         type="button"
-        class="chat-header__action chat-header__action--deliverables chat-share-btn chat-deliverables-btn"
+        class="chat-header__action chat-header__action--deliverables chat-share-btn chat-deliverables-btn topbar-state topbar-state--deliverables"
+        data-state="normal"
         :title="deliverablesLabel"
         :aria-label="deliverablesLabel"
         data-testid="chat-session-action-deliverables"
@@ -62,11 +63,12 @@
         type="button"
         class="chat-header__action chat-header__action--icon"
         :class="{
-          'chat-header__action--deliverables chat-deliverables-btn': primaryAction === 'deliverables',
+          'chat-header__action--deliverables chat-deliverables-btn topbar-state topbar-state--deliverables': primaryAction === 'deliverables',
         }"
         :title="primaryActionLabel"
         :aria-label="primaryActionLabel"
         :data-action="primaryAction"
+        :data-state="primaryAction === 'deliverables' ? 'normal' : undefined"
         data-testid="chat-header-primary-action"
         @click="invoke(primaryAction)"
       >
@@ -96,7 +98,8 @@
         <Icon name="moreHorizontal" :size="18" />
         <span
           v-if="layout === 'tight' && deliverableCount > 0"
-          class="chat-header__count-badge chat-header__count-badge--corner"
+          class="chat-header__count-badge chat-header__count-badge--corner topbar-state topbar-state--deliverables"
+          data-state="normal"
           aria-hidden="true"
         >{{ deliverableBadge }}</span>
       </button>
@@ -115,7 +118,8 @@
         <button
           v-if="menuActions.includes('deliverables')"
           type="button"
-          class="chat-header__menu-item"
+          class="chat-header__menu-item topbar-state topbar-state--deliverables"
+          data-state="normal"
           role="menuitem"
           :aria-label="deliverablesLabel"
           data-testid="chat-session-action-deliverables"
@@ -565,6 +569,12 @@ defineExpose({ focusAction, closeMenu })
   padding: 0.25rem;
 }
 
+.chat-header__action--deliverables.topbar-state {
+  background: var(--topbar-state-fill);
+  border-color: var(--topbar-state-border);
+  color: var(--topbar-state-channel);
+}
+
 .chat-header__count-badge {
   align-items: center;
   background: var(--bg-hover);
@@ -587,6 +597,13 @@ defineExpose({ focusAction, closeMenu })
   inset-block-start: 1px;
   inset-inline-end: 1px;
   position: absolute;
+}
+
+.topbar-state--deliverables .chat-header__count-badge,
+.chat-header__count-badge.topbar-state--deliverables {
+  background: var(--topbar-state-fill);
+  border-color: var(--topbar-state-border);
+  color: var(--topbar-state-channel);
 }
 
 .chat-header__menu {
