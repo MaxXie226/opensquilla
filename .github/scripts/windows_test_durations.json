@@ -1210,6 +1210,8 @@
     "tests/test_request_proof_levers.py": 0.01,
     "tests/test_envelope_policy_deny_cap.py": 0.01,
     "tests/test_toolcomp_matcher_levers.py": 0.01,
+    "tests/test_toolcomp_matcher_safety.py": 0.01,
+    "tests/test_toolcomp_reducer_semantics.py": 0.01,
     "tests/test_engine/test_agent_patch_hygiene_block.py": 0.01,
     "tests/test_engine/test_agent_submit_review.py": 0.01,
     "tests/test_engine/test_agent_verify_mirror_and_variant_challenge.py": 0.01,

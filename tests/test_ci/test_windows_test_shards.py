@@ -172,6 +172,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_envelope_policy_deny_cap.py",
     "tests/test_request_proof_levers.py",
     "tests/test_toolcomp_matcher_levers.py",
+    "tests/test_toolcomp_matcher_safety.py",
+    "tests/test_toolcomp_reducer_semantics.py",
     "tests/test_engine/test_agent_patch_hygiene_block.py",
     "tests/test_engine/test_agent_submit_review.py",
     "tests/test_engine/test_agent_verify_mirror_and_variant_challenge.py",

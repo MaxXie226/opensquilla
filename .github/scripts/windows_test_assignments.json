@@ -230,6 +230,8 @@
       "tests/test_skills_third_party_notices.py",
       "tests/test_thinking_level_propagation.py",
       "tests/test_toolcomp_matcher_levers.py",
+      "tests/test_toolcomp_matcher_safety.py",
+      "tests/test_toolcomp_reducer_semantics.py",
       "tests/test_tools/test_candidate_patch_checkpoint.py",
       "tests/test_tools/test_description_overrides.py",
       "tests/test_tools/test_dispatch_corpus_snapshots.py",
