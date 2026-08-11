@@ -1238,7 +1238,14 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "desktop_changed == 'true'" in jobs["desktop-check"]["if"]
     assert "python_changed == 'true'" in jobs["ubuntu-quality"]["if"]
     assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
-    assert "platform_sensitive_changed == 'true'" in jobs["windows-compat"]["if"]
+    assert jobs["windows-compat"]["if"] == (
+        "${{ (needs.classify-changes.outputs.python_changed == 'true' || "
+        "needs.classify-changes.outputs.platform_sensitive_changed == 'true' || "
+        "needs.classify-changes.outputs.dependency_changed == 'true' || "
+        "needs.classify-changes.outputs.release_changed == 'true') && "
+        "needs.classify-changes.outputs.windows_full_required != 'true' && "
+        "needs.classify-changes.outputs.full_required != 'true' }}"
+    )
     assert "windows_full_required == 'true'" in jobs["windows-full"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["macos-recovery"]["if"]
     assert "desktop_changed == 'true'" in jobs["macos-recovery"]["if"]

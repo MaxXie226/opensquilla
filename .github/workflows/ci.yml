@@ -555,7 +555,7 @@ jobs:
   windows-compat:
     name: Windows compatibility smoke (3.12)
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.dependency_changed == 'true' || needs.classify-changes.outputs.release_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ (needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.dependency_changed == 'true' || needs.classify-changes.outputs.release_changed == 'true') && needs.classify-changes.outputs.windows_full_required != 'true' && needs.classify-changes.outputs.full_required != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 20
 
