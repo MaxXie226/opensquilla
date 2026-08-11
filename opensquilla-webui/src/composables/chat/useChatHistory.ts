@@ -88,6 +88,23 @@ function historyContextText(value: unknown, key: string): string | undefined {
   return typeof raw === 'string' && raw ? raw : undefined
 }
 
+function historyTurnPresentationProvenance(value: unknown): {
+  inputMode?: string
+  runKind?: string
+} {
+  const explicitInputMode = historyContextText(value, 'input_mode')
+    ?? historyContextText(value, 'inputMode')
+  const explicitRunKind = historyContextText(value, 'run_kind')
+    ?? historyContextText(value, 'runKind')
+  const isLegacyGoalContinuation = historyContextText(value, 'intent') === 'goal_continuation'
+  return {
+    inputMode: explicitInputMode
+      ?? (isLegacyGoalContinuation ? 'system_event' : undefined),
+    runKind: explicitRunKind
+      ?? (isLegacyGoalContinuation ? 'goal' : undefined),
+  }
+}
+
 function historyHasSteerEvidence(value: unknown): boolean {
   const disposition = historyContextText(value, 'disposition')
   const intent = historyContextText(value, 'intent')
@@ -439,6 +456,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     const reasoningText = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
     const messageId = msg.message_id || msg.id || ''
     const steerContext = historyHasSteerEvidence(msg.turn_context)
+    const turnProvenance = historyTurnPresentationProvenance(msg.turn_context)
     return {
       role: msg.role || 'assistant',
       text: msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
@@ -454,6 +472,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       provenanceSourceSessionKey: msg.provenance_source_session_key || '',
       provenanceSourceTool: msg.provenance_source_tool || '',
       turnId: historyTurnId(msg.turn_context),
+      turnInputMode: turnProvenance.inputMode,
+      turnRunKind: turnProvenance.runKind,
       inputDisposition: historyInputDisposition(msg.turn_context),
       inputDispositionRevision: historyDispositionRevision(msg.turn_context),
       steerClientRequestId: steerContext

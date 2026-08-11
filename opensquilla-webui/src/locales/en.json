@@ -3693,6 +3693,7 @@
       "pausedTitle": "Goal paused",
       "completeTitle": "Goal complete",
       "sentAsGoal": "Sent as goal",
+      "achieved": "Goal achieved",
       "achievedIn": "Goal achieved · {duration} active",
       "blockedTitle": "Goal blocked",
       "usageLimitedTitle": "Goal usage limited",
@@ -4007,7 +4008,12 @@
       "saved": "saved",
       "fallback": "fallback",
       "fallbackUsed": "used",
-      "ensembleModelsAria": "Ensemble models"
+      "ensembleRequests": "{count} requests",
+      "ensembleModelsAria": "Ensemble models",
+      "coverage": "coverage",
+      "usageIncompleteSubtotal": "Incomplete · shown values are a known subtotal",
+      "usageIncompleteUnknown": "Incomplete · exact usage total unavailable",
+      "unknownProviderCalls": "{count} provider call has unknown usage | {count} provider calls have unknown usage"
     },
     "modelRouting": {
       "updateFailed": "Couldn't switch model routing — reverted. Check the gateway connection and try again."

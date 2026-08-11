@@ -26,7 +26,10 @@ function renderedMessage(overrides: Partial<ChatRenderedMessage>): ChatRenderedM
 
 function makeOptions(
   messages: ChatMessage[],
-  sanitizeCopyText: (text: string) => string = text => text,
+  sanitizeCopyText: (
+    text: string,
+    opts?: { assistantBoundary?: boolean },
+  ) => string = text => text,
   aiGeneratedLabel?: () => string,
 ) {
   const pendingForkBeforeMessageId = ref<string | null>(null)
@@ -246,6 +249,42 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     await api.copyMessage(renderedMessage({ text: 'Keep my words unchanged.' }))
 
     expect(copyTextWithFallback).toHaveBeenCalledWith('Keep my words unchanged.')
+  })
+
+  it('copies timeline markers only when they are not assistant boundaries', async () => {
+    const { sanitizeCopyText } = useChatTextRendering()
+    const { api } = makeOptions([], sanitizeCopyText)
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'NO_REPLY\nBeforeNO_REPLYAfter\nHEARTBEAT_OK',
+      turnRunKind: 'goal',
+      timelineItems: [
+        { type: 'text', key: 'leading', html: '', rawText: 'NO_REPLY' },
+        { type: 'text', key: 'before', html: '', rawText: 'Before' },
+        { type: 'text', key: 'middle', html: '', rawText: 'NO_REPLY' },
+        { type: 'text', key: 'after', html: '', rawText: 'After' },
+        { type: 'text', key: 'trailing', html: '', rawText: 'HEARTBEAT_OK' },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith('Before\n\nNO_REPLY\n\nAfter')
+  })
+
+  it('preserves a mixed sentinel-looking boundary when copying a direct-user answer', async () => {
+    const { sanitizeCopyText } = useChatTextRendering()
+    const { api } = makeOptions([], sanitizeCopyText)
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'NO_REPLY\nLiteral explanation',
+      turnInputMode: 'user',
+      turnRunKind: 'default',
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith('NO_REPLY\nLiteral explanation')
   })
 
   it('copies the same terminal PlanRun delivery shown outside activity', async () => {

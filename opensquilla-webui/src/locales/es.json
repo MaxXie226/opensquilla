@@ -3640,6 +3640,7 @@
       "pausedTitle": "Objetivo en pausa",
       "completeTitle": "Objetivo completado",
       "sentAsGoal": "Enviado como objetivo",
+      "achieved": "Objetivo alcanzado",
       "achievedIn": "Objetivo alcanzado · {duration} activo",
       "blockedTitle": "Objetivo bloqueado",
       "usageLimitedTitle": "Uso del objetivo limitado",
@@ -3954,7 +3955,12 @@
       "saved": "ahorro",
       "fallback": "reserva",
       "fallbackUsed": "usado",
-      "ensembleModelsAria": "Modelos del conjunto"
+      "ensembleRequests": "{count} solicitudes",
+      "ensembleModelsAria": "Modelos del conjunto",
+      "coverage": "cobertura",
+      "usageIncompleteSubtotal": "Incompleto · los valores mostrados son un subtotal conocido",
+      "usageIncompleteUnknown": "Incompleto · total exacto de uso no disponible",
+      "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
     "modelRouting": {
       "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo."

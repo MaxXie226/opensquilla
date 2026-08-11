@@ -3640,6 +3640,7 @@
       "pausedTitle": "Ziel angehalten",
       "completeTitle": "Ziel abgeschlossen",
       "sentAsGoal": "Als Ziel gesendet",
+      "achieved": "Ziel erreicht",
       "achievedIn": "Ziel erreicht · {duration} aktiv",
       "blockedTitle": "Ziel blockiert",
       "usageLimitedTitle": "Zielnutzung begrenzt",
@@ -3954,7 +3955,12 @@
       "saved": "gespart",
       "fallback": "Fallback",
       "fallbackUsed": "genutzt",
-      "ensembleModelsAria": "Ensemble-Modelle"
+      "ensembleRequests": "{count} Anfragen",
+      "ensembleModelsAria": "Ensemble-Modelle",
+      "coverage": "Abdeckung",
+      "usageIncompleteSubtotal": "Unvollständig · angezeigte Werte sind eine bekannte Zwischensumme",
+      "usageIncompleteUnknown": "Unvollständig · exakte Nutzungssumme nicht verfügbar",
+      "unknownProviderCalls": "{count} Provider-Aufruf mit unbekannter Nutzung | {count} Provider-Aufrufe mit unbekannter Nutzung"
     },
     "modelRouting": {
       "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Prüfen Sie die Gateway-Verbindung und versuchen Sie es erneut."

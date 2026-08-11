@@ -261,9 +261,11 @@ jobs:
         working-directory: opensquilla-webui
         run: >-
           npm run test:e2e --
+          assistant-activity.spec.ts
           history-hydration.spec.ts
           goal-mode.spec.ts
           queue-steer.spec.ts
+          share.spec.ts
           --project=chromium
           --workers=1
 
@@ -434,7 +436,16 @@ jobs:
             tests/test_recovery \
             tests/test_migration/test_opensquilla_home_migration.py \
             tests/test_engine/test_coding_mode.py \
+            tests/test_engine/test_cancelled_turn_segments.py \
+            tests/test_engine/test_history_silent_reply.py \
+            tests/test_engine/test_silent_reply.py \
+            tests/test_engine/test_silent_reply_runtime.py \
             tests/test_engine/test_stream_wrappers.py \
+            tests/test_engine/turn_runner/test_stream_consumer_stage_unit.py \
+            tests/test_engine/turn_runner/test_turn_finalizer_stage_unit.py \
+            tests/test_gateway/test_rpc_chat_history.py \
+            tests/test_persistence/test_usage_ledger.py \
+            tests/functional/test_gateway_silent_reply_process_e2e.py \
             tests/test_tools/test_shell_process_isolation.py \
             -q -m "${markers}" --durations=50
 

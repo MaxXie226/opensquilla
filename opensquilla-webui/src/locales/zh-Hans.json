@@ -3693,6 +3693,7 @@
       "pausedTitle": "目标已暂停",
       "completeTitle": "目标已完成",
       "sentAsGoal": "已作为目标发送",
+      "achieved": "目标已完成",
       "achievedIn": "目标已完成 · 活跃用时 {duration}",
       "blockedTitle": "目标受阻",
       "usageLimitedTitle": "目标受用量限制",
@@ -4007,7 +4008,12 @@
       "saved": "节省",
       "fallback": "降级",
       "fallbackUsed": "已使用",
-      "ensembleModelsAria": "参与融合的模型"
+      "ensembleRequests": "{count} 次请求",
+      "ensembleModelsAria": "参与融合的模型",
+      "coverage": "统计完整性",
+      "usageIncompleteSubtotal": "不完整 · 显示值为已知小计",
+      "usageIncompleteUnknown": "不完整 · 无法获得准确用量总计",
+      "unknownProviderCalls": "{count} 次服务商调用的用量未知"
     },
     "modelRouting": {
       "updateFailed": "切换模型路由失败，已恢复原设置。请检查网关连接后重试。"

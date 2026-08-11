@@ -317,6 +317,27 @@ export interface TextDeltaPayload extends SessionEventPayload {
   presentation?: 'intermediate' | 'answer'
 }
 
+export type AssistantDelivery = 'visible' | 'suppressed'
+export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
+
+/**
+ * Additive terminal-delivery contract. Older gateways omit these fields; the
+ * client then retains the conservative presentation-only sentinel fallback.
+ */
+export interface SessionDonePayload extends SessionEventPayload {
+  text?: string
+  text_snapshot?: string | null
+  textSnapshot?: string | null
+  delivery?: AssistantDelivery
+  suppression_reason?: AssistantSuppressionReason | null
+  suppressionReason?: AssistantSuppressionReason | null
+  /** Additive turn provenance; snake_case is the canonical gateway spelling. */
+  input_mode?: string
+  inputMode?: string
+  run_kind?: string
+  runKind?: string
+}
+
 export interface ToolUsePayload extends SessionEventPayload {
   id?: string
   toolId?: string
@@ -799,4 +820,5 @@ export interface RpcEventMap {
   'session.event.meta_run_announced': MetaRunAnnouncedPayload
   'session.event.meta_step_state': MetaStepStatePayload
   'session.event.meta_run_completed': MetaRunCompletedPayload
+  'session.event.done': SessionDonePayload
 }
