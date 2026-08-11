@@ -34,7 +34,6 @@
         v-if="!isNewChatLanding"
         ref="chatHeaderActionsRef"
         :title="currentChatTitle"
-        :session-key="sessionKey"
         :copy-state="sessionCopyState"
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"

@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Einklappen der Seitenleiste abgebrochen",
     "openBlockedSession": "Blockierte Sitzung öffnen",
     "approvalRequired": "Genehmigung erforderlich",
+    "approvalRequiredCount": "Genehmigungen erforderlich: {count}",
+    "systemStatus": "Systemstatus",
+    "systemStatusSummary": "Systemstatus: {state}; {count} Hinweise",
     "manageConnection": "Gateway-Verbindung verwalten",
     "connectionTitle": "Verbindung: {state} — in den Einstellungen verwalten",
     "connectionState": {

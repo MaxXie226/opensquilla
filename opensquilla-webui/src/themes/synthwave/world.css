@@ -26,10 +26,20 @@
 }
 
 /* Neon rim on elevated accent surfaces. Sidebar navigation stays flat beside
-   the other destinations instead of reading as a floating primary control. */
+   the other destinations instead of reading as a floating primary control.
+   Semantic topbar states are excluded so stable status stays quiet. */
 [data-theme="synthwave"] .btn--primary,
-[data-theme="synthwave"] .conn-pill {
+[data-theme="synthwave"] .conn-pill:not(.topbar-state) {
   box-shadow: var(--elev-1), 0 0 16px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+[data-theme="synthwave"] .topbar .topbar-state:is(
+  [data-state="info"],
+  [data-state="warning"],
+  [data-state="danger"]
+) {
+  box-shadow: var(--elev-1),
+              0 0 16px color-mix(in srgb, var(--topbar-state-channel) 34%, transparent);
 }
 
 /* Focus styling lives in tokens.css as --focus-ring/--focus-ring-inset overrides
