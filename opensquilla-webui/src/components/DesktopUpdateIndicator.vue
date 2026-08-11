@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from './Icon.vue'
 import { useDesktopUpdate } from '@/composables/useDesktopUpdate'
+import { useDesktopUpdatePresentation } from '@/composables/useDesktopUpdatePresentation'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 
@@ -15,60 +16,16 @@ useDialogLayer(computed(() => open.value))
 
 onMounted(update.init)
 
-const status = computed(() => update.state.value.status)
-const latestVersion = computed(() => update.latestVersion.value)
-const manualInstall = computed(() => update.state.value.installMode === 'manual')
-const canInstall = computed(() => update.state.value.installMode !== 'unsupported')
-const busy = computed(() => update.actionBusy.value || status.value === 'downloading' || status.value === 'applying')
-const progressText = computed(() => {
-  const progress = update.state.value.progress
-  return typeof progress === 'number' ? String(Math.round(progress)) : ''
-})
-
-const indicatorLabel = computed(() => {
-  if (status.value === 'downloaded') {
-    return manualInstall.value
-      ? t('updates.desktop.indicatorInstallerReady')
-      : t('updates.desktop.indicatorDownloaded')
-  }
-  if (status.value === 'downloading') {
-    return progressText.value
-      ? t('updates.desktop.indicatorDownloadingProgress', { progress: progressText.value })
-      : t('updates.desktop.indicatorDownloading')
-  }
-  if (status.value === 'error') return t('updates.desktop.indicatorError')
-  return t('updates.desktop.indicatorAvailable', { version: latestVersion.value })
-})
-
-const title = computed(() => {
-  if (status.value === 'downloaded') {
-    return manualInstall.value
-      ? t('updates.desktop.manualDownloadedTitle')
-      : t('updates.desktop.downloadedTitle')
-  }
-  if (status.value === 'downloading') return t('updates.desktop.downloadingTitle')
-  if (status.value === 'error') return t('updates.desktop.errorTitle')
-  return t('updates.desktop.availableTitle', { version: latestVersion.value })
-})
-
-const description = computed(() => {
-  if (status.value === 'downloaded') {
-    return manualInstall.value
-      ? t('updates.desktop.manualDownloadedDesc', { version: latestVersion.value })
-      : t('updates.desktop.downloadedDesc', { version: latestVersion.value })
-  }
-  if (status.value === 'downloading') return t('updates.desktop.downloadingDesc')
-  if (status.value === 'error') return update.localizedError.value
-  if (manualInstall.value) return t('updates.desktop.manualAvailableDesc')
-  return t('updates.desktop.availableDesc')
-})
-
-const iconName = computed(() => {
-  if (status.value === 'downloaded') return 'check'
-  if (status.value === 'downloading') return 'refresh'
-  if (status.value === 'error') return 'info'
-  return 'download'
-})
+const {
+  status,
+  manualInstall,
+  canInstall,
+  busy,
+  indicatorLabel,
+  title,
+  description,
+  iconName,
+} = useDesktopUpdatePresentation(update)
 
 function positionPopover() {
   const trigger = triggerRef.value

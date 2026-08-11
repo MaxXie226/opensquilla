@@ -37,7 +37,7 @@ function desktopUpdateApi(state: Record<string, unknown>, overrides: Record<stri
   }
 }
 
-async function mountIndicator(api: ReturnType<typeof desktopUpdateApi>) {
+async function mountIndicator(api?: ReturnType<typeof desktopUpdateApi>) {
   vi.resetModules()
   document.body.innerHTML = ''
   setDesktopApi(api)
@@ -60,6 +60,40 @@ beforeEach(() => {
 })
 
 describe('DesktopUpdateIndicator', () => {
+  it('stays hidden on the Web platform', async () => {
+    const { app, el } = await mountIndicator()
+
+    expect(el.querySelector('[data-testid="desktop-update-indicator"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('keeps a snoozed managed update out of the topbar', async () => {
+    const api = desktopUpdateApi({
+      status: 'available',
+      snoozedUntil: '2999-01-01T00:00:00.000Z',
+    })
+    const { app, el } = await mountIndicator(api)
+
+    expect(el.querySelector('[data-testid="desktop-update-indicator"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('shows rounded download progress without exposing install actions', async () => {
+    const api = desktopUpdateApi({ status: 'downloading', progress: 42.4 })
+    const { app, el } = await mountIndicator(api)
+
+    const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
+    expect(trigger.textContent).toContain('Downloading 42%')
+    trigger.click()
+    await settle()
+
+    expect(document.body.textContent).toContain('Keep OpenSquilla open')
+    expect(document.querySelector('[data-testid="desktop-update-download"]')).toBeNull()
+    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
+    expect(document.querySelector('[data-testid="desktop-update-later"]')).toBeNull()
+    app.unmount()
+  })
+
   it('renders a compact available update control and downloads only after user action', async () => {
     const api = desktopUpdateApi({ status: 'available', latestVersion: '99.0.0' })
     const { app, el } = await mountIndicator(api)
