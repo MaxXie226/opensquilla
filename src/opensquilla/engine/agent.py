@@ -3278,6 +3278,11 @@ class Agent:
                     entry.get("content") or "",
                     entry.get("tool_calls"),
                     entry.get("reasoning_content"),
+                    turn_context=(
+                        entry.get("turn_context")
+                        if isinstance(entry.get("turn_context"), dict)
+                        else None
+                    ),
                 )
             )
 

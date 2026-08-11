@@ -7,12 +7,17 @@ import type {
 import { copyTextWithFallback } from '@/utils/browser'
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 import { turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import { sanitizeAssistantPresentationSegments } from '@/utils/chat/silentSentinels'
+import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
 
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
   inputText: Ref<string>
   isStreaming: Ref<boolean>
-  sanitizeCopyText: (text: string) => string
+  sanitizeCopyText: (text: string, opts?: {
+    assistantBoundary?: boolean
+    provenance?: AssistantPresentationProvenance
+  }) => string
   stripTimePrefix: (text: string) => string
   autoResizeTextarea: () => void
   sendCurrentInput: () => void
@@ -56,6 +61,10 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
             ? 'working'
             : 'settled',
     )
+    const provenance: AssistantPresentationProvenance = {
+      inputMode: message.turnInputMode,
+      runKind: message.turnRunKind,
+    }
     // The same structurally proven PlanRun answer shown outside the collapsed
     // activity must also be what Copy returns. Otherwise the compact completed
     // state would silently copy the entire execution narration.
@@ -63,23 +72,27 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       answer.source === 'terminal-control-boundary'
       || answer.source === 'terminal-timeline-boundary'
     ) {
-      return options.sanitizeCopyText(answer.text)
+      return options.sanitizeCopyText(answer.text, { provenance })
     }
     // Canonical is the fail-open presentation used by the message body. Keep
     // its exact paragraph spacing instead of rebuilding it from timeline
     // chunks, which can insert separators that are not visible on screen.
     if (answer.source === 'canonical') {
-      return options.sanitizeCopyText(answer.text)
+      return options.sanitizeCopyText(answer.text, { provenance })
     }
-    // Tool-bearing turns render text as separate timeline segments; the raw
-    // message text can be absent in older history, so rebuild only that
-    // source-less compatibility case from the available segments.
-    const segmentTexts = (message.timelineItems || [])
-      .filter((item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> => item.type === 'text')
-      .map(item => options.sanitizeCopyText(item.rawText || ''))
+    // The raw message text can be absent in older history, so rebuild only
+    // that source-less compatibility case from the available segments while
+    // applying the same provenance-aware silent-reply projection as the body.
+    const segmentTexts = sanitizeAssistantPresentationSegments(
+      (message.timelineItems || [])
+        .filter((item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> => item.type === 'text')
+        .map(item => item.rawText || ''),
+      provenance,
+    )
+      .map(text => options.sanitizeCopyText(text, { assistantBoundary: false }))
       .filter(Boolean)
     if (segmentTexts.length) return segmentTexts.join('\n\n')
-    return options.sanitizeCopyText(message.text || '')
+    return options.sanitizeCopyText(message.text || '', { provenance })
   }
 
   async function copyMessage(msg: ChatRenderedMessage): Promise<boolean> {

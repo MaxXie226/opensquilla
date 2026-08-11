@@ -13,6 +13,7 @@ import type {
   EnsembleProgressPayload,
   InputDispositionPayload,
   RouterDecisionPayload,
+  SessionDonePayload,
   SessionEventPayload,
   SessionMessagesSnapshotResponse,
   StreamEventEnvelope,
@@ -69,7 +70,7 @@ export interface ChatRpcStreamApi {
   streamBubble: Ref<boolean>
   streamHasVisibleOutput: Ref<boolean>
   startStreaming: () => void
-  endStreaming: (opts?: { reason?: string }) => void
+  endStreaming: (opts?: { reason?: string, suppressed?: boolean }) => void
   checkpointForUserMessage?: (turnId: string) => void
   appendDelta: (text: string, presentation?: 'intermediate' | 'answer') => void
   scheduleRender: () => void
@@ -156,10 +157,16 @@ type ChatDoneUsageFields = {
   modelUsageBreakdown?: unknown
   ensemble_trace?: unknown
   ensembleTrace?: unknown
+  coverage_status?: string
+  coverageStatus?: string
+  usage_unknown?: boolean
+  usageUnknown?: boolean
+  unknown_usage_events?: number
+  unknownUsageEvents?: number
   decision_id?: string
 }
 
-type ChatDoneUsagePayload = SessionEventPayload & ChatDoneUsageFields & {
+type ChatDoneUsagePayload = SessionDonePayload & ChatDoneUsageFields & {
   usage?: ChatDoneUsageFields
 }
 
@@ -254,6 +261,41 @@ function doneTextSnapshot(
     if (typeof source.text === 'string' && source.text) return source.text
   }
   return null
+}
+
+function doneDeliveryIsSuppressed(donePayload: ChatDoneUsagePayload): boolean {
+  // The contract is deliberately strict and outer-payload-owned. A reason by
+  // itself is diagnostic, not authority to erase output from a mixed-version
+  // gateway.
+  return donePayload.delivery === 'suppressed'
+}
+
+function doneTurnProvenance(
+  donePayload: ChatDoneUsagePayload,
+  snakeKey: 'input_mode' | 'run_kind',
+  camelKey: 'inputMode' | 'runKind',
+): string | undefined {
+  // Provenance is outer-payload-owned like delivery. Accept camelCase only as
+  // an additive client compatibility spelling; do not infer it from usage.
+  for (const value of [donePayload[snakeKey], donePayload[camelKey]]) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function doneTurnId(donePayload: ChatDoneUsagePayload): string | undefined {
+  // Terminal identity is outer-payload-owned. TaskRuntime stamps the same
+  // durable turn id on Done and transcript turn_context; camelCase remains an
+  // additive compatibility spelling for alternate gateways.
+  for (const value of [
+    donePayload.turn_id,
+    donePayload.turnId,
+    donePayload.task_id,
+    donePayload.taskId,
+  ]) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
 }
 
 // A completed turn's measured thinking duration must survive the
@@ -694,6 +736,18 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
     if (direct.ensembleTrace != null && usage.ensembleTrace == null) {
       usage.ensembleTrace = direct.ensembleTrace as never
+    }
+    for (const key of [
+      'coverage_status',
+      'coverageStatus',
+      'usage_unknown',
+      'usageUnknown',
+      'unknown_usage_events',
+      'unknownUsageEvents',
+    ] as const) {
+      if (direct[key] != null && usage[key] == null) {
+        usage[key] = direct[key] as never
+      }
     }
     return usage
   }
@@ -1292,6 +1346,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       markTaskSettled(payload)
       const donePayload = payload as ChatDoneUsagePayload
       const u = donePayload.usage || donePayload || {}
+      const doneSuppressed = payload?.reason !== 'aborted'
+        && doneDeliveryIsSuppressed(donePayload)
       if (u.input_tokens || u.output_tokens) {
         usageAccum.value.input += u.input_tokens || 0
         usageAccum.value.output += u.output_tokens || 0
@@ -1302,7 +1358,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       if (u.model) usageModel.value = u.model
       options.saveWidgetState()
 
-      stream.reconcileFinalText(doneTextSnapshot(donePayload, u))
+      stream.reconcileFinalText(doneSuppressed ? '' : doneTextSnapshot(donePayload, u))
 
       if (payload?.reason === 'aborted') {
         options.clearPendingRouterDecision()
@@ -1334,7 +1390,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       })()
       clearLiveThinking()
       const messageCountBeforeEnd = messages.value.length
-      stream.endStreaming()
+      stream.endStreaming(
+        payload?.reason === 'aborted'
+          ? { reason: 'aborted' }
+          : doneSuppressed
+            ? { suppressed: true }
+            : undefined,
+      )
       // endStreaming pushes the assistant message only when the turn kept
       // visible output; sentinel/empty bubbles must not record reasoning.
       // Bind reasoning to that exact bubble, then keep a record so the
@@ -1343,7 +1405,20 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       const completedAssistant = completedMessage?.role === 'assistant'
         ? completedMessage
         : null
+      if (completedAssistant) {
+        completedAssistant.turnId = doneTurnId(donePayload) ?? completedAssistant.turnId
+      }
       if (completedAssistant && payload?.reason !== 'aborted') {
+        completedAssistant.turnInputMode = doneTurnProvenance(
+          donePayload,
+          'input_mode',
+          'inputMode',
+        )
+        completedAssistant.turnRunKind = doneTurnProvenance(
+          donePayload,
+          'run_kind',
+          'runKind',
+        )
         // task.succeeded is a lifecycle-only fallback when the richer done
         // receipt went missing; do not mislabel its task metadata as usage.
         if (!taskSucceededFallback) completedAssistant.usage = doneUsagePayload(donePayload)

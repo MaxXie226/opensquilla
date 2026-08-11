@@ -342,6 +342,13 @@ export interface ChatUsagePayload {
   routePlan?: Record<string, unknown>
   model_call_segments?: ChatModelCallSegment[]
   modelCallSegments?: ChatModelCallSegment[]
+  /** Per-turn ledger coverage. Older gateways omit these additive fields. */
+  coverage_status?: string
+  coverageStatus?: string
+  usage_unknown?: boolean
+  usageUnknown?: boolean
+  unknown_usage_events?: number
+  unknownUsageEvents?: number
   /** V017 routing-decision id — presence is what makes a turn rateable. */
   decision_id?: string
   __savings_ui_suppressed?: boolean
@@ -460,6 +467,10 @@ export interface ChatMessage {
   provenanceSourceTool?: string
   /** Durable causal turn identity restored from transcript turn_context. */
   turnId?: string
+  /** Internal-input provenance used by presentation-only compatibility rules. */
+  turnInputMode?: string
+  /** Runtime turn kind used by presentation-only compatibility rules. */
+  turnRunKind?: string
   /** Same-turn input lifecycle, sourced only from durable context or typed events. */
   inputDisposition?: ChatSteerDisposition
   /** Monotonic server revision for the disposition state machine. */
@@ -516,6 +527,12 @@ export interface ChatMessageMeta {
   savedLabel: string
   turnSavedPct?: number
   ensemble?: ChatEnsembleMeta
+  /** Normalized additive coverage metadata from the per-turn usage receipt. */
+  coverageStatus?: string
+  usageUnknown?: boolean
+  unknownUsageEvents?: number
+  /** True when at least one measured token/cost fact contributes to the receipt. */
+  hasKnownUsage?: boolean
   /** Routing-decision id from turn usage; thumbs render only when present. */
   decisionId?: string
 }
@@ -540,6 +557,10 @@ export interface ChatRenderedMessage {
   turnKey?: string
   /** Durable server turn identity restored from transcript turn_context. */
   turnId?: string
+  /** Internal-input provenance copied from the source ChatMessage. */
+  turnInputMode?: string
+  /** Runtime turn kind copied from the source ChatMessage. */
+  turnRunKind?: string
   inputDisposition?: ChatSteerDisposition
   maintenance?: ChatMaintenanceEvent
   inputDispositionRevision?: number

@@ -3640,6 +3640,7 @@
       "pausedTitle": "目標を一時停止中",
       "completeTitle": "目標完了",
       "sentAsGoal": "目標として送信",
+      "achieved": "目標を達成",
       "achievedIn": "目標を達成 · 稼働時間 {duration}",
       "blockedTitle": "目標がブロックされました",
       "usageLimitedTitle": "目標の使用量が制限されました",
@@ -3954,7 +3955,12 @@
       "saved": "節約",
       "fallback": "フォールバック",
       "fallbackUsed": "使用",
-      "ensembleModelsAria": "アンサンブルモデル"
+      "ensembleRequests": "{count} リクエスト",
+      "ensembleModelsAria": "アンサンブルモデル",
+      "coverage": "集計範囲",
+      "usageIncompleteSubtotal": "不完全 · 表示値は判明分の小計",
+      "usageIncompleteUnknown": "不完全 · 正確な使用量合計は不明",
+      "unknownProviderCalls": "{count} 件のプロバイダー呼び出しの使用量が不明"
     },
     "modelRouting": {
       "updateFailed": "モデルルーティングを切り替えられませんでした。元に戻しました。ゲートウェイ接続を確認して再試行してください。"

@@ -3640,6 +3640,7 @@
       "pausedTitle": "Objectif en pause",
       "completeTitle": "Objectif terminé",
       "sentAsGoal": "Envoyé comme objectif",
+      "achieved": "Objectif atteint",
       "achievedIn": "Objectif atteint · {duration} actif",
       "blockedTitle": "Objectif bloqué",
       "usageLimitedTitle": "Utilisation de l'objectif limitée",
@@ -3954,7 +3955,12 @@
       "saved": "économie",
       "fallback": "repli",
       "fallbackUsed": "utilisé",
-      "ensembleModelsAria": "Modèles de l'ensemble"
+      "ensembleRequests": "{count} requêtes",
+      "ensembleModelsAria": "Modèles de l'ensemble",
+      "coverage": "couverture",
+      "usageIncompleteSubtotal": "Incomplet · les valeurs affichées constituent un sous-total connu",
+      "usageIncompleteUnknown": "Incomplet · total d’utilisation exact indisponible",
+      "unknownProviderCalls": "{count} appel fournisseur a une utilisation inconnue | {count} appels fournisseur ont une utilisation inconnue"
     },
     "modelRouting": {
       "updateFailed": "Impossible de changer le routage des modèles — rétabli. Vérifiez la connexion à la passerelle et réessayez."
