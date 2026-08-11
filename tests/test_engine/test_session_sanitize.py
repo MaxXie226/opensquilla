@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-import opensquilla.engine.session_sanitize as session_sanitize_module
 from opensquilla.engine import Agent, AgentConfig, ToolResult, ToolResultEvent
 from opensquilla.engine.history import limit_turns
 from opensquilla.engine.session_sanitize import (
@@ -683,7 +682,7 @@ def test_recoverable_tool_result_reference_prefilters_unmarked_json(
     def unexpected_json_loads(_content: str) -> Any:
         raise AssertionError("unmarked JSON must not reach json.loads")
 
-    monkeypatch.setattr(session_sanitize_module.json, "loads", unexpected_json_loads)
+    monkeypatch.setattr(json, "loads", unexpected_json_loads)
 
     assert recoverable_tool_result_reference('{"nested":{"value":1}}') is None
 
