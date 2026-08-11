@@ -263,6 +263,7 @@ jobs:
           npm run test:e2e --
           history-hydration.spec.ts
           goal-mode.spec.ts
+          queue-steer.spec.ts
           --project=chromium
           --workers=1
 
@@ -1041,6 +1042,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
@@ -1060,6 +1062,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
               )
               ;;
             workbench)
