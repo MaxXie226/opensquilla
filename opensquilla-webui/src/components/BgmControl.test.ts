@@ -171,4 +171,41 @@ describe('BgmControl responsive presentation', () => {
     expect(testId(el, 'bgm-menu-trigger')).toBeNull()
     expect(document.activeElement).toBe(pause)
   })
+
+  it('closes the picker on Escape and restores the caret trigger', async () => {
+    const { el, nextTick } = await mountControl({ playing: false })
+    const trigger = testId(el, 'bgm-menu-trigger') as HTMLButtonElement
+    trigger.focus()
+    trigger.click()
+    await nextTick()
+    const track = testId(el, 'bgm-track-stream') as HTMLButtonElement
+    track.focus()
+    expect(el.querySelector('[data-chat-topbar-popover="bgm"]')).toBeTruthy()
+
+    const escape = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    })
+    document.dispatchEvent(escape)
+    await nextTick()
+
+    expect(escape.defaultPrevented).toBe(true)
+    expect(el.querySelector('[data-chat-topbar-popover="bgm"]')).toBeNull()
+    expect(document.activeElement).toBe(trigger)
+  })
+
+  it('keeps outside focus when an outside click dismisses the picker', async () => {
+    const { el, nextTick } = await mountControl({ playing: false })
+    testId(el, 'bgm-menu-trigger')?.click()
+    await nextTick()
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    outside.focus()
+    outside.click()
+    await nextTick()
+
+    expect(el.querySelector('[data-chat-topbar-popover="bgm"]')).toBeNull()
+    expect(document.activeElement).toBe(outside)
+  })
 })

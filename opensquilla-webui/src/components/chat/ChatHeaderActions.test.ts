@@ -542,6 +542,7 @@ describe('ChatHeaderActions', () => {
 
     const items = Array.from(el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
     expect(items).toHaveLength(2)
+    expect(el.querySelector('[data-chat-topbar-popover="session-actions"]')).toBeTruthy()
     expect(document.activeElement).toBe(items[0])
 
     items[0]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
@@ -555,6 +556,19 @@ describe('ChatHeaderActions', () => {
     expect(el.querySelector('[role="menu"]')).toBeNull()
     expect(menuTrigger.getAttribute('aria-expanded')).toBe('false')
     expect(document.activeElement).toBe(menuTrigger)
+  })
+
+  it('closes the session menu on outside click without stealing outside focus', async () => {
+    const { el } = await mountHeader(400)
+    await openMenu(el)
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    outside.focus()
+    outside.click()
+    await flush()
+
+    expect(el.querySelector('[data-chat-topbar-popover="session-actions"]')).toBeNull()
+    expect(document.activeElement).toBe(outside)
   })
 
   it('keeps the menu open and emits nothing when disabled share is activated', async () => {

@@ -252,7 +252,13 @@
           >
             <Icon :name="themeIconName" :size="16" />
           </button>
-          <div v-if="themeMenuOpen" class="theme-menu" role="menu" :aria-label="t('chrome.theme')">
+          <div
+            v-if="themeMenuOpen"
+            class="theme-menu"
+            role="menu"
+            :aria-label="t('chrome.theme')"
+            data-chat-topbar-popover="theme"
+          >
             <button
               v-for="opt in themeOptions"
               :key="opt.mode"
@@ -450,7 +456,11 @@ import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
-import { useDialogLayer } from './composables/useDialogA11y'
+import { hasOpenDialogLayer, useDialogLayer } from './composables/useDialogA11y'
+import {
+  provideChatTopbarPopoverCoordinator,
+  useChatTopbarPopoverCoordination,
+} from './composables/useChatTopbarPopoverCoordinator'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
@@ -493,6 +503,10 @@ const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
+// Chat-only transient chrome is coordinated independently from every modal and
+// from the non-chat topbar. The local menu refs remain authoritative elsewhere.
+const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const chatTopbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(isChatRoute)
 const sidebarRef = ref<HTMLElement | null>(null)
 const sidebarDockToggleRef = ref<HTMLButtonElement | null>(null)
 const topbarSidebarToggleRef = ref<HTMLButtonElement | null>(null)
@@ -685,7 +699,12 @@ const themeIconName = computed(() => {
 })
 
 const themeMenuOpen = ref(false)
-useDialogLayer(themeMenuOpen)
+useChatTopbarPopoverCoordination(
+  'theme',
+  themeMenuOpen,
+  chatTopbarPopoverCoordinator,
+)
+const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
 
 // The compact topbar menu deliberately lists only the basic modes (Light / Dark
@@ -748,7 +767,6 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
 })
 
 // Chat layout applies to both the session view and the draft route.
-const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
 const systemHeaderPressureCount = computed(() => (
   Number(rpcStore.state !== 'connected')
   + Number(appStore.approvalCount > 0)
@@ -1716,21 +1734,24 @@ function handleKeydown(e: KeyboardEvent) {
   // consumed the key: the composer textarea (@keydown, target phase) and any
   // earlier-registered document listener (e.g. ChatView). Overlays (drawers,
   // modals) attach their document listeners on open — AFTER this one — so they
-  // run later and are NOT covered by this guard; their collision with the
-  // sidebar-Escape branch is ruled out by the mobile-only gate below instead.
+  // run later and are covered separately by the shared dialog-layer guard.
   if (e.defaultPrevented) return
 
-  if (e.key === 'Escape' && themeMenuOpen.value) {
+  if (e.key === 'Escape' && themeMenuOpen.value && themeMenuIsTopmost.value) {
+    e.preventDefault()
     themeMenuOpen.value = false
     themeButtonRef.value?.focus()
     return
   }
+  // Child topbar controls and routed dialogs install their Escape handlers
+  // after App's listener. Let the current dialog-stack owner handle the key
+  // instead of pre-emptively collapsing the mobile sidebar beneath it.
+  if (e.key === 'Escape' && hasOpenDialogLayer()) return
   // Escape dismisses the sidebar only as the mobile slide-over. On desktop the
   // sidebar is a persistent dock toggled by its own button, so it must never
   // collapse as a side effect of an Escape meant for an overlay opened on top of
-  // it. Because those overlays run after this handler (see above), this
-  // mobile-only gate — not the defaultPrevented check — is what prevents that
-  // collision; keep it. The settings overlay owns Escape while open and is excluded.
+  // it. The shared dialog-layer guard above handles that ordering collision;
+  // this branch remains mobile-only because desktop uses a persistent dock.
   if (e.key === 'Escape' && appStore.sidebarOpen && !settingsOverlayOpen.value && isSidebarDrawer.value) {
     closeSidebarDrawer()
   }

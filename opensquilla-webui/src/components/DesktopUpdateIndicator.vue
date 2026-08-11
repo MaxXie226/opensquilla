@@ -5,6 +5,7 @@ import Icon from './Icon.vue'
 import { useDesktopUpdate } from '@/composables/useDesktopUpdate'
 import { useDesktopUpdatePresentation } from '@/composables/useDesktopUpdatePresentation'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 
 const { t } = useI18n()
@@ -12,7 +13,8 @@ const update = useDesktopUpdate()
 const open = ref(false)
 const triggerRef = ref<HTMLButtonElement | null>(null)
 const popoverStyle = ref<Record<string, string>>({})
-useDialogLayer(computed(() => open.value))
+useChatTopbarPopoverCoordination('desktop-update', open)
+const popoverIsTopmost = useDialogLayer(computed(() => open.value))
 
 onMounted(update.init)
 
@@ -74,6 +76,14 @@ useDocumentEvent('click', (event) => {
   if (target instanceof Element && (target.closest('.desktop-update') || target.closest('.desktop-update__popover'))) return
   open.value = false
 })
+
+useDocumentEvent('keydown', event => {
+  if (event.defaultPrevented || event.key !== 'Escape') return
+  if (!open.value || !popoverIsTopmost.value) return
+  event.preventDefault()
+  open.value = false
+  triggerRef.value?.focus()
+})
 </script>
 
 <template>
@@ -93,7 +103,14 @@ useDocumentEvent('click', (event) => {
     </button>
 
     <Teleport to="body">
-      <div v-if="open" class="desktop-update__popover" :style="popoverStyle" role="dialog" :aria-label="title">
+      <div
+        v-if="open"
+        class="desktop-update__popover"
+        :style="popoverStyle"
+        role="dialog"
+        :aria-label="title"
+        data-chat-topbar-popover="desktop-update"
+      >
         <div class="desktop-update__head">
           <Icon :name="iconName" :size="16" aria-hidden="true" />
           <strong>{{ title }}</strong>

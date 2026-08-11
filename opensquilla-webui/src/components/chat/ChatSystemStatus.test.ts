@@ -259,6 +259,7 @@ describe('ChatSystemStatus keyboard and focus behavior', () => {
     trigger.focus()
     key(trigger, 'ArrowDown')
     await nextTick()
+    expect(host.querySelector('[data-chat-topbar-popover="system-status"]')).not.toBeNull()
     expect((document.activeElement as HTMLElement).dataset.testid).toBe('chat-system-connection')
 
     key(document.activeElement as Element, 'ArrowUp')

@@ -211,4 +211,85 @@ describe('DesktopUpdateIndicator', () => {
     expect(document.body.textContent).not.toContain('deadbeef')
     app.unmount()
   })
+
+  it('closes the update popover on Escape and restores its trigger', async () => {
+    const api = desktopUpdateApi({ status: 'available', latestVersion: '99.0.0' })
+    const { app, el } = await mountIndicator(api)
+    const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
+    trigger.focus()
+    trigger.click()
+    await settle()
+    const download = document.querySelector('[data-testid="desktop-update-download"]') as HTMLButtonElement
+    download.focus()
+    expect(document.querySelector('[data-chat-topbar-popover="desktop-update"]')).toBeTruthy()
+
+    const escape = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    })
+    document.dispatchEvent(escape)
+    await settle()
+
+    expect(escape.defaultPrevented).toBe(true)
+    expect(document.querySelector('[data-chat-topbar-popover="desktop-update"]')).toBeNull()
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(trigger)
+    app.unmount()
+  })
+
+  it('leaves Escape to a dialog layer opened above the update popover', async () => {
+    const api = desktopUpdateApi({ status: 'available', latestVersion: '99.0.0' })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+
+    const { createApp, defineComponent, h, ref } = await import('vue')
+    const { useDialogLayer } = await import('@/composables/useDialogA11y')
+    const blockerRoot = document.createElement('div')
+    document.body.appendChild(blockerRoot)
+    const blocker = createApp(defineComponent({
+      setup() {
+        useDialogLayer(ref(true))
+        return () => h('div', { role: 'dialog' }, 'Upper layer')
+      },
+    }))
+    blocker.mount(blockerRoot)
+
+    const blockedEscape = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    })
+    document.dispatchEvent(blockedEscape)
+    await settle()
+    expect(document.querySelector('[data-chat-topbar-popover="desktop-update"]')).toBeTruthy()
+    expect(blockedEscape.defaultPrevented).toBe(false)
+
+    blocker.unmount()
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    }))
+    await settle()
+    expect(document.querySelector('[data-chat-topbar-popover="desktop-update"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('closes on outside click without taking focus from the outside target', async () => {
+    const api = desktopUpdateApi({ status: 'available', latestVersion: '99.0.0' })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    outside.focus()
+    outside.click()
+    await settle()
+
+    expect(document.querySelector('[data-chat-topbar-popover="desktop-update"]')).toBeNull()
+    expect(document.activeElement).toBe(outside)
+    app.unmount()
+  })
 })

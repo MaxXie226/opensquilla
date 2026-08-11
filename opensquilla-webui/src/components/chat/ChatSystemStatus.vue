@@ -6,6 +6,7 @@ import Icon from '@/components/Icon.vue'
 import { useDesktopUpdate } from '@/composables/useDesktopUpdate'
 import { useDesktopUpdatePresentation } from '@/composables/useDesktopUpdatePresentation'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { ConnectionState } from '@/lib/rpc'
 import {
@@ -46,7 +47,8 @@ const updateWrapRef = ref<HTMLDivElement | null>(null)
 const triggerRef = ref<HTMLButtonElement | null>(null)
 const menuRef = ref<HTMLDivElement | null>(null)
 const menuOpen = ref(false)
-useDialogLayer(computed(() => menuOpen.value))
+useChatTopbarPopoverCoordination('system-status', menuOpen)
+const menuIsTopmost = useDialogLayer(computed(() => menuOpen.value))
 
 onMounted(update.init)
 
@@ -206,10 +208,10 @@ useDocumentEvent('click', event => {
 })
 
 useDocumentEvent('keydown', event => {
-  if (event.key === 'Escape' && menuOpen.value) {
-    event.preventDefault()
-    closeMenu(true)
-  }
+  if (event.defaultPrevented || event.key !== 'Escape') return
+  if (!menuOpen.value || !menuIsTopmost.value) return
+  event.preventDefault()
+  closeMenu(true)
 })
 
 watch(() => props.layout, () => {
@@ -348,6 +350,7 @@ watch(menuActions, actions => {
       role="menu"
       :aria-label="t('chrome.systemStatus')"
       data-testid="chat-system-status-menu"
+      data-chat-topbar-popover="system-status"
       @keydown="onMenuKeydown"
     >
       <button

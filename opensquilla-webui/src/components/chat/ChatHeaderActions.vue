@@ -109,6 +109,7 @@
         role="menu"
         :aria-label="t('chat.sessionActions')"
         data-testid="chat-session-actions-menu"
+        data-chat-topbar-popover="session-actions"
         @keydown="onMenuKeydown"
       >
         <button
@@ -164,6 +165,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import {
   resolveSessionHeaderLayout,
@@ -202,7 +204,8 @@ const wideShareRef = ref<HTMLButtonElement | null>(null)
 const wideCopyRef = ref<HTMLButtonElement | null>(null)
 const layout = ref<SessionHeaderLayout>('wide')
 const menuOpen = ref(false)
-useDialogLayer(computed(() => menuOpen.value))
+useChatTopbarPopoverCoordination('session-actions', menuOpen)
+const menuIsTopmost = useDialogLayer(computed(() => menuOpen.value))
 let resizeObserver: ResizeObserver | null = null
 let coarsePointerMedia: MediaQueryList | null = null
 let layoutFrame: number | null = null
@@ -389,10 +392,10 @@ useDocumentEvent('click', (event) => {
 })
 
 useDocumentEvent('keydown', (event) => {
-  if (event.key === 'Escape' && menuOpen.value) {
-    event.preventDefault()
-    closeMenu(true)
-  }
+  if (event.defaultPrevented || event.key !== 'Escape') return
+  if (!menuOpen.value || !menuIsTopmost.value) return
+  event.preventDefault()
+  closeMenu(true)
 })
 
 watch(() => [

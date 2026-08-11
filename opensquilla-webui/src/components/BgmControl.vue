@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useBgm, BGM_LOCAL_TRACK_ID } from '@/composables/useBgm'
 
 // Topbar background-music control. Full presentation is the existing split
@@ -38,7 +39,8 @@ const rootRef = ref<HTMLDivElement | null>(null)
 const toggleRef = ref<HTMLButtonElement | null>(null)
 const caretRef = ref<HTMLButtonElement | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
-useDialogLayer(computed(() => menuOpen.value))
+useChatTopbarPopoverCoordination('bgm', menuOpen)
+const menuIsTopmost = useDialogLayer(computed(() => menuOpen.value))
 
 onMounted(() => { void initBgm() })
 
@@ -84,10 +86,11 @@ useDocumentEvent('click', (e) => {
 })
 
 useDocumentEvent('keydown', (e) => {
-  if (e.key === 'Escape' && menuOpen.value) {
-    menuOpen.value = false
-    caretRef.value?.focus()
-  }
+  if (e.defaultPrevented || e.key !== 'Escape') return
+  if (!menuOpen.value || !menuIsTopmost.value) return
+  e.preventDefault()
+  menuOpen.value = false
+  caretRef.value?.focus()
 })
 
 watch(() => props.presentation, presentation => {
@@ -136,7 +139,13 @@ watch(() => props.presentation, presentation => {
       >
         <Icon name="chevronDown" :size="12" />
       </button>
-      <div v-if="menuOpen" class="theme-menu bgm-menu" role="menu" :aria-label="t('chrome.bgm.label')">
+      <div
+        v-if="menuOpen"
+        class="theme-menu bgm-menu"
+        role="menu"
+        :aria-label="t('chrome.bgm.label')"
+        data-chat-topbar-popover="bgm"
+      >
         <button
           v-for="track in tracks"
           :key="track.id"
