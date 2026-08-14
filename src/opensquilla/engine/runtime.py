@@ -6044,6 +6044,26 @@ class TurnRunner:
                 code=event_code,
                 error_id=error_id or "",
                 failure_kind=provider_boundary_failure_kind,
+                retry_after_ms=(
+                    getattr(exc, "retry_after_ms", None)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
+                usage_call_index=(
+                    getattr(exc, "usage_call_index", None)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
+                no_prior_provider_dispatch=(
+                    getattr(exc, "no_prior_provider_dispatch", False)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
+                replay_safe=(
+                    getattr(exc, "replay_safe", False)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
             )
 
     @staticmethod

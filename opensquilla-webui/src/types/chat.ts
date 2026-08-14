@@ -266,6 +266,14 @@ export interface ChatTurnOutcome {
   startedAt?: number | string
   finishedAt?: number | string
   retryable?: boolean
+  errorClass?: string
+  terminalMessage?: string
+  retryAfterMs?: number
+  statusHistory?: import('./parts').StatusPart[]
+  usageCallIndex?: number
+  noPriorProviderDispatch?: boolean
+  replaySafe?: boolean
+  userMessageId?: string
 }
 
 export interface ChatRunTask {

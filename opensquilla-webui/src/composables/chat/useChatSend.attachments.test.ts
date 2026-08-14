@@ -61,6 +61,33 @@ function memoryHandoffWal(): PendingInputWal {
     list: async () => [],
     delete: async () => {},
     putHandoff: async record => { handoffs.set(record.ownerRequestId, structuredClone(record)) },
+    prepareHandoff: async record => {
+      const current = handoffs.get(record.ownerRequestId)
+      if (current) return { applied: false, record: structuredClone(current) }
+      const prepared = structuredClone(record)
+      handoffs.set(record.ownerRequestId, prepared)
+      return { applied: true, record: structuredClone(prepared) }
+    },
+    compareAndSwapHandoff: async (
+      ownerRequestId,
+      expectedWalOwnerId,
+      expectedWalRevision,
+      record,
+    ) => {
+      const current = handoffs.get(ownerRequestId)
+      if (
+        !current
+        || current.walOwnerId !== expectedWalOwnerId
+        || current.walRevision !== expectedWalRevision
+      ) return { applied: false, record: current ? structuredClone(current) : null }
+      if (!record) {
+        handoffs.delete(ownerRequestId)
+        return { applied: true, record: null }
+      }
+      const next = structuredClone(record)
+      handoffs.set(ownerRequestId, next)
+      return { applied: true, record: structuredClone(next) }
+    },
     listHandoffs: async () => [...handoffs.values()].map(record => structuredClone(record)),
     acceptHandoff: async (ownerRequestId, acceptedSessionKey) => {
       const record = handoffs.get(ownerRequestId)
@@ -137,6 +164,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     messages,
     sessionKey: ref('agent:main:webchat:test'),
     pendingQueueOwnerContext: ref(null),
+    hasPendingQueueWork: () => false,
     pendingInputWal: memoryHandoffWal(),
     busySendMode: ref<BusySendMode>('queue'),
     modelRoutingMode: ref<'off'>('off'),
@@ -187,6 +215,918 @@ function sameTurnSteerOptions(
     activeStreamTaskId: ref(expectedTurnId),
   }
 }
+
+function usageReplayMessages(): ChatMessage[] {
+  return [
+    {
+      role: 'user',
+      text: '/reset',
+      ts: null,
+      messageId: 'usage-primary',
+      turnId: 'usage-turn',
+    },
+    {
+      role: 'user',
+      text: 'same-turn steer',
+      ts: null,
+      messageId: 'usage-steer',
+      turnId: 'usage-turn',
+    },
+    {
+      role: 'error',
+      text: 'Usage accounting temporarily unavailable.',
+      ts: null,
+      messageId: 'usage-error',
+      turnId: 'usage-turn',
+      errorCode: 'usage_accounting_busy',
+    },
+  ]
+}
+
+describe('useChatSend dedicated usage-barrier replay', () => {
+  it('atomically admits only one of two cross-tab clicks for the same barrier', async () => {
+    const pendingInputWal = memoryHandoffWal()
+    let releaseSend!: (value: unknown) => void
+    const sendBlocked = new Promise(resolve => { releaseSend = resolve })
+    const first = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const second = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    first.rpc.call.mockImplementation(() => sendBlocked)
+    second.rpc.call.mockImplementation(() => sendBlocked)
+
+    const results = [first, second].map(harness => harness.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    }))
+    await vi.waitFor(() => expect(
+      first.rpc.call.mock.calls.length + second.rpc.call.mock.calls.length,
+    ).toBe(1))
+    releaseSend({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'cross-tab-winner',
+    })
+
+    expect((await Promise.all(results)).sort()).toEqual([false, true])
+    const wire = (first.rpc.call.mock.calls[0] || second.rpc.call.mock.calls[0])?.[1]
+    expect(wire).toMatchObject({
+      forkBeforeMessageId: 'usage-primary',
+      attachments: [],
+    })
+    expect(wire?.clientRequestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+  })
+
+  it('reuses the server receipt after winner cleanup when another tab still shows the card', async () => {
+    const pendingInputWal = memoryHandoffWal()
+    const first = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const second = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    first.rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'first-accepted-task',
+    })
+    second.rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'same-receipt-task',
+      replayed: true,
+    })
+
+    expect(await first.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(await second.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+
+    expect(second.rpc.call.mock.calls[0]?.[1]).toMatchObject({
+      clientRequestId: first.rpc.call.mock.calls[0]?.[1]?.clientRequestId,
+      clientMessageId: first.rpc.call.mock.calls[0]?.[1]?.clientMessageId,
+      message: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+  })
+
+  it('lets another tab safely recover a rejected winner with the same stable receipt', async () => {
+    const pendingInputWal = memoryHandoffWal()
+    const first = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const second = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    first.rpc.call.mockRejectedValue(Object.assign(new Error('busy'), {
+      accepted: false,
+      retryable: true,
+    }))
+
+    expect(await first.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+    const rejectedWire = first.rpc.call.mock.calls[0]?.[1]
+
+    await second.api.recoverResponseHandoffs()
+    expect(second.rpc.call).not.toHaveBeenCalled()
+
+    second.rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'recovered-winner',
+    })
+    expect(await second.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(second.rpc.call.mock.calls[0]?.[1]).toMatchObject({
+      clientRequestId: rejectedWire?.clientRequestId,
+      clientMessageId: rejectedWire?.clientMessageId,
+      forkBeforeMessageId: 'usage-primary',
+    })
+  })
+
+  it('isolates stable receipts by session and primary barrier without changing ordinary sends', async () => {
+    const pendingInputWal = memoryHandoffWal()
+    const sessionA = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const sessionB = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+      sessionKey: ref('agent:main:webchat:other'),
+    })
+    const otherBarrierMessages = usageReplayMessages().map(message => (
+      message.messageId === 'usage-primary'
+        ? { ...message, messageId: 'usage-primary-2' }
+        : message
+    ))
+    const barrierB = makeOptions({
+      messages: ref(otherBarrierMessages),
+      pendingInputWal,
+    })
+    const ordinary = makeOptions({
+      inputText: ref('ordinary send'),
+      pendingInputWal,
+    })
+
+    expect(await sessionA.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(await sessionB.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(await barrierB.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary-2',
+    })).toBe(true)
+    await ordinary.api.onSend()
+    expect(ordinary.rpc.call).toHaveBeenCalledOnce()
+
+    const requestIds = [sessionA, sessionB, barrierB, ordinary].map(
+      harness => harness.rpc.call.mock.calls[0]?.[1]?.clientRequestId,
+    )
+    expect(new Set(requestIds).size).toBe(4)
+  })
+
+  it.each([
+    'x'.repeat(513),
+    'usage-primary\nforged',
+  ])('rejects an unsafe durable primary identity before coordination: %j', async (messageId) => {
+    const messages = usageReplayMessages().map(message => (
+      message.messageId === 'usage-primary' ? { ...message, messageId } : message
+    ))
+    const { api, rpc } = makeOptions({ messages: ref(messages) })
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: messageId,
+    })).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('sends literal slash text with an exact fork and empty attachments without touching the draft', async () => {
+    const messages = ref(usageReplayMessages())
+    const inputText = ref('unrelated Goal/Replan draft')
+    const pendingForkBeforeMessageId = ref<string | null>('draft-fork')
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingAttachments = ref<Attachment[]>([
+      {
+        kind: 'inline',
+        local_id: 1,
+        name: 'draft-inline.txt',
+        mime: 'text/plain',
+        data: 'aW5saW5l',
+      },
+      {
+        kind: 'staged',
+        local_id: 2,
+        name: 'draft-staged.pdf',
+        mime: 'application/pdf',
+        file_uuid: 'draft-upload',
+      },
+      {
+        kind: 'failed',
+        local_id: 3,
+        name: 'draft-failed.txt',
+        mime: 'text/plain',
+        error: 'keep me',
+      },
+    ])
+    const { api, options, rpc } = makeOptions({
+      messages,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      pendingForkBeforeMessageId,
+    })
+    rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'usage-replay-task',
+      user_message_id: 'usage-replay-message',
+    })
+
+    const accepted = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+
+    expect(accepted).toBe(true)
+    expect(options.classifySlashCommand).not.toHaveBeenCalled()
+    expect(options.executeSlashCommand).not.toHaveBeenCalled()
+    expect(options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+      queueMode: 'followup',
+      attachments: [],
+    }))
+    expect(inputText.value).toBe('unrelated Goal/Replan draft')
+    expect(pendingAttachments.value).toHaveLength(3)
+    expect(pendingAttachments.value.map(attachment => attachment.local_id)).toEqual([1, 2, 3])
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
+    expect(messages.value).toMatchObject([{
+      role: 'user',
+      text: '/reset',
+      clientId: expect.any(String),
+      messageId: 'usage-replay-message',
+      turnId: 'usage-replay-task',
+    }])
+  })
+
+  it.each([
+    'streaming',
+    'authoritative work',
+    'compaction',
+    'pending queue',
+    'pending queue ownership',
+  ])('fails closed during %s instead of queuing or dropping the fork anchor', async (blockedBy) => {
+    const messages = ref(usageReplayMessages())
+    const inputText = ref('keep draft')
+    const pendingForkBeforeMessageId = ref<string | null>('keep-draft-fork')
+    const pendingQueueOwnerContext = ref<UseChatSendOptions['pendingQueueOwnerContext']['value']>(null)
+    const taskOwnership = blockedBy === 'authoritative work'
+      ? {
+          hydrationResolved: ref(true),
+          hasAuthoritativeWork: ref(true),
+        } as unknown as NonNullable<UseChatSendOptions['taskOwnership']>
+      : undefined
+    const { api, rpc, stream, options } = makeOptions({
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingQueueOwnerContext,
+      ...(taskOwnership ? { taskOwnership } : {}),
+      ...(blockedBy === 'compaction'
+        ? { isCompactInFlightForCurrentSession: () => true }
+        : {}),
+      ...(blockedBy === 'pending queue'
+        ? { hasPendingQueueWork: () => true }
+        : {}),
+    })
+    if (blockedBy === 'streaming') stream.isStreaming.value = true
+    if (blockedBy === 'pending queue ownership') {
+      pendingQueueOwnerContext.value = {
+        sessionKey: options.sessionKey.value,
+        ownerRequestId: 'pending-owner',
+      }
+    }
+
+    const accepted = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+
+    expect(accepted).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(messages.value).toEqual(usageReplayMessages())
+    expect(inputText.value).toBe('keep draft')
+    expect(pendingForkBeforeMessageId.value).toBe('keep-draft-fork')
+  })
+
+  it('fails closed behind an existing fork handoff without sending a second request', async () => {
+    let resolveFirst!: (value: unknown) => void
+    const firstResponse = new Promise(resolve => { resolveFirst = resolve })
+    const messages = ref<ChatMessage[]>([
+      ...usageReplayMessages(),
+      { role: 'user', text: 'ordinary fork', ts: null, messageId: 'ordinary-anchor' },
+    ])
+    const pendingForkBeforeMessageId = ref<string | null>('ordinary-anchor')
+    const { api, rpc } = makeOptions({
+      messages,
+      inputText: ref('ordinary fork'),
+      pendingForkBeforeMessageId,
+    })
+    rpc.call.mockImplementationOnce(() => firstResponse)
+
+    const ordinarySend = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(1))
+    const accepted = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+
+    expect(accepted).toBe(false)
+    expect(rpc.call).toHaveBeenCalledTimes(1)
+    resolveFirst({ sessionKey: 'agent:main:webchat:test' })
+    await ordinarySend
+  })
+
+  it('keeps history and composer unchanged after rejection, then retries the exact receipt', async () => {
+    const messages = ref(usageReplayMessages())
+    const originalMessages = [...messages.value]
+    const inputText = ref('draft survives')
+    const pendingForkBeforeMessageId = ref<string | null>('draft-fork')
+    const { api, rpc } = makeOptions({ messages, inputText, pendingForkBeforeMessageId })
+    rpc.call
+      .mockRejectedValueOnce(Object.assign(new Error('busy'), {
+        accepted: false,
+        retryable: true,
+      }))
+      .mockResolvedValueOnce({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'usage-retry-task',
+        user_message_id: 'usage-retry-message',
+      })
+
+    const first = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+
+    expect(first).toBe(false)
+    expect(messages.value).toEqual(originalMessages)
+    expect(inputText.value).toBe('draft survives')
+    expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
+
+    const second = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+
+    expect(second).toBe(true)
+    expect(rpc.call.mock.calls[1]?.[1]).toMatchObject({
+      clientRequestId: firstParams?.clientRequestId,
+      clientMessageId: firstParams?.clientMessageId,
+      message: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+      attachments: [],
+    })
+    expect(inputText.value).toBe('draft survives')
+    expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
+  })
+
+  it('never restores a definitely rejected protocol replay into the composer from handoff WAL', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        if (retained) return { applied: false, record: structuredClone(retained) }
+        retained = structuredClone(record)
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const messages = ref(usageReplayMessages())
+    const inputText = ref('do not replace this draft')
+    const pendingForkBeforeMessageId = ref<string | null>('draft-fork')
+    const { api, rpc } = makeOptions({
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+    })
+    rpc.call.mockRejectedValue(Object.assign(new Error('rejected'), {
+      accepted: false,
+      retryable: false,
+    }))
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+    expect(retained).toMatchObject({
+      state: 'failed',
+      restoreComposerOnFailure: false,
+    })
+
+    await api.recoverResponseHandoffs()
+
+    expect(retained).toBeNull()
+    expect(inputText.value).toBe('do not replace this draft')
+    expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
+    expect(messages.value).toEqual(usageReplayMessages())
+  })
+
+  it('rechecks the session after delayed attachment preparation before creating an attempt', async () => {
+    let releasePreparation!: (ready: boolean) => void
+    const preparation = new Promise<boolean>(resolve => { releasePreparation = resolve })
+    const prepareAttachmentsForSend = vi.fn(() => preparation)
+    const messages = ref(usageReplayMessages())
+    const inputText = ref('keep draft')
+    const sessionKey = ref('agent:main:webchat:test')
+    const { api, rpc } = makeOptions({
+      messages,
+      inputText,
+      sessionKey,
+      prepareAttachmentsForSend,
+    })
+
+    const replay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(prepareAttachmentsForSend).toHaveBeenCalledOnce())
+    sessionKey.value = 'agent:main:webchat:other'
+    releasePreparation(true)
+
+    expect(await replay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(messages.value).toEqual(usageReplayMessages())
+    expect(inputText.value).toBe('keep draft')
+  })
+
+  it('never recovers an unarmed write-after-throw and safely retries the same receipt', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let failPrepareAfterWrite = true
+    let failDelete = true
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        if (retained) return { applied: false, record: structuredClone(retained) }
+        retained = structuredClone(record)
+        if (failPrepareAfterWrite) {
+          failPrepareAfterWrite = false
+          throw new Error('storage reported failure after write')
+        }
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        if (!record && failDelete) throw new Error('delete unavailable')
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { throw new Error('legacy delete unavailable') },
+      close: () => {},
+    }
+    const { api, rpc } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toMatchObject({ state: 'preparing', walRevision: 1 })
+    const firstParams = structuredClone(retained!.params)
+
+    await api.recoverResponseHandoffs()
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toMatchObject({ state: 'preparing', walRevision: 1 })
+
+    failDelete = false
+    rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'retry-after-unarmed',
+    })
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: firstParams.clientRequestId,
+      clientMessageId: firstParams.clientMessageId,
+      forkBeforeMessageId: 'usage-primary',
+    }))
+  })
+
+  it('does not dispatch when arming the prepared handoff fails', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let failArm = true
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        if (retained) return { applied: false, record: structuredClone(retained) }
+        retained = structuredClone(record)
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        if (record?.state === 'submitting' && failArm) {
+          failArm = false
+          throw new Error('arm transaction aborted')
+        }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const { api, rpc } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toBeNull()
+  })
+
+  it.each([
+    'session switch',
+    'busy work',
+    'anchor disappearance',
+  ])('rechecks %s after delayed arm and safely retries the same receipt', async (invalidatedBy) => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let releaseArm!: () => void
+    const armBlocked = new Promise<void>(resolve => { releaseArm = resolve })
+    let blockFirstArm = true
+    let armStarted = false
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        if (retained) return { applied: false, record: structuredClone(retained) }
+        retained = structuredClone(record)
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        if (record?.state === 'submitting' && blockFirstArm) {
+          blockFirstArm = false
+          armStarted = true
+          await armBlocked
+        }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const taskOwnership = useChatTaskOwnership()
+    const sessionKey = ref('agent:main:webchat:test')
+    const messages = ref(usageReplayMessages())
+    const { api, rpc } = makeOptions({
+      messages,
+      pendingInputWal,
+      sessionKey,
+      taskOwnership,
+    })
+    rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'post-arm-retry',
+    })
+
+    const replay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(armStarted).toBe(true))
+    const firstParams = structuredClone(retained!.params)
+    if (invalidatedBy === 'session switch') {
+      sessionKey.value = 'agent:main:webchat:other'
+    } else if (invalidatedBy === 'busy work') {
+      taskOwnership.runningTaskId.value = 'other-running-task'
+    } else {
+      messages.value = messages.value.filter(message => message.messageId !== 'usage-primary')
+    }
+    releaseArm()
+
+    expect(await replay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toBeNull()
+
+    sessionKey.value = 'agent:main:webchat:test'
+    taskOwnership.runningTaskId.value = ''
+    messages.value = usageReplayMessages()
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: firstParams.clientRequestId,
+      clientMessageId: firstParams.clientMessageId,
+      forkBeforeMessageId: 'usage-primary',
+    }))
+  })
+
+  it('lets recovery delete an unarmed record before a concurrent arm without sending it', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let releasePrepare!: () => void
+    const prepareBlocked = new Promise<void>(resolve => { releasePrepare = resolve })
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        retained = structuredClone(record)
+        await prepareBlocked
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const live = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const recovery = makeOptions({ pendingInputWal })
+
+    const replay = live.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(retained?.state).toBe('preparing'))
+    await recovery.api.recoverResponseHandoffs()
+    releasePrepare()
+
+    expect(await replay).toBe(false)
+    expect(live.rpc.call).not.toHaveBeenCalled()
+    expect(recovery.rpc.call).not.toHaveBeenCalled()
+    expect(retained).toBeNull()
+  })
+
+  it('does not let stale pre-dispatch cleanup erase a concurrently armed record', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let releasePrepare!: () => void
+    const prepareBlocked = new Promise<void>(resolve => { releasePrepare = resolve })
+    const sessionKey = ref('agent:main:webchat:test')
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        retained = structuredClone(record)
+        await prepareBlocked
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const { api, rpc } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+      sessionKey,
+    })
+
+    const replay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(retained?.state).toBe('preparing'))
+    retained = {
+      ...retained!,
+      state: 'submitting',
+      walRevision: retained!.walRevision! + 1,
+      updatedAt: Date.now(),
+    }
+    sessionKey.value = 'agent:main:webchat:other'
+    releasePrepare()
+
+    expect(await replay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toMatchObject({ state: 'submitting', walRevision: 2 })
+  })
+
+  it.each([
+    'session switch',
+    'busy stream',
+    'authoritative work',
+    'compaction',
+    'pending queue',
+    'anchor disappearance',
+  ])('rechecks %s after delayed handoff persistence and keeps the same retry receipt', async (invalidatedBy) => {
+    let releasePersistence!: () => void
+    const persistence = new Promise<void>(resolve => { releasePersistence = resolve })
+    let firstPersist = true
+    let retained: ResponseHandoffWalRecord | null = null
+    const prepareHandoff = vi.fn(async (record: ResponseHandoffWalRecord) => {
+      retained = structuredClone(record)
+      if (firstPersist) {
+        firstPersist = false
+        await persistence
+      }
+      return { applied: true, record: structuredClone(record) }
+    })
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff,
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    let pendingQueueWork = false
+    let compactInFlight = false
+    const taskOwnership = useChatTaskOwnership()
+    const messages = ref(usageReplayMessages())
+    const sessionKey = ref('agent:main:webchat:test')
+    const { api, rpc, stream } = makeOptions({
+      messages,
+      sessionKey,
+      pendingInputWal,
+      hasPendingQueueWork: () => pendingQueueWork,
+      isCompactInFlightForCurrentSession: () => compactInFlight,
+      taskOwnership,
+    })
+    rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'retried-task',
+      user_message_id: 'retried-message',
+    })
+
+    const firstReplay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(prepareHandoff).toHaveBeenCalledOnce())
+    const firstParams = structuredClone(retained!.params)
+    if (invalidatedBy === 'session switch') {
+      sessionKey.value = 'agent:main:webchat:other'
+    } else if (invalidatedBy === 'busy stream') {
+      stream.isStreaming.value = true
+    } else if (invalidatedBy === 'authoritative work') {
+      taskOwnership.runningTaskId.value = 'other-running-task'
+    } else if (invalidatedBy === 'compaction') {
+      compactInFlight = true
+    } else if (invalidatedBy === 'pending queue') {
+      pendingQueueWork = true
+    } else {
+      messages.value = messages.value.filter(message => message.messageId !== 'usage-primary')
+    }
+    releasePersistence()
+
+    expect(await firstReplay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toBeNull()
+
+    sessionKey.value = 'agent:main:webchat:test'
+    stream.isStreaming.value = false
+    taskOwnership.runningTaskId.value = ''
+    compactInFlight = false
+    pendingQueueWork = false
+    messages.value = usageReplayMessages()
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: firstParams.clientRequestId,
+      clientMessageId: firstParams.clientMessageId,
+      forkBeforeMessageId: 'usage-primary',
+      attachments: [],
+    }))
+  })
+
+  it('tears down its fresh stream when the final pre-RPC guard becomes blocked', async () => {
+    let pendingQueueWork = false
+    const activeStreamTaskId = ref('')
+    const activeStreamSessionKey = ref('')
+    const aborted = ref(true)
+    const { api, rpc, stream } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      activeStreamTaskId,
+      activeStreamSessionKey,
+      aborted,
+      hasPendingQueueWork: () => pendingQueueWork,
+    })
+    stream.startStreaming = vi.fn(() => {
+      stream.isStreaming.value = true
+      pendingQueueWork = true
+    })
+    stream.endStreaming = vi.fn(() => {
+      stream.isStreaming.value = false
+    })
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(stream.endStreaming).toHaveBeenCalledOnce()
+    expect(stream.isStreaming.value).toBe(false)
+    expect(activeStreamTaskId.value).toBe('')
+    expect(activeStreamSessionKey.value).toBe('')
+    expect(aborted.value).toBe(true)
+  })
+})
 
 describe('useChatSend attachment payloads', () => {
   it('replays a persisted handoff identity after refresh and repairs its owner queue', async () => {
@@ -2216,6 +3156,7 @@ describe('useChatSend attachment payloads', () => {
       stripTimePrefix: text => text,
       autoResizeTextarea: vi.fn(),
       sendCurrentInput: vi.fn(),
+      sendUsageBarrierReplay: vi.fn(async () => false),
       focusComposer: vi.fn(),
       pendingForkBeforeMessageId,
     })
